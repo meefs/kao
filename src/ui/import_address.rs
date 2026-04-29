@@ -1,8 +1,12 @@
+use std::sync::Arc;
+
 use alloy::primitives::Address;
 use iced::keyboard;
 use iced::widget::{Space, column, container, row, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
+use crate::ens;
+use crate::net::BalanceFetcher;
 use crate::settings;
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
@@ -16,6 +20,14 @@ pub const ADDRESS_INPUT_ID: &str = "view_only_address_input";
 pub enum Message {
     AddressInput(String),
     AddPressed,
+    /// Result of an ENS forward-resolution task spawned by `AddPressed`.
+    /// `seq` is the input-generation counter that was current when the task
+    /// was spawned; we drop the result if the user has typed since.
+    EnsResolved {
+        seq: u64,
+        name: String,
+        result: Result<Option<Address>, String>,
+    },
     BackPressed,
     KeyboardEvent(keyboard::Event),
 }
@@ -23,24 +35,76 @@ pub enum Message {
 /// Outcome signals emitted by this screen to its parent.
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    Imported { address: Address },
+    Imported {
+        address: Address,
+        /// The ENS name the user typed (forward-verified at resolve time),
+        /// or `None` when they entered a raw `0x…` address. Used by the
+        /// caller as the default account display name.
+        ens_name: Option<String>,
+    },
     Back,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ImportAddressScreen {
     address_input: String,
     error: Option<String>,
+    /// Bumped on every keystroke. ENS resolution tasks tag results with the
+    /// sequence they were spawned at, so a stale lookup can't import a
+    /// stale address after the user kept typing.
+    input_seq: u64,
+    /// `Some(seq)` while an ENS resolution task is in flight for the given
+    /// sequence; `None` when idle.
+    resolving: Option<u64>,
+    network: Arc<dyn BalanceFetcher>,
 }
 
 impl ImportAddressScreen {
+    pub fn new(network: Arc<dyn BalanceFetcher>) -> Self {
+        Self {
+            address_input: String::new(),
+            error: None,
+            input_seq: 0,
+            resolving: None,
+            network,
+        }
+    }
+
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::AddressInput(s) => {
                 self.address_input = s;
+                self.input_seq = self.input_seq.wrapping_add(1);
+                // Any in-flight ENS lookup is now stale.
+                self.resolving = None;
+                self.error = None;
                 (Task::none(), None)
             }
-            Message::AddPressed => (Task::none(), self.try_import()),
+            Message::AddPressed => self.try_import(),
+            Message::EnsResolved { seq, name, result } => {
+                if self.resolving != Some(seq) {
+                    // User kept typing — drop the result.
+                    return (Task::none(), None);
+                }
+                self.resolving = None;
+                match result {
+                    Ok(Some(address)) => (
+                        Task::none(),
+                        Some(Outcome::Imported {
+                            address,
+                            ens_name: Some(name),
+                        }),
+                    ),
+                    Ok(None) => {
+                        self.error = Some(format!("ENS name “{name}” has no address record."));
+                        (Task::none(), None)
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("ENS lookup failed: {e}"));
+                        (Task::none(), None)
+                    }
+                }
+            }
             Message::BackPressed => (Task::none(), Some(Outcome::Back)),
             Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => match key {
                 keyboard::Key::Named(keyboard::key::Named::Escape) => {
@@ -52,25 +116,46 @@ impl ImportAddressScreen {
         }
     }
 
-    fn try_import(&mut self) -> Option<Outcome> {
-        let trimmed = self.address_input.trim();
+    fn try_import(&mut self) -> (Task<Message>, Option<Outcome>) {
+        let trimmed = self.address_input.trim().to_string();
         if trimmed.is_empty() {
-            self.error = Some("Please enter an Ethereum address.".into());
-            return None;
+            self.error = Some("Please enter an Ethereum address or ENS name.".into());
+            return (Task::none(), None);
         }
-        match trimmed.parse::<Address>() {
-            Ok(address) => {
-                self.error = None;
-                Some(Outcome::Imported { address })
-            }
-            Err(_) => {
-                self.error = Some(
-                    "Invalid address — expected 20 bytes as 40 hex characters (0x prefix optional)."
-                        .into(),
-                );
-                None
-            }
+        // Hex first: a 40-char hex string with optional 0x parses straight to
+        // an Address and skips a network round-trip.
+        if let Ok(address) = trimmed.parse::<Address>() {
+            self.error = None;
+            return (
+                Task::none(),
+                Some(Outcome::Imported {
+                    address,
+                    ens_name: None,
+                }),
+            );
         }
+        if ens::looks_like_ens(&trimmed) {
+            self.error = None;
+            let seq = self.input_seq;
+            self.resolving = Some(seq);
+            let network = self.network.clone();
+            let name = trimmed;
+            let task = Task::perform(
+                async move {
+                    let result = match network.provider().await {
+                        Some(provider) => ens::resolve_name(&provider, &name).await,
+                        None => Err("no execution RPCs configured".to_string()),
+                    };
+                    (seq, name, result)
+                },
+                |(seq, name, result)| Message::EnsResolved { seq, name, result },
+            );
+            return (task, None);
+        }
+        self.error = Some(
+            "Not a valid Ethereum address or ENS name. Expected `0x…` (40 hex chars) or `name.eth`.".into(),
+        );
+        (Task::none(), None)
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -80,7 +165,7 @@ impl ImportAddressScreen {
     pub fn view(&self) -> Element<'_, Message> {
         let t = KaoTheme::for_kind(settings::theme());
 
-        let address_input = text_input("0x…", &self.address_input)
+        let address_input = text_input("0x… or name.eth", &self.address_input)
             .id(ADDRESS_INPUT_ID)
             .on_input(Message::AddressInput)
             .on_submit(Message::AddPressed)
@@ -89,7 +174,17 @@ impl ImportAddressScreen {
             .font(mono())
             .style(move |_theme, status| text_input_style(t, status));
 
-        let add_btn = primary_button(t, "Watch Address →", true).on_press(Message::AddPressed);
+        let resolving_now = self.resolving.is_some();
+        let btn_label = if resolving_now {
+            "Resolving ENS…"
+        } else {
+            "Watch Address →"
+        };
+        let add_btn = primary_button(t, btn_label, !resolving_now).on_press_maybe(if resolving_now {
+            None
+        } else {
+            Some(Message::AddPressed)
+        });
 
         let hint = container(
             row![
@@ -110,7 +205,7 @@ impl ImportAddressScreen {
             vspace(10),
             screen_title(t, "Watch an Address"),
             vspace(6),
-            screen_subtitle(t, "Track any wallet read-only — no signing, no risk."),
+            screen_subtitle(t, "Track any wallet read-only — paste an address or ENS name."),
             vspace(22),
             address_input,
             vspace(18),

@@ -1,5 +1,11 @@
 //! Activity pane — transaction list. Demo data today; the eventual fetch
 //! pipeline lands here.
+//!
+//! When real history is wired in, the counterparty addresses on each row
+//! should pass through `crate::ens::lookup_address` (forward-verified
+//! reverse resolution) before display. Treat unverified reverse records as
+//! the address itself — they are set by the address owner and impersonate
+//! arbitrary names without forward verification.
 
 use iced::widget::{Space, column, container, row, text};
 use iced::{Alignment, Element, Length, Padding};

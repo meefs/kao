@@ -244,14 +244,17 @@ impl App {
         let address = screen.address_for_log();
         let balance_task = screen.fetch_balance_task().map(Message::WalletDashboard);
         let portfolio_task = screen.fetch_portfolio_task().map(Message::WalletDashboard);
+        // Reverse-ENS lookup. No-ops when the active account is already
+        // named, so account switches don't pile up redundant lookups.
+        let ens_task = screen.fetch_ens_name_task().map(Message::WalletDashboard);
         self.screen = Screen::Wallet(screen);
         debug!(
             active_index,
             addr = %address,
             built_in = ?started.elapsed(),
-            "entered dashboard; balance+portfolio fetch queued",
+            "entered dashboard; balance+portfolio+ens fetch queued",
         );
-        iced::Task::batch(vec![balance_task, portfolio_task])
+        iced::Task::batch(vec![balance_task, portfolio_task, ens_task])
     }
 
     /// Routes the active account of `self.wallet` to the right destination.
@@ -508,7 +511,9 @@ impl App {
                             iced::Task::none()
                         }
                         SetupMethod::WatchAddress => {
-                            self.screen = Screen::ImportAddress(ImportAddressScreen::default());
+                            self.screen = Screen::ImportAddress(ImportAddressScreen::new(
+                                self.network.clone(),
+                            ));
                             focus_widget(crate::ui::import_address::ADDRESS_INPUT_ID)
                                 .map(Message::ImportAddress)
                         }
@@ -617,8 +622,15 @@ impl App {
                 };
                 let (cmd, outcome) = screen.update(msg);
                 match outcome {
-                    Some(ImportAddressOutcome::Imported { address }) => {
-                        let account = wallet::view_only_account(address);
+                    Some(ImportAddressOutcome::Imported { address, ens_name }) => {
+                        let mut account = wallet::view_only_account(address);
+                        // Use the ENS name (already forward-verified at
+                        // resolve time — this came from a forward lookup, so
+                        // there's no impersonation risk) as the default
+                        // account name.
+                        if let Some(name) = ens_name {
+                            account.set_name(Some(name));
+                        }
                         self.save_account_and_enter_dashboard(account, KaoSigner::ViewOnly(address))
                     }
                     Some(ImportAddressOutcome::Back) => {

@@ -87,6 +87,13 @@ pub enum Message {
         result: Result<TxHash, String>,
         signer: SignerHandoff,
     },
+    /// Result of the dashboard's startup reverse-ENS lookup. Carries the
+    /// address it was issued against so a quick account switch can't apply
+    /// a name to the wrong account.
+    EnsAutoNameResolved {
+        address: Address,
+        result: Result<Option<String>, String>,
+    },
     /// Side-effect ack from a clipboard write. No-op handler.
     ClipboardWritten,
 }
@@ -252,6 +259,43 @@ impl WalletScreen {
         )
     }
 
+    /// Reverse-resolve the active address against ENS (forward-verified)
+    /// and use the result as a default account name when none is set yet.
+    /// Skipped when the user has already named the account: we never
+    /// overwrite an explicit choice with an inferred one. Also skipped for
+    /// inputs that look like they were just imported with an ENS name —
+    /// the import flow already set the name, so a second lookup is wasted
+    /// work (and would noisily reapply it).
+    pub fn fetch_ens_name_task(&self) -> Task<Message> {
+        let address = self.address;
+        let network = self.network.clone();
+        let already_named = self
+            .accounts
+            .get(self.active_index)
+            .and_then(|a| a.name())
+            .is_some();
+        if already_named {
+            return Task::none();
+        }
+        Task::perform(
+            async move {
+                debug!(addr = %short_address(address), "ens reverse lookup");
+                let started = std::time::Instant::now();
+                let result = match network.provider().await {
+                    Some(provider) => crate::ens::lookup_address(&provider, address).await,
+                    None => Err("no execution RPCs configured".to_string()),
+                };
+                debug!(
+                    elapsed = ?started.elapsed(),
+                    found = matches!(&result, Ok(Some(_))),
+                    "ens reverse lookup completed",
+                );
+                (address, result)
+            },
+            |(address, result)| Message::EnsAutoNameResolved { address, result },
+        )
+    }
+
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::BalanceFetched(r) => {
@@ -354,18 +398,27 @@ impl WalletScreen {
                 }
 
                 let (task, outcome) = p.update(child_msg);
+                // After pumping the pane, check whether the recipient
+                // input now points at an ENS-shaped value that hasn't been
+                // dispatched yet. The pane bumps a sequence on each
+                // change; `take_pending_ens` returns Some exactly once
+                // per sequence so a no-op repaint won't refire the lookup.
+                let ens_task = match p.take_pending_ens() {
+                    Some((seq, name)) => spawn_ens_resolve_task(self.network.clone(), seq, name),
+                    None => Task::none(),
+                };
                 let task = task.map(Message::Send);
                 match outcome {
                     Some(send::Outcome::Closed) => {
                         self.chrome.start_close();
-                        return (task, None);
+                        return (Task::batch([task, ens_task]), None);
                     }
                     Some(send::Outcome::CopyText(s)) => {
                         let copy_task =
                             iced::clipboard::write(s).map(|_: ()| Message::ClipboardWritten);
-                        return (Task::batch([task, copy_task]), None);
+                        return (Task::batch([task, copy_task, ens_task]), None);
                     }
-                    None => return (task, None),
+                    None => return (Task::batch([task, ens_task]), None),
                 }
             }
             Message::SendBroadcastReturn { result, signer } => {
@@ -402,6 +455,33 @@ impl WalletScreen {
                     };
                     return (Task::batch([task.map(Message::Send), refresh]), None);
                 }
+            }
+            Message::EnsAutoNameResolved { address, result } => {
+                // The lookup was issued against `self.address` at the time
+                // it was kicked off; if the user switched accounts before
+                // it landed, drop it.
+                if address != self.address {
+                    return (Task::none(), None);
+                }
+                let name = match result {
+                    Ok(Some(n)) => n,
+                    Ok(None) => return (Task::none(), None),
+                    Err(e) => {
+                        warn!(error = %e, "ens auto-name lookup failed");
+                        return (Task::none(), None);
+                    }
+                };
+                // Re-check the name slot — the user could have renamed
+                // since we kicked off the lookup, and we never overwrite
+                // an explicit choice with an inferred one.
+                let acc = match self.accounts.get_mut(self.active_index) {
+                    Some(a) if a.name().is_none() => a,
+                    _ => return (Task::none(), None),
+                };
+                acc.set_name(Some(name.clone()));
+                // Bubble up so the App persists the rename to disk via
+                // its existing rename pipeline.
+                return (Task::none(), Some(Outcome::RenameActiveAccount(Some(name))));
             }
             Message::ClipboardWritten => {}
             Message::OpenReceive => {
@@ -665,6 +745,26 @@ fn compute_max_amount(tk: &LiveToken, p: &SendPane) -> String {
         raw
     };
     format_units(max_raw, tk.decimals).unwrap_or_else(|_| tk.balance.replace(',', ""))
+}
+
+/// Spawn a forward ENS resolution task for the Send recipient input.
+/// Returns a `Task` that resolves to a `Send::EnsResolved(...)` message
+/// tagged with `seq` so the pane can drop stale lookups.
+fn spawn_ens_resolve_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    name: String,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = match network.provider().await {
+                Some(provider) => crate::ens::resolve_name(&provider, &name).await,
+                None => Err("no execution RPCs configured".to_string()),
+            };
+            (seq, name, result)
+        },
+        |(seq, name, result)| Message::Send(send::Message::EnsResolved { seq, name, result }),
+    )
 }
 
 /// Spawn a quote task using the network's shared provider. Returns a

@@ -15,6 +15,7 @@ use iced::keyboard;
 use iced::widget::{Space, column, container, mouse_area, row, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
+use crate::ens;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
@@ -56,11 +57,50 @@ pub enum Message {
     Confirm,
     QuoteFetched(Result<TxQuote, String>),
     BroadcastDone(Result<TxHash, String>),
+    /// Result of an ENS forward-resolution task spawned by the dashboard.
+    /// `seq` is the input-generation counter that was current when the task
+    /// was spawned; results carrying a stale seq are dropped so the user's
+    /// most recent typing always wins.
+    EnsResolved {
+        seq: u64,
+        name: String,
+        result: Result<Option<Address>, String>,
+    },
     CopyHash,
     CopyEtherscan,
     Close,
     BoxClickIgnored,
     Key(keyboard::Event),
+}
+
+/// Resolution state of the recipient input. Tracks both the literal user
+/// input and any ENS lookup that resulted from it.
+#[derive(Debug, Clone)]
+enum Resolution {
+    /// Empty input.
+    Empty,
+    /// User typed something that's not a valid address and not ENS-shaped
+    /// (no dot). Continue is disabled.
+    Invalid,
+    /// User pasted a valid hex address — no network round-trip needed.
+    Address(Address),
+    /// User typed an ENS-shaped name and a lookup is in flight.
+    Resolving { name: String },
+    /// ENS lookup succeeded.
+    Resolved { name: String, addr: Address },
+    /// ENS lookup returned no address record.
+    NotFound { name: String },
+    /// ENS lookup errored (network, RPC, decoding).
+    Error { name: String, msg: String },
+}
+
+impl Resolution {
+    fn recipient(&self) -> Option<Address> {
+        match self {
+            Resolution::Address(a) | Resolution::Resolved { addr: a, .. } => Some(*a),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,8 +118,18 @@ pub struct SendPane {
     from: Address,
     step: u8,
     to: String,
-    /// Parsed recipient. `None` until `to` is a valid hex address.
-    recipient: Option<Address>,
+    /// Parsed/resolved recipient state. Inputs that are valid hex
+    /// addresses skip the network; ENS-shaped inputs go through a
+    /// dashboard-coordinated resolver. The `recipient()` accessor pulls a
+    /// concrete `Address` out only when the state is settled.
+    resolution: Resolution,
+    /// Bumped on every recipient-input change. ENS lookups tag their
+    /// results with the seq they were spawned at; stale results are dropped.
+    resolution_seq: u64,
+    /// Highest seq for which the dashboard has already spawned a task. Lets
+    /// `take_pending_ens` return `Some` once per fresh input change without
+    /// the dashboard having to track per-pane state.
+    last_dispatched_seq: Option<u64>,
     amount: String,
     token_idx: usize,
     busy: bool,
@@ -97,7 +147,9 @@ impl SendPane {
             from,
             step: 0,
             to: String::new(),
-            recipient: None,
+            resolution: Resolution::Empty,
+            resolution_seq: 0,
+            last_dispatched_seq: None,
             amount: String::new(),
             token_idx: 0,
             busy: false,
@@ -120,6 +172,42 @@ impl SendPane {
         self.quote
     }
 
+    /// Coordinator hook: returns `Some((seq, name))` exactly once per
+    /// recipient-input change that landed on an ENS-shaped value. The
+    /// dashboard spawns a forward-resolution task tagged with `seq`, and a
+    /// later `EnsResolved` carries the result back. After the first
+    /// dispatch this returns `None` until the user types something that
+    /// bumps the seq again.
+    pub fn take_pending_ens(&mut self) -> Option<(u64, String)> {
+        match &self.resolution {
+            Resolution::Resolving { name }
+                if self.last_dispatched_seq != Some(self.resolution_seq) =>
+            {
+                let seq = self.resolution_seq;
+                self.last_dispatched_seq = Some(seq);
+                Some((seq, name.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn set_to(&mut self, raw: String) {
+        self.to = raw;
+        self.resolution_seq = self.resolution_seq.wrapping_add(1);
+        let trimmed = self.to.trim();
+        self.resolution = if trimmed.is_empty() {
+            Resolution::Empty
+        } else if let Ok(addr) = Address::from_str(trimmed) {
+            Resolution::Address(addr)
+        } else if ens::looks_like_ens(trimmed) {
+            Resolution::Resolving {
+                name: trimmed.to_string(),
+            }
+        } else {
+            Resolution::Invalid
+        };
+    }
+
     /// Coordinator-driven Max: the dashboard knows the active token's raw
     /// balance and (when a quote is loaded) the expected ETH gas cost, so it
     /// computes the max sendable amount and pumps it back as a formatted
@@ -131,15 +219,36 @@ impl SendPane {
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             Message::SetTo(s) => {
-                self.recipient = Address::from_str(s.trim()).ok();
-                self.to = s;
+                self.set_to(s);
                 (Task::none(), None)
             }
             Message::PickContact(i) => {
                 if let Some(c) = CONTACTS.get(i) {
-                    self.to = c.addr.into();
-                    self.recipient = Address::from_str(c.addr).ok();
+                    self.set_to(c.addr.into());
                 }
+                (Task::none(), None)
+            }
+            Message::EnsResolved { seq, name, result } => {
+                if seq != self.resolution_seq {
+                    return (Task::none(), None);
+                }
+                // Only apply the result if the resolution slot is still
+                // pointing at the same name we dispatched for. The user
+                // could have typed a different ENS-shaped value at the
+                // same seq if rapid edits straddled wrapping boundaries —
+                // unlikely in practice, but cheap to guard.
+                let still_relevant = matches!(
+                    &self.resolution,
+                    Resolution::Resolving { name: pending } if pending == &name,
+                );
+                if !still_relevant {
+                    return (Task::none(), None);
+                }
+                self.resolution = match result {
+                    Ok(Some(addr)) => Resolution::Resolved { name, addr },
+                    Ok(None) => Resolution::NotFound { name },
+                    Err(msg) => Resolution::Error { name, msg },
+                };
                 (Task::none(), None)
             }
             Message::SetAmount(s) => {
@@ -245,7 +354,7 @@ impl SendPane {
     /// later broadcast. Returns `None` if the current state can't be
     /// turned into a valid plan (input parses missing).
     pub fn build_plan(&self, portfolio: &[LiveToken]) -> Option<SendPlan> {
-        let recipient = self.recipient?;
+        let recipient = self.resolution.recipient()?;
         let token = portfolio.get(self.token_idx)?;
         let amount_units = parse_amount_units(&self.amount, token.decimals).ok()?;
         if amount_units.is_zero() {
@@ -355,23 +464,64 @@ impl SendPane {
     fn step_recipient<'a>(&'a self, t: KaoTheme) -> Element<'a, Message> {
         let label = text("TO").size(11).color(t.sub).font(bold());
 
-        let input = text_input("0x… address (40 hex chars)", &self.to)
+        let input = text_input("0x… address or name.eth", &self.to)
             .on_input(Message::SetTo)
             .padding(Padding::from([12, 14]))
             .size(15)
             .font(mono())
             .style(move |_theme, status| text_input_style(t, status));
 
-        let parse_hint: Element<'_, Message> = if self.to.trim().is_empty() {
-            Space::new().height(0).into()
-        } else if self.recipient.is_some() {
-            container(text("✓ valid address").size(11).color(t.up).font(bold()))
-                .padding(Padding::from([4, 0]))
-                .into()
-        } else {
-            container(text("Not a valid 0x… address").size(11).color(t.down).font(bold()))
-                .padding(Padding::from([4, 0]))
-                .into()
+        let parse_hint: Element<'_, Message> = match &self.resolution {
+            Resolution::Empty => Space::new().height(0).into(),
+            Resolution::Address(_) => container(
+                text("✓ valid address").size(11).color(t.up).font(bold()),
+            )
+            .padding(Padding::from([4, 0]))
+            .into(),
+            Resolution::Resolved { name, addr } => container(
+                row![
+                    text(format!("✓ {name} →  ")).size(11).color(t.up).font(bold()),
+                    text(short_address_str(&format!("{addr:#x}")))
+                        .size(11)
+                        .color(t.sub)
+                        .font(mono()),
+                ]
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([4, 0]))
+            .into(),
+            Resolution::Resolving { name } => container(
+                text(format!("(；・∀・) resolving {name}…"))
+                    .size(11)
+                    .color(t.sub)
+                    .font(bold()),
+            )
+            .padding(Padding::from([4, 0]))
+            .into(),
+            Resolution::NotFound { name } => container(
+                text(format!("ENS name “{name}” has no address record"))
+                    .size(11)
+                    .color(t.down)
+                    .font(bold()),
+            )
+            .padding(Padding::from([4, 0]))
+            .into(),
+            Resolution::Error { name, msg } => container(
+                text(format!("ENS lookup for “{name}” failed: {msg}"))
+                    .size(11)
+                    .color(t.down)
+                    .font(bold()),
+            )
+            .padding(Padding::from([4, 0]))
+            .into(),
+            Resolution::Invalid => container(
+                text("Not a valid 0x… address or ENS name")
+                    .size(11)
+                    .color(t.down)
+                    .font(bold()),
+            )
+            .padding(Padding::from([4, 0]))
+            .into(),
         };
 
         let recent_label = text("RECENT").size(11).color(t.sub).font(bold());
@@ -381,7 +531,7 @@ impl SendPane {
             contacts_col = contacts_col.push(self.contact_row(t, i, *c));
         }
 
-        let can_continue = self.recipient.is_some();
+        let can_continue = self.resolution.recipient().is_some();
         let continue_btn =
             primary_button(t, "Continue →", can_continue).on_press_maybe(if can_continue {
                 Some(Message::Step(1))
@@ -448,19 +598,31 @@ impl SendPane {
         t: KaoTheme,
         portfolio: &'a [LiveToken],
     ) -> Element<'a, Message> {
-        let recipient = self.recipient;
+        let recipient = self.resolution.recipient();
         let recipient_kao = "(￣ω￣)";
 
         let recipient_summary: Element<'_, Message> = match recipient {
-            Some(addr) => column![
-                container(avatar(t, recipient_kao, 52.0, t.ab2))
-                    .width(Length::Fill)
-                    .center_x(Length::Fill),
-                Space::new().height(8),
-                colored_address(t, addr),
-            ]
-            .align_x(Alignment::Center)
-            .into(),
+            Some(addr) => {
+                let mut col = column![
+                    container(avatar(t, recipient_kao, 52.0, t.ab2))
+                        .width(Length::Fill)
+                        .center_x(Length::Fill),
+                    Space::new().height(8),
+                ]
+                .align_x(Alignment::Center);
+                // Show the resolved ENS name above the chunked address
+                // when the user typed a name rather than a raw address.
+                if let Resolution::Resolved { name, .. } = &self.resolution {
+                    col = col.push(
+                        container(text(name.clone()).size(13).color(t.text).font(bold()))
+                            .width(Length::Fill)
+                            .center_x(Length::Fill),
+                    );
+                    col = col.push(Space::new().height(4));
+                }
+                col = col.push(colored_address(t, addr));
+                col.into()
+            }
             None => column![
                 container(text("Recipient parse failed").size(13).color(t.down).font(bold()))
                     .width(Length::Fill)
@@ -597,7 +759,7 @@ impl SendPane {
     ) -> Element<'a, Message> {
         let token = portfolio.get(self.token_idx);
         let token_sym = token.map(|t| t.symbol.as_str()).unwrap_or("ETH");
-        let recipient = self.recipient;
+        let recipient = self.resolution.recipient();
 
         // Sending row + chain id label below.
         let sending_row = column![
@@ -621,13 +783,20 @@ impl SendPane {
         .spacing(2);
 
         // To row: full checksum address rendered with per-chunk colors.
+        // When the user typed an ENS name we put the name above the
+        // chunked address — the chunked address is still the load-bearing
+        // identifier the user is signing for, so the ENS name is
+        // supporting context, not a substitute.
         let to_block: Element<'_, Message> = match recipient {
-            Some(addr) => column![
-                text("To").size(13).color(t.sub),
-                Space::new().height(4),
-                colored_address(t, addr),
-            ]
-            .into(),
+            Some(addr) => {
+                let mut col = column![text("To").size(13).color(t.sub), Space::new().height(4)];
+                if let Resolution::Resolved { name, .. } = &self.resolution {
+                    col = col.push(text(name.clone()).size(13).color(t.text).font(bold()));
+                    col = col.push(Space::new().height(4));
+                }
+                col = col.push(colored_address(t, addr));
+                col.into()
+            }
             None => row![
                 text("To").size(13).color(t.sub),
                 Space::new().width(Length::Fill),
@@ -773,10 +942,17 @@ impl SendPane {
             .width(Length::Fill)
             .center_x(Length::Fill);
 
-        let recipient_short = self
-            .recipient
-            .map(|a| short_address_str(&format!("{a:#x}")))
-            .unwrap_or_else(|| self.to.clone());
+        // Prefer the ENS name on the success screen — the user already
+        // saw the chunked checksum address on the review step, and the
+        // human-readable name is what they remember acting on.
+        let recipient_short = match &self.resolution {
+            Resolution::Resolved { name, .. } => name.clone(),
+            _ => self
+                .resolution
+                .recipient()
+                .map(|a| short_address_str(&format!("{a:#x}")))
+                .unwrap_or_else(|| self.to.clone()),
+        };
         let detail = container(
             text(format!(
                 "{} {} → {}",
