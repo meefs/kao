@@ -222,6 +222,7 @@ impl ConnectLedgerScreen {
                 };
                 let address = signer.address();
                 let account = AccountDescriptor::Ledger {
+                    name: None,
                     path: LedgerHdPath::LedgerLive(picked),
                     address: address.into_array(),
                 };

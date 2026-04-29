@@ -379,13 +379,16 @@ mod tests {
         let desc = WalletDescriptor {
             accounts: vec![
                 AccountDescriptor::Local {
+                    name: Some("Treasury".into()),
                     key_bytes: [0xab; 32],
                 },
                 AccountDescriptor::Ledger {
+                    name: None,
                     path: LedgerHdPath::LedgerLive(2),
                     address: [0x33; 20],
                 },
                 AccountDescriptor::Local {
+                    name: None,
                     key_bytes: [0xcd; 32],
                 },
             ],
@@ -396,18 +399,22 @@ mod tests {
         assert_eq!(loaded.accounts.len(), 3);
         assert_eq!(loaded.active_index, 2);
         match &loaded.accounts[0] {
-            AccountDescriptor::Local { key_bytes } => assert_eq!(*key_bytes, [0xab; 32]),
+            AccountDescriptor::Local { name, key_bytes } => {
+                assert_eq!(name.as_deref(), Some("Treasury"));
+                assert_eq!(*key_bytes, [0xab; 32]);
+            }
             _ => panic!("expected Local"),
         }
         match &loaded.accounts[1] {
-            AccountDescriptor::Ledger { path, address } => {
+            AccountDescriptor::Ledger { name, path, address } => {
+                assert!(name.is_none());
                 assert!(matches!(path, LedgerHdPath::LedgerLive(2)));
                 assert_eq!(*address, [0x33; 20]);
             }
             _ => panic!("expected Ledger"),
         }
         match &loaded.accounts[2] {
-            AccountDescriptor::Local { key_bytes } => assert_eq!(*key_bytes, [0xcd; 32]),
+            AccountDescriptor::Local { key_bytes, .. } => assert_eq!(*key_bytes, [0xcd; 32]),
             _ => panic!("expected Local"),
         }
     }
@@ -420,6 +427,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
             key_bytes: [0x42; 32],
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
@@ -451,6 +459,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
             key_bytes: [0x42; 32],
         });
         save_to(&path, &desc, &pw("correct")).unwrap();
@@ -466,6 +475,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
             key_bytes: [0x11; 32],
         });
         save_to(&path, &desc, &pw("right")).unwrap();
@@ -504,6 +514,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
             key_bytes: [0x55; 32],
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
@@ -539,12 +550,15 @@ mod tests {
         let big = WalletDescriptor {
             accounts: vec![
                 AccountDescriptor::Local {
+                    name: None,
                     key_bytes: [0x01; 32],
                 },
                 AccountDescriptor::Local {
+                    name: None,
                     key_bytes: [0x02; 32],
                 },
                 AccountDescriptor::Local {
+                    name: None,
                     key_bytes: [0x03; 32],
                 },
             ],
@@ -553,6 +567,7 @@ mod tests {
         save_to(&path, &big, &pw("pw")).unwrap();
 
         let small = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
             key_bytes: [0x09; 32],
         });
         save_to(&path, &small, &pw("pw")).unwrap();
@@ -561,7 +576,7 @@ mod tests {
         assert_eq!(loaded.accounts.len(), 1);
         assert_eq!(loaded.active_index, 0);
         match &loaded.accounts[0] {
-            AccountDescriptor::Local { key_bytes } => assert_eq!(*key_bytes, [0x09; 32]),
+            AccountDescriptor::Local { key_bytes, .. } => assert_eq!(*key_bytes, [0x09; 32]),
             _ => panic!("expected Local"),
         }
     }
@@ -575,9 +590,11 @@ mod tests {
         let desc = WalletDescriptor {
             accounts: vec![
                 AccountDescriptor::Local {
+                    name: None,
                     key_bytes: [0x01; 32],
                 },
                 AccountDescriptor::Local {
+                    name: None,
                     key_bytes: [0x02; 32],
                 },
             ],

@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::primitives::{Address, TxHash};
+use iced::widget::operation::focus as focus_widget;
 use iced::widget::{column, container, row, stack};
 use iced::{Element, Length, Subscription, Task};
 use tracing::{debug, info, warn};
@@ -69,6 +70,15 @@ pub enum Message {
     Tick,
     OpenNetworksSettings,
     Networks(networks::Message),
+    /// Header pencil clicked — switch the title slot to an editable text
+    /// input pre-filled with the active account's current display name.
+    BeginRenameAccount,
+    /// Each keystroke while the rename input is open.
+    RenameInput(String),
+    /// User pressed Enter (or clicked ✓) — commit the draft to the account.
+    CommitRename,
+    /// User pressed Escape (or clicked ✗) — discard the draft.
+    CancelRename,
     /// Result of a sign-and-broadcast task spawned from `Message::Send(Confirm)`.
     /// Carries the signer back via `SignerHandoff` so the dashboard can put it
     /// back into `self.signer` (it had to be moved out by value to be sent to
@@ -86,6 +96,9 @@ pub enum Message {
 pub enum Outcome {
     SwitchAccount(usize),
     AddAccount,
+    /// User edited the active account's display name. Carries the new
+    /// value (or `None` to clear back to the indexed default).
+    RenameActiveAccount(Option<String>),
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -139,6 +152,10 @@ pub struct WalletScreen {
     portfolio: Vec<LiveToken>,
     /// True while a portfolio fetch is in flight.
     portfolio_loading: bool,
+    /// Inline rename draft for the active account. `Some(s)` means the
+    /// header is showing the rename text input; `None` means it's showing
+    /// the static name + pencil affordance.
+    rename_draft: Option<String>,
 }
 
 impl WalletScreen {
@@ -164,6 +181,7 @@ impl WalletScreen {
             settings_pane: SettingsPane::Root,
             portfolio: Vec::new(),
             portfolio_loading: true,
+            rename_draft: None,
         }
     }
 
@@ -459,6 +477,41 @@ impl WalletScreen {
                 self.settings_pane =
                     SettingsPane::Networks(NetworksPane::new(self.network.clone()));
             }
+            Message::BeginRenameAccount => {
+                let current = self
+                    .accounts
+                    .get(self.active_index)
+                    .map(|a| a.name().unwrap_or("").to_string())
+                    .unwrap_or_default();
+                self.rename_draft = Some(current);
+                return (focus_widget(header::RENAME_INPUT_ID), None);
+            }
+            Message::RenameInput(s) => {
+                if self.rename_draft.is_some() {
+                    self.rename_draft = Some(s);
+                }
+            }
+            Message::CommitRename => {
+                let Some(draft) = self.rename_draft.take() else {
+                    return (Task::none(), None);
+                };
+                // Match `AccountDescriptor::set_name`'s trim-and-collapse rule
+                // so the in-memory copy and the persisted copy agree on what
+                // counts as "no name set".
+                let trimmed = draft.trim();
+                let cleaned = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+                if let Some(acc) = self.accounts.get_mut(self.active_index) {
+                    acc.set_name(cleaned.clone());
+                }
+                return (Task::none(), Some(Outcome::RenameActiveAccount(cleaned)));
+            }
+            Message::CancelRename => {
+                self.rename_draft = None;
+            }
             Message::Networks(child_msg) => {
                 let SettingsPane::Networks(p) = &mut self.settings_pane else {
                     return (Task::none(), None);
@@ -570,10 +623,25 @@ impl WalletScreen {
             },
         };
 
-        column![header::view(t, self.nav, self.address, self.verification), body]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        let display_name = self
+            .accounts
+            .get(self.active_index)
+            .map(|a| a.display_name(self.active_index))
+            .unwrap_or_else(|| format!("Account {}", self.active_index + 1));
+
+        column![
+            header::view(
+                t,
+                self.address,
+                self.verification,
+                display_name,
+                self.rename_draft.as_deref(),
+            ),
+            body
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
 

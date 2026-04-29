@@ -15,7 +15,6 @@
 //! Mirrors the pattern in kohaku-extension's `HeliosEthersProvider`. The UI
 //! reads `last_status()` to surface verification state in the header badge.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -427,7 +426,7 @@ async fn build_client(
         .map_err(|e| e.to_string())?
         .checkpoint(snap.checkpoint)
         .load_external_fallback()
-        .data_dir(helios_data_dir())
+        .data_dir(crate::paths::data_dir().join("helios"))
         .with_file_db()
         .build()
         .map_err(|e| e.to_string())?;
@@ -468,19 +467,6 @@ async fn wait_for_head(client: &EthereumClient) -> Result<(), String> {
             }
         }
     }
-}
-
-fn helios_data_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".local").join("share"))
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("kao").join("helios")
 }
 
 /// Stub `BalanceFetcher` for tests. Returns "0" for every address and is a

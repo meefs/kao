@@ -208,6 +208,7 @@ impl ConnectTrezorScreen {
                 };
                 let address = signer.address();
                 let account = AccountDescriptor::Trezor {
+                    name: None,
                     path: TrezorHdPath::TrezorLive(picked),
                     address: address.into_array(),
                 };

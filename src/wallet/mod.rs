@@ -59,19 +59,67 @@ pub const CHAIN_ID: u64 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AccountDescriptor {
     Local {
+        name: Option<String>,
         key_bytes: [u8; 32],
     },
     Ledger {
+        name: Option<String>,
         path: LedgerHdPath,
         address: [u8; 20],
     },
     Trezor {
+        name: Option<String>,
         path: TrezorHdPath,
         address: [u8; 20],
     },
     ViewOnly {
+        name: Option<String>,
         address: [u8; 20],
     },
+}
+
+impl AccountDescriptor {
+    /// User-assigned label for this account, if any. `None` means "no
+    /// custom name set" — call `display_name(idx)` to get a string suitable
+    /// for rendering ("Account 1" / "Account 2" / …).
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            AccountDescriptor::Local { name, .. }
+            | AccountDescriptor::Ledger { name, .. }
+            | AccountDescriptor::Trezor { name, .. }
+            | AccountDescriptor::ViewOnly { name, .. } => name.as_deref(),
+        }
+    }
+
+    /// Replace the account's user-assigned name. Trims whitespace and
+    /// collapses an empty result to `None` so blank inputs revert to the
+    /// "Account N" default.
+    pub fn set_name(&mut self, name: Option<String>) {
+        let cleaned = name.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
+        let slot = match self {
+            AccountDescriptor::Local { name, .. }
+            | AccountDescriptor::Ledger { name, .. }
+            | AccountDescriptor::Trezor { name, .. }
+            | AccountDescriptor::ViewOnly { name, .. } => name,
+        };
+        *slot = cleaned;
+    }
+
+    /// Name to render. Falls back to `Account {idx + 1}` when no custom
+    /// name has been set.
+    pub fn display_name(&self, idx: usize) -> String {
+        match self.name() {
+            Some(n) => n.to_string(),
+            None => format!("Account {}", idx + 1),
+        }
+    }
 }
 
 /// Top-level wallet payload. Encrypted at rest inside `wallet.enc`. Holds the
@@ -111,13 +159,13 @@ impl WalletDescriptor {
 /// account that survived persistence, but the call is fallible upstream).
 pub fn account_address(account: &AccountDescriptor) -> Option<Address> {
     match account {
-        AccountDescriptor::Local { key_bytes } => {
+        AccountDescriptor::Local { key_bytes, .. } => {
             let b = B256::from_slice(key_bytes);
             signer_from_bytes(&b).ok().map(|s| s.address())
         }
         AccountDescriptor::Ledger { address, .. }
         | AccountDescriptor::Trezor { address, .. }
-        | AccountDescriptor::ViewOnly { address } => Some(Address::from(*address)),
+        | AccountDescriptor::ViewOnly { address, .. } => Some(Address::from(*address)),
     }
 }
 
@@ -296,12 +344,16 @@ pub fn signer_address(signer: &PrivateKeySigner) -> Address {
 /// Convenience: build a `Local` account descriptor from a software signer.
 pub fn local_account(signer: &PrivateKeySigner) -> AccountDescriptor {
     let bytes: [u8; 32] = signer.to_bytes().0;
-    AccountDescriptor::Local { key_bytes: bytes }
+    AccountDescriptor::Local {
+        name: None,
+        key_bytes: bytes,
+    }
 }
 
 /// Convenience: build a `ViewOnly` account descriptor from an address.
 pub fn view_only_account(address: Address) -> AccountDescriptor {
     AccountDescriptor::ViewOnly {
+        name: None,
         address: address.into_array(),
     }
 }
@@ -337,12 +389,16 @@ mod tests {
     #[test]
     fn account_bincode_roundtrip_local() {
         let acc = AccountDescriptor::Local {
+            name: Some("Treasury".into()),
             key_bytes: [0xab; 32],
         };
         let encoded = bincode::serialize(&acc).unwrap();
         let decoded: AccountDescriptor = bincode::deserialize(&encoded).unwrap();
         match decoded {
-            AccountDescriptor::Local { key_bytes } => assert_eq!(key_bytes, [0xab; 32]),
+            AccountDescriptor::Local { name, key_bytes } => {
+                assert_eq!(name.as_deref(), Some("Treasury"));
+                assert_eq!(key_bytes, [0xab; 32]);
+            }
             _ => panic!("expected Local"),
         }
     }
@@ -350,13 +406,15 @@ mod tests {
     #[test]
     fn account_bincode_roundtrip_ledger() {
         let acc = AccountDescriptor::Ledger {
+            name: None,
             path: LedgerHdPath::LedgerLive(3),
             address: [0x11; 20],
         };
         let encoded = bincode::serialize(&acc).unwrap();
         let decoded: AccountDescriptor = bincode::deserialize(&encoded).unwrap();
         match decoded {
-            AccountDescriptor::Ledger { path, address } => {
+            AccountDescriptor::Ledger { name, path, address } => {
+                assert!(name.is_none());
                 assert!(matches!(path, LedgerHdPath::LedgerLive(3)));
                 assert_eq!(address, [0x11; 20]);
             }
@@ -367,13 +425,15 @@ mod tests {
     #[test]
     fn account_bincode_roundtrip_trezor() {
         let acc = AccountDescriptor::Trezor {
+            name: None,
             path: TrezorHdPath::TrezorLive(2),
             address: [0x22; 20],
         };
         let encoded = bincode::serialize(&acc).unwrap();
         let decoded: AccountDescriptor = bincode::deserialize(&encoded).unwrap();
         match decoded {
-            AccountDescriptor::Trezor { path, address } => {
+            AccountDescriptor::Trezor { name, path, address } => {
+                assert!(name.is_none());
                 assert!(matches!(path, TrezorHdPath::TrezorLive(2)));
                 assert_eq!(address, [0x22; 20]);
             }
@@ -386,9 +446,11 @@ mod tests {
         let desc = WalletDescriptor {
             accounts: vec![
                 AccountDescriptor::Local {
+                    name: None,
                     key_bytes: [0x11; 32],
                 },
                 AccountDescriptor::Ledger {
+                    name: None,
                     path: LedgerHdPath::LedgerLive(2),
                     address: [0x22; 20],
                 },
@@ -492,6 +554,7 @@ mod tests {
             .parse()
             .unwrap();
         let view = AccountDescriptor::ViewOnly {
+            name: None,
             address: addr.into_array(),
         };
         assert_eq!(account_address(&view), Some(addr));
@@ -502,7 +565,10 @@ mod tests {
         let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
         let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
         let key_bytes: [u8; 32] = signer.to_bytes().0;
-        let acc = AccountDescriptor::Local { key_bytes };
+        let acc = AccountDescriptor::Local {
+            name: None,
+            key_bytes,
+        };
         assert_eq!(account_address(&acc), Some(signer.address()));
     }
 
@@ -510,15 +576,49 @@ mod tests {
     fn wallet_descriptor_active_clamps_when_index_too_large() {
         let desc = WalletDescriptor {
             accounts: vec![AccountDescriptor::Local {
+                name: None,
                 key_bytes: [0xab; 32],
             }],
             // Bogus index larger than accounts.len(); active() must clamp.
             active_index: 99,
         };
         match desc.active() {
-            AccountDescriptor::Local { key_bytes } => assert_eq!(*key_bytes, [0xab; 32]),
+            AccountDescriptor::Local { key_bytes, .. } => assert_eq!(*key_bytes, [0xab; 32]),
             _ => panic!("expected Local"),
         }
+    }
+
+    #[test]
+    fn display_name_falls_back_to_indexed_default() {
+        let unnamed = AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        };
+        assert_eq!(unnamed.display_name(0), "Account 1");
+        assert_eq!(unnamed.display_name(4), "Account 5");
+
+        let named = AccountDescriptor::Local {
+            name: Some("Cold Storage".into()),
+            key_bytes: [0x42; 32],
+        };
+        assert_eq!(named.display_name(0), "Cold Storage");
+    }
+
+    #[test]
+    fn set_name_trims_and_collapses_blank_to_none() {
+        let mut acc = AccountDescriptor::ViewOnly {
+            name: Some("old".into()),
+            address: [0; 20],
+        };
+        acc.set_name(Some("  Treasury  ".into()));
+        assert_eq!(acc.name(), Some("Treasury"));
+
+        acc.set_name(Some("   ".into()));
+        assert_eq!(acc.name(), None);
+
+        acc.set_name(Some("Anvil".into()));
+        acc.set_name(None);
+        assert_eq!(acc.name(), None);
     }
 
     #[test]
@@ -532,5 +632,16 @@ mod tests {
             .parse()
             .unwrap();
         assert!(!desc.contains_address(other));
+    }
+
+    #[test]
+    fn convenience_constructors_default_to_no_name() {
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        assert!(local_account(signer).name().is_none());
+        let addr: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        assert!(view_only_account(addr).name().is_none());
     }
 }

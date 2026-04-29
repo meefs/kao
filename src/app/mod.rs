@@ -266,7 +266,7 @@ impl App {
             );
         };
         match wallet.active().clone() {
-            AccountDescriptor::Local { key_bytes } => {
+            AccountDescriptor::Local { key_bytes, .. } => {
                 let b = alloy::primitives::B256::from_slice(&key_bytes);
                 match wallet::signer_from_bytes(&b) {
                     Ok(s) => self.enter_dashboard(KaoSigner::Local(s)),
@@ -275,21 +275,21 @@ impl App {
                     }
                 }
             }
-            AccountDescriptor::Ledger { path, address } => {
+            AccountDescriptor::Ledger { path, address, .. } => {
                 let expected = alloy::primitives::Address::from(address);
                 let (screen, task) =
                     ConnectLedgerScreen::new_reconnect(path, expected, self.network.clone());
                 self.screen = Screen::ConnectLedger(screen);
                 task.map(Message::ConnectLedger)
             }
-            AccountDescriptor::Trezor { path, address } => {
+            AccountDescriptor::Trezor { path, address, .. } => {
                 let expected = alloy::primitives::Address::from(address);
                 let (screen, task) =
                     ConnectTrezorScreen::new_reconnect(path, expected, self.network.clone());
                 self.screen = Screen::ConnectTrezor(screen);
                 task.map(Message::ConnectTrezor)
             }
-            AccountDescriptor::ViewOnly { address } => {
+            AccountDescriptor::ViewOnly { address, .. } => {
                 let addr = alloy::primitives::Address::from(address);
                 self.enter_dashboard(KaoSigner::ViewOnly(addr))
             }
@@ -379,6 +379,30 @@ impl App {
         }
         self.setup_context = Some(SetupContext::AddAccount);
         iced::Task::none()
+    }
+
+    /// Apply a name change to the currently-active account in the loaded
+    /// wallet and persist the descriptor. The dashboard has already mirrored
+    /// the change into its own `accounts` clone for snappy UI; this is the
+    /// source-of-truth update + disk write.
+    fn rename_active_account(&mut self, name: Option<String>) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_mut() else {
+            warn!("rename: no wallet loaded; ignoring");
+            return iced::Task::none();
+        };
+        let idx = wallet.active_index;
+        let Some(acc) = wallet.accounts.get_mut(idx) else {
+            warn!(idx, "rename: active index out of range; ignoring");
+            return iced::Task::none();
+        };
+        acc.set_name(name);
+        match self.passphrase.as_ref() {
+            Some(passphrase) => save_descriptor_task(wallet.clone(), passphrase.clone()),
+            None => {
+                warn!("rename: no passphrase held; skipping save");
+                iced::Task::none()
+            }
+        }
     }
 
     pub fn update(&mut self, message: Message) -> iced::Task<Message> {
@@ -779,6 +803,10 @@ impl App {
                 match outcome {
                     Some(WalletDashboardOutcome::SwitchAccount(idx)) => self.switch_account(idx),
                     Some(WalletDashboardOutcome::AddAccount) => self.begin_add_account(),
+                    Some(WalletDashboardOutcome::RenameActiveAccount(name)) => {
+                        let save = self.rename_active_account(name);
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
+                    }
                     None => cmd.map(Message::WalletDashboard),
                 }
             }

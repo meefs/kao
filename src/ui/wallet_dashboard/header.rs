@@ -1,28 +1,31 @@
-//! Top header strip — page title, address pill, network row, mood pill.
+//! Top header strip — wallet name (with inline rename), address pill,
+//! network row, mood pill.
 
 use alloy::primitives::Address;
 use iced::border::Radius;
-use iced::widget::{Space, column, container, mouse_area, row, text};
-use iced::{Alignment, Background, Border, Element, Length, Padding};
+use iced::widget::{Space, button, column, container, mouse_area, row, text, text_input};
+use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use crate::net::VerificationStatus;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
-use crate::ui::kao_widgets::{bold, kao_text, mono, mono_bold, verification_badge};
+use crate::ui::kao_widgets::{black, bold, kao_text, mono, mono_bold, text_input_style, verification_badge};
 use crate::wallet::short_address;
 
-use super::{MOOD, Message, Nav};
+use super::{MOOD, Message};
+
+/// Widget id used by the dashboard's `BeginRenameAccount` handler to focus
+/// the input as soon as it appears. Kept as a constant so both the header
+/// (which sets it on the widget) and the coordinator (which sends focus
+/// commands) refer to the same string.
+pub const RENAME_INPUT_ID: &str = "wallet_dashboard_rename_input";
 
 pub fn view<'a>(
     t: KaoTheme,
-    nav: Nav,
     address: Address,
     verification: VerificationStatus,
+    display_name: String,
+    rename_draft: Option<&'a str>,
 ) -> Element<'a, Message> {
-    let title = match nav {
-        Nav::Home => "Portfolio",
-        Nav::Activity => "Activity",
-        Nav::Settings => "Settings",
-    };
     let addr_short = short_address(address);
     // Address pill: clickable trigger that opens the account dropdown.
     let addr_pill = container(
@@ -56,8 +59,13 @@ pub fn view<'a>(
     ]
     .align_y(Alignment::Center);
 
+    let title_slot: Element<'a, Message> = match rename_draft {
+        Some(draft) => rename_input(t, draft),
+        None => static_name(t, display_name),
+    };
+
     let title_col = column![
-        text(title).size(17).color(t.text).font(bold()),
+        title_slot,
         Space::new().height(2),
         addr_trigger,
         Space::new().height(2),
@@ -93,4 +101,82 @@ pub fn view<'a>(
         ..container::Style::default()
     })
     .into()
+}
+
+/// Static "Wallet name ✎" row. Clicking the pencil swaps the slot to the
+/// editable input variant.
+fn static_name<'a>(t: KaoTheme, display_name: String) -> Element<'a, Message> {
+    let name = text(display_name).size(17).color(t.text).font(bold());
+
+    let pencil = button(text("✎").size(13).color(t.sub).font(bold()))
+        .padding(Padding::from([2, 6]))
+        .on_press(Message::BeginRenameAccount)
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => with_alpha(t.text, 0.06),
+                _ => Color::TRANSPARENT,
+            })),
+            text_color: t.sub,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(8),
+            },
+            ..button::Style::default()
+        });
+
+    row![name, Space::new().width(6), pencil]
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// Editable "[input] ✓ ✗" row used while renaming. Enter (text_input
+/// `on_submit`) commits; the ✗ button cancels.
+fn rename_input<'a>(t: KaoTheme, draft: &'a str) -> Element<'a, Message> {
+    let input = text_input("Wallet name", draft)
+        .id(RENAME_INPUT_ID)
+        .on_input(Message::RenameInput)
+        .on_submit(Message::CommitRename)
+        .padding(Padding::from([4, 10]))
+        .size(15)
+        .width(Length::Fixed(220.0))
+        .style(move |_theme, status| text_input_style(t, status));
+
+    let commit = button(text("✓").size(13).color(t.up).font(black()))
+        .padding(Padding::from([3, 8]))
+        .on_press(Message::CommitRename)
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => with_alpha(t.up, 0.16),
+                _ => with_alpha(t.up, 0.08),
+            })),
+            text_color: t.up,
+            border: Border {
+                color: with_alpha(t.up, 0.3),
+                width: 1.0,
+                radius: Radius::from(8),
+            },
+            ..button::Style::default()
+        });
+
+    let cancel = button(text("✗").size(13).color(t.sub).font(black()))
+        .padding(Padding::from([3, 8]))
+        .on_press(Message::CancelRename)
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => with_alpha(t.text, 0.08),
+                _ => Color::TRANSPARENT,
+            })),
+            text_color: t.sub,
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(8),
+            },
+            ..button::Style::default()
+        });
+
+    row![input, Space::new().width(6), commit, Space::new().width(4), cancel]
+        .align_y(Alignment::Center)
+        .into()
 }

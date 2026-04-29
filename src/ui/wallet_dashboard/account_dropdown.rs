@@ -130,7 +130,7 @@ fn account_row<'a>(
 ) -> Element<'a, Message> {
     let active = idx == active_index;
     let kao = kaomoji_for_account(idx);
-    let label = format!("Account {}", idx + 1);
+    let label = account.display_name(idx);
     let addr_text = account_short_address(account);
     let kind = match account {
         AccountDescriptor::Local { .. } => "Local",
