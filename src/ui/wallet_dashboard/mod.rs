@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 
 mod account_dropdown;
 mod activity;
+mod appearance;
 mod header;
 mod home;
 mod modal_chrome;
@@ -70,6 +71,8 @@ pub enum Message {
     Tick,
     OpenNetworksSettings,
     Networks(networks::Message),
+    OpenAppearanceSettings,
+    CloseAppearanceSettings,
     /// Header pencil clicked — switch the title slot to an editable text
     /// input pre-filled with the active account's current display name.
     BeginRenameAccount,
@@ -125,6 +128,7 @@ enum Modal {
 enum SettingsPane {
     Root,
     Networks(NetworksPane),
+    Appearance,
 }
 
 
@@ -557,6 +561,12 @@ impl WalletScreen {
                 self.settings_pane =
                     SettingsPane::Networks(NetworksPane::new(self.network.clone()));
             }
+            Message::OpenAppearanceSettings => {
+                self.settings_pane = SettingsPane::Appearance;
+            }
+            Message::CloseAppearanceSettings => {
+                self.settings_pane = SettingsPane::Root;
+            }
             Message::BeginRenameAccount => {
                 let current = self
                     .accounts
@@ -651,7 +661,7 @@ impl WalletScreen {
     pub fn view(&self) -> Element<'_, Message> {
         let t = self.theme();
 
-        let app = row![sidebar::view(t, self.nav, self.theme_kind), self.main_pane(t)]
+        let app = row![sidebar::view(t, self.nav), self.main_pane(t)]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -700,6 +710,7 @@ impl WalletScreen {
             Nav::Settings => match &self.settings_pane {
                 SettingsPane::Root => settings_root::view(t),
                 SettingsPane::Networks(p) => p.view(t).map(Message::Networks),
+                SettingsPane::Appearance => appearance::view(t, self.theme_kind),
             },
         };
 

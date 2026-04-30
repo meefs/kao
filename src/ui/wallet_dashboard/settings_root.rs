@@ -14,11 +14,7 @@ const SETTINGS_ROWS: &[(&str, &str, &str)] = &[
     ("Security", "(⌐■_■)", "Seed phrase · lock screen"),
     ("Networks", "( ・∀・)ﾉ", "Mainnet · testnets · L2s"),
     ("Notifications", "ヾ(＾∇＾)", "Price alerts · tx updates"),
-    (
-        "Appearance",
-        "(｡◕‿◕｡)",
-        "Theme · currency · kaomoji density",
-    ),
+    ("Appearance", "(｡◕‿◕｡)", "Theme · palette"),
     ("About Kao", "(´｡• ᵕ •｡`)", "v0.1.0 · kawaii edition"),
 ];
 
@@ -27,6 +23,7 @@ pub fn view<'a>(t: KaoTheme) -> Element<'a, Message> {
     for (label, kao, sub) in SETTINGS_ROWS {
         let on_click = match *label {
             "Networks" => Some(Message::OpenNetworksSettings),
+            "Appearance" => Some(Message::OpenAppearanceSettings),
             _ => None,
         };
         list = list.push(settings_row(t, label, kao, sub, on_click));
