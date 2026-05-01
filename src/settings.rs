@@ -102,6 +102,15 @@ struct OnDisk {
     checkpoint_override: Option<String>,
 }
 
+/// True iff `s` parses as an HTTPS URL. Non-HTTPS endpoints are dropped on
+/// load so a hand-edited `settings.toml` can't bypass the UI's HTTPS check
+/// and steer the wallet onto a MITM-able transport.
+fn is_https_url(s: &str) -> bool {
+    url::Url::parse(s)
+        .map(|u| u.scheme() == "https")
+        .unwrap_or(false)
+}
+
 /// Pure parser: produce a `State` from settings-file TOML. A malformed TOML
 /// document, missing keys, and unparseable values all silently fall back to
 /// defaults so a hand-edited config can never brick startup.
@@ -116,13 +125,13 @@ fn parse(text: &str) -> State {
         state.theme = k;
     }
     if let Some(rpcs) = on_disk.rpcs {
-        let filtered: Vec<String> = rpcs.into_iter().filter(|s| !s.is_empty()).collect();
+        let filtered: Vec<String> = rpcs.into_iter().filter(|s| is_https_url(s)).collect();
         if !filtered.is_empty() {
             state.rpcs = filtered;
         }
     }
     if let Some(cls) = on_disk.consensus_rpcs {
-        let filtered: Vec<String> = cls.into_iter().filter(|s| !s.is_empty()).collect();
+        let filtered: Vec<String> = cls.into_iter().filter(|s| is_https_url(s)).collect();
         if !filtered.is_empty() {
             state.consensus_rpcs = filtered;
         }

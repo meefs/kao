@@ -93,9 +93,12 @@ impl SelectRpcScreen {
             self.error = Some("Please enter an RPC URL.".into());
             return None;
         }
-        if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-            self.error = Some("RPC URL must start with http:// or https://".into());
-            return None;
+        match url::Url::parse(trimmed) {
+            Ok(url) if url.scheme() == "https" => {}
+            _ => {
+                self.error = Some("RPC URL must start with https://".into());
+                return None;
+            }
         }
         self.error = None;
         Some(Outcome::Custom(trimmed.to_string()))

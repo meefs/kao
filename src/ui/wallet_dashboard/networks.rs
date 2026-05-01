@@ -280,9 +280,15 @@ fn draft_valid(draft: &Draft) -> bool {
     true
 }
 
-/// True iff `list` contains at least one parseable URL and no entry with
-/// non-empty content that fails to parse. Empty entries are tolerated so the
-/// user can have a blank row mid-edit; they're stripped on save.
+/// True iff `list` contains at least one parseable HTTPS URL and no entry
+/// with non-empty content that fails to parse or uses a non-HTTPS scheme.
+/// Empty entries are tolerated so the user can have a blank row mid-edit;
+/// they're stripped on save.
+///
+/// HTTPS is required: a plain-HTTP consensus endpoint lets a network
+/// attacker tamper with the light-client bootstrap before any consensus
+/// signatures get verified, and a plain-HTTP exec endpoint exposes
+/// `eth_getProof` responses to the same MITM.
 fn list_has_at_least_one_valid_url(list: &[String]) -> bool {
     let mut any_ok = false;
     for s in list {
@@ -291,8 +297,8 @@ fn list_has_at_least_one_valid_url(list: &[String]) -> bool {
             continue;
         }
         match url::Url::parse(s) {
-            Ok(_) => any_ok = true,
-            Err(_) => return false,
+            Ok(url) if url.scheme() == "https" => any_ok = true,
+            _ => return false,
         }
     }
     any_ok
