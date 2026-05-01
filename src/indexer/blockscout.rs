@@ -20,7 +20,8 @@ use serde::Deserialize;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
-    Indexer, IndexedToken, IndexedTx, TxStatus, classify_direction, http_client, parse_iso8601,
+    Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
+    parse_iso8601,
 };
 
 const DEFAULT_BASE: &str = "https://eth.blockscout.com";
@@ -97,6 +98,41 @@ struct AddressRef {
     hash: String,
 }
 
+/// `/api/v2/addresses/{addr}/token-transfers` row. Only the fields the
+/// activity feed needs are decoded — the live API returns a much larger
+/// envelope (block_hash, log_index, address metadata, …) that we drop.
+#[derive(Deserialize)]
+struct RawTokenTransfer {
+    transaction_hash: String,
+    #[serde(default)]
+    block_number: Option<u64>,
+    #[serde(default)]
+    timestamp: Option<String>,
+    from: AddressRef,
+    #[serde(default)]
+    to: Option<AddressRef>,
+    total: TransferTotal,
+    token: TokenMeta,
+    #[serde(default)]
+    method: Option<String>,
+    /// `"ERC-20"` after the server-side `type=ERC-20` filter, but we
+    /// double-check defensively because some forks ignore the param.
+    #[serde(default)]
+    token_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TransferTotal {
+    value: String,
+    #[serde(default)]
+    decimals: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TokenTransfersResponse {
+    items: Vec<RawTokenTransfer>,
+}
+
 #[derive(Deserialize)]
 struct AddressDetail {
     #[serde(default)]
@@ -145,21 +181,55 @@ struct TokenMeta {
 #[async_trait]
 impl Indexer for BlockscoutClient {
     async fn transactions(&self, addr: Address, limit: usize) -> Result<Vec<IndexedTx>, String> {
-        let path = format!("/api/v2/addresses/{addr:#x}/transactions");
-        // `to | from` filter — must be percent-encoded.
-        let url = self.build_url(&path, "filter=to%20%7C%20from");
-        let body: TxListResponse = http_client()
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| format!("blockscout transactions GET: {e}"))?
-            .error_for_status()
-            .map_err(|e| format!("blockscout transactions status: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("blockscout transactions decode: {e}"))?;
+        let txs_url = self.build_url(
+            // No `filter=…` — Blockscout V2's filter only accepts the
+            // literal values `to` or `from` (one direction each).
+            // Omitting the param returns both incoming and outgoing.
+            &format!("/api/v2/addresses/{addr:#x}/transactions"),
+            "",
+        );
+        let token_url = self.build_url(
+            &format!("/api/v2/addresses/{addr:#x}/token-transfers"),
+            "type=ERC-20",
+        );
 
-        Ok(parse_txs(body.items, addr, limit))
+        let client = http_client();
+        let (txs_res, tokens_res): (
+            Result<TxListResponse, String>,
+            Result<TokenTransfersResponse, String>,
+        ) = futures::future::join(
+            async {
+                client
+                    .get(&txs_url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("blockscout transactions GET: {e}"))?
+                    .error_for_status()
+                    .map_err(|e| format!("blockscout transactions status: {e}"))?
+                    .json::<TxListResponse>()
+                    .await
+                    .map_err(|e| format!("blockscout transactions decode: {e}"))
+            },
+            async {
+                client
+                    .get(&token_url)
+                    .send()
+                    .await
+                    .map_err(|e| format!("blockscout token-transfers GET: {e}"))?
+                    .error_for_status()
+                    .map_err(|e| format!("blockscout token-transfers status: {e}"))?
+                    .json::<TokenTransfersResponse>()
+                    .await
+                    .map_err(|e| format!("blockscout token-transfers decode: {e}"))
+            },
+        )
+        .await;
+
+        // Native-tx fetch is the must-have; the token call is best-effort
+        // so a token-endpoint hiccup doesn't blank the activity feed.
+        let normal = txs_res?;
+        let tokens = tokens_res.map(|r| r.items).unwrap_or_default();
+        Ok(merge_normal_and_token(normal.items, tokens, addr, limit))
     }
 
     async fn balances(&self, addr: Address) -> Result<Vec<IndexedToken>, String> {
@@ -252,7 +322,90 @@ fn convert_tx(r: RawTx, owner: Address) -> Option<IndexedTx> {
         status,
         direction: classify_direction(from, to, owner),
         method: r.method,
+        token: None,
     })
+}
+
+fn convert_token_transfer(r: RawTokenTransfer, owner: Address) -> Option<IndexedTx> {
+    if r.token_type
+        .as_deref()
+        .is_some_and(|t| !t.eq_ignore_ascii_case("ERC-20"))
+    {
+        return None;
+    }
+    let hash = B256::from_str(&r.transaction_hash).ok()?;
+    let from = parse_address(&r.from.hash)?;
+    let to = r.to.as_ref().and_then(|a| parse_address(&a.hash));
+    let contract = parse_address(&r.token.address_hash)?;
+    let amount_raw = U256::from_str(&r.total.value).unwrap_or(U256::ZERO);
+    // `total.decimals` is authoritative for the actual transferred amount;
+    // fall back to the token-level decimals if the per-row field is
+    // missing on a quirky deployment.
+    let decimals = r
+        .total
+        .decimals
+        .as_deref()
+        .or(r.token.decimals.as_deref())
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(18);
+    Some(IndexedTx {
+        hash,
+        block_number: r.block_number.unwrap_or(0),
+        timestamp: r
+            .timestamp
+            .as_deref()
+            .map(parse_iso8601)
+            .unwrap_or(0),
+        from,
+        to,
+        value: U256::ZERO,
+        gas_used: None,
+        gas_price: None,
+        // `/token-transfers` only enumerates successful Transfer logs.
+        status: TxStatus::Success,
+        direction: classify_direction(from, to, owner),
+        method: r.method,
+        token: Some(TokenTransfer {
+            contract,
+            symbol: r.token.symbol.unwrap_or_default(),
+            decimals,
+            amount_raw,
+        }),
+    })
+}
+
+/// Merge `/transactions` (outer txs) and `/token-transfers` (ERC-20
+/// movements). Outer txs whose hash also produced a token-transfer row
+/// are dropped — they'd otherwise render as a redundant "0 ETH"
+/// alongside the real movement.
+fn merge_normal_and_token(
+    normal: Vec<RawTx>,
+    tokens: Vec<RawTokenTransfer>,
+    owner: Address,
+    limit: usize,
+) -> Vec<IndexedTx> {
+    use std::collections::HashSet;
+
+    let mut out: Vec<IndexedTx> = Vec::with_capacity(normal.len() + tokens.len());
+    let mut token_hashes: HashSet<B256> = HashSet::with_capacity(tokens.len());
+    for r in tokens {
+        if let Some(tx) = convert_token_transfer(r, owner) {
+            token_hashes.insert(tx.hash);
+            out.push(tx);
+        }
+    }
+    for r in normal {
+        let Some(tx) = convert_tx(r, owner) else {
+            continue;
+        };
+        if token_hashes.contains(&tx.hash) {
+            continue;
+        }
+        out.push(tx);
+    }
+    out.sort_by(|a, b| b.block_number.cmp(&a.block_number));
+    out.truncate(limit);
+    out
 }
 
 fn parse_balances(detail: AddressDetail, rows: Vec<TokenBalanceRow>) -> Vec<IndexedToken> {

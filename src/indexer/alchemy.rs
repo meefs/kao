@@ -18,7 +18,8 @@ use tracing::warn;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
-    Indexer, IndexedToken, IndexedTx, TxStatus, classify_direction, http_client, parse_iso8601,
+    Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
+    parse_iso8601,
 };
 
 const NETWORK: &str = "eth-mainnet";
@@ -112,6 +113,10 @@ struct RawTransfer {
     to: Option<String>,
     #[serde(default)]
     category: String,
+    /// Token symbol (e.g. "USDC") for ERC-20/721/1155 categories; "ETH" for
+    /// `external`/`internal`. May be `null` per Alchemy docs.
+    #[serde(default)]
+    asset: Option<String>,
     #[serde(default, rename = "rawContract")]
     raw_contract: Option<RawContract>,
     #[serde(default)]
@@ -120,8 +125,18 @@ struct RawTransfer {
 
 #[derive(Deserialize, Clone)]
 struct RawContract {
+    /// Hex-encoded raw amount. For ERC-20 this is the token's raw amount
+    /// (in `decimal`-scaled units); for native ETH it's wei.
     #[serde(default)]
     value: Option<String>,
+    /// Token contract address; `null` for native ETH transfers.
+    #[serde(default)]
+    address: Option<String>,
+    /// Hex-encoded decimal count (e.g. `"0x12"` for 18). Spelled `decimal`
+    /// (singular) in the Alchemy schema — keep the rename to avoid
+    /// confusion with the `IndexedToken.decimals` field elsewhere.
+    #[serde(default)]
+    decimal: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -366,7 +381,7 @@ fn convert_transfer(t: RawTransfer, owner: Address) -> Option<IndexedTx> {
         u64::from_str_radix(t.block_num.trim_start_matches("0x"), 16).unwrap_or(0);
     let from = t.from.as_deref().and_then(|s| Address::from_str(s).ok())?;
     let to = t.to.as_deref().and_then(|s| Address::from_str(s).ok());
-    let value = t
+    let raw_amount = t
         .raw_contract
         .as_ref()
         .and_then(|c| c.value.as_deref())
@@ -378,6 +393,37 @@ fn convert_transfer(t: RawTransfer, owner: Address) -> Option<IndexedTx> {
         .and_then(|m| m.block_timestamp.as_deref())
         .map(parse_iso8601)
         .unwrap_or(0);
+
+    // ERC-20 rows carry their token contract on `rawContract.address`. For
+    // `external`/`internal` (native ETH) the address is null and the raw
+    // amount is wei.
+    let token_contract = t
+        .raw_contract
+        .as_ref()
+        .and_then(|c| c.address.as_deref())
+        .and_then(|s| Address::from_str(s).ok());
+    let (value, token) = match (t.category.as_str(), token_contract) {
+        ("erc20", Some(contract)) => {
+            let decimals = t
+                .raw_contract
+                .as_ref()
+                .and_then(|c| c.decimal.as_deref())
+                .and_then(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                .unwrap_or(18);
+            let symbol = t.asset.clone().unwrap_or_default();
+            (
+                U256::ZERO,
+                Some(TokenTransfer {
+                    contract,
+                    symbol,
+                    decimals,
+                    amount_raw: raw_amount,
+                }),
+            )
+        }
+        _ => (raw_amount, None),
+    };
+
     Some(IndexedTx {
         hash,
         block_number,
@@ -392,6 +438,7 @@ fn convert_transfer(t: RawTransfer, owner: Address) -> Option<IndexedTx> {
         status: TxStatus::Success,
         direction: classify_direction(from, to, owner),
         method: Some(t.category),
+        token,
     })
 }
 
@@ -445,6 +492,40 @@ mod tests {
         assert_eq!(tx.timestamp, 1_704_067_200);
         assert!(matches!(tx.direction, TxDirection::In));
         assert_eq!(tx.method.as_deref(), Some("external"));
+        assert!(tx.token.is_none());
+    }
+
+    #[test]
+    fn convert_transfer_attaches_erc20_token_details() {
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap();
+        // 5 USDC (6 decimals) from owner to BEEF.
+        let raw: RawTransfer = serde_json::from_str(
+            r#"{
+                "hash": "0x5555555555555555555555555555555555555555555555555555555555555555",
+                "blockNum": "0x112a881",
+                "from": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045",
+                "to": "0x000000000000000000000000000000000000beef",
+                "category": "erc20",
+                "asset": "USDC",
+                "rawContract": {
+                    "value": "0x4c4b40",
+                    "address": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                    "decimal": "0x6"
+                },
+                "metadata": { "blockTimestamp": "2024-06-15T12:34:56.000000Z" }
+            }"#,
+        )
+        .unwrap();
+        let tx = convert_transfer(raw, owner).expect("converts");
+        assert_eq!(tx.value, U256::ZERO, "ERC-20 row carries 0 native wei");
+        let token = tx.token.expect("token attached");
+        assert_eq!(token.symbol, "USDC");
+        assert_eq!(token.decimals, 6);
+        assert_eq!(token.amount_raw, U256::from(5_000_000u64));
+        assert_eq!(
+            format!("{:#x}", token.contract),
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use serde::Deserialize;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
-    Indexer, IndexedToken, IndexedTx, TxStatus, classify_direction, http_client,
+    Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
 };
 
 const BASE: &str = "https://api.etherscan.io/v2/api";
@@ -94,6 +94,30 @@ struct RawTx {
     function_name: String,
 }
 
+/// `account&action=tokentx` row. Includes the same envelope fields as
+/// `txlist` plus three token columns.
+#[derive(Deserialize)]
+struct RawTokenTx {
+    #[serde(rename = "blockNumber")]
+    block_number: String,
+    #[serde(rename = "timeStamp")]
+    timestamp: String,
+    hash: String,
+    from: String,
+    to: String,
+    value: String,
+    #[serde(rename = "contractAddress")]
+    contract_address: String,
+    #[serde(rename = "tokenSymbol", default)]
+    token_symbol: String,
+    #[serde(rename = "tokenDecimal", default)]
+    token_decimal: String,
+    #[serde(rename = "gasUsed", default)]
+    gas_used: String,
+    #[serde(rename = "gasPrice", default)]
+    gas_price: String,
+}
+
 #[derive(Deserialize)]
 struct RawTokenBalance {
     #[serde(rename = "TokenAddress")]
@@ -122,7 +146,7 @@ impl Indexer for EtherscanClient {
     async fn transactions(&self, addr: Address, limit: usize) -> Result<Vec<IndexedTx>, String> {
         let addr_str = format!("{addr:#x}");
         let limit_str = limit.to_string();
-        let url = self.url(&[
+        let txlist_url = self.url(&[
             ("module", "account"),
             ("action", "txlist"),
             ("address", &addr_str),
@@ -132,11 +156,33 @@ impl Indexer for EtherscanClient {
             ("offset", &limit_str),
             ("sort", "desc"),
         ]);
-        let rows: Vec<RawTx> = fetch_envelope(&url, "etherscan txlist").await?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| convert_tx(r, addr))
-            .collect())
+        let tokentx_url = self.url(&[
+            ("module", "account"),
+            ("action", "tokentx"),
+            ("address", &addr_str),
+            ("startblock", "0"),
+            ("endblock", "99999999"),
+            ("page", "1"),
+            ("offset", &limit_str),
+            ("sort", "desc"),
+        ]);
+
+        // Fire both in parallel. tokentx returning `No transactions found`
+        // arrives as a status="0" envelope which `fetch_envelope` surfaces
+        // as `Err`; collapse that to an empty list so an account with no
+        // ERC-20 history doesn't drop the whole feed.
+        let (txlist_res, tokentx_res): (
+            Result<Vec<RawTx>, String>,
+            Result<Vec<RawTokenTx>, String>,
+        ) = futures::future::join(
+            fetch_envelope::<Vec<RawTx>>(&txlist_url, "etherscan txlist"),
+            fetch_envelope::<Vec<RawTokenTx>>(&tokentx_url, "etherscan tokentx"),
+        )
+        .await;
+
+        let normal = txlist_res?;
+        let tokens = tokentx_res.unwrap_or_default();
+        Ok(merge_normal_and_token(normal, tokens, addr, limit))
     }
 
     async fn balances(&self, addr: Address) -> Result<Vec<IndexedToken>, String> {
@@ -308,7 +354,88 @@ fn convert_tx(r: RawTx, owner: Address) -> Option<IndexedTx> {
         status,
         direction: classify_direction(from, to, owner),
         method,
+        token: None,
     })
+}
+
+fn convert_token_tx(r: RawTokenTx, owner: Address) -> Option<IndexedTx> {
+    let hash = B256::from_str(&r.hash).ok()?;
+    let block_number = r.block_number.parse::<u64>().ok()?;
+    let timestamp = r.timestamp.parse::<u64>().unwrap_or(0);
+    let from = Address::from_str(&r.from).ok()?;
+    let to = if r.to.is_empty() {
+        None
+    } else {
+        Address::from_str(&r.to).ok()
+    };
+    let contract = Address::from_str(&r.contract_address).ok()?;
+    let amount_raw = U256::from_str(&r.value).unwrap_or(U256::ZERO);
+    let decimals = r.token_decimal.parse::<u8>().unwrap_or(18);
+    let gas_used = r.gas_used.parse::<u64>().ok();
+    let gas_price = r.gas_price.parse::<u128>().ok();
+    Some(IndexedTx {
+        hash,
+        block_number,
+        timestamp,
+        from,
+        to,
+        // `tokentx` doesn't surface an outer-tx native-ETH value (the
+        // outer call is just a contract invocation that may carry 0 wei
+        // anyway). Leave value at zero — the renderer reads `token`.
+        value: U256::ZERO,
+        gas_used,
+        gas_price,
+        // tokentx only enumerates successful transfers (failed transfers
+        // don't emit a Transfer log). Mirror Alchemy's choice of Success.
+        status: TxStatus::Success,
+        direction: classify_direction(from, to, owner),
+        method: Some("transfer".into()),
+        token: Some(TokenTransfer {
+            contract,
+            symbol: r.token_symbol,
+            decimals,
+            amount_raw,
+        }),
+    })
+}
+
+/// Merge `txlist` (outer-tx) and `tokentx` (ERC-20 movements) into one
+/// newest-first feed. When both endpoints surface the same hash, the
+/// token row wins — the outer entry would otherwise render as an
+/// uninformative "0 ETH transfer" stacked on top of the real movement.
+/// Truly stand-alone outer txs (plain ETH sends, contract calls with no
+/// token transfer) are kept.
+fn merge_normal_and_token(
+    normal: Vec<RawTx>,
+    tokens: Vec<RawTokenTx>,
+    owner: Address,
+    limit: usize,
+) -> Vec<IndexedTx> {
+    use std::collections::HashSet;
+
+    let mut out: Vec<IndexedTx> = Vec::with_capacity(normal.len() + tokens.len());
+    let mut token_hashes: HashSet<B256> = HashSet::with_capacity(tokens.len());
+    for r in tokens {
+        if let Some(tx) = convert_token_tx(r, owner) {
+            token_hashes.insert(tx.hash);
+            out.push(tx);
+        }
+    }
+    for r in normal {
+        let Some(tx) = convert_tx(r, owner) else {
+            continue;
+        };
+        // Suppress outer-tx rows whose hash already produced one or more
+        // token rows. A swap with two token movements still keeps both
+        // token rows; we only drop the outer 0-value contract call.
+        if token_hashes.contains(&tx.hash) {
+            continue;
+        }
+        out.push(tx);
+    }
+    out.sort_by(|a, b| b.block_number.cmp(&a.block_number));
+    out.truncate(limit);
+    out
 }
 
 /// Minimal RFC 3986 percent-encoder. The crate doesn't depend on

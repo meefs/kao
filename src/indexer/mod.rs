@@ -70,6 +70,23 @@ pub struct IndexedTx {
     pub direction: TxDirection,
     /// Decoded function name when the provider supplies it.
     pub method: Option<String>,
+    /// `Some(_)` when this row represents an ERC-20 transfer rather than a
+    /// pure native-ETH transaction. The outer `value` for ERC-20 rows is
+    /// usually zero (the actual amount lives in `token.amount_raw`); the
+    /// renderer should prefer the token fields when present.
+    pub token: Option<TokenTransfer>,
+}
+
+/// ERC-20 transfer details attached to an `IndexedTx`. Captured from the
+/// indexer's token-transfer endpoint so the activity feed can format
+/// `1.23 USDC` instead of `0 ETH` for an ERC-20 send.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TokenTransfer {
+    pub contract: Address,
+    pub symbol: String,
+    pub decimals: u8,
+    pub amount_raw: U256,
 }
 
 /// Provider-agnostic token holding. Mirrors `portfolio::LiveToken` but is

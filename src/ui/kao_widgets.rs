@@ -183,6 +183,30 @@ pub fn secondary_button<'a, M: Clone + 'a>(t: KaoTheme, label: &'a str) -> butto
     })
 }
 
+/// Compact variant of `secondary_button` for inline affordances (copy
+/// chips next to a field label, etc.). Smaller text and padding so it
+/// doesn't dominate a row whose primary content is the value below.
+pub fn small_secondary_button<'a, M: Clone + 'a>(
+    t: KaoTheme,
+    label: &'a str,
+) -> button::Button<'a, M> {
+    button(text(label.to_string()).size(11).color(t.text).font(bold()))
+        .padding(Padding::from([4, 10]))
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => mix(t.card_alt, t.text, 0.06),
+                _ => t.card_alt,
+            })),
+            text_color: t.text,
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(8),
+            },
+            ..button::Style::default()
+        })
+}
+
 /// Subtle text-only button used for "← Back" links in the corner of auth
 /// screens. Renders as a plain text label with no background.
 pub fn link_button<'a, M: Clone + 'a>(t: KaoTheme, label: &'a str) -> button::Button<'a, M> {

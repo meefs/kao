@@ -28,20 +28,28 @@ mod send;
 mod settings_root;
 mod sidebar;
 mod swap;
+mod tx_details;
 
 use account_dropdown::AccountDropdown;
 use networks::NetworksPane;
 use receive::ReceivePane;
 use send::SendPane;
 use swap::SwapPane;
+use tx_details::TxDetailsPane;
 
 /// User mood emoji shown in the header and balance hero. Currently constant;
 /// future iterations might derive it from portfolio P&L or recent activity.
 pub(super) const MOOD: &str = "(´｡• ᵕ •｡`)";
 
+/// How many transactions to ask the indexer for. Generous enough that the
+/// Activity scroll view is rarely empty after a single round-trip, small
+/// enough that providers without server-side paging stay responsive.
+const HISTORY_LIMIT: usize = 50;
+
 use modal_chrome::ModalChrome;
 pub use nav::Nav;
 
+use crate::indexer::IndexedTx;
 use crate::net::{BalanceFetcher, VerificationStatus};
 use crate::portfolio::{LiveToken, PortfolioCache};
 use crate::settings;
@@ -58,16 +66,23 @@ use crate::wallet::{
 pub enum Message {
     BalanceFetched(Result<String, String>),
     PortfolioFetched(Result<Vec<LiveToken>, String>),
+    /// Result of an indexer transaction-history fetch for `self.address`.
+    HistoryFetched(Result<Vec<IndexedTx>, String>),
     SelectNav(Nav),
     SelectTheme(ThemeKind),
     OpenSend,
     OpenReceive,
     OpenSwap,
     OpenAccountDropdown,
+    /// User clicked an activity row. The argument is the index into
+    /// `self.history` at the moment of the click; bounds-checked when
+    /// handling because the history can refresh between view and event.
+    OpenTxDetails(usize),
     AccountDropdown(account_dropdown::Message),
     Receive(receive::Message),
     Send(send::Message),
     Swap(swap::Message),
+    TxDetails(tx_details::Message),
     Tick,
     OpenNetworksSettings,
     Networks(networks::Message),
@@ -120,6 +135,7 @@ enum Modal {
     Receive(ReceivePane),
     Swap(SwapPane),
     AccountDropdown(AccountDropdown),
+    TxDetails(TxDetailsPane),
 }
 
 /// Which settings pane is currently rendered. The Settings nav slot can show
@@ -171,6 +187,12 @@ pub struct WalletScreen {
     /// header is showing the rename text input; `None` means it's showing
     /// the static name + pencil affordance.
     rename_draft: Option<String>,
+    /// Most recent transactions for the active address, newest first. Empty
+    /// while a fetch is in flight or when the active provider returns
+    /// nothing (e.g. `IndexerProvider::None`).
+    history: Vec<IndexedTx>,
+    /// True while an indexer history fetch is in flight.
+    history_loading: bool,
 }
 
 impl WalletScreen {
@@ -211,6 +233,8 @@ impl WalletScreen {
             portfolio_loading,
             portfolio_cache,
             rename_draft: None,
+            history: Vec::new(),
+            history_loading: true,
         }
     }
 
@@ -253,6 +277,36 @@ impl WalletScreen {
                 result
             },
             Message::BalanceFetched,
+        )
+    }
+
+    /// Pull the most recent transactions for the active address from the
+    /// configured indexer. `IndexerProvider::None` short-circuits to an empty
+    /// list — there's no on-chain fallback the way `fetch_portfolio_task`
+    /// has, since reconstructing history from logs/blocks is way out of
+    /// scope for a wallet UI.
+    pub fn fetch_history_task(&self) -> Task<Message> {
+        let address = self.address;
+        let provider = settings::indexer_provider();
+        Task::perform(
+            async move {
+                debug!(
+                    addr = %short_address(address),
+                    indexer = ?provider,
+                    "fetching history",
+                );
+                let started = std::time::Instant::now();
+                let indexer = crate::indexer::build_indexer();
+                let result = indexer.transactions(address, HISTORY_LIMIT).await;
+                debug!(
+                    elapsed = ?started.elapsed(),
+                    ok = result.is_ok(),
+                    count = result.as_ref().map(|v| v.len()).unwrap_or(0),
+                    "history fetch completed",
+                );
+                result
+            },
+            Message::HistoryFetched,
         )
     }
 
@@ -351,6 +405,13 @@ impl WalletScreen {
                         self.portfolio = tokens;
                     }
                     Err(e) => warn!(error = %e, "portfolio fetch failed"),
+                }
+            }
+            Message::HistoryFetched(result) => {
+                self.history_loading = false;
+                match result {
+                    Ok(txs) => self.history = txs,
+                    Err(e) => warn!(error = %e, "history fetch failed"),
                 }
             }
             Message::SelectNav(nav) => {
@@ -486,13 +547,16 @@ impl WalletScreen {
                         Err(e) => warn!(error = %e, "broadcast failed"),
                     }
                     let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
-                    // Refresh balance + portfolio on success so the
-                    // dashboard reflects the new state (the hero balance
-                    // and held-token list both shift).
+                    // Refresh balance + portfolio + history on success so
+                    // the dashboard reflects the new state (the hero
+                    // balance, held-token list, and activity feed all
+                    // shift).
                     let refresh = if success {
+                        self.history_loading = true;
                         Task::batch([
                             self.fetch_balance_task(),
                             self.fetch_portfolio_task(),
+                            self.fetch_history_task(),
                         ])
                     } else {
                         Task::none()
@@ -566,6 +630,35 @@ impl WalletScreen {
             }
             Message::OpenAccountDropdown => {
                 self.modal = Modal::AccountDropdown(AccountDropdown::new());
+            }
+            Message::OpenTxDetails(idx) => {
+                let Some(tx) = self.history.get(idx).cloned() else {
+                    // History refreshed in the gap between view and click;
+                    // silently ignore — the user will retry against the
+                    // newer list.
+                    return (Task::none(), None);
+                };
+                self.modal = Modal::TxDetails(TxDetailsPane::new(tx));
+                self.chrome.open();
+            }
+            Message::TxDetails(child_msg) => {
+                let Modal::TxDetails(p) = &mut self.modal else {
+                    return (Task::none(), None);
+                };
+                let (task, outcome) = p.update(child_msg);
+                let task = task.map(Message::TxDetails);
+                match outcome {
+                    Some(tx_details::Outcome::Closed) => {
+                        self.chrome.start_close();
+                        return (task, None);
+                    }
+                    Some(tx_details::Outcome::CopyText(s)) => {
+                        let copy = iced::clipboard::write(s)
+                            .map(|_: ()| Message::ClipboardWritten);
+                        return (Task::batch([task, copy]), None);
+                    }
+                    None => return (task, None),
+                }
             }
             Message::AccountDropdown(child_msg) => {
                 let Modal::AccountDropdown(d) = &mut self.modal else {
@@ -675,6 +768,9 @@ impl WalletScreen {
             Modal::Send(p) => {
                 subs.push(p.subscription().map(Message::Send));
             }
+            Modal::TxDetails(p) => {
+                subs.push(p.subscription().map(Message::TxDetails));
+            }
             Modal::None => {}
         }
         if let SettingsPane::Networks(p) = &self.settings_pane {
@@ -735,6 +831,11 @@ impl WalletScreen {
                     .map(Message::AccountDropdown),
             ]
             .into(),
+            Modal::TxDetails(p) => stack![
+                background,
+                p.view(t, self.chrome.progress()).map(Message::TxDetails),
+            ]
+            .into(),
         }
     }
 
@@ -746,7 +847,7 @@ impl WalletScreen {
     fn main_pane(&self, t: KaoTheme) -> Element<'_, Message> {
         let body: Element<'_, Message> = match self.nav {
             Nav::Home => home::view(t, &self.signer, &self.portfolio, self.portfolio_loading),
-            Nav::Activity => activity::view(t),
+            Nav::Activity => activity::view(t, self.address, &self.history, self.history_loading),
             Nav::Settings => match &self.settings_pane {
                 SettingsPane::Root => settings_root::view(t),
                 SettingsPane::Networks(p) => p.view(t).map(Message::Networks),
