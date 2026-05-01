@@ -19,6 +19,7 @@ dirs = "6"
 # zero-width chars, mixed-script confusables, and other display-spoofing
 # inputs that a naive ASCII-lowercase pass would accept.
 ens-normalize-rs = "0.1.1"
+futures = "0.3"
 getrandom = "0.4.2"
 # Pinned to commit on tag 0.11.1. Bump deliberately rather than tracking a branch.
 helios-ethereum = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
@@ -26,8 +27,10 @@ iced = { version = "0.14.0", features = ["tokio", "image", "qr_code"] }
 keyring = "3.6.3"
 rand = "0.8"
 redb = "4.1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["rt", "sync"] }
 toml = "0.8"
 tracing = "0.1"

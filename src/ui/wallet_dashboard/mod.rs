@@ -259,15 +259,32 @@ impl WalletScreen {
     pub fn fetch_portfolio_task(&self) -> Task<Message> {
         let address = self.address;
         let network = self.network.clone();
+        let provider = settings::indexer_provider();
         Task::perform(
             async move {
-                debug!(addr = %short_address(address), "fetching portfolio");
+                debug!(
+                    addr = %short_address(address),
+                    indexer = ?provider,
+                    "fetching portfolio",
+                );
                 let started = std::time::Instant::now();
-                let result = match network.provider().await {
-                    Some(provider) => {
-                        crate::portfolio::fetch_portfolio(address, &provider).await
+                // The indexer path is preferred when configured: one HTTP
+                // round-trip vs. seven on-chain reads + per-token Uniswap
+                // pool lookups. `IndexerProvider::None` falls back to the
+                // on-chain walk (slow, but no third-party dependency).
+                let result = if matches!(provider, crate::settings::IndexerProvider::None) {
+                    match network.provider().await {
+                        Some(provider) => {
+                            crate::portfolio::fetch_portfolio(address, &provider).await
+                        }
+                        None => Err("no execution RPCs configured".to_string()),
                     }
-                    None => Err("no execution RPCs configured".to_string()),
+                } else {
+                    let indexer = crate::indexer::build_indexer();
+                    indexer
+                        .balances(address)
+                        .await
+                        .map(crate::indexer::into_live_tokens)
                 };
                 debug!(
                     elapsed = ?started.elapsed(),

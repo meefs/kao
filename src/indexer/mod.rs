@@ -1,0 +1,343 @@
+// The Indexer trait is not yet wired into the UI; these implementations
+// satisfy the trait API surface that future wallet/portfolio screens will
+// consume. Keep the dead-code lint silenced module-wide until then so warnings
+// don't drown out genuine ones.
+#![allow(dead_code)]
+
+//! Third-party indexers for transaction history and ERC-20 balance fan-out.
+//!
+//! These are NOT light-client verified. Native ETH balance verification stays
+//! in `crate::net` (Helios). The indexer trades trust for coverage and speed:
+//! one HTTP round-trip discovers every token an address holds, including
+//! assets the bundled `portfolio::TOKEN_LIST` doesn't know about.
+//!
+//! Three implementations live in this module: Blockscout (no key), Etherscan
+//! (V2 API), and Alchemy. The active provider is chosen via
+//! `crate::settings::indexer_provider`.
+
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use alloy::primitives::{Address, B256, U256};
+use async_trait::async_trait;
+
+use crate::portfolio::LiveToken;
+use crate::settings::{self, IndexerProvider};
+use crate::ui::token_logos::{self, NATIVE_ETH};
+
+mod alchemy;
+mod blockscout;
+mod etherscan;
+
+pub use alchemy::AlchemyClient;
+pub use blockscout::BlockscoutClient;
+pub use etherscan::EtherscanClient;
+
+/// Outcome of a single transaction relative to the queried address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxStatus {
+    Success,
+    Failure,
+    Pending,
+}
+
+/// Direction of value flow relative to the queried address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxDirection {
+    In,
+    Out,
+    SelfTransfer,
+}
+
+/// Provider-agnostic transaction summary. Fields the indexer doesn't surface
+/// are `None` rather than zero so the UI can distinguish "missing" from "0".
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct IndexedTx {
+    pub hash: B256,
+    pub block_number: u64,
+    /// Unix seconds.
+    pub timestamp: u64,
+    pub from: Address,
+    /// `None` for contract creation.
+    pub to: Option<Address>,
+    /// Native ETH value in wei.
+    pub value: U256,
+    pub gas_used: Option<u64>,
+    pub gas_price: Option<u128>,
+    pub status: TxStatus,
+    pub direction: TxDirection,
+    /// Decoded function name when the provider supplies it.
+    pub method: Option<String>,
+}
+
+/// Provider-agnostic token holding. Mirrors `portfolio::LiveToken` but is
+/// distinct because the indexer's price/logo come from the indexer (or are
+/// missing), whereas `LiveToken` carries on-chain Uniswap prices and bundled
+/// logo IDs. Callers wanting Helios-verified data must use
+/// `portfolio::fetch_portfolio` instead.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct IndexedToken {
+    pub symbol: String,
+    pub name: String,
+    /// `None` for native ETH; `Some(addr)` for ERC-20s.
+    pub contract: Option<Address>,
+    pub decimals: u8,
+    pub balance_raw: U256,
+    pub balance_f64: f64,
+    /// Display string formatted with the same rules as `portfolio::LiveToken`.
+    pub balance: String,
+    /// `None` when the indexer doesn't price this asset.
+    pub usd_price: Option<f64>,
+    pub usd_value: Option<f64>,
+    /// Remote URL — indexers serve full URLs, unlike the bundled token-logo IDs
+    /// the curated portfolio uses.
+    pub logo_url: Option<String>,
+}
+
+/// Source of unverified transaction history and balance fan-out.
+#[async_trait]
+pub trait Indexer: Send + Sync + std::fmt::Debug {
+    /// Most recent transactions involving `addr`, newest first, up to `limit`.
+    async fn transactions(&self, addr: Address, limit: usize) -> Result<Vec<IndexedTx>, String>;
+
+    /// Native ETH plus every ERC-20 the indexer knows `addr` holds, with
+    /// prices when the provider supplies them. NOT light-client verified.
+    async fn balances(&self, addr: Address) -> Result<Vec<IndexedToken>, String>;
+}
+
+/// Shared `reqwest::Client` for every indexer impl. One TLS pool per process,
+/// reused across account switches and provider changes.
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(20))
+            .user_agent(concat!("kao/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("reqwest client must build")
+    })
+}
+
+/// Build an indexer matching the user's settings. Falls back to Blockscout
+/// (with whatever Blockscout overrides the user has set) when the chosen
+/// provider has no API key configured — a missing key is a configuration
+/// gap, not an error worth bubbling to the UI. `IndexerProvider::None`
+/// returns the `NoopIndexer` so callers can stay trait-object-shaped without
+/// branching on `Option<Arc<dyn Indexer>>`.
+#[allow(dead_code)]
+pub fn build_indexer() -> Arc<dyn Indexer> {
+    let blockscout = || {
+        Arc::new(BlockscoutClient::new(
+            settings::blockscout_base_url(),
+            settings::blockscout_api_key(),
+        )) as Arc<dyn Indexer>
+    };
+    match settings::indexer_provider() {
+        IndexerProvider::Blockscout => blockscout(),
+        IndexerProvider::Etherscan => match settings::etherscan_api_key() {
+            Some(key) => Arc::new(EtherscanClient::new(key)),
+            None => blockscout(),
+        },
+        IndexerProvider::Alchemy => match settings::alchemy_api_key() {
+            Some(key) => Arc::new(AlchemyClient::new(key)),
+            None => blockscout(),
+        },
+        IndexerProvider::None => Arc::new(NoopIndexer),
+    }
+}
+
+/// Parse an RFC 3339 timestamp (`YYYY-MM-DDTHH:MM:SS[.fraction](Z|±HH:MM)`)
+/// to unix seconds. Used by Blockscout (`timestamp`) and Alchemy
+/// (`metadata.blockTimestamp`); both encode the same way. Returns 0 on a
+/// malformed input rather than failing the whole tx-list response over a
+/// single bad timestamp.
+pub(crate) fn parse_iso8601(s: &str) -> u64 {
+    let b = s.as_bytes();
+    if b.len() < 19 {
+        return 0;
+    }
+    let y = parse_digits(&b[0..4]) as i32;
+    let mo = parse_digits(&b[5..7]);
+    let d = parse_digits(&b[8..10]);
+    let h = parse_digits(&b[11..13]);
+    let mi = parse_digits(&b[14..16]);
+    let se = parse_digits(&b[17..19]);
+    let days = days_from_civil(y, mo, d);
+    if days < 0 {
+        return 0;
+    }
+    days as u64 * 86_400 + h as u64 * 3600 + mi as u64 * 60 + se as u64
+}
+
+fn parse_digits(b: &[u8]) -> u32 {
+    let mut v = 0u32;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return v;
+        }
+        v = v * 10 + (c - b'0') as u32;
+    }
+    v
+}
+
+/// Howard Hinnant's "days from civil" — proleptic Gregorian days since the
+/// 1970-01-01 epoch. Public-domain algorithm.
+fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = (y - era * 400) as i64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era as i64 * 146_097 + doe - 719_468
+}
+
+/// Convert indexer-fetched tokens to the dashboard's `LiveToken` shape so
+/// the existing portfolio UI can render them without touching every call
+/// site. Indexer-supplied prices may be missing — those map to `0.0` in
+/// `LiveToken` so the column sort behaves the same way as the on-chain
+/// portfolio path. Logos resolve via the bundled `token_logos::logo_id_for`
+/// table; tokens not in the table render the kaomoji fallback avatar.
+pub fn into_live_tokens(tokens: Vec<IndexedToken>) -> Vec<LiveToken> {
+    tokens
+        .into_iter()
+        .map(|t| {
+            let logo_id = match t.contract {
+                None => Some(NATIVE_ETH),
+                Some(c) => token_logos::logo_id_for(c),
+            };
+            LiveToken {
+                symbol: t.symbol,
+                name: t.name,
+                balance: t.balance,
+                balance_f64: t.balance_f64,
+                balance_raw: t.balance_raw,
+                decimals: t.decimals,
+                contract: t.contract,
+                usd_price: t.usd_price.unwrap_or(0.0),
+                usd_value: t.usd_value.unwrap_or(0.0),
+                logo_id,
+            }
+        })
+        .collect()
+}
+
+/// Classify a tx's direction relative to `owner`. Centralized so each impl
+/// doesn't reimplement the self-transfer edge case.
+pub(crate) fn classify_direction(from: Address, to: Option<Address>, owner: Address) -> TxDirection {
+    let from_owner = from == owner;
+    let to_owner = to == Some(owner);
+    match (from_owner, to_owner) {
+        (true, true) => TxDirection::SelfTransfer,
+        (true, false) => TxDirection::Out,
+        (false, true) => TxDirection::In,
+        // Indexers may surface txs that touch `owner` via internal calls or
+        // logs without `owner` being either endpoint of the outer tx.
+        // Treat that as inbound — it's the conservative default for "this
+        // address received something".
+        (false, false) => TxDirection::In,
+    }
+}
+
+/// Indexer that returns empty results for everything. Selected when the user
+/// picks `IndexerProvider::None` — the wallet still works (balances come
+/// from the on-chain `portfolio` walk; tx history is just empty).
+#[derive(Debug, Default)]
+pub struct NoopIndexer;
+
+#[async_trait]
+impl Indexer for NoopIndexer {
+    async fn transactions(&self, _addr: Address, _limit: usize) -> Result<Vec<IndexedTx>, String> {
+        Ok(Vec::new())
+    }
+
+    async fn balances(&self, _addr: Address) -> Result<Vec<IndexedToken>, String> {
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noop_indexer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<NoopIndexer>();
+        assert_send_sync::<Arc<dyn Indexer>>();
+    }
+
+    #[test]
+    fn iso8601_known_epochs() {
+        assert_eq!(parse_iso8601("1970-01-01T00:00:00.000000Z"), 0);
+        assert_eq!(parse_iso8601("2024-01-01T00:00:00.000000Z"), 1_704_067_200);
+        assert_eq!(parse_iso8601("2024-06-15T12:34:56.000000Z"), 1_718_454_896);
+    }
+
+    #[test]
+    fn into_live_tokens_assigns_native_eth_logo_and_zeroes_missing_prices() {
+        let usdc: Address =
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse().unwrap();
+        let unknown: Address = "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let tokens = vec![
+            IndexedToken {
+                symbol: "ETH".into(),
+                name: "Ethereum".into(),
+                contract: None,
+                decimals: 18,
+                balance_raw: alloy::primitives::U256::ZERO,
+                balance_f64: 0.0,
+                balance: "0".into(),
+                usd_price: Some(2000.0),
+                usd_value: Some(0.0),
+                logo_url: None,
+            },
+            IndexedToken {
+                symbol: "USDC".into(),
+                name: "USD Coin".into(),
+                contract: Some(usdc),
+                decimals: 6,
+                balance_raw: alloy::primitives::U256::from(1u8),
+                balance_f64: 0.000001,
+                balance: "0.000001".into(),
+                usd_price: None, // indexer didn't supply a price
+                usd_value: None,
+                logo_url: None,
+            },
+            IndexedToken {
+                symbol: "BEEF".into(),
+                name: "Random".into(),
+                contract: Some(unknown),
+                decimals: 18,
+                balance_raw: alloy::primitives::U256::from(1u8),
+                balance_f64: 0.0,
+                balance: "0".into(),
+                usd_price: None,
+                usd_value: None,
+                logo_url: None,
+            },
+        ];
+        let live = into_live_tokens(tokens);
+        assert_eq!(live[0].logo_id, Some(NATIVE_ETH));
+        assert_eq!(live[1].logo_id, Some("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"));
+        assert_eq!(live[2].logo_id, None, "unknown contract has no bundled logo");
+        assert_eq!(live[1].usd_price, 0.0, "missing indexer price collapses to 0");
+        assert_eq!(live[1].usd_value, 0.0);
+    }
+
+    #[test]
+    fn classify_direction_covers_all_cases() {
+        let me = Address::repeat_byte(0x11);
+        let other = Address::repeat_byte(0x22);
+        assert_eq!(classify_direction(me, Some(other), me), TxDirection::Out);
+        assert_eq!(classify_direction(other, Some(me), me), TxDirection::In);
+        assert_eq!(
+            classify_direction(me, Some(me), me),
+            TxDirection::SelfTransfer,
+        );
+        assert_eq!(classify_direction(me, None, me), TxDirection::Out);
+        assert_eq!(classify_direction(other, None, me), TxDirection::In);
+    }
+}

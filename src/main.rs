@@ -1,5 +1,6 @@
 mod app;
 mod ens;
+mod indexer;
 mod net;
 mod paths;
 mod portfolio;

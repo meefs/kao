@@ -37,6 +37,41 @@ pub const BUILTIN_CHECKPOINT: &str =
 pub const BUILTIN_CHECKPOINT_PUBLISHED: u64 = 1777188238;
 pub const BUILTIN_FRESHNESS_DAYS: u64 = 14;
 
+/// Third-party indexer used for transaction history and unverified balance
+/// fan-outs. Helios verification of native ETH stays in `crate::net`; this
+/// picks who answers `Indexer::transactions` / `Indexer::balances`. `None`
+/// disables the indexer entirely — balances fall back to the on-chain
+/// `portfolio::fetch_portfolio` walk and tx history is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IndexerProvider {
+    #[default]
+    Blockscout,
+    Etherscan,
+    Alchemy,
+    None,
+}
+
+impl IndexerProvider {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Blockscout => "blockscout",
+            Self::Etherscan => "etherscan",
+            Self::Alchemy => "alchemy",
+            Self::None => "none",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "blockscout" => Some(Self::Blockscout),
+            "etherscan" => Some(Self::Etherscan),
+            "alchemy" => Some(Self::Alchemy),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct State {
     theme: ThemeKind,
@@ -47,6 +82,13 @@ struct State {
     /// Starts as the built-in constant; the network layer may swap in a
     /// fresher community-fallback hash on app startup.
     auto_checkpoint: B256,
+    indexer_provider: IndexerProvider,
+    etherscan_api_key: Option<String>,
+    alchemy_api_key: Option<String>,
+    /// Custom Blockscout instance base URL (e.g. for L2s). `None` falls back
+    /// to the public mainnet endpoint baked into the indexer.
+    blockscout_base_url: Option<String>,
+    blockscout_api_key: Option<String>,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -66,6 +108,11 @@ fn default_state() -> State {
         checkpoint_override: None,
         auto_checkpoint: B256::from_str(BUILTIN_CHECKPOINT)
             .expect("built-in checkpoint constant must be valid hex"),
+        indexer_provider: IndexerProvider::default(),
+        etherscan_api_key: None,
+        alchemy_api_key: None,
+        blockscout_base_url: None,
+        blockscout_api_key: None,
     }
 }
 
@@ -100,6 +147,16 @@ struct OnDisk {
     consensus_rpcs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     checkpoint_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    indexer_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etherscan_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alchemy_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blockscout_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blockscout_api_key: Option<String>,
 }
 
 /// True iff `s` parses as an HTTPS URL. Non-HTTPS endpoints are dropped on
@@ -143,6 +200,17 @@ fn parse(text: &str) -> State {
             B256::from_str(s).ok()
         };
     }
+    if let Some(p) = on_disk.indexer_provider.as_deref()
+        && let Some(parsed) = IndexerProvider::from_key(p)
+    {
+        state.indexer_provider = parsed;
+    }
+    state.etherscan_api_key = on_disk.etherscan_api_key.filter(|s| !s.is_empty());
+    state.alchemy_api_key = on_disk.alchemy_api_key.filter(|s| !s.is_empty());
+    state.blockscout_base_url = on_disk
+        .blockscout_base_url
+        .filter(|s| !s.is_empty() && is_https_url(s));
+    state.blockscout_api_key = on_disk.blockscout_api_key.filter(|s| !s.is_empty());
     state
 }
 
@@ -157,6 +225,11 @@ fn serialize(state: &State) -> String {
         checkpoint_override: state
             .checkpoint_override
             .map(|b| format!("0x{}", alloy::hex::encode(b.as_slice()))),
+        indexer_provider: Some(state.indexer_provider.key().to_string()),
+        etherscan_api_key: state.etherscan_api_key.clone(),
+        alchemy_api_key: state.alchemy_api_key.clone(),
+        blockscout_base_url: state.blockscout_base_url.clone(),
+        blockscout_api_key: state.blockscout_api_key.clone(),
     };
     toml::to_string(&on_disk).expect("serializing settings cannot fail")
 }
@@ -223,6 +296,86 @@ pub fn set_checkpoint_override(value: Option<B256>) {
         .lock()
         .expect("settings mutex poisoned")
         .checkpoint_override = value;
+    write_all();
+}
+
+pub fn indexer_provider() -> IndexerProvider {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .indexer_provider
+}
+
+pub fn set_indexer_provider(value: IndexerProvider) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .indexer_provider = value;
+    write_all();
+}
+
+pub fn etherscan_api_key() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .etherscan_api_key
+        .clone()
+}
+
+pub fn set_etherscan_api_key(value: Option<String>) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .etherscan_api_key = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+pub fn alchemy_api_key() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .alchemy_api_key
+        .clone()
+}
+
+pub fn set_alchemy_api_key(value: Option<String>) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .alchemy_api_key = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+pub fn blockscout_base_url() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .blockscout_base_url
+        .clone()
+}
+
+pub fn set_blockscout_base_url(value: Option<String>) {
+    let cleaned = value.filter(|s| !s.is_empty() && is_https_url(s));
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .blockscout_base_url = cleaned;
+    write_all();
+}
+
+pub fn blockscout_api_key() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .blockscout_api_key
+        .clone()
+}
+
+pub fn set_blockscout_api_key(value: Option<String>) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .blockscout_api_key = value.filter(|s| !s.is_empty());
     write_all();
 }
 
@@ -367,6 +520,11 @@ mod tests {
             consensus_rpcs: vec!["https://cl1.example".into(), "https://cl2.example".into()],
             checkpoint_override: Some(B256::from_str(BUILTIN_CHECKPOINT).unwrap()),
             auto_checkpoint: B256::from_str(BUILTIN_CHECKPOINT).unwrap(),
+            indexer_provider: IndexerProvider::Alchemy,
+            etherscan_api_key: Some("ETHERSCAN_TEST_KEY".into()),
+            alchemy_api_key: Some("ALCHEMY_TEST_KEY".into()),
+            blockscout_base_url: Some("https://base.blockscout.com".into()),
+            blockscout_api_key: Some("BLOCKSCOUT_TEST_KEY".into()),
         };
         let serialized = serialize(&original);
         let parsed = parse(&serialized);
@@ -374,6 +532,11 @@ mod tests {
         assert_eq!(parsed.rpcs, original.rpcs);
         assert_eq!(parsed.consensus_rpcs, original.consensus_rpcs);
         assert_eq!(parsed.checkpoint_override, original.checkpoint_override);
+        assert_eq!(parsed.indexer_provider, original.indexer_provider);
+        assert_eq!(parsed.etherscan_api_key, original.etherscan_api_key);
+        assert_eq!(parsed.alchemy_api_key, original.alchemy_api_key);
+        assert_eq!(parsed.blockscout_base_url, original.blockscout_base_url);
+        assert_eq!(parsed.blockscout_api_key, original.blockscout_api_key);
         // auto_checkpoint isn't persisted; parsed value reverts to the default.
         assert_eq!(parsed.auto_checkpoint, default_state().auto_checkpoint);
     }
@@ -386,6 +549,11 @@ mod tests {
             consensus_rpcs: vec!["c".into(), "d".into(), "e".into()],
             checkpoint_override: None,
             auto_checkpoint: default_state().auto_checkpoint,
+            indexer_provider: IndexerProvider::Blockscout,
+            etherscan_api_key: None,
+            alchemy_api_key: None,
+            blockscout_base_url: None,
+            blockscout_api_key: None,
         };
         let text = serialize(&state);
         let reparsed: OnDisk = toml::from_str(&text).expect("output must be valid toml");

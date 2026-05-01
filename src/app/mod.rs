@@ -32,6 +32,9 @@ use crate::ui::select_hardware_wallet::{
 use crate::ui::select_hd_account::{
     Message as SelectHdAccountMessage, Outcome as SelectHdAccountOutcome, SelectHdAccountScreen,
 };
+use crate::ui::select_indexer::{
+    Message as SelectIndexerMessage, Outcome as SelectIndexerOutcome, SelectIndexerScreen,
+};
 use crate::ui::select_rpc::{
     Message as SelectRpcMessage, Outcome as SelectRpcOutcome, SelectRpcScreen,
 };
@@ -63,6 +66,7 @@ pub enum Message {
     ImportSeedPhrase(ImportSeedPhraseMessage),
     SelectHardwareWallet(SelectHardwareWalletMessage),
     SelectHdAccount(SelectHdAccountMessage),
+    SelectIndexer(SelectIndexerMessage),
     SelectRpc(SelectRpcMessage),
     SetupMethod(SetupMethodMessage),
     ShowSeed(ShowSeedMessage),
@@ -86,6 +90,9 @@ pub enum Screen {
     /// Pick the RPC source to use for on-chain reads (defaults or custom).
     /// Shown once, after the user creates their initial passphrase.
     SelectRpc(SelectRpcScreen),
+    /// Pick the third-party indexer (transaction history + unverified
+    /// balances). Shown once, right after `SelectRpc`.
+    SelectIndexer(SelectIndexerScreen),
     /// Choose how to set up the wallet (create new, import seed, import key,
     /// or open the hardware-wallet sub-screen).
     SetupMethod(SetupMethodScreen),
@@ -476,15 +483,43 @@ impl App {
                             .collect();
                         crate::settings::set_rpcs(exec);
                         crate::settings::set_consensus_rpcs(consensus);
-                        self.screen = Screen::SetupMethod(SetupMethodScreen::default());
+                        self.screen = Screen::SelectIndexer(SelectIndexerScreen::new(None));
                         iced::Task::none()
                     }
                     Some(SelectRpcOutcome::Custom(url)) => {
-                        crate::settings::set_rpcs(vec![url]);
+                        crate::settings::set_rpcs(vec![url.clone()]);
+                        self.screen =
+                            Screen::SelectIndexer(SelectIndexerScreen::new(Some(&url)));
+                        iced::Task::none()
+                    }
+                    Some(SelectRpcOutcome::Back) => {
+                        self.passphrase = None;
+                        self.setup_context = None;
+                        self.screen = Screen::CreatePassword(CreatePasswordScreen::default());
+                        focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
+                            .map(Message::CreatePassword)
+                    }
+                    None => cmd.map(Message::SelectRpc),
+                }
+            }
+
+            // ── SelectIndexer ───────────────────────────────────────
+            Message::SelectIndexer(msg) => {
+                let Screen::SelectIndexer(screen) = &mut self.screen else {
+                    return iced::Task::none();
+                };
+                let (cmd, outcome) = screen.update(msg);
+                match outcome {
+                    Some(SelectIndexerOutcome::Back) => {
+                        self.screen = Screen::SelectRpc(SelectRpcScreen::default());
+                        iced::Task::none()
+                    }
+                    Some(out) => {
+                        apply_indexer_outcome(out);
                         self.screen = Screen::SetupMethod(SetupMethodScreen::default());
                         iced::Task::none()
                     }
-                    None => cmd.map(Message::SelectRpc),
+                    None => cmd.map(Message::SelectIndexer),
                 }
             }
 
@@ -535,8 +570,13 @@ impl App {
                         if matches!(self.setup_context, Some(SetupContext::AddAccount)) {
                             self.cancel_add_account()
                         } else {
-                            // Fresh setup: step back to the RPC picker.
-                            self.screen = Screen::SelectRpc(SelectRpcScreen::default());
+                            // Fresh setup: step back one — to the indexer
+                            // picker — so users can flip from e.g. Etherscan
+                            // to None without re-picking RPC.
+                            let rpc = crate::settings::rpcs().into_iter().next();
+                            self.screen = Screen::SelectIndexer(SelectIndexerScreen::new(
+                                rpc.as_deref(),
+                            ));
                             iced::Task::none()
                         }
                     }
@@ -857,6 +897,7 @@ impl App {
             Screen::CreatePassword(screen) => screen.view().map(Message::CreatePassword),
             Screen::Unlock(screen) => screen.view().map(Message::Unlock),
             Screen::SelectRpc(screen) => screen.view().map(Message::SelectRpc),
+            Screen::SelectIndexer(screen) => screen.view().map(Message::SelectIndexer),
             Screen::SetupMethod(screen) => screen.view().map(Message::SetupMethod),
             Screen::SelectHardwareWallet(screen) => {
                 screen.view().map(Message::SelectHardwareWallet)
@@ -878,6 +919,7 @@ impl App {
             Screen::CreatePassword(screen) => screen.subscription().map(Message::CreatePassword),
             Screen::Unlock(_) => Subscription::none(),
             Screen::SelectRpc(screen) => screen.subscription().map(Message::SelectRpc),
+            Screen::SelectIndexer(screen) => screen.subscription().map(Message::SelectIndexer),
             Screen::SetupMethod(screen) => screen.subscription().map(Message::SetupMethod),
             Screen::SelectHardwareWallet(screen) => {
                 screen.subscription().map(Message::SelectHardwareWallet)
@@ -932,6 +974,34 @@ fn save_descriptor_task(
         },
         Message::WalletSaved,
     )
+}
+
+/// Persist the user's indexer choice. Each branch sets the provider plus
+/// any provider-specific config; fields the outcome doesn't carry are left
+/// untouched so a re-run of setup doesn't wipe an unrelated existing key.
+fn apply_indexer_outcome(outcome: SelectIndexerOutcome) {
+    use crate::settings::{self, IndexerProvider};
+    match outcome {
+        SelectIndexerOutcome::Alchemy { api_key } => {
+            settings::set_alchemy_api_key(Some(api_key));
+            settings::set_indexer_provider(IndexerProvider::Alchemy);
+        }
+        SelectIndexerOutcome::Blockscout { base_url, api_key } => {
+            settings::set_blockscout_base_url(base_url);
+            settings::set_blockscout_api_key(api_key);
+            settings::set_indexer_provider(IndexerProvider::Blockscout);
+        }
+        SelectIndexerOutcome::Etherscan { api_key } => {
+            settings::set_etherscan_api_key(Some(api_key));
+            settings::set_indexer_provider(IndexerProvider::Etherscan);
+        }
+        SelectIndexerOutcome::NoIndexer => {
+            settings::set_indexer_provider(IndexerProvider::None);
+        }
+        SelectIndexerOutcome::Back => {
+            // Handled by the caller — back navigation doesn't touch settings.
+        }
+    }
 }
 
 #[cfg(test)]

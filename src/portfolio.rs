@@ -208,7 +208,7 @@ fn balance_of_calldata(owner: Address) -> Bytes {
     Bytes::from(data)
 }
 
-fn format_token_balance(raw: U256, decimals: u8) -> (String, f64) {
+pub(crate) fn format_token_balance(raw: U256, decimals: u8) -> (String, f64) {
     if raw.is_zero() {
         return ("0".into(), 0.0);
     }
@@ -225,7 +225,7 @@ fn format_token_balance(raw: U256, decimals: u8) -> (String, f64) {
     (formatted, value)
 }
 
-fn format_eth_balance(raw: U256) -> (String, f64) {
+pub(crate) fn format_eth_balance(raw: U256) -> (String, f64) {
     let formatted = alloy::primitives::utils::format_ether(raw);
     let f = formatted.parse::<f64>().unwrap_or(0.0);
     let display = if f >= 1000.0 {

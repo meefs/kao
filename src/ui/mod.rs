@@ -8,6 +8,7 @@ pub mod kao_theme;
 pub mod kao_widgets;
 pub mod select_hardware_wallet;
 pub mod select_hd_account;
+pub mod select_indexer;
 pub mod select_rpc;
 pub mod setup_method;
 pub mod show_seed;

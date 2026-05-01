@@ -4736,6 +4736,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tower-service",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -5601,14 +5602,17 @@ dependencies = [
  "chacha20poly1305",
  "dirs 6.0.0",
  "ens-normalize-rs",
+ "futures",
  "getrandom 0.4.2",
  "helios-ethereum",
  "iced",
  "keyring",
  "rand 0.8.6",
  "redb",
+ "reqwest 0.12.28",
  "secrecy",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",
@@ -7857,6 +7861,8 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
+ "rustls 0.23.39",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -7864,6 +7870,7 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-native-tls",
+ "tokio-rustls 0.26.4",
  "tower 0.5.3",
  "tower-http",
  "tower-service",
@@ -7871,6 +7878,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]
@@ -8357,6 +8365,7 @@ checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki 0.103.13",
  "subtle",
