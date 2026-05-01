@@ -3,6 +3,7 @@ use iced::widget::operation::focus as focus_widget;
 use iced::widget::{Space, column, container, row, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 use secrecy::SecretString;
+use zeroize::Zeroizing;
 
 use crate::settings;
 use crate::ui::kao_theme::KaoTheme;
@@ -35,8 +36,11 @@ pub enum Outcome {
 
 #[derive(Debug, Default)]
 pub struct CreatePasswordScreen {
-    password: String,
-    confirm: String,
+    /// Live `text_input` buffers. `Zeroizing<String>` zeros the heap
+    /// allocation each time the input is replaced (every keystroke) and
+    /// on screen drop.
+    password: Zeroizing<String>,
+    confirm: Zeroizing<String>,
     error: Option<String>,
     /// Tracks which field currently has focus for Tab navigation.
     focused: Focus,
@@ -53,11 +57,11 @@ impl CreatePasswordScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::PasswordInput(p) => {
-                self.password = p;
+                self.password = Zeroizing::new(p);
                 (Task::none(), None)
             }
             Message::ConfirmInput(c) => {
-                self.confirm = c;
+                self.confirm = Zeroizing::new(c);
                 (Task::none(), None)
             }
             Message::PasswordSubmitted => {
@@ -103,20 +107,24 @@ impl CreatePasswordScreen {
             self.error = Some("Password must be at least 8 characters".into());
             return None;
         }
-        if self.password != self.confirm {
+        if self.password.as_str() != self.confirm.as_str() {
             self.error = Some("Passwords do not match".into());
             return None;
         }
         self.error = None;
-        let secret = SecretString::new(std::mem::take(&mut self.password).into_boxed_str());
-        self.confirm.clear();
+        // Take both buffers so the previous heap allocations zero on drop.
+        // `Box::from(&str)` reallocates into a fresh buffer that
+        // `SecretString` then owns and zeros.
+        let taken = std::mem::take(&mut self.password);
+        let _confirm = std::mem::take(&mut self.confirm);
+        let secret = SecretString::new(Box::from(taken.as_str()));
         Some(Outcome::Created(secret))
     }
 
     pub fn view(&self) -> Element<'_, Message> {
         let t = KaoTheme::for_kind(settings::theme());
 
-        let password_input = text_input("Password", &self.password)
+        let password_input = text_input("Password", self.password.as_str())
             .id(PASSWORD_INPUT_ID)
             .secure(true)
             .on_input(Message::PasswordInput)
@@ -126,7 +134,7 @@ impl CreatePasswordScreen {
             .font(mono())
             .style(move |_theme, status| text_input_style(t, status));
 
-        let confirm_input = text_input("Confirm password", &self.confirm)
+        let confirm_input = text_input("Confirm password", self.confirm.as_str())
             .id(CONFIRM_INPUT_ID)
             .secure(true)
             .on_input(Message::ConfirmInput)

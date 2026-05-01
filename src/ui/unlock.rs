@@ -1,6 +1,7 @@
 use iced::widget::{Space, column, container, row, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Task};
 use secrecy::SecretString;
+use zeroize::Zeroizing;
 
 use crate::settings;
 use crate::ui::kao_theme::KaoTheme;
@@ -31,7 +32,9 @@ pub enum Outcome {
 
 #[derive(Debug, Default)]
 pub struct UnlockScreen {
-    password: String,
+    /// Live `text_input` buffer. `Zeroizing<String>` zeros the heap allocation
+    /// each time the input is replaced (every keystroke) and on screen drop.
+    password: Zeroizing<String>,
     error: Option<String>,
     unlocking: bool,
 }
@@ -40,14 +43,17 @@ impl UnlockScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::PasswordInput(p) => {
-                self.password = p;
+                self.password = Zeroizing::new(p);
                 (Task::none(), None)
             }
             Message::PasswordSubmitted | Message::UnlockPressed => (self.try_unlock(), None),
             Message::UnlockResult(Ok(descriptor)) => {
                 self.unlocking = false;
-                let passphrase =
-                    SecretString::new(std::mem::take(&mut self.password).into_boxed_str());
+                // Take the buffer so the previous heap allocation gets
+                // zeroed on drop. `Box::from(&str)` reallocates into a
+                // fresh buffer that `SecretString` then owns and zeros.
+                let taken = std::mem::take(&mut self.password);
+                let passphrase = SecretString::new(Box::from(taken.as_str()));
                 (
                     Task::none(),
                     Some(Outcome::Unlocked {
@@ -71,10 +77,14 @@ impl UnlockScreen {
         self.error = None;
         self.unlocking = true;
 
+        // Clone into another `Zeroizing<String>` so the async-task copy
+        // gets wiped after the SecretString takes over. The original
+        // `self.password` stays put so the user doesn't have to retype on
+        // a wrong-password error.
         let password = self.password.clone();
         Task::perform(
             async move {
-                let passphrase = SecretString::new(password.into_boxed_str());
+                let passphrase = SecretString::new(Box::from(password.as_str()));
                 wallet::load_descriptor(&passphrase).map_err(|e| match e {
                     wallet::WalletError::Encryption(_) => "Incorrect password".to_string(),
                     other => other.to_string(),
@@ -87,7 +97,7 @@ impl UnlockScreen {
     pub fn view(&self) -> Element<'_, Message> {
         let t = KaoTheme::for_kind(settings::theme());
 
-        let password_input = text_input("Password", &self.password)
+        let password_input = text_input("Password", self.password.as_str())
             .id(PASSWORD_INPUT_ID)
             .secure(true)
             .on_input(Message::PasswordInput)
