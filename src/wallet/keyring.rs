@@ -1,9 +1,3 @@
-// The wrapper has no in-tree consumer until the follow-up PR wires the
-// rollback-protection epoch through `store::save_to` / `load_from`. Tests
-// exercise the API, but non-test builds would otherwise warn on every
-// function. Drop this attribute the moment a consumer lands.
-#![allow(dead_code)]
-
 //! Thin wrapper around the OS keyring (`keyring` crate).
 //!
 //! Acts as the external trust anchor for state that must not roll back
@@ -20,8 +14,8 @@
 //!
 //! All entries live under the service name `"com.kaowallet"` (reverse-DNS
 //! of the project's domain, to avoid colliding with any other "kao" tool
-//! on the same machine); `name` is the per-purpose key (e.g.
-//! `"wallet-epoch"` in the follow-up PR).
+//! on the same machine); `name` is the per-purpose key (currently
+//! `wallet-epoch-<hex(salt[..8])>`, written by `wallet::store`).
 //!
 //! # Errors
 //!
@@ -82,6 +76,10 @@ pub fn write_secret(name: &str, value: &[u8]) -> Result<(), KeyringError> {
     entry.set_secret(value).map_err(map_err)
 }
 
+// No production consumer yet — the wallet store reads and writes but
+// never deletes. Tests need this to simulate the "user wiped their
+// keyring" scenario, so it stays in the public API.
+#[allow(dead_code)]
 /// Remove a secret. Idempotent: deleting a non-existent entry is `Ok(())`,
 /// since the post-condition ("no entry under this name") already holds.
 pub fn delete_secret(name: &str) -> Result<(), KeyringError> {
@@ -108,9 +106,17 @@ fn map_err(e: keyring::Error) -> KeyringError {
     }
 }
 
+/// In-process keyring backend for tests, keyed on (service, user) with a
+/// shared map. Lives here (not under `mod tests`) so other modules in the
+/// crate — notably `wallet::store` — can install it from their own tests.
+///
+/// Why not the stock `keyring::mock`: the stock backend creates a fresh,
+/// isolated credential for every `Entry::new` call, so write-via-one-handle
+/// / read-via-another (which is exactly what this wrapper does) never
+/// shares state. Real OS backends key on service+user, so this fake
+/// matches their semantics rather than the mock's.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
     use keyring::credential::{
         Credential, CredentialApi, CredentialBuilderApi, CredentialPersistence,
     };
@@ -118,15 +124,6 @@ mod tests {
     use std::collections::HashMap;
     use std::fmt::{self, Formatter};
     use std::sync::{Mutex, OnceLock};
-
-    // The stock `keyring::mock` backend creates a fresh, isolated credential
-    // for every `Entry::new` call, so write-via-one-handle / read-via-another
-    // (which is exactly what our wrapper does) never shares state. To get
-    // realistic round-trip coverage we install our own backend that keys on
-    // (service, user) and stores values in a process-global map. This is
-    // also a sharper test of the wrapper's semantics than the stock mock,
-    // since real OS backends behave the same way (state is keyed by
-    // service+user, not by handle).
 
     type StoreKey = (String, String);
 
@@ -218,28 +215,35 @@ mod tests {
         }
     }
 
-    /// `set_default_credential_builder` is process-global; install once and
-    /// every parallel test then sees our shared-map backend.
-    fn setup() {
+    /// Install the in-memory backend as the process-global keyring. Safe to
+    /// call from many tests in parallel — the `OnceLock` guard ensures the
+    /// underlying `set_default_credential_builder` runs exactly once and
+    /// late callers block until install completes.
+    pub fn install() {
         static INIT: OnceLock<()> = OnceLock::new();
         INIT.get_or_init(|| {
             keyring::set_default_credential_builder(Box::new(InMemoryBuilder));
         });
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     // Each test uses a unique entry name so parallel runs don't trample
     // each other through the process-global store.
 
     #[test]
     fn read_missing_returns_none() {
-        setup();
+        test_support::install();
         let got = read_secret("test_read_missing").unwrap();
         assert!(got.is_none(), "expected None for unwritten entry, got {got:?}");
     }
 
     #[test]
     fn round_trip_bytes() {
-        setup();
+        test_support::install();
         let name = "test_round_trip";
         let value = b"hello, keyring";
         write_secret(name, value).unwrap();
@@ -251,7 +255,7 @@ mod tests {
     fn round_trip_bytes_with_nul_and_high_bytes() {
         // Ensures we're going through the bytes API, not a UTF-8 string
         // round-trip that would mangle these.
-        setup();
+        test_support::install();
         let name = "test_round_trip_binary";
         let value: &[u8] = &[0x00, 0x01, 0xff, 0x00, 0x80, 0x7f];
         write_secret(name, value).unwrap();
@@ -261,7 +265,7 @@ mod tests {
 
     #[test]
     fn write_overwrites_previous_value() {
-        setup();
+        test_support::install();
         let name = "test_overwrite";
         write_secret(name, b"first").unwrap();
         write_secret(name, b"second").unwrap();
@@ -271,7 +275,7 @@ mod tests {
 
     #[test]
     fn delete_removes_entry() {
-        setup();
+        test_support::install();
         let name = "test_delete";
         write_secret(name, b"to be deleted").unwrap();
         delete_secret(name).unwrap();
@@ -284,7 +288,7 @@ mod tests {
         // `delete_secret` is idempotent — the post-condition already holds.
         // Callers that retry / clean up shouldn't have to special-case the
         // first-run path.
-        setup();
+        test_support::install();
         delete_secret("test_delete_missing").unwrap();
     }
 

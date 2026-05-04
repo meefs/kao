@@ -13,7 +13,12 @@ mod store;
 pub mod tx;
 
 pub use store::db_exists as wallet_exists;
-pub use store::{load_descriptor, save_descriptor};
+// `load_descriptor_accepting_keyring_reset` has no in-tree consumer until
+// the unlock screen grows the "no record on this machine — accept this
+// wallet?" modal. Re-exported now so the public surface stays stable when
+// that lands; suppress the unused-import warning until then.
+#[allow(unused_imports)]
+pub use store::{load_descriptor, load_descriptor_accepting_keyring_reset, save_descriptor};
 
 /// Errors that can occur during wallet operations.
 #[derive(Debug)]
@@ -26,6 +31,37 @@ pub enum WalletError {
     Io(std::io::Error),
     /// No wallet found on disk.
     NotFound,
+    /// The OS keyring is unreachable (D-Bus down on Linux, Keychain locked,
+    /// Credential Manager service stopped). The wallet refuses to open in
+    /// this state because rollback protection cannot be verified — opening
+    /// anyway would silently degrade the protection. Surface as a "fix
+    /// your environment" message, not a generic crash.
+    KeyringUnavailable(String),
+    /// The wallet file's epoch is lower than the keyring's last-seen epoch:
+    /// the on-disk file is older than what this machine has previously
+    /// observed, so the file has been rolled back. Refuse to open.
+    /// `file` is the epoch in the file, `expected` is the keyring value
+    /// (the file's epoch must be `>=` `expected`).
+    Rollback { file: u64, expected: u64 },
+    /// The wallet file exists but the keyring has no record for it on
+    /// this machine. Could be a legitimate restore from backup, a wallet
+    /// copied from another machine, OR an attacker who's set up a fresh
+    /// OS user and dropped a stolen wallet file in place. The caller
+    /// MUST surface a security warning to the user; if the user
+    /// explicitly accepts, they re-call via
+    /// `load_descriptor_accepting_keyring_reset` which seeds the keyring
+    /// with the file's current epoch.
+    KeyringMissingEntry { file_epoch: u64 },
+    /// Save soft-error: the wallet file was committed to disk
+    /// successfully, but the post-commit keyring write — which mirrors
+    /// the new epoch out so future loads can detect rollback — failed.
+    /// The user's data is safe and durable; only the rollback-protection
+    /// anchor is stale, and the next load will auto-resync (or surface
+    /// `KeyringMissingEntry` if the keyring entry was wiped entirely).
+    /// Treat as "saved with a warning" in the UI rather than as a
+    /// failed save — a retry would just bump the epoch again and hit
+    /// the same condition.
+    SavedKeyringSyncFailed(String),
 }
 
 impl std::fmt::Display for WalletError {
@@ -35,6 +71,19 @@ impl std::fmt::Display for WalletError {
             WalletError::Encryption(e) => write!(f, "encryption error: {e}"),
             WalletError::Io(e) => write!(f, "io error: {e}"),
             WalletError::NotFound => write!(f, "no wallet found"),
+            WalletError::KeyringUnavailable(e) => write!(f, "keyring unavailable: {e}"),
+            WalletError::Rollback { file, expected } => write!(
+                f,
+                "wallet file has been rolled back (file epoch {file}, expected at least {expected})",
+            ),
+            WalletError::KeyringMissingEntry { file_epoch } => write!(
+                f,
+                "no keyring record for this wallet on this machine (file epoch {file_epoch}); explicit user acceptance required",
+            ),
+            WalletError::SavedKeyringSyncFailed(e) => write!(
+                f,
+                "wallet saved, but rollback-protection sync to keyring failed: {e}",
+            ),
         }
     }
 }

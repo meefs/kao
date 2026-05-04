@@ -64,14 +64,29 @@ use crate::wallet::{
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    BalanceFetched(Result<String, String>),
+    /// Carries the address the fetch was issued against so a quick
+    /// account switch (or a network/indexer change that kicks fresh
+    /// fetches) can't apply a stale balance to a different account.
+    BalanceFetched {
+        address: Address,
+        result: Result<String, String>,
+    },
     /// Per-chain portfolio result. The dashboard issues one fetch per
     /// configured chain in parallel and merges by `chain` as each lands,
     /// so a slow Optimism RPC never blocks the Mainnet rows from
-    /// rendering.
-    PortfolioFetched(crate::chain::Chain, Result<Vec<LiveToken>, String>),
-    /// Result of an indexer transaction-history fetch for `self.address`.
-    HistoryFetched(Result<Vec<IndexedTx>, String>),
+    /// rendering. `address` is checked on arrival so a late response
+    /// can't pollute the wrong account's portfolio (or its cache slot).
+    PortfolioFetched {
+        address: Address,
+        chain: crate::chain::Chain,
+        result: Result<Vec<LiveToken>, String>,
+    },
+    /// Result of an indexer transaction-history fetch. `address` is
+    /// the address it was issued against; dropped on mismatch.
+    HistoryFetched {
+        address: Address,
+        result: Result<Vec<IndexedTx>, String>,
+    },
     SelectNav(Nav),
     SelectTheme(ThemeKind),
     OpenSend,
@@ -285,9 +300,9 @@ impl WalletScreen {
                     ok = result.is_ok(),
                     "dashboard: helios get_balance completed",
                 );
-                result
+                (address, result)
             },
-            Message::BalanceFetched,
+            |(address, result)| Message::BalanceFetched { address, result },
         )
     }
 
@@ -319,9 +334,9 @@ impl WalletScreen {
                     count = result.as_ref().map(|v| v.len()).unwrap_or(0),
                     "history fetch completed",
                 );
-                result
+                (address, result)
             },
-            Message::HistoryFetched,
+            |(address, result)| Message::HistoryFetched { address, result },
         )
     }
 
@@ -331,7 +346,7 @@ impl WalletScreen {
     /// is non-empty — Mainnet is always configured (the built-in default
     /// seeds it); L2 chains are only configured if the user opted in
     /// via the setup flow's Alchemy / Custom RPCs path or the Networks
-    /// pane. Each chain emits its own `PortfolioFetched(chain, result)`
+    /// pane. Each chain emits its own `PortfolioFetched { address, chain, result }`
     /// message; the handler merges by chain so a slow Optimism RPC
     /// can't stall the Mainnet rows from rendering.
     pub fn fetch_portfolio_task(&self) -> Task<Message> {
@@ -385,9 +400,11 @@ impl WalletScreen {
                         count = result.as_ref().map(|v: &Vec<LiveToken>| v.len()).unwrap_or(0),
                         "portfolio fetch completed",
                     );
-                    (chain, result)
+                    (address, chain, result)
                 },
-                |(chain, result)| Message::PortfolioFetched(chain, result),
+                |(address, chain, result)| {
+                    Message::PortfolioFetched { address, chain, result }
+                },
             ));
         }
         Task::batch(tasks)
@@ -432,20 +449,37 @@ impl WalletScreen {
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
-            Message::BalanceFetched(r) => {
-                self.balance = r;
+            Message::BalanceFetched { address, result } => {
+                // The fetch was issued against `address`; if the user
+                // switched accounts (or invalidated the network client)
+                // before it landed, drop it so the previous account's
+                // balance can't appear under the new one.
+                if address != self.address {
+                    return (Task::none(), None);
+                }
+                self.balance = result;
                 self.verification = self.network.last_status(crate::chain::Chain::Mainnet);
             }
-            Message::PortfolioFetched(chain, result) => {
+            Message::PortfolioFetched { address, chain, result } => {
+                // Always write the (address, chain) we issued the fetch
+                // for into the cache — it's still the correct slot for
+                // that account's data even if the user has since
+                // switched away. Only the live portfolio merge is gated
+                // on `address == self.address`.
+                if let Ok(tokens) = &result {
+                    if let Ok(mut cache) = self.portfolio_cache.lock() {
+                        cache.insert((address, chain), tokens.clone());
+                    }
+                }
+                if address != self.address {
+                    return (Task::none(), None);
+                }
                 // Loading flag clears once *any* chain lands; the user
                 // sees results stream in rather than wait for the
                 // slowest chain.
                 self.portfolio_loading = false;
                 match result {
                     Ok(tokens) => {
-                        if let Ok(mut cache) = self.portfolio_cache.lock() {
-                            cache.insert((self.address, chain), tokens.clone());
-                        }
                         // Merge by chain: replace the rows belonging to
                         // `chain` with the new ones, leave other chains'
                         // rows untouched. Re-sort ETH-first then by USD
@@ -474,7 +508,10 @@ impl WalletScreen {
                     ),
                 }
             }
-            Message::HistoryFetched(result) => {
+            Message::HistoryFetched { address, result } => {
+                if address != self.address {
+                    return (Task::none(), None);
+                }
                 self.history_loading = false;
                 match result {
                     Ok(txs) => self.history = txs,
@@ -1044,4 +1081,161 @@ fn spawn_broadcast_task(
             signer: handoff,
         },
     )
+}
+
+#[cfg(test)]
+#[allow(unused_must_use)]
+mod tests {
+    //! Race-condition coverage for the three address-tagged fetch
+    //! messages: an in-flight fetch must never apply to the wrong
+    //! account when the user switches between accounts (or invalidates
+    //! the network/indexer client) before the response lands.
+    use super::*;
+    use crate::chain::Chain;
+    use crate::net::MockFetcher;
+    use crate::portfolio::{LiveToken, new_cache};
+    use crate::wallet::{KaoSigner, view_only_account};
+    use alloy::primitives::{Address, U256};
+
+    fn addr(byte: u8) -> Address {
+        Address::from([byte; 20])
+    }
+
+    fn screen_for(addr: Address, cache: PortfolioCache) -> WalletScreen {
+        WalletScreen::new(
+            KaoSigner::ViewOnly(addr),
+            vec![view_only_account(addr)],
+            0,
+            Arc::new(MockFetcher::new()),
+            cache,
+        )
+    }
+
+    fn token(symbol: &str, chain: Chain) -> LiveToken {
+        LiveToken {
+            symbol: symbol.into(),
+            name: symbol.into(),
+            balance: "1".into(),
+            balance_f64: 1.0,
+            balance_raw: U256::from(1u64),
+            decimals: 18,
+            contract: None,
+            usd_price: 1.0,
+            usd_value: 1.0,
+            chain,
+        }
+    }
+
+    #[test]
+    fn balance_fetched_for_other_address_is_dropped() {
+        let active = addr(0xAA);
+        let other = addr(0xBB);
+        let mut s = screen_for(active, new_cache());
+        let before = s.balance.clone();
+        s.update(Message::BalanceFetched {
+            address: other,
+            result: Ok("999".into()),
+        });
+        // Active screen's balance must be untouched — the response was
+        // for a different account.
+        assert_eq!(s.balance, before);
+    }
+
+    #[test]
+    fn balance_fetched_for_active_address_lands() {
+        let active = addr(0xAA);
+        let mut s = screen_for(active, new_cache());
+        s.update(Message::BalanceFetched {
+            address: active,
+            result: Ok("1.23".into()),
+        });
+        assert_eq!(s.balance, Ok("1.23".into()));
+    }
+
+    #[test]
+    fn portfolio_fetched_for_other_address_does_not_pollute_live_view() {
+        let active = addr(0xAA);
+        let other = addr(0xBB);
+        let cache = new_cache();
+        let mut s = screen_for(active, cache.clone());
+        assert!(s.portfolio.is_empty());
+        s.update(Message::PortfolioFetched {
+            address: other,
+            chain: Chain::Mainnet,
+            result: Ok(vec![token("USDC", Chain::Mainnet)]),
+        });
+        // Active account's live portfolio must stay empty — the
+        // response was for a different account.
+        assert!(s.portfolio.is_empty());
+    }
+
+    #[test]
+    fn portfolio_fetched_for_other_address_still_fills_that_address_cache_slot() {
+        let active = addr(0xAA);
+        let other = addr(0xBB);
+        let cache = new_cache();
+        let mut s = screen_for(active, cache.clone());
+        s.update(Message::PortfolioFetched {
+            address: other,
+            chain: Chain::Mainnet,
+            result: Ok(vec![token("USDC", Chain::Mainnet)]),
+        });
+        // The data is correct for `other`'s slot — we only suppressed
+        // the live merge into the active screen. The active address's
+        // slot must remain untouched.
+        let g = cache.lock().expect("cache");
+        assert_eq!(
+            g.get(&(other, Chain::Mainnet)).map(|v| v.len()),
+            Some(1),
+            "other's cache slot should be populated",
+        );
+        assert!(
+            g.get(&(active, Chain::Mainnet)).is_none(),
+            "active's cache slot must not be touched by another address's fetch",
+        );
+    }
+
+    #[test]
+    fn portfolio_fetched_for_active_address_merges_and_caches() {
+        let active = addr(0xAA);
+        let cache = new_cache();
+        let mut s = screen_for(active, cache.clone());
+        s.update(Message::PortfolioFetched {
+            address: active,
+            chain: Chain::Mainnet,
+            result: Ok(vec![token("USDC", Chain::Mainnet)]),
+        });
+        assert_eq!(s.portfolio.len(), 1);
+        assert_eq!(s.portfolio[0].symbol, "USDC");
+        assert!(!s.portfolio_loading);
+        let g = cache.lock().expect("cache");
+        assert_eq!(g.get(&(active, Chain::Mainnet)).map(|v| v.len()), Some(1));
+    }
+
+    #[test]
+    fn history_fetched_for_other_address_is_dropped() {
+        let active = addr(0xAA);
+        let other = addr(0xBB);
+        let mut s = screen_for(active, new_cache());
+        // Pre-seed history so we can detect any clobber.
+        s.update(Message::HistoryFetched {
+            address: active,
+            result: Ok(Vec::new()),
+        });
+        let baseline_loading = s.history_loading;
+        s.history_loading = true; // simulate a fresh fetch in flight
+        s.update(Message::HistoryFetched {
+            address: other,
+            result: Ok(Vec::new()),
+        });
+        // The dropped response must not flip `history_loading` off —
+        // otherwise the spinner would disappear before the *real*
+        // fetch for `active` lands.
+        assert!(
+            s.history_loading,
+            "history_loading must stay true when a foreign-address response is dropped",
+        );
+        // Sanity: the initial active-address response did clear it.
+        assert!(!baseline_loading);
+    }
 }
