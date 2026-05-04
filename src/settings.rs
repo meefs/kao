@@ -48,6 +48,7 @@ pub enum IndexerProvider {
     Blockscout,
     Etherscan,
     Alchemy,
+    Drpc,
     None,
 }
 
@@ -57,6 +58,7 @@ impl IndexerProvider {
             Self::Blockscout => "blockscout",
             Self::Etherscan => "etherscan",
             Self::Alchemy => "alchemy",
+            Self::Drpc => "drpc",
             Self::None => "none",
         }
     }
@@ -66,6 +68,7 @@ impl IndexerProvider {
             "blockscout" => Some(Self::Blockscout),
             "etherscan" => Some(Self::Etherscan),
             "alchemy" => Some(Self::Alchemy),
+            "drpc" => Some(Self::Drpc),
             "none" => Some(Self::None),
             _ => None,
         }
@@ -85,6 +88,7 @@ struct State {
     indexer_provider: IndexerProvider,
     etherscan_api_key: Option<String>,
     alchemy_api_key: Option<String>,
+    drpc_api_key: Option<String>,
     /// Custom Blockscout instance base URL (e.g. for L2s). `None` falls back
     /// to the public mainnet endpoint baked into the indexer.
     blockscout_base_url: Option<String>,
@@ -111,6 +115,7 @@ fn default_state() -> State {
         indexer_provider: IndexerProvider::default(),
         etherscan_api_key: None,
         alchemy_api_key: None,
+        drpc_api_key: None,
         blockscout_base_url: None,
         blockscout_api_key: None,
     }
@@ -153,6 +158,8 @@ struct OnDisk {
     etherscan_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     alchemy_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drpc_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blockscout_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,6 +214,7 @@ fn parse(text: &str) -> State {
     }
     state.etherscan_api_key = on_disk.etherscan_api_key.filter(|s| !s.is_empty());
     state.alchemy_api_key = on_disk.alchemy_api_key.filter(|s| !s.is_empty());
+    state.drpc_api_key = on_disk.drpc_api_key.filter(|s| !s.is_empty());
     state.blockscout_base_url = on_disk
         .blockscout_base_url
         .filter(|s| !s.is_empty() && is_https_url(s));
@@ -228,6 +236,7 @@ fn serialize(state: &State) -> String {
         indexer_provider: Some(state.indexer_provider.key().to_string()),
         etherscan_api_key: state.etherscan_api_key.clone(),
         alchemy_api_key: state.alchemy_api_key.clone(),
+        drpc_api_key: state.drpc_api_key.clone(),
         blockscout_base_url: state.blockscout_base_url.clone(),
         blockscout_api_key: state.blockscout_api_key.clone(),
     };
@@ -343,6 +352,22 @@ pub fn set_alchemy_api_key(value: Option<String>) {
         .lock()
         .expect("settings mutex poisoned")
         .alchemy_api_key = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+pub fn drpc_api_key() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .drpc_api_key
+        .clone()
+}
+
+pub fn set_drpc_api_key(value: Option<String>) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .drpc_api_key = value.filter(|s| !s.is_empty());
     write_all();
 }
 

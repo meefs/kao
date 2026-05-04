@@ -19,7 +19,7 @@ use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
     Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
-    parse_iso8601,
+    parse_iso8601, redact_url_in_err,
 };
 
 const NETWORK: &str = "eth-mainnet";
@@ -85,12 +85,12 @@ async fn rpc<T: for<'de> Deserialize<'de>>(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("{label} POST: {e}"))?
+        .map_err(|e| format!("{label} POST: {}", redact_url_in_err(e)))?
         .error_for_status()
-        .map_err(|e| format!("{label} status: {e}"))?
+        .map_err(|e| format!("{label} status: {}", redact_url_in_err(e)))?
         .json()
         .await
-        .map_err(|e| format!("{label} decode: {e}"))?;
+        .map_err(|e| format!("{label} decode: {}", redact_url_in_err(e)))?;
     if let Some(err) = resp.error {
         return Err(format!("{label}: {}", err.message));
     }
@@ -284,12 +284,12 @@ impl Indexer for AlchemyClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("alchemy portfolio POST: {e}"))?
+            .map_err(|e| format!("alchemy portfolio POST: {}", redact_url_in_err(e)))?
             .error_for_status()
-            .map_err(|e| format!("alchemy portfolio status: {e}"))?
+            .map_err(|e| format!("alchemy portfolio status: {}", redact_url_in_err(e)))?
             .json()
             .await
-            .map_err(|e| format!("alchemy portfolio decode: {e}"))?;
+            .map_err(|e| format!("alchemy portfolio decode: {}", redact_url_in_err(e)))?;
 
         Ok(parse_portfolio(resp.data.tokens))
     }

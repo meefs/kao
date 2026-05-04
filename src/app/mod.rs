@@ -987,6 +987,10 @@ fn apply_indexer_outcome(outcome: SelectIndexerOutcome) {
             settings::set_alchemy_api_key(Some(api_key));
             settings::set_indexer_provider(IndexerProvider::Alchemy);
         }
+        SelectIndexerOutcome::Drpc { api_key } => {
+            settings::set_drpc_api_key(Some(api_key));
+            settings::set_indexer_provider(IndexerProvider::Drpc);
+        }
         SelectIndexerOutcome::Blockscout { base_url, api_key } => {
             settings::set_blockscout_base_url(base_url);
             settings::set_blockscout_api_key(api_key);

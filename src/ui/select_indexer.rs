@@ -1,10 +1,10 @@
 //! Pick the third-party indexer (transaction history + unverified balances)
 //! used by the wallet. Shown right after `select_rpc` during fresh setup.
 //!
-//! UI: a single screen with four cards. Clicking Alchemy/Blockscout/
+//! UI: a single screen with five cards. Clicking Alchemy/dRPC/Blockscout/
 //! Etherscan expands the chosen card inline to show its input fields plus
 //! a submit button — the other cards stay collapsed. Clicking "No Indexer"
-//! (or Alchemy when its key can be reused from the RPC URL) emits an
+//! (or Alchemy/dRPC when their key can be reused from the RPC URL) emits an
 //! outcome immediately, no expansion needed.
 
 use iced::border::Radius;
@@ -21,16 +21,19 @@ use crate::ui::kao_widgets::{
 };
 
 pub const ALCHEMY_KEY_INPUT_ID: &str = "indexer_alchemy_key_input";
+pub const DRPC_KEY_INPUT_ID: &str = "indexer_drpc_key_input";
 pub const BLOCKSCOUT_URL_INPUT_ID: &str = "indexer_blockscout_url_input";
 pub const ETHERSCAN_KEY_INPUT_ID: &str = "indexer_etherscan_key_input";
 
 #[derive(Debug, Clone)]
 pub enum Message {
     PickAlchemy,
+    PickDrpc,
     PickBlockscout,
     PickEtherscan,
     PickNone,
     AlchemyKeyInput(String),
+    DrpcKeyInput(String),
     BlockscoutUrlInput(String),
     BlockscoutKeyInput(String),
     EtherscanKeyInput(String),
@@ -43,6 +46,8 @@ pub enum Message {
 pub enum Outcome {
     /// Use Alchemy with this API key.
     Alchemy { api_key: String },
+    /// Use dRPC's Wallet API with this API key.
+    Drpc { api_key: String },
     /// Use Blockscout. `base_url`/`api_key` are `None` when the user left
     /// the field blank — the indexer falls back to its built-in defaults.
     Blockscout {
@@ -63,6 +68,7 @@ enum Expanded {
     #[default]
     None,
     Alchemy,
+    Drpc,
     Blockscout,
     Etherscan,
 }
@@ -76,6 +82,11 @@ pub struct SelectIndexerScreen {
     /// without needing to expand for an input.
     alchemy_key_from_rpc: Option<String>,
     alchemy_key_input: String,
+    /// dRPC key extracted from the user's RPC URL when it points at
+    /// `lb.drpc.live/{chain}/{key}`. Same short-circuit as Alchemy:
+    /// picking the card with a known key emits an outcome immediately.
+    drpc_key_from_rpc: Option<String>,
+    drpc_key_input: String,
     blockscout_url_input: String,
     blockscout_key_input: String,
     etherscan_key_input: String,
@@ -88,10 +99,13 @@ impl SelectIndexerScreen {
     /// set (defaults are in use).
     pub fn new(rpc_url: Option<&str>) -> Self {
         let alchemy_key_from_rpc = rpc_url.and_then(extract_alchemy_key);
+        let drpc_key_from_rpc = rpc_url.and_then(extract_drpc_key);
         Self {
             expanded: Expanded::default(),
             alchemy_key_input: alchemy_key_from_rpc.clone().unwrap_or_default(),
             alchemy_key_from_rpc,
+            drpc_key_input: drpc_key_from_rpc.clone().unwrap_or_default(),
+            drpc_key_from_rpc,
             blockscout_url_input: String::new(),
             blockscout_key_input: String::new(),
             etherscan_key_input: String::new(),
@@ -102,6 +116,7 @@ impl SelectIndexerScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
             Message::PickAlchemy => self.toggle_alchemy(),
+            Message::PickDrpc => self.toggle_drpc(),
             Message::PickBlockscout => self.toggle(Expanded::Blockscout, BLOCKSCOUT_URL_INPUT_ID),
             Message::PickEtherscan => self.toggle(Expanded::Etherscan, ETHERSCAN_KEY_INPUT_ID),
             Message::PickNone => {
@@ -111,6 +126,10 @@ impl SelectIndexerScreen {
             }
             Message::AlchemyKeyInput(s) => {
                 self.alchemy_key_input = s;
+                (Task::none(), None)
+            }
+            Message::DrpcKeyInput(s) => {
+                self.drpc_key_input = s;
                 (Task::none(), None)
             }
             Message::BlockscoutUrlInput(s) => {
@@ -167,24 +186,34 @@ impl SelectIndexerScreen {
         self.toggle(Expanded::Alchemy, ALCHEMY_KEY_INPUT_ID)
     }
 
+    fn toggle_drpc(&mut self) -> (Task<Message>, Option<Outcome>) {
+        if let Some(key) = self.drpc_key_from_rpc.clone() {
+            self.expanded = Expanded::None;
+            self.error = None;
+            return (Task::none(), Some(Outcome::Drpc { api_key: key }));
+        }
+        self.toggle(Expanded::Drpc, DRPC_KEY_INPUT_ID)
+    }
+
     fn handle_key(&mut self, key: keyboard::Key) -> (Task<Message>, Option<Outcome>) {
         match (&self.expanded, &key) {
             (_, keyboard::Key::Character(c)) if c.as_str() == "1" => self.toggle_alchemy(),
-            (_, keyboard::Key::Character(c)) if c.as_str() == "2" => {
+            (_, keyboard::Key::Character(c)) if c.as_str() == "2" => self.toggle_drpc(),
+            (_, keyboard::Key::Character(c)) if c.as_str() == "3" => {
                 self.toggle(Expanded::Blockscout, BLOCKSCOUT_URL_INPUT_ID)
             }
-            (_, keyboard::Key::Character(c)) if c.as_str() == "3" => {
+            (_, keyboard::Key::Character(c)) if c.as_str() == "4" => {
                 self.toggle(Expanded::Etherscan, ETHERSCAN_KEY_INPUT_ID)
             }
-            (_, keyboard::Key::Character(c)) if c.as_str() == "4" => {
+            (_, keyboard::Key::Character(c)) if c.as_str() == "5" => {
                 self.expanded = Expanded::None;
                 self.error = None;
                 (Task::none(), Some(Outcome::NoIndexer))
             }
-            (Expanded::Alchemy | Expanded::Blockscout | Expanded::Etherscan,
-                keyboard::Key::Named(n))
-                if *n == keyboard::key::Named::Escape =>
-            {
+            (
+                Expanded::Alchemy | Expanded::Drpc | Expanded::Blockscout | Expanded::Etherscan,
+                keyboard::Key::Named(n),
+            ) if *n == keyboard::key::Named::Escape => {
                 self.expanded = Expanded::None;
                 self.error = None;
                 (Task::none(), None)
@@ -210,6 +239,15 @@ impl SelectIndexerScreen {
                 }
                 self.error = None;
                 Some(Outcome::Alchemy { api_key: key })
+            }
+            Expanded::Drpc => {
+                let key = self.drpc_key_input.trim().to_string();
+                if key.is_empty() {
+                    self.error = Some("Please enter your dRPC API key.".into());
+                    return None;
+                }
+                self.error = None;
+                Some(Outcome::Drpc { api_key: key })
             }
             Expanded::Blockscout => {
                 let url_raw = self.blockscout_url_input.trim();
@@ -256,6 +294,10 @@ impl SelectIndexerScreen {
             }
             _ => None,
         };
+        let drpc_body = match self.expanded {
+            Expanded::Drpc if self.drpc_key_from_rpc.is_none() => Some(self.drpc_body(t)),
+            _ => None,
+        };
         let blockscout_body = (self.expanded == Expanded::Blockscout)
             .then(|| self.blockscout_body(t));
         let etherscan_body = (self.expanded == Expanded::Etherscan)
@@ -265,6 +307,11 @@ impl SelectIndexerScreen {
             "Reuse the API key from your RPC"
         } else {
             "Fast & accurate · Requires API key"
+        };
+        let drpc_sub: &str = if self.drpc_key_from_rpc.is_some() {
+            "Reuse the API key from your RPC · Wallet API needs a paid plan"
+        } else {
+            "Decentralized · Wallet API needs a paid plan"
         };
 
         let alchemy_card = self.card(
@@ -278,11 +325,22 @@ impl SelectIndexerScreen {
             alchemy_body,
             Message::PickAlchemy,
         );
-        let blockscout_card = self.card(
+        let drpc_card = self.card(
             t,
             t.ab2,
             t.a2,
             "2",
+            "dRPC",
+            drpc_sub,
+            self.expanded == Expanded::Drpc && self.drpc_key_from_rpc.is_none(),
+            drpc_body,
+            Message::PickDrpc,
+        );
+        let blockscout_card = self.card(
+            t,
+            t.ab1,
+            t.a1,
+            "3",
             "Blockscout",
             "Public, no key needed · Custom URL supported",
             self.expanded == Expanded::Blockscout,
@@ -291,9 +349,9 @@ impl SelectIndexerScreen {
         );
         let etherscan_card = self.card(
             t,
-            t.ab1,
-            t.a1,
-            "3",
+            t.ab2,
+            t.a2,
+            "4",
             "Etherscan",
             "Requires Pro API key (~$50/month)",
             self.expanded == Expanded::Etherscan,
@@ -302,9 +360,9 @@ impl SelectIndexerScreen {
         );
         let none_card = self.card(
             t,
-            t.ab2,
-            t.a2,
-            "4",
+            t.ab1,
+            t.a1,
+            "5",
             "No Indexer",
             "Slower · history limited to txs sent from Kao",
             false,
@@ -321,6 +379,8 @@ impl SelectIndexerScreen {
                 hint_pill(t, "3"),
                 Space::new().width(4),
                 hint_pill(t, "4"),
+                Space::new().width(4),
+                hint_pill(t, "5"),
                 Space::new().width(8),
                 text("pick a source").size(11).color(t.sub).font(mono()),
             ]
@@ -337,6 +397,8 @@ impl SelectIndexerScreen {
             screen_subtitle(t, "Where should Kao fetch transaction history from?"),
             vspace(22),
             alchemy_card,
+            vspace(10),
+            drpc_card,
             vspace(10),
             blockscout_card,
             vspace(10),
@@ -379,6 +441,25 @@ impl SelectIndexerScreen {
             .style(move |_theme, status| text_input_style(t, status));
         let has_key = !self.alchemy_key_input.trim().is_empty();
         let mut submit = primary_button(t, "Use Alchemy →", has_key);
+        if has_key {
+            submit = submit.on_press(Message::SubmitCurrent);
+        }
+        column![key_input, vspace(10), submit]
+            .width(Length::Fill)
+            .into()
+    }
+
+    fn drpc_body(&self, t: KaoTheme) -> Element<'_, Message> {
+        let key_input = text_input("Your dRPC API key", &self.drpc_key_input)
+            .id(DRPC_KEY_INPUT_ID)
+            .on_input(Message::DrpcKeyInput)
+            .on_submit(Message::SubmitCurrent)
+            .padding(Padding::from([10, 12]))
+            .size(13)
+            .font(mono())
+            .style(move |_theme, status| text_input_style(t, status));
+        let has_key = !self.drpc_key_input.trim().is_empty();
+        let mut submit = primary_button(t, "Use dRPC →", has_key);
         if has_key {
             submit = submit.on_press(Message::SubmitCurrent);
         }
@@ -540,6 +621,24 @@ fn extract_alchemy_key(url: &str) -> Option<String> {
     Some(key.to_string())
 }
 
+/// Pull a dRPC API key out of an RPC URL like
+/// `https://lb.drpc.live/{chain}/{key}`. The same key works for both
+/// the standard JSON-RPC and the Wallet API endpoints.
+fn extract_drpc_key(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if host != "lb.drpc.live" {
+        return None;
+    }
+    let mut segs = parsed.path_segments()?;
+    let _chain = segs.next()?;
+    let key = segs.next()?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.to_string())
+}
+
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests {
@@ -684,6 +783,68 @@ mod tests {
         let (_, outcome) = s.update(Message::SubmitCurrent);
         assert!(outcome.is_none());
         assert!(s.error.is_some());
+    }
+
+    #[test]
+    fn extract_drpc_key_from_rpc_url() {
+        assert_eq!(
+            extract_drpc_key("https://lb.drpc.live/ethereum/abc123"),
+            Some("abc123".to_string()),
+        );
+        assert_eq!(
+            extract_drpc_key("https://lb.drpc.live/base/XYZ-_."),
+            Some("XYZ-_.".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_drpc_key_rejects_other_hosts() {
+        assert_eq!(extract_drpc_key("https://eth.drpc.org/"), None);
+        assert_eq!(
+            extract_drpc_key("https://lb.drpc.live/ethereum/"),
+            None,
+        );
+        assert_eq!(extract_drpc_key("not-a-url"), None);
+    }
+
+    #[test]
+    fn pick_drpc_with_rpc_key_skips_expansion() {
+        let mut s = SelectIndexerScreen::new(Some("https://lb.drpc.live/ethereum/MYKEY"));
+        let (_, outcome) = s.update(Message::PickDrpc);
+        match outcome {
+            Some(Outcome::Drpc { api_key }) => assert_eq!(api_key, "MYKEY"),
+            other => panic!("expected immediate Drpc outcome, got {other:?}"),
+        }
+        assert_eq!(s.expanded, Expanded::None);
+    }
+
+    #[test]
+    fn pick_drpc_without_rpc_key_expands_card() {
+        let mut s = SelectIndexerScreen::new(None);
+        let (_, outcome) = s.update(Message::PickDrpc);
+        assert!(outcome.is_none());
+        assert_eq!(s.expanded, Expanded::Drpc);
+    }
+
+    #[test]
+    fn submitting_empty_drpc_key_errors() {
+        let mut s = SelectIndexerScreen::new(None);
+        s.update(Message::PickDrpc);
+        let (_, outcome) = s.update(Message::SubmitCurrent);
+        assert!(outcome.is_none());
+        assert!(s.error.is_some());
+    }
+
+    #[test]
+    fn submitting_drpc_key_emits_outcome() {
+        let mut s = SelectIndexerScreen::new(None);
+        s.update(Message::PickDrpc);
+        s.update(Message::DrpcKeyInput("  somekey  ".into()));
+        let (_, outcome) = s.update(Message::SubmitCurrent);
+        match outcome {
+            Some(Outcome::Drpc { api_key }) => assert_eq!(api_key, "somekey"),
+            other => panic!("expected Drpc outcome, got {other:?}"),
+        }
     }
 
 }

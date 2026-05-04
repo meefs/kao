@@ -21,7 +21,7 @@ use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
     Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
-    parse_iso8601,
+    parse_iso8601, redact_url_in_err,
 };
 
 const DEFAULT_BASE: &str = "https://eth.blockscout.com";
@@ -203,24 +203,24 @@ impl Indexer for BlockscoutClient {
                     .get(&txs_url)
                     .send()
                     .await
-                    .map_err(|e| format!("blockscout transactions GET: {e}"))?
+                    .map_err(|e| format!("blockscout transactions GET: {}", redact_url_in_err(e)))?
                     .error_for_status()
-                    .map_err(|e| format!("blockscout transactions status: {e}"))?
+                    .map_err(|e| format!("blockscout transactions status: {}", redact_url_in_err(e)))?
                     .json::<TxListResponse>()
                     .await
-                    .map_err(|e| format!("blockscout transactions decode: {e}"))
+                    .map_err(|e| format!("blockscout transactions decode: {}", redact_url_in_err(e)))
             },
             async {
                 client
                     .get(&token_url)
                     .send()
                     .await
-                    .map_err(|e| format!("blockscout token-transfers GET: {e}"))?
+                    .map_err(|e| format!("blockscout token-transfers GET: {}", redact_url_in_err(e)))?
                     .error_for_status()
-                    .map_err(|e| format!("blockscout token-transfers status: {e}"))?
+                    .map_err(|e| format!("blockscout token-transfers status: {}", redact_url_in_err(e)))?
                     .json::<TokenTransfersResponse>()
                     .await
-                    .map_err(|e| format!("blockscout token-transfers decode: {e}"))
+                    .map_err(|e| format!("blockscout token-transfers decode: {}", redact_url_in_err(e)))
             },
         )
         .await;
@@ -246,24 +246,24 @@ impl Indexer for BlockscoutClient {
                     .get(&detail_url)
                     .send()
                     .await
-                    .map_err(|e| format!("blockscout address GET: {e}"))?
+                    .map_err(|e| format!("blockscout address GET: {}", redact_url_in_err(e)))?
                     .error_for_status()
-                    .map_err(|e| format!("blockscout address status: {e}"))?
+                    .map_err(|e| format!("blockscout address status: {}", redact_url_in_err(e)))?
                     .json::<AddressDetail>()
                     .await
-                    .map_err(|e| format!("blockscout address decode: {e}"))
+                    .map_err(|e| format!("blockscout address decode: {}", redact_url_in_err(e)))
             },
             async {
                 client
                     .get(&tokens_url)
                     .send()
                     .await
-                    .map_err(|e| format!("blockscout tokens GET: {e}"))?
+                    .map_err(|e| format!("blockscout tokens GET: {}", redact_url_in_err(e)))?
                     .error_for_status()
-                    .map_err(|e| format!("blockscout tokens status: {e}"))?
+                    .map_err(|e| format!("blockscout tokens status: {}", redact_url_in_err(e)))?
                     .json::<TokenListResponse>()
                     .await
-                    .map_err(|e| format!("blockscout tokens decode: {e}"))
+                    .map_err(|e| format!("blockscout tokens decode: {}", redact_url_in_err(e)))
             },
         )
         .await;

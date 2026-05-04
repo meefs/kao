@@ -28,10 +28,12 @@ use crate::ui::token_logos::{self, NATIVE_ETH};
 
 mod alchemy;
 mod blockscout;
+mod drpc;
 mod etherscan;
 
 pub use alchemy::AlchemyClient;
 pub use blockscout::BlockscoutClient;
+pub use drpc::DrpcClient;
 pub use etherscan::EtherscanClient;
 
 /// Outcome of a single transaction relative to the queried address.
@@ -123,6 +125,19 @@ pub trait Indexer: Send + Sync + std::fmt::Debug {
     /// Native ETH plus every ERC-20 the indexer knows `addr` holds, with
     /// prices when the provider supplies them. NOT light-client verified.
     async fn balances(&self, addr: Address) -> Result<Vec<IndexedToken>, String>;
+}
+
+/// Format a `reqwest::Error` for an error string or log line **without**
+/// including the request URL. Every indexer in this module embeds its
+/// API key in the URL (path segment for Alchemy/dRPC/Etherscan, query
+/// string for Blockscout), so the default `Display` impl — which ends
+/// with `for url (...)` — would leak the key into any log line that
+/// surfaces the error.
+///
+/// Always route reqwest errors through this helper instead of writing
+/// `format!("…: {e}")` directly. See `feedback_reqwest_url_leak.md`.
+pub(crate) fn redact_url_in_err(e: reqwest::Error) -> String {
+    e.without_url().to_string()
 }
 
 /// Shared `reqwest::Client` for every indexer impl. One TLS pool per process,
