@@ -17,7 +17,6 @@ use std::time::Duration;
 use tracing::{debug, trace, warn};
 
 use crate::chain::Chain;
-use crate::ui::token_logos::NATIVE_ETH;
 use crate::wallet::short_address;
 
 // ── Retry on RPC rate-limit ─────────────────────────────────────────────────
@@ -128,7 +127,6 @@ struct TokenMeta {
     name: &'static str,
     address: Address,
     decimals: u8,
-    logo_id: Option<&'static str>,
     price_source: PriceSource,
 }
 
@@ -143,7 +141,6 @@ const MAINNET_TOKENS: &[TokenMeta] = &[
         name: "USD Coin",
         address: address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
         decimals: 6,
-        logo_id: Some("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
         price_source: PriceSource::UniswapWethPool { fee: 500 },
     },
     TokenMeta {
@@ -151,7 +148,6 @@ const MAINNET_TOKENS: &[TokenMeta] = &[
         name: "Tether",
         address: address!("0xdac17f958d2ee523a2206206994597c13d831ec7"),
         decimals: 6,
-        logo_id: None,
         price_source: PriceSource::UniswapWethPool { fee: 500 },
     },
     TokenMeta {
@@ -159,7 +155,6 @@ const MAINNET_TOKENS: &[TokenMeta] = &[
         name: "Wrapped BTC",
         address: address!("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
         decimals: 8,
-        logo_id: Some("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
     },
     TokenMeta {
@@ -167,7 +162,6 @@ const MAINNET_TOKENS: &[TokenMeta] = &[
         name: "Wrapped Ether",
         address: address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
         decimals: 18,
-        logo_id: None,
         price_source: PriceSource::EthPeg,
     },
     TokenMeta {
@@ -175,7 +169,6 @@ const MAINNET_TOKENS: &[TokenMeta] = &[
         name: "Chainlink",
         address: address!("0x514910771af9ca656af840dff83e8264ecf986ca"),
         decimals: 18,
-        logo_id: Some("0x514910771af9ca656af840dff83e8264ecf986ca"),
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
     },
     TokenMeta {
@@ -183,7 +176,6 @@ const MAINNET_TOKENS: &[TokenMeta] = &[
         name: "Uniswap",
         address: address!("0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"),
         decimals: 18,
-        logo_id: None,
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
     },
     TokenMeta {
@@ -191,7 +183,6 @@ const MAINNET_TOKENS: &[TokenMeta] = &[
         name: "Dai",
         address: address!("0x6b175474e89094c44da98b954eedeac495271d0f"),
         decimals: 18,
-        logo_id: None,
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
     },
 ];
@@ -228,7 +219,6 @@ pub struct LiveToken {
     pub contract: Option<Address>,
     pub usd_price: f64,
     pub usd_value: f64,
-    pub logo_id: Option<&'static str>,
     /// Which chain this entry was fetched from. The asset-row UI reads
     /// this to suffix L2 entries with their chain (e.g. "USDC (Base)")
     /// while leaving Mainnet entries bare ("USDC").
@@ -502,7 +492,6 @@ pub async fn fetch_portfolio(
         contract: None,
         usd_price: eth_usd,
         usd_value: eth_bal_f64 * eth_usd,
-        logo_id: Some(NATIVE_ETH),
         chain,
     });
 
@@ -546,7 +535,6 @@ pub async fn fetch_portfolio(
             contract: Some(meta.address),
             usd_price: price,
             usd_value: bal_f64 * price,
-            logo_id: meta.logo_id,
             chain,
         });
     }

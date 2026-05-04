@@ -1,0 +1,63 @@
+<svg width="78" height="78" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="linearGradient-1" x1="0.104929715" y1="0" x2="0.92252547" y2="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(76 0 0 76 0 0)">
+            <stop offset="0" stop-color="#0093ed"/>
+            <stop offset="1" stop-color="#00f3ab"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-2" x1="0.55835706" y1="0.9256038" x2="0.35706452" y2="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(15.993601 0 0 26.482183 15.995734 0)">
+            <stop offset="0" stop-color="#000a17"/>
+            <stop offset="1" stop-color="#00554f"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-3" x1="0.5583726" y1="0.9256038" x2="0.35702637" y2="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(15.995734 0 0 26.482183 0 0)">
+            <stop offset="0" stop-color="#000a17"/>
+            <stop offset="1" stop-color="#00554f"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-4" x1="0.5810035" y1="0.9256038" x2="0.30159596" y2="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(16.004267 0 0 22.492517 15.995734 29.507483)">
+            <stop offset="0" stop-color="#000a17"/>
+            <stop offset="1" stop-color="#00554f"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-5" x1="0.5809171" y1="0.9256038" x2="0.30180746" y2="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(15.995734 0 0 22.492517 0 29.507483)">
+            <stop offset="0" stop-color="#000a17"/>
+            <stop offset="1" stop-color="#00554f"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-6" x1="0.64694047" y1="0.9256038" x2="0.14009471" y2="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(15.993601 0 0 16.688976 15.995734 19.226673)">
+            <stop offset="0" stop-color="#000a17"/>
+            <stop offset="1" stop-color="#00554f"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-7" x1="0.6469797" y1="0.9256038" x2="0.1399987" y2="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(15.995734 0 0 16.688976 0 19.226673)">
+            <stop offset="0" stop-color="#000a17"/>
+            <stop offset="1" stop-color="#00554f"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-8" x1="0.65999573" y1="0.9256038" x2="0.108118124" y2="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(13 0 0 13 -0 0)">
+            <stop offset="0" stop-color="#000a17"/>
+            <stop offset="1" stop-color="#00554f"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-9" x1="0.29843354" y1="0" x2="0.71557426" y2="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(5 0 0 7 4 3)">
+            <stop offset="0" stop-color="#0093ed"/>
+            <stop offset="1" stop-color="#00f3ab"/>
+        </linearGradient>
+    </defs>
+    <g id="staker---staking-flow">
+        <g id="copy-2-1" transform="matrix(1 0 0 1 -299 -152)">
+            <g id="Group-3" transform="matrix(1 0 0 1 300 153)">
+                <g id="cosmos-logo-horizontal-dark">
+                    <path id="Path" fill="url(#linearGradient-1)" fill-rule="evenodd" stroke="#00f3ab" stroke-opacity="0.2" d="M 37.999935 0 C 58.986748 0 76 17.013159 76 37.999935 C 76 58.986748 58.986748 76 37.999935 76 C 17.013159 76 0 58.986748 0 37.999935 C 0 17.013159 17.013159 0 37.999935 0 Z"/>
+                    <g id="eth-crypto-cryptocurrency-cryptocurrencies-cash-money-bank-payment_95451" transform="matrix(1 0 0 1 22 12)">
+                        <g id="Group">
+                            <path id="Path" fill="url(#linearGradient-2)" stroke="none" d="M 15.995734 0 L 15.995734 19.222338 L 31.989334 26.482183 Z"/>
+                            <path id="Path" fill="url(#linearGradient-3)" stroke="none" d="M 15.995734 0 L 0 26.482183 L 15.995734 19.222338 Z"/>
+                            <path id="Path" fill="url(#linearGradient-4)" stroke="none" d="M 15.995734 38.938778 L 15.995734 52 L 32 29.507483 Z"/>
+                            <path id="Path" fill="url(#linearGradient-5)" stroke="none" d="M 15.995734 52 L 15.995734 38.93661 L 0 29.507483 Z"/>
+                            <path id="Path" fill="url(#linearGradient-6)" stroke="none" d="M 15.995734 35.91565 L 31.989334 26.482183 L 15.995734 19.226673 Z"/>
+                            <path id="Path" fill="url(#linearGradient-7)" stroke="none" d="M 0 26.482183 L 15.995734 35.91565 L 15.995734 19.226673 Z"/>
+                        </g>
+                    </g>
+                </g>
+                <g id="Group-12" transform="matrix(1 0 0 1 7 10)">
+                    <path id="Combined-Shape-Copy-5" fill="url(#linearGradient-8)" fill-rule="evenodd" stroke="none" d="M 13 6.5 C 13 10.08985 10.08985 13 6.5 13 C 2.910149 13 0 10.08985 0 6.5 C -0 2.910149 2.910149 0 6.5 0 C 10.08985 0 13 2.910149 13 6.5 Z"/>
+                    <path id="Path" fill="url(#linearGradient-9)" fill-rule="evenodd" stroke="none" d="M 5.765375 4.6848674 L 5.765375 3 L 4 3 L 4 10 L 5.765375 10 L 5.765375 7.6926675 C 5.765375 6.4945397 7.4282455 5.146646 8.806378 5.146646 L 9 5.146646 L 9 3.2121682 L 8.806378 3.2121682 C 7.5990887 3.2121682 6.3120728 3.7113886 5.765375 4.6848674 Z"/>
+                </g>
+            </g>
+        </g>
+    </g>
+</svg>

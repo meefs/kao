@@ -1,0 +1,30 @@
+<svg width="256" height="256" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <filter id="prefix__filter0_d_210_2212" x="48.174" y="31.651" width="112.93001" height="179.259" filterUnits="userSpaceOnUse">
+            <feFlood color-interpolation-filters="sRGB" flood-color="#000000" flood-opacity="0" result="BackgroundImage"/>
+            <feColorMatrix color-interpolation-filters="sRGB" in="SourceAlpha" result="hardAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"/>
+            <feOffset color-interpolation-filters="sRGB" in="hardAlpha" dx="-13.7" dy="-6.85" result="result3"/>
+            <feGaussianBlur color-interpolation-filters="sRGB" in="result3" stdDeviation="10.19 10.19" result="result4"/>
+            <feComposite color-interpolation-filters="sRGB" in="result4" in2="hardAlpha" operator="out" result="result5"/>
+            <feColorMatrix color-interpolation-filters="sRGB" in="result5" result="result6" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.16 0"/>
+            <feBlend color-interpolation-filters="sRGB" in="result6" in2="SourceGraphic" mode="normal" result="effect1_dropShadow_210_2212"/>
+            <feBlend color-interpolation-filters="sRGB" in="SourceGraphic" in2="effect1_dropShadow_210_2212" mode="normal" result="shape"/>
+        </filter>
+        <clipPath id="prefix__clip0_210_2212">
+            <path fill="#000000" stroke="none" d="M 0 0 L 256 0 L 256 256 L 0 256 Z"/>
+        </clipPath>
+        <mask id="prefix__a" maskUnits="userSpaceOnUse" x="0" y="0" width="256" height="256">
+            <path fill="#ffffff" stroke="none" d="M 256 0 L 0 0 L 0 256 L 256 256 L 256 0 Z"/>
+        </mask>
+    </defs>
+    <g clip-path="url(#prefix__clip0_210_2212)">
+        <g mask="url(#prefix__a)">
+            <path fill="#121212" stroke="none" d="M 256 128 C 256 57.307995 198.693 0 128 0 C 57.307995 0 0 57.307 0 128 C 0 198.693 57.307 256 128 256 C 198.693 256 256 198.693 256 128 Z"/>
+            <path fill="#81d9d9" stroke="none" d="M 118.34899 186.738 C 85.845 186.738 59.392 160.317 59.392 127.84999 C 59.392 95.384 85.845 68.962 118.34899 68.962 C 150.854 68.962 177.30602 95.384 177.30602 127.84999 C 177.30602 160.317 150.854 186.738 118.34899 186.738 Z M 118.34899 85.25 C 94.831 85.25 75.699 104.361 75.699 127.84999 C 75.699 151.341 94.831 170.451 118.34899 170.451 C 141.866 170.451 160.999 151.341 160.999 127.84999 C 160.999 104.361 141.866 85.25 118.34899 85.25 Z"/>
+            <g filter="url(#prefix__filter0_d_210_2212)">
+                <path fill="#ffffff" stroke="none" d="M 90.41 197.38002 C 89.240425 197.37946 88.08475 197.12634 87.021996 196.638 C 82.928 194.775 81.116 189.942 83 185.852 L 138.859 63.642 C 140.725 59.553005 145.562 57.743 149.657 59.625 C 153.752 61.489 155.564 66.321 153.679 70.411 L 97.821 192.62099 C 96.48584 195.52094 93.58554 197.37912 90.393 197.38002 L 90.41 197.38002 Z"/>
+            </g>
+            <path fill="#ebac76" stroke="none" d="M 175.729 163.556 C 175.729 175.319 185.277 184.856 197.055 184.856 L 197.055 142.273 C 185.277 142.273 175.729 151.811 175.729 163.573 L 175.729 163.556 Z"/>
+        </g>
+    </g>
+</svg>

@@ -1,0 +1,48 @@
+<svg width="250" height="250" xmlns="http://www.w3.org/2000/svg">
+    <g transform="matrix(0.7246377 0 0 0.7246377 48.188404 0)">
+        <g id="Page-1">
+            <g id="bulb" transform="matrix(1 0 0 1 -51 -27)">
+                <g id="Group-5" transform="matrix(1 0 0 1 107 290)">
+                    <path id="Triangle-3" fill="#656565" fill-rule="evenodd" stroke="none" d="M 24.752476 43 L 22.772278 72 L 24.752476 43 Z"/>
+                    <path id="Triangle-3" fill="#656565" fill-rule="evenodd" stroke="none" d="M 0 62 L 25 41 L 50 82 Z"/>
+                    <path id="Triangle-3" fill="#787778" fill-rule="evenodd" stroke="none" d="M 0 0 L 0 62 L 25 41 Z"/>
+                    <path id="Triangle-3" fill="#5c5c5c" fill-rule="evenodd" stroke="none" d="M 75 41 L 50 82 L 100 62 Z"/>
+                    <path id="Triangle-3" fill="#787778" fill-rule="evenodd" stroke="none" d="M 100 62 L 75 41 L 100 0 Z"/>
+                    <path id="Triangle-3" fill="#4a4a4a" fill-rule="evenodd" stroke="none" d="M 0 0 L 100 0 L 50 82 Z"/>
+                </g>
+                <g id="Group" transform="matrix(1 0 0 1 6 1)">
+                    <path id="Triangle-3" fill="#fed12f" fill-rule="evenodd" stroke="none" d="M 111 100 L 217 144 L 141 205 Z"/>
+                    <path id="Triangle-3" fill="#fed12f" fill-rule="evenodd" stroke="none" d="M 191 26 L 251 88 L 217 144 Z"/>
+                    <path id="Triangle-3" fill="#fed12f" fill-rule="evenodd" stroke="none" d="M 101 289 L 211 257 L 201 289 Z"/>
+                    <path id="Triangle-3" fill="#fed12f" fill-rule="evenodd" stroke="none" d="M 91 257 L 141 205 L 101 289 Z"/>
+                    <path id="Triangle-3" fill="#fed12f" fill-rule="evenodd" stroke="none" d="M 51 88 L 111 26 L 111 100 Z"/>
+                    <path id="Triangle-3" fill="#fff3cb" fill-rule="evenodd" stroke="none" d="M 141 205 L 211 257 L 217 144 Z"/>
+                    <g transform="matrix(-0.7660444 0.64278764 -0.64278764 -0.7660444 292.5297 298.28113)">
+                        <path id="Triangle-3" fill="#fff3cb" fill-rule="evenodd" stroke="none" d="M 56.118534 168.85889 L 118.731415 243.58926 L 127.84571 161.16396 Z"/>
+                    </g>
+                    <g transform="matrix(0.60181504 -0.79863554 0.79863554 0.60181504 2.3490849 185.94533)">
+                        <path id="Triangle-3" fill="#ffdd63" fill-rule="evenodd" stroke="none" d="M 134.02675 35.049286 L 241.271 54.405815 L 162.67918 146.18451 Z"/>
+                    </g>
+                    <g transform="matrix(0.60181504 -0.79863554 0.79863554 0.60181504 -91.011185 157.75745)">
+                        <path id="Triangle-3" fill="#ffedac" fill-rule="evenodd" stroke="none" d="M 57.7008 126.82377 L 167.70052 126.574 L 101.89824 213.72365 Z"/>
+                    </g>
+                    <g transform="matrix(0.60181504 -0.79863554 0.79863554 0.60181504 -154.39764 225.12825)">
+                        <path id="Triangle-3" fill="#ffdd63" fill-rule="evenodd" stroke="none" d="M 102.691895 242.40862 L 193.84988 223.80157 L 194.44788 311.00043 Z"/>
+                    </g>
+                    <g transform="matrix(0.60181504 -0.79863554 0.79863554 0.60181504 -74.91483 250.74408)">
+                        <path id="Triangle-3" fill="#ffdd63" fill-rule="evenodd" stroke="none" d="M 167.07166 232.10664 L 260.92834 168.89336 L 249.861 227.31863 Z"/>
+                    </g>
+                    <g transform="matrix(0.60181504 -0.79863554 0.79863554 0.60181504 -79.46149 95.44089)">
+                        <path id="Triangle-3" fill="#ffdd63" fill-rule="evenodd" stroke="none" d="M 0.9817964 155.10283 L 84.45624 99.71315 L 110.98151 154.85306 Z"/>
+                    </g>
+                    <g transform="matrix(0.60181504 -0.79863554 0.79863554 0.60181504 -9.072717 257.80295)">
+                        <path id="Triangle-3" fill="#fee382" fill-rule="evenodd" stroke="none" d="M 226.94102 112.06138 L 292.12634 105.513336 L 215.87367 170.48666 Z"/>
+                    </g>
+                    <g transform="matrix(-0.9396926 0.34202015 -0.34202015 -0.9396926 300.9679 47.219738)">
+                        <path id="Triangle-3" fill="#fef1c0" fill-rule="evenodd" stroke="none" d="M 96.07844 57.55126 L 196.56334 15.375621 L 171.25385 84.91287 Z"/>
+                    </g>
+                </g>
+            </g>
+        </g>
+    </g>
+</svg>

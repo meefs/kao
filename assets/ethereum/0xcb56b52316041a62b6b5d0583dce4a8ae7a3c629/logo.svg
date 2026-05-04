@@ -1,0 +1,21 @@
+<svg width="300" height="300" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="paint0_linear_609_349" x1="150" y1="0" x2="150" y2="300" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#f08710"/>
+            <stop offset="1" stop-color="#f96d36"/>
+        </linearGradient>
+        <linearGradient id="paint1_linear_609_349" x1="150" y1="10" x2="150" y2="290" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#f0870d"/>
+            <stop offset="1" stop-color="#f09a39"/>
+        </linearGradient>
+    </defs>
+    <path fill="url(#paint0_linear_609_349)" stroke="none" d="M 300 150 C 300 232.84271 232.84271 300 150 300 C 67.15729 300 0 232.84271 0 150 C -0 67.15729 67.15729 0 150 0 C 232.84271 0 300 67.15729 300 150 Z"/>
+    <path fill="url(#paint1_linear_609_349)" stroke="none" d="M 290 150 C 290 227.31987 227.31987 290 150 290 C 72.68014 290 10 227.31987 10 150 C 10 72.68014 72.68014 10 150 10 C 227.31987 10 290 72.68014 290 150 Z"/>
+    <path fill="#000000" stroke="none" d="M 76 182 L 207 182 L 207 204 L 76 204 Z"/>
+    <path fill="#ffffff" stroke="none" d="M 76 204 L 184 204 L 184 226 L 76 226 Z"/>
+    <path fill="#000000" stroke="none" d="M 54 204 L 76 204 L 76 226 L 54 226 Z"/>
+    <path fill="#e25b26" stroke="none" d="M 184 204 L 207 204 L 207 226 L 184 226 Z"/>
+    <path fill="#000000" stroke="none" d="M 76 226 L 207 226 L 207 248 L 76 248 Z"/>
+    <path fill="#000000" stroke="none" d="M 207 204 L 231 204 L 231 226 L 207 226 Z"/>
+    <path fill="#fcf7d6" stroke="none" d="M 184 26 L 205 26 L 205 158 L 184 158 Z"/>
+</svg>

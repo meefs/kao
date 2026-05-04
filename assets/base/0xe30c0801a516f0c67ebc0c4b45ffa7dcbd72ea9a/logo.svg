@@ -1,0 +1,26 @@
+<svg width="684" height="683" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="SVGID_1_" x1="22.6421" y1="341.7052" x2="659.321" y2="341.7052" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#2b3d8e"/>
+            <stop offset="1" stop-color="#02a8ea"/>
+        </linearGradient>
+        <linearGradient id="SVGID_00000004532215570749855410000005466861140389750947_" x1="22.6421" y1="341.7052" x2="659.321" y2="341.7052" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#2b3d8e"/>
+            <stop offset="1" stop-color="#02a8ea"/>
+        </linearGradient>
+        <linearGradient id="SVGID_00000110465671370795816760000013466094625578285964_" x1="22.6421" y1="341.5" x2="659.321" y2="341.5" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#2b3d8e"/>
+            <stop offset="1" stop-color="#02a8ea"/>
+        </linearGradient>
+    </defs>
+    <g>
+        <g opacity="0.998">
+            <path fill="#f2f2f2" fill-rule="evenodd" stroke="none" d="M 318.5 -0.5 C 333.8 -0.5 349.2 -0.5 364.5 -0.5 C 484.9 11.4 576.4 68.8 639 171.5 C 664.5 217 679.3 265.7 683.5 317.5 C 683.5 333.2 683.5 348.8 683.5 364.5 C 670.7 489.6 609.7 582.8 500.5 644 C 457.6 665.9 412.3 678.7 364.5 682.5 C 349.2 682.5 333.8 682.5 318.5 682.5 C 198.1 670.6 106.6 613.2 44 510.5 C 18.5 465 3.7 416.3 -0.5 364.5 C -0.5 348.8 -0.5 333.2 -0.5 317.5 C 12.3 192.4 73.3 99.2 182.5 38 C 225.4 16.1 270.7 3.3 318.5 -0.5 Z"/>
+        </g>
+    </g>
+    <g>
+        <path fill="url(#SVGID_1_)" stroke="none" d="M 248.70001 224.19998 L 222.6 191.6 L 33.3 341.7 L 222.79999 491.8 L 248.70001 459 L 101.299995 341.9 Z"/>
+        <path fill="url(#SVGID_00000004532215570749855410000005466861140389750947_)" stroke="none" d="M 435.3 224.19998 L 582.7 341.9 L 435.3 459 L 461.2 491.8 L 650.7 341.7 L 461.4 191.6 Z"/>
+        <path fill="url(#SVGID_00000110465671370795816760000013466094625578285964_)" stroke="none" d="M 275.4 505 L 316 515.8 L 407.6 178.7 L 367 167.2 Z"/>
+    </g>
+</svg>

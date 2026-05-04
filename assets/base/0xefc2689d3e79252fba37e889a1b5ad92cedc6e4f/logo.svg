@@ -1,0 +1,37 @@
+<svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="SVGID_1_" x1="100" y1="150" x2="100" y2="50" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#546e7a"/>
+            <stop offset="1" stop-color="#77929e"/>
+        </linearGradient>
+        <linearGradient id="SVGID_2_" x1="87.8826" y1="138" x2="87.8826" y2="78" gradientUnits="userSpaceOnUse">
+            <stop offset="0.1543" stop-color="#000000"/>
+            <stop offset="1" stop-color="#707070"/>
+        </linearGradient>
+    </defs>
+    <g>
+        <g>
+            <g>
+                <g>
+                    <path fill="url(#SVGID_1_)" stroke="none" d="M 150 100 C 150 127.614235 127.614235 150 100 150 C 72.385765 150 50 127.614235 50 100 C 50 72.385765 72.385765 50 100 50 C 127.614235 50 150 72.385765 150 100 Z"/>
+                </g>
+                <g opacity="0.15">
+                    <path fill="#ffffff" stroke="none" d="M 100 50 C 85.2 50 72 56.4 62.8 66.6 C 67.8 78.1 75.4 90.19999 85.2 101.80001 C 100.09999 119.399994 117.1 132.2 132.1 138.4 C 143 129.2 150 115.5 150 100.09999 C 150 72.4 127.6 50 100 50 Z"/>
+                </g>
+            </g>
+            <g>
+                <g>
+                    <g>
+                        <path fill="#ffffff" stroke="none" d="M 121 78 C 114.8 78 109.80001 83 109.80001 89.2 C 109.80001 95.399994 114.8 100.4 121 100.4 C 127.2 100.4 132.2 95.399994 132.2 89.2 C 132.2 83 127.2 78 121 78 Z M 85.7 78.4 L 108.9 121.49999 C 109 121.7 109 122 108.9 122.19999 L 100.600006 137.6 C 100.3 138.1 99.5 138.1 99.3 137.6 L 67.8 79.1 C 67.5 78.6 67.9 78 68.5 78 L 85 78 C 85.3 78 85.6 78.2 85.7 78.4 Z"/>
+                    </g>
+                </g>
+                <g opacity="0.06">
+                    <path fill="url(#SVGID_2_)" stroke="none" d="M 81.7 97 C 77.1 90.9 72 84 68.5 78 L 68.5 78 C 67.9 78 67.6 78.6 67.8 79.1 L 99.3 137.6 C 99.6 138.1 100.4 138.1 100.600006 137.6 L 108 123.90001 C 99.2 116.8 90.1 108.09999 81.7 97 Z"/>
+                </g>
+            </g>
+        </g>
+        <g>
+            <path fill="none" stroke="none" visibility="hidden" d="M 0 0 L 200 0 L 200 200 L 0 200 Z"/>
+        </g>
+    </g>
+</svg>

@@ -1,0 +1,20 @@
+<svg width="256" height="256" xmlns="http://www.w3.org/2000/svg">
+    <g id="Adex_icon_256px" transform="matrix(1 0 0 1 20270 11021)">
+        <g id="Layer_x0020_1" transform="matrix(1 0 0 1 -20221 -11021)">
+            <g id="_1942084283040">
+                <g transform="matrix(1 0 0 1 0 -1123.973)">
+                    <path id="Path_17737" fill="#7298fe" fill-rule="evenodd" stroke="none" d="M 0 1301.312 L 49.341 1251.974 L 0 1202.639 L 29.287 1173.351 L 78.662 1222.727 L 128.042 1173.351 L 157.327 1202.639 L 107.988 1251.974 L 157.327 1301.312 L 128 1330.638 L 78.666 1281.3 L 29.328 1330.642 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -742.195 0)">
+                    <path id="Path_17738" fill="#2855cc" fill-rule="evenodd" stroke="none" d="M 774.8 46.055 L 820.857 0 L 866.91296 46.055 L 842.2 70.767 L 820.857 49.419 L 799.51 70.767 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -742.195 -4216.514)">
+                    <path id="Path_17739" fill="#2855cc" fill-rule="evenodd" stroke="none" d="M 774.8 4426.457 L 820.857 4472.514 L 866.91296 4426.457 L 842.2 4401.75 L 820.852 4423.095 L 799.51 4401.75 Z"/>
+                </g>
+            </g>
+        </g>
+        <g transform="matrix(1 0 0 1 -20270 -11021)">
+            <path id="Rectangle_2110" fill="none" stroke="none" visibility="hidden" d="M 0 0 L 256 0 L 256 256 L 0 256 Z"/>
+        </g>
+    </g>
+</svg>

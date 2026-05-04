@@ -1,3 +1,7 @@
+[workspace]
+members = ["xtask"]
+exclude = ["vendor/op-alloy-network"]
+
 [package]
 name = "kao"
 version = "0.1.0"
@@ -33,7 +37,7 @@ helios-ethereum = { git = "https://github.com/a16z/helios", rev = "204c998a92734
 # coherence-conflicting `op-alloy-network 0.20.0`. See the patch entries
 # for the full story.
 helios-opstack = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
-iced = { version = "0.14.0", features = ["tokio", "image", "qr_code"] }
+iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg"] }
 keyring = "3.6.3"
 rand = "0.8"
 redb = "4.1.0"

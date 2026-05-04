@@ -1,0 +1,25 @@
+<svg width="411" height="411" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="paint0_linear_997_12384" x1="0" y1="1" x2="410" y2="411" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#596aec"/>
+            <stop offset="1" stop-color="#60e2e9"/>
+        </linearGradient>
+        <clipPath id="clip0_997_12384">
+            <path fill="#000000" stroke="none" transform="matrix(1 0 0 1 0.5 0.5)" d="M 0 0 L 410 0 L 410 410 L 0 410 Z"/>
+        </clipPath>
+        <mask id="mask0_997_12384" maskUnits="userSpaceOnUse" x="0" y="1" width="410" height="410">
+            <path fill="#ffffff" stroke="none" d="M 410 1 L 0 1 L 0 411 L 410 411 L 410 1 Z"/>
+        </mask>
+    </defs>
+    <g clip-path="url(#clip0_997_12384)">
+        <g mask="url(#mask0_997_12384)">
+            <path fill="url(#paint0_linear_997_12384)" stroke="none" d="M 205 411 C 318.219 411 410 319.218 410 206 C 410 92.7817 318.219 1 205 1 C 91.7817 1 0 92.7817 0 206 C 0 319.218 91.7817 411 205 411 Z"/>
+            <path fill="#ffffff" fill-opacity="0.6" stroke="none" d="M 211.378 52.25 L 211.378 165.897 L 307.434 208.819 L 211.378 52.25 Z"/>
+            <path fill="#ffffff" stroke="none" d="M 211.379 52.25 L 115.311005 208.819 L 211.379 165.897 L 211.379 52.25 Z"/>
+            <path fill="#ffffff" fill-opacity="0.6" stroke="none" d="M 211.378 282.47 L 211.378 359.692 L 307.498 226.71002 L 211.378 282.47 Z"/>
+            <path fill="#ffffff" stroke="none" d="M 211.379 359.692 L 211.379 282.458 L 115.311005 226.71002 L 211.379 359.692 Z"/>
+            <path fill="#ffffff" fill-opacity="0.2" stroke="none" d="M 211.378 264.59 L 307.434 208.817 L 211.378 165.92 L 211.378 264.59 Z"/>
+            <path fill="#ffffff" fill-opacity="0.6" stroke="none" d="M 115.311005 208.817 L 211.379 264.59 L 211.379 165.92 L 115.311005 208.817 Z"/>
+        </g>
+    </g>
+</svg>

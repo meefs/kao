@@ -1,0 +1,19 @@
+<svg width="160" height="160" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="linear-gradient" x1="174.44" y1="-10427.81" x2="285.32" y2="-10538.68" gradientUnits="userSpaceOnUse" gradientTransform="matrix(-1 -0 0 -1 309.88 -10403.25)">
+            <stop offset="0" stop-color="#f2681d"/>
+            <stop offset="1" stop-color="#f89863"/>
+        </linearGradient>
+        <linearGradient id="linear-gradient-2" x1="-1445.25" y1="183.65" x2="-1304.6" y2="183.65" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0.7071068 -0.7071068 0.7071068 0.7071068 922.36 -1022.08)">
+            <stop offset="0" stop-color="#f2681d"/>
+            <stop offset="1" stop-color="#f89863"/>
+        </linearGradient>
+    </defs>
+    <g id="Logomark">
+        <g id="Logo_BG">
+            <path fill="url(#linear-gradient)" stroke="none" d="M 158.4 80 C 158.4 123.29911 123.29911 158.4 80 158.4 C 36.70088 158.4 1.6000028 123.299126 1.5999984 80 C 1.5999984 36.700874 36.700874 1.5999984 80 1.5999984 C 123.299126 1.6000028 158.4 36.70088 158.4 80 Z"/>
+            <path id="bg" fill="url(#linear-gradient-2)" stroke="none" d="M 80 9.67 C 41.16 9.67 9.67 41.15 9.67 80 C 9.67 115.42 35.86 144.73 69.95 149.6 C 71.27 149.8 72.61 149.95 73.97 150.06 C 75.3 150.18 76.64 150.25 77.99 150.29 C 78.66 150.31 79.33 150.32 80 150.32 C 80.67 150.32 81.34 150.32 82.01 150.29 C 83.36 150.26 84.7 150.18 86.03 150.06 C 87.38 149.95 88.72001 149.8 90.05001 149.61 C 124.13 144.74 150.33 115.43 150.33 80 C 150.33 41.15 118.83999 9.67 80 9.67 Z"/>
+        </g>
+    </g>
+    <path fill="#ffffff" stroke="none" d="M 110.73 80.86 L 80 29.97 L 49.27 80.86 L 80 98.95999 L 110.73 80.86 Z M 49.27 87.49 L 80 130.78 L 110.73 87.49 L 80 105.68001 L 49.27 87.49 Z"/>
+</svg>

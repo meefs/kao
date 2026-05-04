@@ -1,0 +1,13 @@
+<svg width="400" height="400" xmlns="http://www.w3.org/2000/svg">
+    <path fill="#ffd700" stroke="#000000" stroke-width="6" d="M 390 200 C 390 304.9341 304.9341 390 200 390 C 95.065895 390 10 304.9341 10 200 C 10 95.065895 95.065895 10 200 10 C 304.9341 10 390 95.065895 390 200 Z"/>
+    <path fill="#808080" stroke="none" d="M 315 185 C 315 229.18279 263.51276 265 200 265 C 136.48726 265 85 229.18279 85 185 C 85 140.81721 136.48726 105 200 105 C 263.51276 105 315 140.81721 315 185 Z"/>
+    <path fill="none" stroke="#808080" stroke-width="29" stroke-linecap="round" d="M 130 220 Q 118 256 136 268"/>
+    <path fill="none" stroke="#808080" stroke-width="29" stroke-linecap="round" d="M 270 220 Q 282 256 264 268"/>
+    <path fill="#a0a0a0" stroke="none" d="M 269 230 C 269 268.10764 238.10765 299 200 299 C 161.89235 299 131 268.10764 131 230 C 131 191.89236 161.89235 161 200 161 C 238.10765 161 269 191.89236 269 230 Z"/>
+    <path fill="#000000" stroke="#606060" stroke-width="5" stroke-linecap="round" d="M 190 230 L 210 230 M 200 220 L 200 240"/>
+    <path fill="#000000" stroke="#606060" stroke-width="4" stroke-linecap="round" d="M 193 223 L 207 237 M 207 223 L 193 237"/>
+    <path fill="none" stroke="#808080" stroke-width="17" stroke-linecap="round" d="M 190 190 Q 130 115 110 75 Q 105 65 115 70"/>
+    <path fill="#808080" stroke="none" d="M 120 155 L 145 85 L 170 155"/>
+    <path fill="#808080" stroke="none" d="M 230 155 L 255 85 L 280 155"/>
+    <path fill="none" stroke="#707070" stroke-width="5" stroke-linecap="round" d="M 190 190 Q 130 115 110 75"/>
+</svg>

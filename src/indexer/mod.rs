@@ -25,7 +25,6 @@ use async_trait::async_trait;
 use crate::chain::Chain;
 use crate::portfolio::LiveToken;
 use crate::settings::{self, IndexerProvider};
-use crate::ui::token_logos::{self, NATIVE_ETH};
 
 mod alchemy;
 mod blockscout;
@@ -269,29 +268,23 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
 /// the existing portfolio UI can render them without touching every call
 /// site. Indexer-supplied prices may be missing — those map to `0.0` in
 /// `LiveToken` so the column sort behaves the same way as the on-chain
-/// portfolio path. Logos resolve via the bundled `token_logos::logo_id_for`
-/// table; tokens not in the table render the kaomoji fallback avatar.
+/// portfolio path. Logos resolve at render time from `(chain, contract)`
+/// against the bundled SVG set; tokens not in the bundle render the
+/// kaomoji fallback avatar.
 pub fn into_live_tokens(chain: Chain, tokens: Vec<IndexedToken>) -> Vec<LiveToken> {
     tokens
         .into_iter()
-        .map(|t| {
-            let logo_id = match t.contract {
-                None => Some(NATIVE_ETH),
-                Some(c) => token_logos::logo_id_for(c),
-            };
-            LiveToken {
-                symbol: t.symbol,
-                name: t.name,
-                balance: t.balance,
-                balance_f64: t.balance_f64,
-                balance_raw: t.balance_raw,
-                decimals: t.decimals,
-                contract: t.contract,
-                usd_price: t.usd_price.unwrap_or(0.0),
-                usd_value: t.usd_value.unwrap_or(0.0),
-                logo_id,
-                chain,
-            }
+        .map(|t| LiveToken {
+            symbol: t.symbol,
+            name: t.name,
+            balance: t.balance,
+            balance_f64: t.balance_f64,
+            balance_raw: t.balance_raw,
+            decimals: t.decimals,
+            contract: t.contract,
+            usd_price: t.usd_price.unwrap_or(0.0),
+            usd_value: t.usd_value.unwrap_or(0.0),
+            chain,
         })
         .collect()
 }
@@ -392,9 +385,9 @@ mod tests {
             },
         ];
         let live = into_live_tokens(Chain::Mainnet, tokens);
-        assert_eq!(live[0].logo_id, Some(NATIVE_ETH));
-        assert_eq!(live[1].logo_id, Some("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"));
-        assert_eq!(live[2].logo_id, None, "unknown contract has no bundled logo");
+        assert_eq!(live[0].contract, None, "native ETH preserved");
+        assert_eq!(live[1].contract, Some(usdc));
+        assert_eq!(live[2].contract, Some(unknown));
         assert_eq!(live[1].usd_price, 0.0, "missing indexer price collapses to 0");
         assert_eq!(live[1].usd_value, 0.0);
         for tk in &live {

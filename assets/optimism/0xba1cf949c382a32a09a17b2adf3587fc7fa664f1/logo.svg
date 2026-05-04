@@ -1,0 +1,21 @@
+<svg width="256" height="256" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="linear0" x1="360.8791" y1="351.4553" x2="141.213" y2="-69.2936" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0.643701 0 0 -0.821132 0 257.862)">
+            <stop offset="0" stop-color="#00ffa3"/>
+            <stop offset="1" stop-color="#dc1fff"/>
+        </linearGradient>
+        <linearGradient id="linear1" x1="264.8291" y1="401.6014" x2="45.163" y2="-19.1475" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0.643701 0 0 -0.821132 0 257.862)">
+            <stop offset="0" stop-color="#00ffa3"/>
+            <stop offset="1" stop-color="#dc1fff"/>
+        </linearGradient>
+        <linearGradient id="linear2" x1="312.5484" y1="376.688" x2="92.8822" y2="-44.061" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0.643701 0 0 -0.821132 0 257.862)">
+            <stop offset="0" stop-color="#00ffa3"/>
+            <stop offset="1" stop-color="#dc1fff"/>
+        </linearGradient>
+    </defs>
+    <g id="surface1">
+        <path fill="url(#linear0)" stroke="none" d="M 41.58203 195.375 C 43.12891 193.40234 45.25391 192.2539 47.503906 192.2539 L 251.8164 192.2539 C 255.55077 192.2539 257.41797 198 254.77734 201.36719 L 214.41795 252.85156 C 212.87108 254.82422 210.74611 255.97266 208.4961 255.97266 L 4.183594 255.97266 C 0.449219 255.97266 -1.417969 250.22656 1.222656 246.85936 Z M 41.58203 195.375"/>
+        <path fill="url(#linear1)" stroke="none" d="M 41.58203 3.148438 C 43.19141 1.175781 45.31641 0.0273438 47.503906 0.0273438 L 251.8164 0.0273438 C 255.55077 0.0273438 257.41797 5.773438 254.77734 9.140625 L 214.41795 60.625 C 212.87108 62.597656 210.74611 63.746094 208.4961 63.746094 L 4.183594 63.746094 C 0.449219 63.746094 -1.417969 58 1.222656 54.632813 Z M 41.58203 3.148438"/>
+        <path fill="url(#linear2)" stroke="none" d="M 214.41795 98.64453 C 212.87108 96.671875 210.74611 95.52344 208.4961 95.52344 L 4.183594 95.52344 C 0.449219 95.52344 -1.417969 101.27344 1.222656 104.640625 L 41.58203 156.125 C 43.12891 158.09375 45.25391 159.24219 47.503906 159.24219 L 251.8164 159.24219 C 255.55077 159.24219 257.41797 153.4961 254.77734 150.1289 Z M 214.41795 98.64453"/>
+    </g>
+</svg>

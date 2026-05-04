@@ -1,0 +1,24 @@
+<svg width="512" height="512" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="linear-gradient" x1="60" y1="142.84" x2="452" y2="369.16" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#1d1d3c"/>
+            <stop offset="0.11" stop-color="#221e43"/>
+            <stop offset="0.27" stop-color="#302256"/>
+            <stop offset="0.46" stop-color="#482876"/>
+            <stop offset="0.68" stop-color="#6931a2"/>
+            <stop offset="0.91" stop-color="#923bda"/>
+            <stop offset="0.9999999" stop-color="#a440f2"/>
+            <stop offset="1" stop-color="#50d313"/>
+        </linearGradient>
+    </defs>
+    <g id="Layer_2">
+        <g id="Layer_1-2">
+            <path fill="#1d1d3c" stroke="none" d="M 512 256 C 512 397.38486 397.38486 512 256 512 C 114.615105 512 0 397.38486 0 256 C 0 114.615105 114.615105 0 256 0 C 397.38486 0 512 114.615105 512 256 Z"/>
+            <path fill="url(#linear-gradient)" stroke="none" d="M 482.28998 256 C 482.28998 380.9765 380.9765 482.28998 256 482.28998 C 131.0235 482.28998 29.710014 380.9765 29.710005 256 C 29.710005 131.02348 131.02348 29.710005 256 29.710005 C 380.9765 29.710014 482.28998 131.0235 482.28998 256 Z"/>
+            <path fill="#1d1d3c" stroke="none" d="M 466.24 256 C 466.24 372.11234 372.11234 466.24 256 466.24 C 139.88765 466.24 45.76 372.11234 45.759995 256 C 45.759995 139.88765 139.88765 45.759995 256 45.759995 C 372.11234 45.76 466.24 139.88765 466.24 256 Z"/>
+            <path fill="#1d1d3c" stroke="none" d="M 131.23 110.31999 L 131.23 401.67996 L 380.78 401.67996 L 380.78 110.31999 Z"/>
+            <path fill="#ffffff" stroke="none" d="M 256.19 193.38 L 256.19 276.7 L 339.17 276.7 L 339.17 318.44 L 172.84 318.44 L 172.84 151.94 L 339.17 151.94 L 339.17 193.38 L 256.19 193.38 Z"/>
+            <path fill="#a440f2" stroke="none" d="M 172.84 360.88998 L 339.16998 360.88998 L 339.16998 369.89 L 172.84 369.89 Z"/>
+        </g>
+    </g>
+</svg>

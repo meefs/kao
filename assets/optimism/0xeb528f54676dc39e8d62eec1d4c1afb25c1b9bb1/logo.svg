@@ -1,0 +1,56 @@
+<svg width="200" height="200" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="linearGradient-1" x1="0.5" y1="1" x2="0.5" y2="0.00000000000000003061617" gradientUnits="userSpaceOnUse" gradientTransform="matrix(48.31348 0 0 38.53858 0 21)">
+            <stop offset="0" stop-color="#abec79"/>
+            <stop offset="1" stop-color="#72d444"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-2" x1="0.5" y1="0" x2="0.5" y2="0.98134935" gradientUnits="userSpaceOnUse" gradientTransform="matrix(74.36927 0 0 89.005775 99.71899 59.53858)">
+            <stop offset="0" stop-color="#36b564"/>
+            <stop offset="1" stop-color="#598e69"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-3" x1="0.5" y1="1" x2="0.5" y2="-0.000000000000000024894982" gradientUnits="userSpaceOnUse" gradientTransform="matrix(174.08826 0 0 19.26929 0 40.26929)">
+            <stop offset="0" stop-color="#499d6c"/>
+            <stop offset="1" stop-color="#1c8441"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-4" x1="-0.0000000000000001110223" y1="0.5" x2="1" y2="0.5" gradientUnits="userSpaceOnUse" gradientTransform="matrix(25.076447 0 0 19.26929 149.01181 40.26929)">
+            <stop offset="0" stop-color="#4c9b72"/>
+            <stop offset="1" stop-color="#25623e"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-5" x1="0.5" y1="0" x2="0.5" y2="0.98060423" gradientUnits="userSpaceOnUse" gradientTransform="matrix(134.94064 0 0 19.26929 32.357227 21)">
+            <stop offset="0" stop-color="#b1f286"/>
+            <stop offset="1" stop-color="#6bd240"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-6" x1="1" y1="0.5" x2="0" y2="0.5" gradientUnits="userSpaceOnUse" gradientTransform="matrix(40.870834 0 0 38.53858 158.47989 21)">
+            <stop offset="0" stop-color="#a6e579"/>
+            <stop offset="1" stop-color="#66b740"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-7" x1="0.5" y1="1" x2="0.5" y2="0.00000000000000003061617" gradientUnits="userSpaceOnUse" gradientTransform="matrix(99.63174 0 0 118.56787 99.71899 59.53858)">
+            <stop offset="0" stop-color="#399163"/>
+            <stop offset="1" stop-color="#205a38"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-8" x1="0.5" y1="0" x2="0.5" y2="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(67.193085 0 0 80.0293 32.79862 98.07716)">
+            <stop offset="0" stop-color="#54a66d"/>
+            <stop offset="1" stop-color="#2a6d3b"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-9" x1="0.5" y1="0" x2="0.5" y2="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(50.33891 0 0 15.598953 32.79862 98.07716)">
+            <stop offset="0" stop-color="#b1f286"/>
+            <stop offset="1" stop-color="#79e14e"/>
+        </linearGradient>
+        <linearGradient id="linearGradient-10" x1="0.5" y1="0" x2="0.5" y2="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(29.507515 0 0 50.467194 70.43854 98.07716)">
+            <stop offset="0" stop-color="#4c9d69"/>
+            <stop offset="1" stop-color="#256438"/>
+        </linearGradient>
+    </defs>
+    <g id="KTON">
+        <path id="Path" fill="url(#linearGradient-1)" stroke="none" d="M 32.357227 21 L 48.31348 40.26929 L 0 59.53858 Z"/>
+        <path id="Combined-Shape" fill="url(#linearGradient-2)" stroke="none" d="M 99.846054 118.0967 L 149.01181 59.53858 L 174.08826 59.53858 L 99.71899 148.54436 Z"/>
+        <path id="Combined-Shape-Copy-16" fill="url(#linearGradient-3)" stroke="none" d="M 149.01181 59.53858 L 0 59.53858 L 48.31348 40.26929 L 158.47989 40.26929 L 174.08826 59.53858 Z"/>
+        <path id="Combined-Shape-Copy-16" fill="url(#linearGradient-4)" stroke="none" d="M 149.01181 59.53858 L 158.47989 40.26929 L 174.08826 59.53858 Z"/>
+        <path id="Combined-Shape" fill="url(#linearGradient-5)" stroke="none" d="M 158.47989 40.26929 L 48.31348 40.26929 L 32.357227 21 L 167.29787 21 Z"/>
+        <path id="Combined-Shape-Copy" fill="url(#linearGradient-6)" stroke="none" d="M 174.08826 59.53858 L 158.47989 40.26929 L 167.29787 21 L 199.35072 59.53858 Z"/>
+        <path id="Combined-Shape-Copy" fill="url(#linearGradient-7)" stroke="none" d="M 99.71899 148.54436 L 174.08826 59.53858 L 199.35072 59.53858 L 125.01551 148.0744 L 99.8917 178.10648 Z"/>
+        <path id="Combined-Shape-Copy" fill="url(#linearGradient-8)" stroke="none" d="M 70.43854 113.67612 L 99.818985 148.54436 L 99.99171 178.10648 L 32.79862 98.07716 Z"/>
+        <path id="Combined-Shape-Copy" fill="url(#linearGradient-9)" stroke="none" d="M 70.43854 113.67612 L 32.79862 98.07716 L 83.13753 98.07716 Z"/>
+        <path id="Combined-Shape" fill="url(#linearGradient-10)" stroke="none" d="M 83.13753 98.07716 L 70.43854 113.67612 L 99.818985 148.54436 L 99.94605 118.0967 Z"/>
+    </g>
+</svg>

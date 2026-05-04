@@ -1,0 +1,35 @@
+<svg width="264" height="264" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="paint0_linear_712_29256" x1="66.0515" y1="285.78" x2="227.925" y2="-37.6674" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#1359ed"/>
+            <stop offset="0.499698" stop-color="#588eff"/>
+            <stop offset="1" stop-color="#558cff"/>
+        </linearGradient>
+        <filter id="filter0_d_712_29256" x="0" y="0" width="264" height="264" filterUnits="userSpaceOnUse">
+            <feFlood color-interpolation-filters="sRGB" flood-color="#000000" flood-opacity="0" result="BackgroundImageFix"/>
+            <feColorMatrix color-interpolation-filters="sRGB" in="SourceAlpha" result="hardAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"/>
+            <feOffset color-interpolation-filters="sRGB" in="hardAlpha" dx="0" dy="0" result="result3"/>
+            <feGaussianBlur color-interpolation-filters="sRGB" in="result3" stdDeviation="2 2" result="result4"/>
+            <feComposite color-interpolation-filters="sRGB" in="result4" in2="hardAlpha" operator="out" result="result5"/>
+            <feColorMatrix color-interpolation-filters="sRGB" in="result5" result="result6" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.1 0"/>
+            <feBlend color-interpolation-filters="sRGB" in="result6" in2="BackgroundImageFix" mode="normal" result="effect1_dropShadow_712_29256"/>
+            <feBlend color-interpolation-filters="sRGB" in="SourceGraphic" in2="effect1_dropShadow_712_29256" mode="normal" result="shape"/>
+        </filter>
+        <filter id="filter1_d_712_29256" x="52.7588" y="66.5479" width="159.082" height="130.904" filterUnits="userSpaceOnUse">
+            <feFlood color-interpolation-filters="sRGB" flood-color="#000000" flood-opacity="0" result="BackgroundImageFix"/>
+            <feColorMatrix color-interpolation-filters="sRGB" in="SourceAlpha" result="hardAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"/>
+            <feOffset color-interpolation-filters="sRGB" in="hardAlpha" dx="0" dy="0" result="result3"/>
+            <feGaussianBlur color-interpolation-filters="sRGB" in="result3" stdDeviation="2 2" result="result4"/>
+            <feComposite color-interpolation-filters="sRGB" in="result4" in2="hardAlpha" operator="out" result="result5"/>
+            <feColorMatrix color-interpolation-filters="sRGB" in="result5" result="result6" type="matrix" values="0 0 0 0 0.227451 0 0 0 0 0.282353 0 0 0 0 0.380392 0 0 0 0.25 0"/>
+            <feBlend color-interpolation-filters="sRGB" in="result6" in2="BackgroundImageFix" mode="normal" result="effect1_dropShadow_712_29256"/>
+            <feBlend color-interpolation-filters="sRGB" in="SourceGraphic" in2="effect1_dropShadow_712_29256" mode="normal" result="shape"/>
+        </filter>
+    </defs>
+    <g filter="url(#filter0_d_712_29256)">
+        <path fill="url(#paint0_linear_712_29256)" stroke="none" d="M 260 132 C 260 202.69244 202.69244 260 132 260 C 61.307552 260 4 202.69244 4 132 C 4 61.307552 61.307552 4 132 4 C 202.69244 4 260 61.307552 260 132 Z"/>
+        <g filter="url(#filter1_d_712_29256)">
+            <path fill="#ffffff" stroke="none" d="M 207.84099 193.452 L 137.967 70.5479 L 68.0899 193.452 L 207.84099 193.452 Z M 88.8633 128.159 L 120.969 70.5479 L 56.7588 70.5479 L 88.8633 128.159 Z M 179.304 177.18301 L 96.6289 177.18301 L 137.967 104.471 L 179.304 177.18301 Z"/>
+        </g>
+    </g>
+</svg>

@@ -1,0 +1,22 @@
+<svg width="256" height="256" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <filter id="filter0_d_1273_2" x="84.5283" y="41.0566" width="108.214" height="177.447" filterUnits="userSpaceOnUse">
+            <feFlood color-interpolation-filters="sRGB" flood-color="#000000" flood-opacity="0" result="BackgroundImageFix"/>
+            <feColorMatrix color-interpolation-filters="sRGB" in="SourceAlpha" result="hardAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0"/>
+            <feOffset color-interpolation-filters="sRGB" in="hardAlpha" dx="10" dy="10" result="result3"/>
+            <feComposite color-interpolation-filters="sRGB" in="result3" in2="hardAlpha" operator="out" result="result4"/>
+            <feColorMatrix color-interpolation-filters="sRGB" in="result4" result="result5" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.15 0"/>
+            <feBlend color-interpolation-filters="sRGB" in="result5" in2="BackgroundImageFix" mode="normal" result="effect1_dropShadow_1273_2"/>
+            <feBlend color-interpolation-filters="sRGB" in="SourceGraphic" in2="effect1_dropShadow_1273_2" mode="normal" result="shape"/>
+        </filter>
+        <clipPath id="clip0_1273_2">
+            <path fill="#000000" stroke="none" d="M 0 0 L 256 0 L 256 256 L 0 256 Z"/>
+        </clipPath>
+    </defs>
+    <g clip-path="url(#clip0_1273_2)">
+        <path fill="#7e46f2" stroke="none" d="M 256 128 C 256 198.69243 198.69243 256 128 256 C 57.307552 256 0 198.69243 0 128 C 0 57.307552 57.307552 0 128 0 C 198.69243 0 256 57.307552 256 128 Z"/>
+        <g filter="url(#filter0_d_1273_2)">
+            <path fill="#ffffff" stroke="none" d="M 133.664 41.0566 C 160.769 41.0566 182.74199 63.4353 182.74199 91.0407 L 182.74199 119.782 C 182.74199 147.387 160.769 169.766 133.664 169.766 C 129.406 169.766 125.275 169.213 121.336006 168.176 L 121.337 171.568 C 121.337 191.763 105.18499 208.172 85.137 208.49799 L 84.5283 208.503 L 84.5283 98.5383 L 84.5846 98.537 L 84.5861 91.0407 C 84.5861 63.4353 106.559 41.0566 133.664 41.0566 Z M 133.664 78.5447 C 126.888 78.5447 121.395 84.1393 121.395 91.0407 L 121.395 119.782 C 121.395 126.68301 126.888 132.278 133.664 132.278 C 140.44 132.278 145.934 126.68301 145.934 119.782 L 145.934 91.0407 C 145.934 84.1393 140.44 78.5447 133.664 78.5447 Z"/>
+        </g>
+    </g>
+</svg>

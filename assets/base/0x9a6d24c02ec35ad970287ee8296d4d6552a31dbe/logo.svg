@@ -1,0 +1,59 @@
+<svg width="128" height="128" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <radialGradient id="b" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <radialGradient id="c" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <radialGradient id="d" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <radialGradient id="e" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <radialGradient id="f" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <radialGradient id="g" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <radialGradient id="h" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <radialGradient id="i" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <radialGradient id="j" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <radialGradient id="k" cx="0" cy="0" r="1" fx="0" fy="0" gradientUnits="userSpaceOnUse" gradientTransform="matrix(0 64 -64 0 64 64)">
+            <stop offset="0.28" stop-color="#d0a0e6" stop-opacity="0"/>
+            <stop offset="1" stop-color="#c575e9"/>
+        </radialGradient>
+        <clipPath id="a">
+            <path fill="#000000" stroke="none" d="M 0 0 L 128 0 L 128 128 L 0 128 Z"/>
+        </clipPath>
+    </defs>
+    <g clip-path="url(#a)">
+        <path fill="url(#b)" fill-rule="evenodd" stroke="none" d="M 64 125.394005 C 97.907 125.394005 125.394005 97.907 125.394005 64 C 125.394005 30.093 97.907 2.606 64 2.606 C 30.093 2.606 2.606 30.093 2.606 64 C 2.606 97.907 30.093 125.394005 64 125.394005 Z M 128 64 C 128 99.346 99.346 128 64 128 C 28.653997 128 0 99.346 0 64 C 0 28.653997 28.653997 0 64 0 C 99.346 0 128 28.653997 128 64 Z"/>
+        <path fill="url(#c)" fill-rule="evenodd" stroke="none" d="M 64 121.05 C 95.507996 121.05 121.05 95.507996 121.05 64 C 121.05 32.492 95.507996 6.95 64 6.95 C 32.492 6.95 6.95 32.492 6.95 64 C 6.95 95.507996 32.492 121.05 64 121.05 Z M 123.656 64 C 123.656 96.947 96.947 123.656 64 123.656 C 31.053 123.656 4.344 96.947 4.344 64 C 4.344 31.053 31.053 4.344 64 4.344 C 96.947 4.344 123.656 31.053 123.656 64 Z"/>
+        <path fill="url(#d)" fill-rule="evenodd" stroke="none" d="M 64 116.70599 C 93.109 116.70599 116.70599 93.109 116.70599 64 C 116.70599 34.891 93.109 11.294 64 11.294 C 34.891 11.294 11.294 34.891 11.294 64 C 11.294 93.109 34.891 116.70599 64 116.70599 Z M 119.312 64 C 119.312 94.548 94.548 119.312 64 119.312 C 33.452 119.312 8.688 94.548 8.688 64 C 8.688 33.452 33.452 8.688 64 8.688 C 94.548 8.688 119.312 33.452 119.312 64 Z"/>
+        <path fill="url(#e)" fill-rule="evenodd" stroke="none" d="M 64 112.36201 C 90.71 112.36201 112.36201 90.71 112.36201 64 C 112.36201 37.29 90.71 15.638 64 15.638 C 37.29 15.638 15.638 37.29 15.638 64 C 15.638 90.71 37.29 112.36201 64 112.36201 Z M 114.968 64 C 114.968 92.149 92.149 114.968 64 114.968 C 35.851 114.968 13.032 92.149 13.032 64 C 13.032 35.851 35.851 13.032 64 13.032 C 92.149 13.032 114.968 35.851 114.968 64 Z"/>
+        <path fill="url(#f)" fill-rule="evenodd" stroke="none" d="M 64 108.018005 C 88.31 108.018005 108.018005 88.311 108.018005 64 C 108.018005 39.69 88.311 19.982 64 19.982 C 39.69 19.982 19.982 39.69 19.982 64 C 19.982 88.31 39.69 108.018005 64 108.018005 Z M 110.624 64 C 110.624 89.74999 89.74999 110.624 64 110.624 C 38.25 110.624 17.376 89.74999 17.376 64 C 17.376 38.25 38.25 17.376 64 17.376 C 89.74999 17.376 110.624 38.25 110.624 64 Z"/>
+        <path fill="url(#g)" fill-rule="evenodd" stroke="none" d="M 64 103.673996 C 85.910995 103.673996 103.673996 85.910995 103.673996 64 C 103.673996 42.089 85.910995 24.326 64 24.326 C 42.089 24.326 24.326 42.089 24.326 64 C 24.326 85.912 42.089 103.673996 64 103.673996 Z M 106.281 64 C 106.281 87.35 87.351 106.281 64 106.281 C 40.65 106.281 21.72 87.351 21.72 64 C 21.72 40.65 40.65 21.72 64 21.72 C 87.35 21.72 106.281 40.65 106.281 64 Z"/>
+        <path fill="url(#h)" fill-rule="evenodd" stroke="none" d="M 64 99.329994 C 83.512 99.329994 99.329994 83.512 99.329994 64 C 99.329994 44.488 83.512 28.67 64 28.67 C 44.488 28.67 28.67 44.488 28.67 64 C 28.67 83.512 44.488 99.329994 64 99.329994 Z M 101.937 64 C 101.937 84.952 84.952 101.937 64 101.937 C 43.048004 101.937 26.063 84.952 26.063 64 C 26.063 43.048004 43.048004 26.063 64 26.063 C 84.952 26.063 101.937 43.048004 101.937 64 Z"/>
+        <path fill="url(#i)" fill-rule="evenodd" stroke="none" d="M 64 94.98601 C 81.113 94.98601 94.98601 81.113 94.98601 64 C 94.98601 46.886997 81.113 33.014 64 33.014 C 46.886997 33.014 33.014 46.886997 33.014 64 C 33.014 81.113 46.886997 94.98601 64 94.98601 Z M 97.593 64 C 97.593 82.553 82.553 97.593 64 97.593 C 45.447 97.593 30.407 82.553 30.407 64 C 30.407 45.447 45.447 30.407 64 30.407 C 82.553 30.407 97.593 45.447 97.593 64 Z"/>
+        <path fill="url(#j)" fill-rule="evenodd" stroke="none" d="M 64 90.642 C 78.714 90.642 90.642 78.714 90.642 64 C 90.642 49.286 78.714 37.358 64 37.358 C 49.286 37.358 37.358 49.286 37.358 64 C 37.358 78.714 49.286 90.642 64 90.642 Z M 93.249 64 C 93.249 80.154 80.154 93.249 64 93.249 C 47.846 93.249 34.751 80.154 34.751 64 C 34.751 47.846 47.846 34.751 64 34.751 C 80.154 34.751 93.249 47.846 93.249 64 Z"/>
+        <path fill="url(#k)" fill-rule="evenodd" stroke="none" d="M 64 86.299 C 76.315 86.299 86.299 76.315 86.299 64 C 86.299 51.685 76.315 41.701 64 41.701 C 51.685 41.701 41.701 51.685 41.701 64 C 41.701 76.315 51.685 86.299 64 86.299 Z M 88.905 64 C 88.905 77.755 77.755 88.905 64 88.905 C 50.245 88.905 39.095 77.755 39.095 64 C 39.095 50.245 50.245 39.095 64 39.095 C 77.755 39.095 88.905 50.245 88.905 64 Z"/>
+    </g>
+</svg>

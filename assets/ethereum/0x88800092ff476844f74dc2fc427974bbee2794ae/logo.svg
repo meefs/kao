@@ -1,0 +1,83 @@
+<svg width="256" height="256" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="linear-gradient" x1="0.554" y1="0.58" x2="0.052" y2="0.409" gradientUnits="userSpaceOnUse" gradientTransform="matrix(90.610596 0 0 133.48535 2936.8293 4507.977)">
+            <stop offset="0" stop-color="#6000ff"/>
+            <stop offset="0.651" stop-color="#4900c3"/>
+            <stop offset="1" stop-color="#320086"/>
+        </linearGradient>
+        <linearGradient id="linear-gradient-2" x1="0.06" y1="-0.087" x2="0.486" y2="0.653" gradientUnits="userSpaceOnUse" gradientTransform="matrix(34.666016 0 0 72.87402 4995.122 3546.885)">
+            <stop offset="0" stop-color="#6a0aff"/>
+            <stop offset="0.047" stop-color="#8c2dff"/>
+            <stop offset="0.102" stop-color="#6a0aff"/>
+            <stop offset="0.902" stop-color="#af50ff"/>
+            <stop offset="1" stop-color="#af50ff"/>
+        </linearGradient>
+        <linearGradient id="linear-gradient-3" x1="1.071" y1="0.062" x2="0.095" y2="1.049" gradientUnits="userSpaceOnUse" gradientTransform="matrix(49.430298 0 0 74.787964 287.23 1334.17)">
+            <stop offset="0" stop-color="#6a0aff"/>
+            <stop offset="0.51" stop-color="#8c2dff"/>
+            <stop offset="0.969" stop-color="#af50ff"/>
+            <stop offset="1" stop-color="#af50ff"/>
+        </linearGradient>
+        <linearGradient id="linear-gradient-4" x1="0.448" y1="0.297" x2="0.538" y2="0.8" gradientUnits="userSpaceOnUse" gradientTransform="matrix(50.925552 0 0 53.629147 195.25647 2992.571)">
+            <stop offset="0" stop-color="#6000ff"/>
+            <stop offset="1" stop-color="#3e00a5"/>
+        </linearGradient>
+        <linearGradient id="linear-gradient-5" x1="-0.529" y1="1.069" x2="1.092" y2="0.86" gradientUnits="userSpaceOnUse" gradientTransform="matrix(118.00265 0 0 234.63626 0.00892913 -0.00000137)">
+            <stop offset="0" stop-color="#ae60ff"/>
+            <stop offset="0.322" stop-color="#af50ff"/>
+            <stop offset="1" stop-color="#6000ff"/>
+        </linearGradient>
+        <linearGradient id="linear-gradient-6" x1="-0.111" y1="0.274" x2="0.872" y2="1.224" gradientUnits="userSpaceOnUse" gradientTransform="matrix(37.66992 0 0 90.43 2933.03 -0.0000052)">
+            <stop offset="0" stop-color="#6f0fff"/>
+            <stop offset="0.702" stop-color="#af50ff"/>
+            <stop offset="1" stop-color="#af50ff"/>
+        </linearGradient>
+        <linearGradient id="linear-gradient-7" x1="0.015" y1="0.007" x2="0.986" y2="0.949" gradientUnits="userSpaceOnUse" gradientTransform="matrix(38.2959 0 0 21.74707 2933.0498 2597.561)">
+            <stop offset="0" stop-color="#ae60ff"/>
+            <stop offset="0.031" stop-color="#b670fa"/>
+            <stop offset="1" stop-color="#be80f5"/>
+        </linearGradient>
+    </defs>
+    <g id="_WALLET" transform="matrix(1 0 0 1 -141 -7374)">
+        <g id="Layer_x0020_1" transform="matrix(1 0 0 1 183.99098 7374)">
+            <g id="_1439445580464" transform="matrix(1 0 0 1 0.009 0)">
+                <g transform="matrix(1 0 0 1 -2857.034 -3453.627)">
+                    <path id="Path_3343" fill="#6000ff" stroke="none" d="M 2993.7 3550.234 L 3027.294 3621.745 C 3027.624 3622.5032 3027.4604 3623.3855 3026.881 3623.975 L 2938.51 3709.36 C 2938.2217 3709.634 2937.7961 3709.7068 2937.4329 3709.544 C 2937.0703 3709.381 2936.8416 3709.0144 2936.855 3708.617 L 2936.855 3630.1677 L 2992.5417 3576.41 C 2992.9304 3576.0505 2993.142 3575.539 2993.121 3575.01 L 2993.287 3550.237 C 2993.287 3550.072 2993.618 3550.072 2993.701 3550.237 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -2857.0151 -4385.455)">
+                    <path id="Path_3344" fill="url(#linear-gradient)" fill-rule="evenodd" stroke="none" d="M 2936.83 4562 L 2936.83 4640.448 C 2936.8157 4640.846 2937.044 4641.2134 2937.4075 4641.3765 C 2937.7712 4641.5396 2938.197 4641.4663 2938.485 4641.191 L 2938.485 4641.191 L 3026.857 4555.807 C 3027.4373 4555.218 3027.6016 4554.3354 3027.272 4553.577 L 3027.272 4553.577 L 2992.772 4507.977 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -4859.365 -3450.494)">
+                    <path id="Path_3345" fill="url(#linear-gradient-2)" fill-rule="evenodd" stroke="none" d="M 4995.8 3546.89 L 4995.787 3546.89 C 4995.733 3546.887 4995.6807 3546.9072 4995.6426 3546.9453 C 4995.604 3546.9836 4995.584 3547.0361 4995.587 3547.09 L 4995.587 3547.09 L 4995.446 3571.859 C 4995.456 3572.267 4995.343 3572.669 4995.122 3573.012 L 5029.76 3619.759 C 5029.8286 3619.3384 5029.7705 3618.9067 5029.594 3618.519 L 5029.594 3618.519 L 4996 3547 C 4995.9585 3546.9285 4995.8823 3546.885 4995.8 3546.885 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -4911.665 -4456.004)">
+                    <path id="Path_3346" fill="#be80f5" fill-rule="evenodd" stroke="none" d="M 5082.057 4625.266 C 5082.125 4624.8457 5082.0674 4624.4146 5081.891 4624.027 L 5081.891 4624.027 L 5080.153 4620.312 L 5048.88 4580.491 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -189.93698 -1297.888)">
+                    <path id="Path_3347" fill="#6000ff" stroke="none" d="M 247.16301 1334.462 L 231.363 1379.218 C 231.1835 1379.7316 231.21332 1380.2952 231.446 1380.787 L 246.175 1409.772 L 205.62898 1432.729 C 205.12491 1432.9888 204.50578 1432.8069 204.222 1432.316 L 195.451 1414.066 C 195.12761 1413.4552 195.19258 1412.7114 195.61702 1412.166 L 246.75302 1334.212 C 246.83586 1334.1401 246.9557 1334.13 247.04936 1334.1871 C 247.14302 1334.2443 247.18896 1334.3555 247.16301 1334.462 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -279.424 -1297.911)">
+                    <path id="Path_3348" fill="url(#linear-gradient-3)" fill-rule="evenodd" stroke="none" d="M 336.408 1334.17 L 336.393 1334.17 C 336.33414 1334.171 336.2779 1334.1946 336.236 1334.236 L 336.236 1334.236 L 287.285 1408.858 L 287.23 1408.958 L 320.846 1379.2429 L 320.952 1378.943 L 320.952 1378.943 L 320.959 1378.922 L 336.65 1334.488 C 336.6726 1334.4127 336.65753 1334.3312 336.60956 1334.2689 C 336.56158 1334.2067 336.48654 1334.1714 336.408 1334.174 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -189.95 -2911.2397)">
+                    <path id="Path_3349" fill="url(#linear-gradient-4)" fill-rule="evenodd" stroke="none" d="M 195.626 3025.5188 C 195.20232 3026.065 195.13737 3026.808 195.46 3027.4187 L 195.46 3027.4187 L 204.23 3045.669 C 204.51384 3046.1604 205.13397 3046.342 205.638 3046.081 L 205.638 3046.081 L 246.182 3023.125 L 231.45401 2994.1414 C 231.22018 2993.6492 231.19034 2993.0847 231.371 2992.571 L 195.625 3025.52 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -0.009 -0.001)">
+                    <path id="Path_3350" fill="url(#linear-gradient-5)" fill-rule="evenodd" stroke="none" d="M 79.824 0.4 L 79.824 70.017 C 79.812485 70.4367 79.667854 70.84187 79.411 71.174 L 79.411 71.174 L 0.389 178.277 C -0.20086855 179.06662 -0.09346358 180.1753 0.637 180.837 L 0.637 180.837 L 56.077 234.34702 C 56.30373 234.58142 56.634937 234.683 56.954105 234.616 C 57.273266 234.549 57.53568 234.3228 57.649 234.017 L 57.649 234.017 L 117.88699 93.058 C 118.0531 92.57625 118.0531 92.05275 117.88699 91.57099 L 117.88699 91.57099 L 80.569 0.241 C 80.52005 0.09664974 80.38442 -0.00034428 80.232 0 L 80.232 0 C 80.009705 -0.00057179 79.828285 0.1777291 79.825 0.4 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -2853.318 0)">
+                    <path id="Path_3351" fill="url(#linear-gradient-6)" fill-rule="evenodd" stroke="none" d="M 2933.5222 0 L 2933.516 0 C 2933.2935 -0.00111578 2933.1118 0.17749833 2933.109 0.4 L 2933.134 70.013 C 2933.1296 70.20957 2933.0957 70.404396 2933.034 70.591 L 2970.7 90.43 L 2933.852 0.24 C 2933.8032 0.09830222 2933.671 0.00235164 2933.5212 0 Z M 2933.03 70.595 L 2940.223 74.724 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -2853.338 -2526.965)">
+                    <path id="Path_3352" fill="url(#linear-gradient-7)" fill-rule="evenodd" stroke="none" d="M 2971.346 2619.308 L 2971.346 2619.297 C 2971.3462 2619.0515 2971.3066 2618.8079 2971.229 2618.575 L 2971.229 2618.575 L 2970.7502 2617.395 L 2933.0498 2597.561 L 2940.269 2601.69 Z"/>
+                </g>
+                <g transform="matrix(1 0 0 1 -204.098 -2911.23)">
+                    <path id="Path_3353" fill="#be80f5" stroke="none" d="M 211.882 3022.3 L 209.8 3025.4731 L 245.51999 2992.5637 Z"/>
+                </g>
+            </g>
+        </g>
+        <g transform="matrix(1 0 0 1 141 7374)">
+            <path id="Rectangle_1607" fill="none" stroke="none" visibility="hidden" d="M 0 0 L 256 0 L 256 256 L 0 256 Z"/>
+        </g>
+    </g>
+</svg>

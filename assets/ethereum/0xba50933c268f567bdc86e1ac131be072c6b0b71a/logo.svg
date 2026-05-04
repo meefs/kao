@@ -1,0 +1,18 @@
+<svg width="1025.01" height="887.28" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+        <linearGradient id="e3027ed2-db00-4fbb-b612-9bb0ff5194c2" x1="649.82" y1="381.68" x2="101.59" y2="815.47" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#deedf8"/>
+            <stop offset="0.11" stop-color="#deedf8"/>
+            <stop offset="1" stop-color="#bcc9d0"/>
+        </linearGradient>
+        <linearGradient id="adae3cec-69e0-4226-9864-482ae86bdd9f" x1="579.18" y1="473.07" x2="882.46" y2="1222.89" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#cdcdcf"/>
+            <stop offset="1" stop-color="#939393"/>
+        </linearGradient>
+    </defs>
+    <path fill="url(#e3027ed2-db00-4fbb-b612-9bb0ff5194c2)" stroke="none" d="M 750.99 697.75 L 163.42 697.75 L 567.42 0 L 457.18 0 L 0.01 792.47 L 805.74 792.4 L 750.99 697.75 Z"/>
+    <g transform="matrix(1 0 0 1 -196.16 -250.46002)">
+        <path fill="url(#adae3cec-69e0-4226-9864-482ae86bdd9f)" stroke="none" d="M 763.58 250.46002 L 1221.17 1042.18 L 1166.17 1137.61 L 763 440.23 L 763 251.43 Z M 763 440.23 L 763 251.43 L 763.56 250.43 L 359.56 948.19 L 469.56 948.36 Z"/>
+    </g>
+    <path fill="#5b5a68" stroke="none" d="M 0 792.46 L 54.88 887.28 L 970.0101 887.28 L 649.97 332.95 L 567 189.88002 L 512.41 284.38 L 805.78 792.46 L 0 792.46 Z"/>
+</svg>

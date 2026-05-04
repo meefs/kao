@@ -173,7 +173,7 @@ fn token_row<'a>(t: KaoTheme, tk: &'a LiveToken, idx: usize) -> Element<'a, Mess
         _ => t.ab3,
     };
     let kao = kaomoji_for_index(idx);
-    let avatar = token_avatar(t, tk.logo_id, kao, 40.0, ab);
+    let avatar = token_avatar(t, tk.chain, tk.contract, kao, 40.0, ab);
     let info = column![
         text(&tk.name).size(14).color(t.text).font(bold()),
         text(format!("{} {}", tk.balance, format_symbol(&tk.symbol, tk.chain)))

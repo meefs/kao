@@ -5,9 +5,10 @@
 use alloy::primitives::Address;
 use iced::border::Radius;
 use iced::widget::text::Wrapping;
-use iced::widget::{Space, button, column, container, image, mouse_area, row, stack, text, text_input};
+use iced::widget::{Space, button, column, container, mouse_area, row, stack, svg, text, text_input};
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Padding};
 
+use crate::chain::Chain;
 use crate::net::VerificationStatus;
 use crate::ui::kao_theme::{KaoTheme, mix, with_alpha};
 use crate::ui::token_logos;
@@ -252,26 +253,26 @@ pub fn avatar<'a, M: 'a>(t: KaoTheme, kao: &'a str, size: f32, bg: Color) -> Ele
         .into()
 }
 
-/// Token-row avatar that prefers a bundled trustwallet PNG when one is
-/// shipped for `logo_id`, and otherwise renders the kaomoji bubble. The
+/// Token-row avatar that prefers a bundled SVG for `(chain, contract)`
+/// when one is shipped, and otherwise renders the kaomoji bubble. The
 /// fallback is intentional — kaomoji on a colored chip is the wallet's
 /// identity, so an unknown token shows as a kaomoji, not a sad
 /// placeholder.
 ///
-/// Trustwallet logos are square PNGs with the icon already shaped (most
-/// are circular on a transparent background), so we render them at the
-/// avatar's full size with `ContentFit::Contain` and skip the colored
-/// chip behind them.
+/// Bundled logos are SVGs already shaped as the icon (most are circular
+/// on a transparent background), so we render them at the avatar's full
+/// size with `ContentFit::Contain` and skip the colored chip behind them.
 pub fn token_avatar<'a, M: 'a>(
     t: KaoTheme,
-    logo_id: Option<&str>,
+    chain: Chain,
+    contract: Option<Address>,
     kao: &'a str,
     size: f32,
     bg: Color,
 ) -> Element<'a, M> {
-    if let Some(handle) = logo_id.and_then(token_logos::handle) {
+    if let Some(handle) = token_logos::handle(chain, contract) {
         return container(
-            image(handle)
+            svg(handle)
                 .width(Length::Fixed(size))
                 .height(Length::Fixed(size))
                 .content_fit(ContentFit::Contain),
