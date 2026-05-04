@@ -8,6 +8,7 @@ use alloy::signers::trezor::{HDPath as AlloyTrezorHDPath, TrezorSigner};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
+mod keyring;
 mod store;
 pub mod tx;
 

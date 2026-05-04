@@ -38,7 +38,6 @@ helios-ethereum = { git = "https://github.com/a16z/helios", rev = "204c998a92734
 # for the full story.
 helios-opstack = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
 iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg"] }
-keyring = "3.6.3"
 rand = "0.8"
 redb = "4.1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -51,6 +50,27 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 zeroize = { version = "1.8.2", features = ["derive"] }
+
+# OS keyring access. Used as the external trust anchor for rollback-protection
+# state that must not be roll-backable along with the wallet file. Per-target
+# features select the platform-native backend; we deliberately avoid keyutils
+# on Linux (kernel-only, doesn't survive reboot) and use Secret Service
+# instead. `crypto-rust` keeps us off OpenSSL — matches the existing
+# chacha20poly1305 / argon2 posture.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `vendored` statically links libdbus-1 into the binary so builds don't
+# require `pkg-config` + libdbus headers in the environment. Runtime
+# behaviour against the user's session bus is unchanged from a dynamic
+# link. Drop `vendored` only if we move build infra to a machine that's
+# guaranteed to have the system dev headers and we want to share libdbus
+# with the rest of the desktop.
+keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
 [dev-dependencies]
 tempfile = "3"
