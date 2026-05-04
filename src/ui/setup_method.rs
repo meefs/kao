@@ -47,6 +47,15 @@ pub struct SetupMethodScreen {
     selected: Option<SetupMethod>,
 }
 
+struct MethodCard<'a> {
+    bg: Color,
+    accent: Color,
+    number: &'a str,
+    label: &'a str,
+    sub: &'a str,
+    on_press: Message,
+}
+
 impl SetupMethodScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         let pick = |this: &mut Self, m: SetupMethod| {
@@ -92,48 +101,58 @@ impl SetupMethodScreen {
 
         let seed_card = self.method_card(
             t,
-            t.ab1,
-            t.a1,
-            "1",
-            "Import from Seed",
-            "Restore using a 12 or 24-word phrase",
-            Message::ImportFromSeed,
+            MethodCard {
+                bg: t.ab1,
+                accent: t.a1,
+                number: "1",
+                label: "Import from Seed",
+                sub: "Restore using a 12 or 24-word phrase",
+                on_press: Message::ImportFromSeed,
+            },
         );
         let key_card = self.method_card(
             t,
-            t.ab2,
-            t.a2,
-            "2",
-            "Import Private Key",
-            "Restore from a raw 32-byte hex key",
-            Message::ImportFromPrivateKey,
+            MethodCard {
+                bg: t.ab2,
+                accent: t.a2,
+                number: "2",
+                label: "Import Private Key",
+                sub: "Restore from a raw 32-byte hex key",
+                on_press: Message::ImportFromPrivateKey,
+            },
         );
         let create_card = self.method_card(
             t,
-            t.ab3,
-            t.a3,
-            "3",
-            "Create New Wallet",
-            "Generate a fresh seed phrase",
-            Message::CreateNewWallet,
+            MethodCard {
+                bg: t.ab3,
+                accent: t.a3,
+                number: "3",
+                label: "Create New Wallet",
+                sub: "Generate a fresh seed phrase",
+                on_press: Message::CreateNewWallet,
+            },
         );
         let hardware_card = self.method_card(
             t,
-            t.ab1,
-            t.a1,
-            "4",
-            "Hardware Wallet",
-            "Connect a Ledger or Trezor device",
-            Message::ConnectHardwareWallet,
+            MethodCard {
+                bg: t.ab1,
+                accent: t.a1,
+                number: "4",
+                label: "Hardware Wallet",
+                sub: "Connect a Ledger or Trezor device",
+                on_press: Message::ConnectHardwareWallet,
+            },
         );
         let watch_card = self.method_card(
             t,
-            t.ab2,
-            t.a2,
-            "5",
-            "Watch an Address",
-            "Track any wallet read-only — view-only mode",
-            Message::WatchAddress,
+            MethodCard {
+                bg: t.ab2,
+                accent: t.a2,
+                number: "5",
+                label: "Watch an Address",
+                sub: "Track any wallet read-only — view-only mode",
+                on_press: Message::WatchAddress,
+            },
         );
 
         let hint = container(
@@ -190,16 +209,15 @@ impl SetupMethodScreen {
         auth_background(t, layout.into())
     }
 
-    fn method_card<'a>(
-        &self,
-        t: KaoTheme,
-        bg: Color,
-        accent: Color,
-        number: &'a str,
-        label: &'a str,
-        sub: &'a str,
-        on_press: Message,
-    ) -> Element<'a, Message> {
+    fn method_card<'a>(&self, t: KaoTheme, card: MethodCard<'a>) -> Element<'a, Message> {
+        let MethodCard {
+            bg,
+            accent,
+            number,
+            label,
+            sub,
+            on_press,
+        } = card;
         let info = column![
             row![
                 container(text(number).size(11).color(accent).font(black()))

@@ -28,6 +28,15 @@ pub enum Outcome {
 #[derive(Debug, Default)]
 pub struct SelectHardwareWalletScreen {}
 
+struct DeviceCard<'a> {
+    bg: Color,
+    accent: Color,
+    number: &'a str,
+    label: &'a str,
+    sub: &'a str,
+    on_press: Message,
+}
+
 impl SelectHardwareWalletScreen {
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
@@ -55,21 +64,25 @@ impl SelectHardwareWalletScreen {
 
         let ledger_card = self.device_card(
             t,
-            t.ab1,
-            t.a1,
-            "1",
-            "Connect Ledger",
-            "Sign with a Ledger hardware wallet",
-            Message::ConnectLedger,
+            DeviceCard {
+                bg: t.ab1,
+                accent: t.a1,
+                number: "1",
+                label: "Connect Ledger",
+                sub: "Sign with a Ledger hardware wallet",
+                on_press: Message::ConnectLedger,
+            },
         );
         let trezor_card = self.device_card(
             t,
-            t.ab2,
-            t.a2,
-            "2",
-            "Connect Trezor",
-            "Sign with a Trezor hardware wallet",
-            Message::ConnectTrezor,
+            DeviceCard {
+                bg: t.ab2,
+                accent: t.a2,
+                number: "2",
+                label: "Connect Trezor",
+                sub: "Sign with a Trezor hardware wallet",
+                on_press: Message::ConnectTrezor,
+            },
         );
 
         let hint = container(
@@ -109,16 +122,15 @@ impl SelectHardwareWalletScreen {
         auth_background(t, auth_card(t, 460.0, content.into()))
     }
 
-    fn device_card<'a>(
-        &self,
-        t: KaoTheme,
-        bg: Color,
-        accent: Color,
-        number: &'a str,
-        label: &'a str,
-        sub: &'a str,
-        on_press: Message,
-    ) -> Element<'a, Message> {
+    fn device_card<'a>(&self, t: KaoTheme, card: DeviceCard<'a>) -> Element<'a, Message> {
+        let DeviceCard {
+            bg,
+            accent,
+            number,
+            label,
+            sub,
+            on_press,
+        } = card;
         let info = column![
             row![
                 container(text(number).size(11).color(accent).font(black()))

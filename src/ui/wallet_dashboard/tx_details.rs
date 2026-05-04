@@ -227,11 +227,10 @@ impl TxDetailsPane {
             ));
         }
 
-        if let Some(method) = &self.tx.method {
-            if !method.is_empty() {
+        if let Some(method) = &self.tx.method
+            && !method.is_empty() {
                 fields = fields.push(simple_field(t, "Method", method.clone()));
             }
-        }
 
         // ── Explorer URL block ───────────────────────────────────────────
         let url_label = text("Explorer")
@@ -431,7 +430,7 @@ fn format_iso_utc(unix_secs: u64) -> String {
 fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64;
+    let doe = z - era * 146_097;
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let y = (yoe + era * 400) as i32;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);

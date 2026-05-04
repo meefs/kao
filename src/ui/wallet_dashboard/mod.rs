@@ -466,11 +466,10 @@ impl WalletScreen {
                 // that account's data even if the user has since
                 // switched away. Only the live portfolio merge is gated
                 // on `address == self.address`.
-                if let Ok(tokens) = &result {
-                    if let Ok(mut cache) = self.portfolio_cache.lock() {
+                if let Ok(tokens) = &result
+                    && let Ok(mut cache) = self.portfolio_cache.lock() {
                         cache.insert((address, chain), tokens.clone());
                     }
-                }
                 if address != self.address {
                     return (Task::none(), None);
                 }
