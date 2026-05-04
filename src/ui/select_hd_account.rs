@@ -111,7 +111,7 @@ impl SelectHdAccountScreen {
                 let hd_index = a.hd_index;
                 let network = self.network.clone();
                 Task::perform(
-                    async move { network.balance(address).await },
+                    async move { network.balance(address, crate::chain::Chain::Mainnet).await },
                     move |balance| Message::BalanceFetched { hd_index, balance },
                 )
             })

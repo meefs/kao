@@ -1,0 +1,91 @@
+//! `Chain` is the small UI-side enum used by the RPC config screens to
+//! label per-network inputs (Mainnet / Base / Optimism). It deliberately
+//! does NOT touch `settings`, `net`, or any wallet plumbing — those layers
+//! are still mainnet-only. The L2 entries are placeholders so the UI can
+//! grow per-chain RPC fields ahead of the runtime catching up.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Chain {
+    #[default]
+    Mainnet,
+    Base,
+    Optimism,
+}
+
+impl Chain {
+    pub const ALL: [Chain; 3] = [Chain::Mainnet, Chain::Base, Chain::Optimism];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Chain::Mainnet => "Mainnet",
+            Chain::Base => "Base",
+            Chain::Optimism => "Optimism",
+        }
+    }
+
+    /// Pre-typed default execution-RPC URL shown in the Custom-RPC inputs.
+    /// The Mainnet entry mirrors `settings::DEFAULT_RPCS[0]` so the Custom
+    /// flow defaults to the same upstream as the "Use Defaults" path.
+    pub fn default_exec_url(self) -> &'static str {
+        match self {
+            Chain::Mainnet => "https://eth.llamarpc.com",
+            Chain::Base => "https://mainnet.base.org",
+            Chain::Optimism => "https://mainnet.optimism.io",
+        }
+    }
+
+    /// Pre-typed default consensus (beacon-chain LC) URL. The L2 endpoints
+    /// are operationsolarstorm.org's L2 light-client beacon proxies.
+    pub fn default_consensus_url(self) -> &'static str {
+        match self {
+            Chain::Mainnet => "https://ethereum-beacon-api.publicnode.com",
+            Chain::Base => "https://base.operationsolarstorm.org",
+            Chain::Optimism => "https://op-mainnet.operationsolarstorm.org",
+        }
+    }
+
+    /// Canonical Blockscout instance for the chain. Used by the indexer
+    /// layer to route per-chain portfolio/history queries when the user
+    /// picks Blockscout — Blockscout runs as a separate deployment per
+    /// chain, so we can't reuse one base URL across all of them.
+    pub fn default_blockscout_url(self) -> &'static str {
+        match self {
+            Chain::Mainnet => "https://eth.blockscout.com",
+            Chain::Base => "https://base.blockscout.com",
+            Chain::Optimism => "https://optimism.blockscout.com",
+        }
+    }
+}
+
+impl std::fmt::Display for Chain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Tiny owned per-chain map so screens can hold one value of `T` per chain
+/// without dragging in a hashmap dependency. Order matches `Chain::ALL`.
+#[derive(Debug, Default, Clone)]
+pub struct PerChain<T> {
+    pub mainnet: T,
+    pub base: T,
+    pub optimism: T,
+}
+
+impl<T> PerChain<T> {
+    pub fn get(&self, chain: Chain) -> &T {
+        match chain {
+            Chain::Mainnet => &self.mainnet,
+            Chain::Base => &self.base,
+            Chain::Optimism => &self.optimism,
+        }
+    }
+
+    pub fn set(&mut self, chain: Chain, value: T) {
+        match chain {
+            Chain::Mainnet => self.mainnet = value,
+            Chain::Base => self.base = value,
+            Chain::Optimism => self.optimism = value,
+        }
+    }
+}

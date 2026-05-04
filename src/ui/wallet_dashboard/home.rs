@@ -4,6 +4,7 @@ use iced::border::Radius;
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
+use crate::chain::Chain;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::{KaoTheme, mix, with_alpha};
 use crate::ui::kao_widgets::{
@@ -175,7 +176,7 @@ fn token_row<'a>(t: KaoTheme, tk: &'a LiveToken, idx: usize) -> Element<'a, Mess
     let avatar = token_avatar(t, tk.logo_id, kao, 40.0, ab);
     let info = column![
         text(&tk.name).size(14).color(t.text).font(bold()),
-        text(format!("{} {}", tk.balance, tk.symbol))
+        text(format!("{} {}", tk.balance, format_symbol(&tk.symbol, tk.chain)))
             .size(11)
             .color(t.sub)
             .font(mono()),
@@ -226,4 +227,32 @@ pub(super) fn format_usd(n: f64) -> String {
     s.push('.');
     s.push_str(&format!("{:02}", frac));
     s
+}
+
+/// Render a token symbol with its chain in parens when the token lives
+/// on an L2. Mainnet entries stay bare ("USDC"); L2 entries get a
+/// suffix ("USDC (Base)", "ETH (Optimism)") so a portfolio that spans
+/// chains is unambiguous at a glance without a separate chain column.
+fn format_symbol(symbol: &str, chain: Chain) -> String {
+    match chain {
+        Chain::Mainnet => symbol.to_string(),
+        Chain::Base | Chain::Optimism => format!("{symbol} ({})", chain.label()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mainnet_symbol_has_no_suffix() {
+        assert_eq!(format_symbol("USDC", Chain::Mainnet), "USDC");
+        assert_eq!(format_symbol("ETH", Chain::Mainnet), "ETH");
+    }
+
+    #[test]
+    fn l2_symbol_carries_chain_in_parens() {
+        assert_eq!(format_symbol("USDC", Chain::Base), "USDC (Base)");
+        assert_eq!(format_symbol("ETH", Chain::Optimism), "ETH (Optimism)");
+    }
 }

@@ -22,6 +22,7 @@ use std::time::Duration;
 use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
 
+use crate::chain::Chain;
 use crate::portfolio::LiveToken;
 use crate::settings::{self, IndexerProvider};
 use crate::ui::token_logos::{self, NATIVE_ETH};
@@ -153,31 +154,69 @@ pub(crate) fn http_client() -> &'static reqwest::Client {
     })
 }
 
-/// Build an indexer matching the user's settings. Falls back to Blockscout
-/// (with whatever Blockscout overrides the user has set) when the chosen
-/// provider has no API key configured — a missing key is a configuration
-/// gap, not an error worth bubbling to the UI. `IndexerProvider::None`
-/// returns the `NoopIndexer` so callers can stay trait-object-shaped without
-/// branching on `Option<Arc<dyn Indexer>>`.
+/// Build an indexer for `chain` matching the user's settings.
+///
+/// Mainnet keeps the full provider matrix (Blockscout / Etherscan /
+/// Alchemy / None). For L2 chains we currently only wire up Alchemy —
+/// it natively supports per-chain scoping via its `networks` slug.
+/// Blockscout and Etherscan are mainnet-only on the public side; rather
+/// than route L2 fetches at a mainnet-shaped indexer we return
+/// `NoopIndexer`, which the dashboard treats as "no indexer answer; use
+/// the on-chain walk fallback". The on-chain walk on L2 surfaces native
+/// ETH (the curated L2 token list is empty); per-chain Blockscout /
+/// Etherscan support is a follow-up.
+///
+/// Falls back to `NoopIndexer` whenever the chosen provider isn't viable
+/// for the requested chain (missing API key, mainnet-only provider on
+/// L2). The previous mainnet-only behavior is preserved for
+/// `Chain::Mainnet` callers.
 #[allow(dead_code)]
-pub fn build_indexer() -> Arc<dyn Indexer> {
-    let blockscout = || {
-        Arc::new(BlockscoutClient::new(
-            settings::blockscout_base_url(),
-            settings::blockscout_api_key(),
-        )) as Arc<dyn Indexer>
+pub fn build_indexer_for(chain: Chain) -> Arc<dyn Indexer> {
+    // Route Blockscout per chain. Mainnet honors any
+    // `settings::blockscout_base_url` override (so a user can point at
+    // a self-hosted instance or a non-canonical mirror); L2 chains use
+    // the canonical Blockscout deployment URL — Blockscout runs as
+    // separate instances per chain and the user's mainnet API key
+    // wouldn't auth against `base.blockscout.com` anyway, so we drop
+    // the key on L2.
+    let blockscout = |c: Chain| -> Arc<dyn Indexer> {
+        match c {
+            Chain::Mainnet => Arc::new(BlockscoutClient::new(
+                settings::blockscout_base_url(),
+                settings::blockscout_api_key(),
+            )),
+            Chain::Base | Chain::Optimism => Arc::new(BlockscoutClient::new(
+                Some(c.default_blockscout_url().to_string()),
+                None,
+            )),
+        }
     };
-    match settings::indexer_provider() {
-        IndexerProvider::Blockscout => blockscout(),
-        IndexerProvider::Etherscan => match settings::etherscan_api_key() {
+    let noop = || -> Arc<dyn Indexer> { Arc::new(NoopIndexer) };
+    let provider = settings::indexer_provider();
+    match (chain, provider) {
+        (_, IndexerProvider::Blockscout) => blockscout(chain),
+        (Chain::Mainnet, IndexerProvider::Etherscan) => match settings::etherscan_api_key() {
             Some(key) => Arc::new(EtherscanClient::new(key)),
-            None => blockscout(),
+            None => blockscout(Chain::Mainnet),
         },
-        IndexerProvider::Alchemy => match settings::alchemy_api_key() {
-            Some(key) => Arc::new(AlchemyClient::new(key)),
-            None => blockscout(),
+        (_, IndexerProvider::Alchemy) => match settings::alchemy_api_key() {
+            Some(key) => Arc::new(AlchemyClient::new(key, chain)),
+            // Per-chain key fallback differs by chain: mainnet drops
+            // to Blockscout (matching pre-L2 behavior), L2 drops to
+            // Blockscout's canonical instance for that chain so the
+            // user still gets per-chain portfolio data.
+            None => blockscout(chain),
         },
-        IndexerProvider::None => Arc::new(NoopIndexer),
+        (_, IndexerProvider::Drpc) => match settings::drpc_api_key() {
+            Some(key) => Arc::new(DrpcClient::new(key, chain)),
+            None => blockscout(chain),
+        },
+        (_, IndexerProvider::None) => noop(),
+        // L2 + Etherscan: Etherscan v2 supports multi-chain via
+        // `chainid` but our `EtherscanClient` doesn't carry that yet.
+        // Fall through to the canonical Blockscout instance so L2
+        // portfolio still resolves; per-chain Etherscan is a follow-up.
+        (Chain::Base | Chain::Optimism, IndexerProvider::Etherscan) => blockscout(chain),
     }
 }
 
@@ -232,7 +271,7 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
 /// `LiveToken` so the column sort behaves the same way as the on-chain
 /// portfolio path. Logos resolve via the bundled `token_logos::logo_id_for`
 /// table; tokens not in the table render the kaomoji fallback avatar.
-pub fn into_live_tokens(tokens: Vec<IndexedToken>) -> Vec<LiveToken> {
+pub fn into_live_tokens(chain: Chain, tokens: Vec<IndexedToken>) -> Vec<LiveToken> {
     tokens
         .into_iter()
         .map(|t| {
@@ -251,6 +290,7 @@ pub fn into_live_tokens(tokens: Vec<IndexedToken>) -> Vec<LiveToken> {
                 usd_price: t.usd_price.unwrap_or(0.0),
                 usd_value: t.usd_value.unwrap_or(0.0),
                 logo_id,
+                chain,
             }
         })
         .collect()
@@ -351,12 +391,15 @@ mod tests {
                 logo_url: None,
             },
         ];
-        let live = into_live_tokens(tokens);
+        let live = into_live_tokens(Chain::Mainnet, tokens);
         assert_eq!(live[0].logo_id, Some(NATIVE_ETH));
         assert_eq!(live[1].logo_id, Some("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"));
         assert_eq!(live[2].logo_id, None, "unknown contract has no bundled logo");
         assert_eq!(live[1].usd_price, 0.0, "missing indexer price collapses to 0");
         assert_eq!(live[1].usd_value, 0.0);
+        for tk in &live {
+            assert_eq!(tk.chain, Chain::Mainnet);
+        }
     }
 
     #[test]

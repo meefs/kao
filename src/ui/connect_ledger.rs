@@ -269,7 +269,7 @@ impl ConnectLedgerScreen {
                 let address = r.address;
                 let network = self.network.clone();
                 Task::perform(
-                    async move { network.balance(address).await },
+                    async move { network.balance(address, crate::chain::Chain::Mainnet).await },
                     move |balance| Message::BalanceFetched { hd_index, balance },
                 )
             })

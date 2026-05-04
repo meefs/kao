@@ -1,33 +1,33 @@
-//! Networks settings sub-screen — exec RPC list, consensus RPC list,
-//! checkpoint override. Owned by the dashboard's Settings nav slot, not the
-//! modal stack.
+//! Networks settings sub-screen — per-chain execution RPC, per-chain
+//! consensus RPC, and the checkpoint override. Owned by the dashboard's
+//! Settings nav slot, not the modal stack.
 //!
 //! Save invalidates the shared `BalanceFetcher` so the next balance/portfolio
 //! fetch rebuilds Helios against the new endpoints.
+//!
+//! The L2 entries (Base / Optimism) and per-chain consensus URLs are
+//! UI-only for now: settings + `net.rs` are still mainnet-only, so on save
+//! we only persist the Mainnet exec/consensus values. The L2 fields stay
+//! in screen state across the session and are dropped on close.
 
 use std::str::FromStr;
 use std::sync::Arc;
 
 use alloy::primitives::B256;
-use iced::widget::{Space, button, column, container, mouse_area, row, text, text_input};
+use iced::widget::{Space, column, container, mouse_area, row, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
 use crate::net::BalanceFetcher;
 use crate::settings;
+use crate::chain::{Chain, PerChain};
 use crate::ui::kao_theme::KaoTheme;
-use crate::ui::kao_widgets::{
-    black, bold, primary_button, secondary_button, section, text_input_style,
-};
+use crate::ui::kao_widgets::{black, bold, primary_button, section, text_input_style};
 
 #[derive(Debug, Clone)]
 pub enum Message {
     Back,
-    RpcChanged(usize, String),
-    RpcAdd,
-    RpcRemove(usize),
-    ConsensusChanged(usize, String),
-    ConsensusAdd,
-    ConsensusRemove(usize),
+    ExecChanged(Chain, String),
+    ConsensusChanged(Chain, String),
     CheckpointChanged(String),
     Save,
     Saved,
@@ -42,8 +42,8 @@ pub enum Outcome {
 
 #[derive(Debug, Clone, Default)]
 struct Draft {
-    rpcs: Vec<String>,
-    consensus_rpcs: Vec<String>,
+    exec: PerChain<String>,
+    consensus: PerChain<String>,
     /// Hex of the user's pasted checkpoint override, blank to use auto.
     checkpoint_override: String,
 }
@@ -57,9 +57,35 @@ pub struct NetworksPane {
 
 impl NetworksPane {
     pub fn new(network: Arc<dyn BalanceFetcher>) -> Self {
+        // Settings is mainnet-only today, so seed Mainnet's slots from the
+        // persisted values (falling back to chain defaults if blank) and
+        // pre-fill the L2 slots with their public defaults so the form
+        // looks complete the moment the pane opens.
+        let saved_exec = settings::rpcs(Chain::Mainnet)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let saved_consensus = settings::consensus_rpcs(Chain::Mainnet)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let mut exec = PerChain::<String>::default();
+        let mut consensus = PerChain::<String>::default();
+        for chain in Chain::ALL {
+            let exec_seed = match chain {
+                Chain::Mainnet if !saved_exec.is_empty() => saved_exec.clone(),
+                _ => chain.default_exec_url().to_string(),
+            };
+            let consensus_seed = match chain {
+                Chain::Mainnet if !saved_consensus.is_empty() => saved_consensus.clone(),
+                _ => chain.default_consensus_url().to_string(),
+            };
+            exec.set(chain, exec_seed);
+            consensus.set(chain, consensus_seed);
+        }
         let draft = Draft {
-            rpcs: settings::rpcs(),
-            consensus_rpcs: settings::consensus_rpcs(),
+            exec,
+            consensus,
             checkpoint_override: settings::checkpoint_override()
                 .map(|b| format!("0x{}", alloy::hex::encode(b.as_slice())))
                 .unwrap_or_default(),
@@ -74,36 +100,12 @@ impl NetworksPane {
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             Message::Back => (Task::none(), Some(Outcome::Closed)),
-            Message::RpcChanged(i, s) => {
-                if let Some(slot) = self.draft.rpcs.get_mut(i) {
-                    *slot = s;
-                }
+            Message::ExecChanged(chain, s) => {
+                self.draft.exec.set(chain, s);
                 (Task::none(), None)
             }
-            Message::RpcAdd => {
-                self.draft.rpcs.push(String::new());
-                (Task::none(), None)
-            }
-            Message::RpcRemove(i) => {
-                if i < self.draft.rpcs.len() {
-                    self.draft.rpcs.remove(i);
-                }
-                (Task::none(), None)
-            }
-            Message::ConsensusChanged(i, s) => {
-                if let Some(slot) = self.draft.consensus_rpcs.get_mut(i) {
-                    *slot = s;
-                }
-                (Task::none(), None)
-            }
-            Message::ConsensusAdd => {
-                self.draft.consensus_rpcs.push(String::new());
-                (Task::none(), None)
-            }
-            Message::ConsensusRemove(i) => {
-                if i < self.draft.consensus_rpcs.len() {
-                    self.draft.consensus_rpcs.remove(i);
-                }
+            Message::ConsensusChanged(chain, s) => {
+                self.draft.consensus.set(chain, s);
                 (Task::none(), None)
             }
             Message::CheckpointChanged(s) => {
@@ -111,23 +113,11 @@ impl NetworksPane {
                 (Task::none(), None)
             }
             Message::Save => {
-                let cleaned_exec: Vec<String> = self
-                    .draft
-                    .rpcs
-                    .iter()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                let cleaned_consensus: Vec<String> = self
-                    .draft
-                    .consensus_rpcs
-                    .iter()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                let exec = self.draft.exec.get(Chain::Mainnet).trim().to_string();
+                let consensus = self.draft.consensus.get(Chain::Mainnet).trim().to_string();
                 let checkpoint_override = parse_checkpoint(self.draft.checkpoint_override.trim());
-                settings::set_rpcs(cleaned_exec);
-                settings::set_consensus_rpcs(cleaned_consensus);
+                settings::set_rpcs(Chain::Mainnet, vec![exec]);
+                settings::set_consensus_rpcs(Chain::Mainnet, vec![consensus]);
                 settings::set_checkpoint_override(checkpoint_override);
                 self.saving = true;
                 let network = self.network.clone();
@@ -166,47 +156,40 @@ impl NetworksPane {
         .align_y(Alignment::Center)
         .width(Length::Fill);
 
-        let mut rpc_rows = column![].spacing(6);
-        for (i, url) in self.draft.rpcs.iter().enumerate() {
-            let input = text_input("https://…", url)
-                .on_input(move |s| Message::RpcChanged(i, s))
+        // Per-chain execution RPC inputs.
+        let mut exec_rows = column![].spacing(6).width(Length::Fill);
+        for chain in Chain::ALL {
+            let value = self.draft.exec.get(chain);
+            let input = text_input("https://…", value)
+                .on_input(move |s| Message::ExecChanged(chain, s))
                 .padding(Padding::from([6, 10]))
                 .style(move |_theme, status| text_input_style(t, status));
-            let remove = button(text("−").size(14).color(t.text).font(bold()))
-                .padding(Padding::from([2, 10]))
-                .on_press(Message::RpcRemove(i));
-            rpc_rows = rpc_rows
-                .push(row![input, Space::new().width(8), remove].align_y(Alignment::Center));
+            exec_rows = exec_rows.push(labeled_row(t, chain.label(), input.into()));
         }
-        let add_btn = secondary_button(t, "＋ Add RPC").on_press(Message::RpcAdd);
         let exec_section = section(
             t,
             "Execution RPCs",
             "(◕‿◕✿)",
-            "Helios picks one at random per session and verifies its responses.",
-            column![rpc_rows, Space::new().height(8), add_btn].into(),
+            "One endpoint per chain. Helios verifies every Mainnet response against the consensus layer; L2 entries are stored locally for now.",
+            exec_rows.into(),
         );
 
-        let mut consensus_rows = column![].spacing(6);
-        for (i, url) in self.draft.consensus_rpcs.iter().enumerate() {
-            let input = text_input("https://…", url)
-                .on_input(move |s| Message::ConsensusChanged(i, s))
+        // Per-chain consensus RPC inputs — same layout as execution.
+        let mut consensus_rows = column![].spacing(6).width(Length::Fill);
+        for chain in Chain::ALL {
+            let value = self.draft.consensus.get(chain);
+            let input = text_input("https://…", value)
+                .on_input(move |s| Message::ConsensusChanged(chain, s))
                 .padding(Padding::from([6, 10]))
                 .style(move |_theme, status| text_input_style(t, status));
-            let remove = button(text("−").size(14).color(t.text).font(bold()))
-                .padding(Padding::from([2, 10]))
-                .on_press(Message::ConsensusRemove(i));
-            consensus_rows = consensus_rows
-                .push(row![input, Space::new().width(8), remove].align_y(Alignment::Center));
+            consensus_rows = consensus_rows.push(labeled_row(t, chain.label(), input.into()));
         }
-        let add_consensus_btn =
-            secondary_button(t, "＋ Add Consensus RPC").on_press(Message::ConsensusAdd);
         let consensus_section = section(
             t,
             "Consensus RPCs",
             "( ´ ▽ ` )ﾉ",
-            "Beacon-chain LC API endpoints. Tried in shuffled order; first one that bootstraps wins.",
-            column![consensus_rows, Space::new().height(8), add_consensus_btn].into(),
+            "Beacon-chain LC API endpoints Helios bootstraps from. Mainnet is required; the L2 rows are kept locally until per-chain plumbing lands.",
+            consensus_rows.into(),
         );
 
         let placeholder = format!(
@@ -266,11 +249,30 @@ fn parse_checkpoint(s: &str) -> Option<B256> {
     B256::from_str(s).ok()
 }
 
+/// Fixed-width chain label (e.g. "Mainnet") next to a URL input. Used to
+/// stack the per-chain rows so the inputs line up under one another.
+fn labeled_row<'a>(
+    t: KaoTheme,
+    label: &'a str,
+    input: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let label_box = container(text(label).size(12).color(t.text).font(bold()))
+        .width(Length::Fixed(80.0));
+    row![label_box, input]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .width(Length::Fill)
+        .into()
+}
+
 fn draft_valid(draft: &Draft) -> bool {
-    if !list_has_at_least_one_valid_url(&draft.rpcs) {
+    // Mainnet is the only chain whose values get persisted today, so it's
+    // the only one Save needs to enforce. L2 fields are session-only and
+    // we don't block save on them — empty is fine, garbled is fine.
+    if !is_https_url(draft.exec.get(Chain::Mainnet)) {
         return false;
     }
-    if !list_has_at_least_one_valid_url(&draft.consensus_rpcs) {
+    if !is_https_url(draft.consensus.get(Chain::Mainnet)) {
         return false;
     }
     let cp = draft.checkpoint_override.trim();
@@ -280,26 +282,16 @@ fn draft_valid(draft: &Draft) -> bool {
     true
 }
 
-/// True iff `list` contains at least one parseable HTTPS URL and no entry
-/// with non-empty content that fails to parse or uses a non-HTTPS scheme.
-/// Empty entries are tolerated so the user can have a blank row mid-edit;
-/// they're stripped on save.
+/// True iff `s` parses as an HTTPS URL.
 ///
 /// HTTPS is required: a plain-HTTP consensus endpoint lets a network
 /// attacker tamper with the light-client bootstrap before any consensus
 /// signatures get verified, and a plain-HTTP exec endpoint exposes
 /// `eth_getProof` responses to the same MITM.
-fn list_has_at_least_one_valid_url(list: &[String]) -> bool {
-    let mut any_ok = false;
-    for s in list {
-        let s = s.trim();
-        if s.is_empty() {
-            continue;
-        }
-        match url::Url::parse(s) {
-            Ok(url) if url.scheme() == "https" => any_ok = true,
-            _ => return false,
-        }
+fn is_https_url(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
     }
-    any_ok
+    matches!(url::Url::parse(s), Ok(url) if url.scheme() == "https")
 }

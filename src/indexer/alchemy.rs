@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
 
+use crate::chain::Chain;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
@@ -22,21 +23,36 @@ use super::{
     parse_iso8601, redact_url_in_err,
 };
 
-const NETWORK: &str = "eth-mainnet";
 const PORTFOLIO_BASE: &str = "https://api.g.alchemy.com/data/v1";
+
+/// Alchemy's network slug for `chain`. The slug feeds both the RPC
+/// hostname (`https://{slug}.g.alchemy.com/v2/{key}`) and the Portfolio
+/// API's `"networks": [...]` array.
+fn alchemy_network(chain: Chain) -> &'static str {
+    match chain {
+        Chain::Mainnet => "eth-mainnet",
+        Chain::Base => "base-mainnet",
+        Chain::Optimism => "opt-mainnet",
+    }
+}
 
 #[derive(Debug)]
 pub struct AlchemyClient {
     api_key: String,
+    chain: Chain,
 }
 
 impl AlchemyClient {
-    pub fn new(api_key: String) -> Self {
-        Self { api_key }
+    pub fn new(api_key: String, chain: Chain) -> Self {
+        Self { api_key, chain }
     }
 
     fn rpc_url(&self) -> String {
-        format!("https://{NETWORK}.g.alchemy.com/v2/{}", self.api_key)
+        format!(
+            "https://{}.g.alchemy.com/v2/{}",
+            alchemy_network(self.chain),
+            self.api_key,
+        )
     }
 
     fn portfolio_tokens_url(&self) -> String {
@@ -272,7 +288,7 @@ impl Indexer for AlchemyClient {
         let body = json!({
             "addresses": [{
                 "address": format!("{addr:#x}"),
-                "networks": [NETWORK],
+                "networks": [alchemy_network(self.chain)],
             }],
             "withMetadata": true,
             "withPrices": true,

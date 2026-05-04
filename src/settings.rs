@@ -8,16 +8,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy::primitives::B256;
 use serde::{Deserialize, Serialize};
 
+use crate::chain::{Chain, PerChain};
 use crate::ui::kao_theme::ThemeKind;
 
-/// Default execution RPC. LlamaRPC's public mainnet endpoint serves
-/// `eth_getProof`, which Helios needs to verify state (plain
+/// Default execution RPC for Mainnet. LlamaRPC's public mainnet endpoint
+/// serves `eth_getProof`, which Helios needs to verify state (plain
 /// `eth_getBalance` isn't enough). Users can swap to their own provider via
 /// the Custom RPC option in setup.
 const DEFAULT_RPCS: &[&str] = &["https://eth.llamarpc.com"];
-/// Default beacon-chain LC API endpoint. PublicNode's beacon API serves the
-/// `/eth/v1/beacon/light_client/{bootstrap,finality_update}` calls Helios
-/// needs to verify consensus.
+/// Default beacon-chain LC API endpoint for Mainnet. PublicNode's beacon API
+/// serves the `/eth/v1/beacon/light_client/{bootstrap,finality_update}`
+/// calls Helios needs to verify consensus.
 ///
 /// HTTPS only. Plain-HTTP endpoints would let a network attacker tamper with
 /// the light-client bootstrap before any consensus signatures get verified.
@@ -78,8 +79,17 @@ impl IndexerProvider {
 #[derive(Debug, Clone)]
 struct State {
     theme: ThemeKind,
-    rpcs: Vec<String>,
-    consensus_rpcs: Vec<String>,
+    /// Per-chain execution RPC lists. Mainnet seeds from `DEFAULT_RPCS`; L2
+    /// slots start empty so a user who never opens the Networks pane stays
+    /// mainnet-only and we don't silently route their requests through any
+    /// third-party L2 endpoint they didn't pick.
+    rpcs: PerChain<Vec<String>>,
+    /// Per-chain consensus (beacon-chain LC) RPC lists. Same defaulting rule
+    /// as `rpcs` — Mainnet seeded, L2 empty until the user opts in.
+    consensus_rpcs: PerChain<Vec<String>>,
+    /// Mainnet-only checkpoint override pasted by the user. OP-Stack chains
+    /// don't carry their own checkpoint — Helios bootstraps L2 off the L1
+    /// SystemConfig contract via the mainnet exec RPC.
     checkpoint_override: Option<B256>,
     /// Resolved checkpoint used when the user hasn't pasted an override.
     /// Starts as the built-in constant; the network layer may swap in a
@@ -102,13 +112,23 @@ fn ensure() -> &'static Mutex<State> {
 }
 
 fn default_state() -> State {
-    State {
-        theme: ThemeKind::Mint,
-        rpcs: DEFAULT_RPCS.iter().map(|s| s.to_string()).collect(),
-        consensus_rpcs: DEFAULT_CONSENSUS_RPCS
+    let mut rpcs = PerChain::<Vec<String>>::default();
+    rpcs.set(
+        Chain::Mainnet,
+        DEFAULT_RPCS.iter().map(|s| s.to_string()).collect(),
+    );
+    let mut consensus_rpcs = PerChain::<Vec<String>>::default();
+    consensus_rpcs.set(
+        Chain::Mainnet,
+        DEFAULT_CONSENSUS_RPCS
             .iter()
             .map(|s| s.to_string())
             .collect(),
+    );
+    State {
+        theme: ThemeKind::Mint,
+        rpcs,
+        consensus_rpcs,
         checkpoint_override: None,
         auto_checkpoint: B256::from_str(BUILTIN_CHECKPOINT)
             .expect("built-in checkpoint constant must be valid hex"),
@@ -142,6 +162,11 @@ pub fn load() {
 /// file falls back to defaults per-key rather than failing the whole load.
 /// `auto_checkpoint` is intentionally absent — it's rederived on each app
 /// start from the network and never persisted.
+///
+/// Per-chain RPC keys: `rpcs` / `consensus_rpcs` carry Mainnet (kept under
+/// these names so an upgrade from the pre-L2 schema is a no-op). L2 lists
+/// live in dedicated keys; we serialize each L2 list only when non-empty so
+/// a stock config doesn't litter the file with empty arrays.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct OnDisk {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,7 +174,15 @@ struct OnDisk {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rpcs: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    rpcs_base: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rpcs_optimism: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     consensus_rpcs: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consensus_rpcs_base: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    consensus_rpcs_optimism: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     checkpoint_override: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -175,6 +208,17 @@ fn is_https_url(s: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Apply a parsed RPC list to one chain. Empty lists and lists where every
+/// entry fails the HTTPS check leave the chain at its current value (so a
+/// hand-edited `rpcs = []` doesn't collapse the mainnet default).
+fn apply_rpc_list(target: &mut PerChain<Vec<String>>, chain: Chain, list: Option<Vec<String>>) {
+    let Some(list) = list else { return };
+    let filtered: Vec<String> = list.into_iter().filter(|s| is_https_url(s)).collect();
+    if !filtered.is_empty() {
+        target.set(chain, filtered);
+    }
+}
+
 /// Pure parser: produce a `State` from settings-file TOML. A malformed TOML
 /// document, missing keys, and unparseable values all silently fall back to
 /// defaults so a hand-edited config can never brick startup.
@@ -188,18 +232,24 @@ fn parse(text: &str) -> State {
     {
         state.theme = k;
     }
-    if let Some(rpcs) = on_disk.rpcs {
-        let filtered: Vec<String> = rpcs.into_iter().filter(|s| is_https_url(s)).collect();
-        if !filtered.is_empty() {
-            state.rpcs = filtered;
-        }
-    }
-    if let Some(cls) = on_disk.consensus_rpcs {
-        let filtered: Vec<String> = cls.into_iter().filter(|s| is_https_url(s)).collect();
-        if !filtered.is_empty() {
-            state.consensus_rpcs = filtered;
-        }
-    }
+    apply_rpc_list(&mut state.rpcs, Chain::Mainnet, on_disk.rpcs);
+    apply_rpc_list(&mut state.rpcs, Chain::Base, on_disk.rpcs_base);
+    apply_rpc_list(&mut state.rpcs, Chain::Optimism, on_disk.rpcs_optimism);
+    apply_rpc_list(
+        &mut state.consensus_rpcs,
+        Chain::Mainnet,
+        on_disk.consensus_rpcs,
+    );
+    apply_rpc_list(
+        &mut state.consensus_rpcs,
+        Chain::Base,
+        on_disk.consensus_rpcs_base,
+    );
+    apply_rpc_list(
+        &mut state.consensus_rpcs,
+        Chain::Optimism,
+        on_disk.consensus_rpcs_optimism,
+    );
     if let Some(s) = on_disk.checkpoint_override.as_deref() {
         state.checkpoint_override = if s.is_empty() {
             None
@@ -222,14 +272,29 @@ fn parse(text: &str) -> State {
     state
 }
 
+/// L2 lists go through `Some(...)` only when non-empty so a stock config
+/// (which leaves L2 unconfigured) doesn't write `rpcs_base = []` lines that
+/// hint at functionality the user hasn't opted into.
+fn nonempty(v: &[String]) -> Option<Vec<String>> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_vec())
+    }
+}
+
 /// Pure serializer: emit TOML for a `State`. Mirrors `parse` — `auto_checkpoint`
 /// is intentionally omitted, and `checkpoint_override` is dropped from the
 /// output when unset rather than being written as an empty string.
 fn serialize(state: &State) -> String {
     let on_disk = OnDisk {
         theme: Some(state.theme.key().to_string()),
-        rpcs: Some(state.rpcs.clone()),
-        consensus_rpcs: Some(state.consensus_rpcs.clone()),
+        rpcs: Some(state.rpcs.get(Chain::Mainnet).clone()),
+        rpcs_base: nonempty(state.rpcs.get(Chain::Base)),
+        rpcs_optimism: nonempty(state.rpcs.get(Chain::Optimism)),
+        consensus_rpcs: Some(state.consensus_rpcs.get(Chain::Mainnet).clone()),
+        consensus_rpcs_base: nonempty(state.consensus_rpcs.get(Chain::Base)),
+        consensus_rpcs_optimism: nonempty(state.consensus_rpcs.get(Chain::Optimism)),
         checkpoint_override: state
             .checkpoint_override
             .map(|b| format!("0x{}", alloy::hex::encode(b.as_slice()))),
@@ -252,44 +317,51 @@ pub fn set_theme(kind: ThemeKind) {
     write_all();
 }
 
-/// The built-in execution-RPC list. Exposed so the setup UI can show the
-/// user exactly which endpoints "use defaults" enrolls them in.
+/// The built-in execution-RPC list for Mainnet. Exposed so the setup UI can
+/// show the user exactly which endpoints "use defaults" enrolls them in.
 pub fn default_rpcs() -> &'static [&'static str] {
     DEFAULT_RPCS
 }
 
-/// The built-in consensus (beacon-chain LC) RPC list. Mirrors `default_rpcs`
-/// so the setup flow can reset both lists in one go.
+/// The built-in consensus (beacon-chain LC) RPC list for Mainnet. Mirrors
+/// `default_rpcs` so the setup flow can reset both lists in one go.
 pub fn default_consensus_rpcs() -> &'static [&'static str] {
     DEFAULT_CONSENSUS_RPCS
 }
 
-pub fn rpcs() -> Vec<String> {
+pub fn rpcs(chain: Chain) -> Vec<String> {
     ensure()
         .lock()
         .expect("settings mutex poisoned")
         .rpcs
+        .get(chain)
         .clone()
 }
 
-pub fn set_rpcs(list: Vec<String>) {
-    ensure().lock().expect("settings mutex poisoned").rpcs = list;
+pub fn set_rpcs(chain: Chain, list: Vec<String>) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .rpcs
+        .set(chain, list);
     write_all();
 }
 
-pub fn consensus_rpcs() -> Vec<String> {
+pub fn consensus_rpcs(chain: Chain) -> Vec<String> {
     ensure()
         .lock()
         .expect("settings mutex poisoned")
         .consensus_rpcs
+        .get(chain)
         .clone()
 }
 
-pub fn set_consensus_rpcs(list: Vec<String>) {
+pub fn set_consensus_rpcs(chain: Chain, list: Vec<String>) {
     ensure()
         .lock()
         .expect("settings mutex poisoned")
-        .consensus_rpcs = list;
+        .consensus_rpcs
+        .set(chain, list);
     write_all();
 }
 
@@ -465,8 +537,11 @@ mod tests {
     fn parse_empty_returns_defaults() {
         let s = parse("");
         let d = default_state();
-        assert_eq!(s.rpcs, d.rpcs);
-        assert_eq!(s.consensus_rpcs, d.consensus_rpcs);
+        assert_eq!(s.rpcs.get(Chain::Mainnet), d.rpcs.get(Chain::Mainnet));
+        assert_eq!(
+            s.consensus_rpcs.get(Chain::Mainnet),
+            d.consensus_rpcs.get(Chain::Mainnet)
+        );
         assert_eq!(s.checkpoint_override, d.checkpoint_override);
         assert_eq!(s.theme, d.theme);
     }
@@ -480,21 +555,30 @@ mod tests {
             # indented comment\n\
             consensus_rpcs = [\"https://cl.example/\"]\n",
         );
-        assert_eq!(s.consensus_rpcs, vec!["https://cl.example/".to_string()]);
+        assert_eq!(
+            s.consensus_rpcs.get(Chain::Mainnet),
+            &vec!["https://cl.example/".to_string()]
+        );
     }
 
     #[test]
     fn parse_ignores_unknown_keys() {
         let s = parse("totally_unknown = \"foo\"\nconsensus_rpcs = [\"https://cl.example/\"]\n");
-        assert_eq!(s.consensus_rpcs, vec!["https://cl.example/".to_string()]);
+        assert_eq!(
+            s.consensus_rpcs.get(Chain::Mainnet),
+            &vec!["https://cl.example/".to_string()]
+        );
     }
 
     #[test]
     fn parse_malformed_toml_returns_defaults() {
         let s = parse("this is = = not valid toml\n");
         let d = default_state();
-        assert_eq!(s.rpcs, d.rpcs);
-        assert_eq!(s.consensus_rpcs, d.consensus_rpcs);
+        assert_eq!(s.rpcs.get(Chain::Mainnet), d.rpcs.get(Chain::Mainnet));
+        assert_eq!(
+            s.consensus_rpcs.get(Chain::Mainnet),
+            d.consensus_rpcs.get(Chain::Mainnet)
+        );
     }
 
     #[test]
@@ -502,8 +586,8 @@ mod tests {
         let s =
             parse("rpcs = [\"https://a.example\", \"https://b.example\", \"https://c.example\"]\n");
         assert_eq!(
-            s.rpcs,
-            vec![
+            s.rpcs.get(Chain::Mainnet),
+            &vec![
                 "https://a.example".to_string(),
                 "https://b.example".to_string(),
                 "https://c.example".to_string(),
@@ -516,13 +600,76 @@ mod tests {
         // An explicit empty list must NOT collapse the default RPC list, since
         // the user almost certainly didn't mean to disable all upstreams.
         let s = parse("rpcs = []\n");
-        assert_eq!(s.rpcs, default_state().rpcs);
+        assert_eq!(
+            s.rpcs.get(Chain::Mainnet),
+            default_state().rpcs.get(Chain::Mainnet)
+        );
     }
 
     #[test]
     fn parse_empty_consensus_rpc_array_does_not_replace_default() {
         let s = parse("consensus_rpcs = []\n");
-        assert_eq!(s.consensus_rpcs, default_state().consensus_rpcs);
+        assert_eq!(
+            s.consensus_rpcs.get(Chain::Mainnet),
+            default_state().consensus_rpcs.get(Chain::Mainnet)
+        );
+    }
+
+    #[test]
+    fn parse_legacy_flat_rpcs_seeds_only_mainnet_slot() {
+        // Pre-L2 configs only carry `rpcs` / `consensus_rpcs` — those keys
+        // must continue to populate Mainnet and leave L2 slots empty.
+        let s = parse(
+            "rpcs = [\"https://eth.example\"]\nconsensus_rpcs = [\"https://cl.example\"]\n",
+        );
+        assert_eq!(
+            s.rpcs.get(Chain::Mainnet),
+            &vec!["https://eth.example".to_string()]
+        );
+        assert!(s.rpcs.get(Chain::Base).is_empty());
+        assert!(s.rpcs.get(Chain::Optimism).is_empty());
+        assert!(s.consensus_rpcs.get(Chain::Base).is_empty());
+        assert!(s.consensus_rpcs.get(Chain::Optimism).is_empty());
+    }
+
+    #[test]
+    fn parse_per_chain_keys_populate_l2_slots() {
+        let s = parse(
+            "rpcs_base = [\"https://base.example\"]\n\
+             rpcs_optimism = [\"https://op.example\"]\n\
+             consensus_rpcs_base = [\"https://cl-base.example\"]\n\
+             consensus_rpcs_optimism = [\"https://cl-op.example\"]\n",
+        );
+        assert_eq!(
+            s.rpcs.get(Chain::Base),
+            &vec!["https://base.example".to_string()]
+        );
+        assert_eq!(
+            s.rpcs.get(Chain::Optimism),
+            &vec!["https://op.example".to_string()]
+        );
+        assert_eq!(
+            s.consensus_rpcs.get(Chain::Base),
+            &vec!["https://cl-base.example".to_string()]
+        );
+        assert_eq!(
+            s.consensus_rpcs.get(Chain::Optimism),
+            &vec!["https://cl-op.example".to_string()]
+        );
+        // Mainnet should still hold the built-in default since the file had
+        // no `rpcs` / `consensus_rpcs` flat keys.
+        assert_eq!(
+            s.rpcs.get(Chain::Mainnet),
+            default_state().rpcs.get(Chain::Mainnet)
+        );
+    }
+
+    #[test]
+    fn parse_drops_non_https_l2_rpcs() {
+        // Same MITM-protection rule applies on L2: a hand-edited http URL
+        // gets filtered out, leaving the slot empty.
+        let s = parse("rpcs_base = [\"http://insecure.example\"]\n");
+        assert!(s.rpcs.get(Chain::Base).is_empty());
     }
 
     #[test]
@@ -539,27 +686,48 @@ mod tests {
 
     #[test]
     fn parse_then_serialize_roundtrip() {
+        let mut rpcs = PerChain::<Vec<String>>::default();
+        rpcs.set(
+            Chain::Mainnet,
+            vec!["https://r1.example".into(), "https://r2.example".into()],
+        );
+        rpcs.set(Chain::Base, vec!["https://base.example".into()]);
+        rpcs.set(Chain::Optimism, vec!["https://op.example".into()]);
+        let mut consensus_rpcs = PerChain::<Vec<String>>::default();
+        consensus_rpcs.set(
+            Chain::Mainnet,
+            vec!["https://cl1.example".into(), "https://cl2.example".into()],
+        );
+        consensus_rpcs.set(Chain::Base, vec!["https://cl-base.example".into()]);
+        consensus_rpcs.set(Chain::Optimism, vec!["https://cl-op.example".into()]);
         let original = State {
             theme: ThemeKind::Mint,
-            rpcs: vec!["https://r1.example".into(), "https://r2.example".into()],
-            consensus_rpcs: vec!["https://cl1.example".into(), "https://cl2.example".into()],
+            rpcs,
+            consensus_rpcs,
             checkpoint_override: Some(B256::from_str(BUILTIN_CHECKPOINT).unwrap()),
             auto_checkpoint: B256::from_str(BUILTIN_CHECKPOINT).unwrap(),
             indexer_provider: IndexerProvider::Alchemy,
             etherscan_api_key: Some("ETHERSCAN_TEST_KEY".into()),
             alchemy_api_key: Some("ALCHEMY_TEST_KEY".into()),
+            drpc_api_key: Some("DRPC_TEST_KEY".into()),
             blockscout_base_url: Some("https://base.blockscout.com".into()),
             blockscout_api_key: Some("BLOCKSCOUT_TEST_KEY".into()),
         };
         let serialized = serialize(&original);
         let parsed = parse(&serialized);
         assert_eq!(parsed.theme, original.theme);
-        assert_eq!(parsed.rpcs, original.rpcs);
-        assert_eq!(parsed.consensus_rpcs, original.consensus_rpcs);
+        for chain in Chain::ALL {
+            assert_eq!(parsed.rpcs.get(chain), original.rpcs.get(chain));
+            assert_eq!(
+                parsed.consensus_rpcs.get(chain),
+                original.consensus_rpcs.get(chain)
+            );
+        }
         assert_eq!(parsed.checkpoint_override, original.checkpoint_override);
         assert_eq!(parsed.indexer_provider, original.indexer_provider);
         assert_eq!(parsed.etherscan_api_key, original.etherscan_api_key);
         assert_eq!(parsed.alchemy_api_key, original.alchemy_api_key);
+        assert_eq!(parsed.drpc_api_key, original.drpc_api_key);
         assert_eq!(parsed.blockscout_base_url, original.blockscout_base_url);
         assert_eq!(parsed.blockscout_api_key, original.blockscout_api_key);
         // auto_checkpoint isn't persisted; parsed value reverts to the default.
@@ -567,16 +735,37 @@ mod tests {
     }
 
     #[test]
+    fn serialize_omits_empty_l2_lists() {
+        // A stock state (no L2 configured) must not emit `rpcs_base = []` /
+        // `rpcs_optimism = []` lines into the file — those keys imply the
+        // user opted into L2 when they didn't.
+        let state = default_state();
+        let text = serialize(&state);
+        assert!(!text.contains("rpcs_base"));
+        assert!(!text.contains("rpcs_optimism"));
+        assert!(!text.contains("consensus_rpcs_base"));
+        assert!(!text.contains("consensus_rpcs_optimism"));
+    }
+
+    #[test]
     fn serialize_emits_valid_toml_arrays() {
+        let mut rpcs = PerChain::<Vec<String>>::default();
+        rpcs.set(Chain::Mainnet, vec!["https://a".into(), "https://b".into()]);
+        let mut consensus_rpcs = PerChain::<Vec<String>>::default();
+        consensus_rpcs.set(
+            Chain::Mainnet,
+            vec!["https://c".into(), "https://d".into(), "https://e".into()],
+        );
         let state = State {
             theme: default_state().theme,
-            rpcs: vec!["a".into(), "b".into()],
-            consensus_rpcs: vec!["c".into(), "d".into(), "e".into()],
+            rpcs,
+            consensus_rpcs,
             checkpoint_override: None,
             auto_checkpoint: default_state().auto_checkpoint,
             indexer_provider: IndexerProvider::Blockscout,
             etherscan_api_key: None,
             alchemy_api_key: None,
+            drpc_api_key: None,
             blockscout_base_url: None,
             blockscout_api_key: None,
         };
@@ -584,11 +773,18 @@ mod tests {
         let reparsed: OnDisk = toml::from_str(&text).expect("output must be valid toml");
         assert_eq!(
             reparsed.rpcs.as_deref(),
-            Some(["a".to_string(), "b".to_string()].as_slice())
+            Some(["https://a".to_string(), "https://b".to_string()].as_slice())
         );
         assert_eq!(
             reparsed.consensus_rpcs.as_deref(),
-            Some(["c".to_string(), "d".to_string(), "e".to_string()].as_slice()),
+            Some(
+                [
+                    "https://c".to_string(),
+                    "https://d".to_string(),
+                    "https://e".to_string()
+                ]
+                .as_slice()
+            ),
         );
         // Unset overrides are dropped from the output rather than emitted as "".
         assert!(reparsed.checkpoint_override.is_none());

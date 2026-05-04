@@ -482,15 +482,54 @@ impl App {
                             .iter()
                             .map(|s| s.to_string())
                             .collect();
-                        crate::settings::set_rpcs(exec);
-                        crate::settings::set_consensus_rpcs(consensus);
+                        crate::settings::set_rpcs(crate::chain::Chain::Mainnet, exec);
+                        crate::settings::set_consensus_rpcs(
+                            crate::chain::Chain::Mainnet,
+                            consensus,
+                        );
+                        // Seed L2 chains with their per-chain defaults from
+                        // `chain.rs` so the dashboard's per-chain portfolio
+                        // fan-out actually runs for Base/Optimism — the loop
+                        // skips chains whose RPC list is empty.
+                        for chain in [crate::chain::Chain::Base, crate::chain::Chain::Optimism] {
+                            crate::settings::set_rpcs(
+                                chain,
+                                vec![chain.default_exec_url().to_string()],
+                            );
+                            crate::settings::set_consensus_rpcs(
+                                chain,
+                                vec![chain.default_consensus_url().to_string()],
+                            );
+                        }
                         self.screen = Screen::SelectIndexer(SelectIndexerScreen::new(None));
                         iced::Task::none()
                     }
-                    Some(SelectRpcOutcome::Custom(url)) => {
-                        crate::settings::set_rpcs(vec![url.clone()]);
-                        self.screen =
-                            Screen::SelectIndexer(SelectIndexerScreen::new(Some(&url)));
+                    Some(SelectRpcOutcome::Custom { exec, consensus }) => {
+                        // Persist every chain whose slot the screen
+                        // populated. Empty slots (typical for L2 in the
+                        // Custom path when the user wiped the row) leave
+                        // those chains unconfigured — the dashboard's
+                        // per-chain fan-out skips chains with no RPC.
+                        for chain in crate::chain::Chain::ALL {
+                            let e = exec.get(chain).trim();
+                            if !e.is_empty() {
+                                crate::settings::set_rpcs(chain, vec![e.to_string()]);
+                            }
+                            let c = consensus.get(chain).trim();
+                            if !c.is_empty() {
+                                crate::settings::set_consensus_rpcs(
+                                    chain,
+                                    vec![c.to_string()],
+                                );
+                            }
+                        }
+                        // SelectIndexer's auto-detect keys off the
+                        // Mainnet RPC URL (Alchemy / Etherscan reuse).
+                        let mainnet_url =
+                            exec.get(crate::chain::Chain::Mainnet).clone();
+                        self.screen = Screen::SelectIndexer(SelectIndexerScreen::new(
+                            Some(&mainnet_url),
+                        ));
                         iced::Task::none()
                     }
                     Some(SelectRpcOutcome::Back) => {
@@ -574,7 +613,9 @@ impl App {
                             // Fresh setup: step back one — to the indexer
                             // picker — so users can flip from e.g. Etherscan
                             // to None without re-picking RPC.
-                            let rpc = crate::settings::rpcs().into_iter().next();
+                            let rpc = crate::settings::rpcs(crate::chain::Chain::Mainnet)
+                                .into_iter()
+                                .next();
                             self.screen = Screen::SelectIndexer(SelectIndexerScreen::new(
                                 rpc.as_deref(),
                             ));

@@ -1,4 +1,5 @@
 mod app;
+mod chain;
 mod ens;
 mod indexer;
 mod net;

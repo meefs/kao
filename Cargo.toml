@@ -23,6 +23,16 @@ futures = "0.3"
 getrandom = "0.4.2"
 # Pinned to commit on tag 0.11.1. Bump deliberately rather than tracking a branch.
 helios-ethereum = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
+# Same git rev as helios-ethereum: both crates ship from the a16z/helios
+# workspace and share types (alloy versions, network presets, etc.). The
+# OP-Stack client wraps Helios's verified L1 anchor with L2 fault-proof
+# bootstrap; the wallet uses it for Base / Optimism balance reads.
+#
+# Pulls in two upstream-broken transitive deps that we work around via
+# [patch.crates-io] below: yanked `core2 0.4.0` (libp2p chain) and
+# coherence-conflicting `op-alloy-network 0.20.0`. See the patch entries
+# for the full story.
+helios-opstack = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
 iced = { version = "0.14.0", features = ["tokio", "image", "qr_code"] }
 keyring = "3.6.3"
 rand = "0.8"
@@ -40,3 +50,25 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# Workarounds for two upstream-broken transitive deps pulled in by
+# helios-opstack. Drop both entries the moment the upstreams ship fixes
+# (see each entry for the exact "drop when" condition).
+[patch.crates-io]
+# helios-opstack -> libp2p 0.51.3 -> multiaddr 0.17 -> multihash 0.17 ->
+# core2 ^0.4.0 (yanked from crates.io). The unmodified upstream source of
+# 0.4.0 still lives at this commit on bbqsrc/core2, so we point cargo
+# straight at it to bypass the yank check. Pure source pin — no behavior
+# change.
+# Drop when: libp2p (or anything upstream of multihash) drops the core2
+# dependency, or republishes a non-yanked 0.4.x.
+core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bcb0f235b12e21351e0c69767958efe2a7" }
+# helios-opstack -> op-alloy-network 0.20.0 carries an explicit
+# `impl NetworkWallet<Optimism> for EthereumWallet` that overlaps with
+# alloy-network 1.x's blanket `impl<N: Network> NetworkWallet<N> for
+# EthereumWallet`. Rust's coherence rule rejects the overlap (E0119) once
+# both crates are linked into the same binary. We vendor a fork of the
+# crate with the explicit impl deleted — see vendor/op-alloy-network/.
+# Drop when: op-alloy-rs ships a release without the explicit impl AND
+# helios-opstack's pinned rev consumes that release.
+op-alloy-network = { path = "vendor/op-alloy-network" }

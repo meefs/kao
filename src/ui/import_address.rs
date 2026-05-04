@@ -142,7 +142,7 @@ impl ImportAddressScreen {
             let name = trimmed;
             let task = Task::perform(
                 async move {
-                    let result = match network.provider().await {
+                    let result = match network.provider(crate::chain::Chain::Mainnet).await {
                         Some(provider) => ens::resolve_name(&provider, &name).await,
                         None => Err("no execution RPCs configured".to_string()),
                     };

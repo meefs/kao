@@ -65,7 +65,11 @@ use crate::wallet::{
 #[derive(Debug, Clone)]
 pub enum Message {
     BalanceFetched(Result<String, String>),
-    PortfolioFetched(Result<Vec<LiveToken>, String>),
+    /// Per-chain portfolio result. The dashboard issues one fetch per
+    /// configured chain in parallel and merges by `chain` as each lands,
+    /// so a slow Optimism RPC never blocks the Mainnet rows from
+    /// rendering.
+    PortfolioFetched(crate::chain::Chain, Result<Vec<LiveToken>, String>),
     /// Result of an indexer transaction-history fetch for `self.address`.
     HistoryFetched(Result<Vec<IndexedTx>, String>),
     SelectNav(Nav),
@@ -208,10 +212,17 @@ impl WalletScreen {
         // the user sees their tokens immediately on switch and the
         // background fetch (still kicked off by the App) refreshes
         // values silently when it lands.
-        let cached = portfolio_cache
-            .lock()
-            .ok()
-            .and_then(|c| c.get(&address).cloned());
+        // Pull every chain's cached rows so an account switch renders
+        // the full multi-chain portfolio immediately; the per-chain
+        // background fetches refresh values silently as they land.
+        let cached: Option<Vec<LiveToken>> = portfolio_cache.lock().ok().map(|c| {
+            crate::chain::Chain::ALL
+                .iter()
+                .filter_map(|chain| c.get(&(address, *chain)).cloned())
+                .flatten()
+                .collect()
+        });
+        let cached = cached.filter(|v: &Vec<LiveToken>| !v.is_empty());
         let (portfolio, portfolio_loading) = match cached {
             Some(p) => (p, false),
             None => (Vec::new(), true),
@@ -268,7 +279,7 @@ impl WalletScreen {
             async move {
                 debug!(addr = %short_address(address), "dashboard: helios get_balance");
                 let started = std::time::Instant::now();
-                let result = network.balance(address).await;
+                let result = network.balance(address, crate::chain::Chain::Mainnet).await;
                 debug!(
                     elapsed = ?started.elapsed(),
                     ok = result.is_ok(),
@@ -296,7 +307,11 @@ impl WalletScreen {
                     "fetching history",
                 );
                 let started = std::time::Instant::now();
-                let indexer = crate::indexer::build_indexer();
+                // History stays mainnet-only for now — Etherscan and
+                // Blockscout don't have per-chain plumbing yet, and
+                // showing a half-baked L2 history would be worse than
+                // none. Per-chain history is a follow-up.
+                let indexer = crate::indexer::build_indexer_for(crate::chain::Chain::Mainnet);
                 let result = indexer.transactions(address, HISTORY_LIMIT).await;
                 debug!(
                     elapsed = ?started.elapsed(),
@@ -310,46 +325,72 @@ impl WalletScreen {
         )
     }
 
+    /// Issue one portfolio fetch per configured chain in parallel.
+    ///
+    /// A chain is "configured" when its execution RPC list in settings
+    /// is non-empty — Mainnet is always configured (the built-in default
+    /// seeds it); L2 chains are only configured if the user opted in
+    /// via the setup flow's Alchemy / Custom RPCs path or the Networks
+    /// pane. Each chain emits its own `PortfolioFetched(chain, result)`
+    /// message; the handler merges by chain so a slow Optimism RPC
+    /// can't stall the Mainnet rows from rendering.
     pub fn fetch_portfolio_task(&self) -> Task<Message> {
         let address = self.address;
-        let network = self.network.clone();
-        let provider = settings::indexer_provider();
-        Task::perform(
-            async move {
-                debug!(
-                    addr = %short_address(address),
-                    indexer = ?provider,
-                    "fetching portfolio",
-                );
-                let started = std::time::Instant::now();
-                // The indexer path is preferred when configured: one HTTP
-                // round-trip vs. seven on-chain reads + per-token Uniswap
-                // pool lookups. `IndexerProvider::None` falls back to the
-                // on-chain walk (slow, but no third-party dependency).
-                let result = if matches!(provider, crate::settings::IndexerProvider::None) {
-                    match network.provider().await {
-                        Some(provider) => {
-                            crate::portfolio::fetch_portfolio(address, &provider).await
-                        }
-                        None => Err("no execution RPCs configured".to_string()),
-                    }
-                } else {
-                    let indexer = crate::indexer::build_indexer();
-                    indexer
+        let provider_kind = settings::indexer_provider();
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        for chain in crate::chain::Chain::ALL {
+            if settings::rpcs(chain).is_empty() {
+                // L2 chain that the user never configured — skip silently.
+                continue;
+            }
+            let network = self.network.clone();
+            tasks.push(Task::perform(
+                async move {
+                    debug!(
+                        addr = %short_address(address),
+                        chain = %chain.label(),
+                        indexer = ?provider_kind,
+                        "fetching portfolio",
+                    );
+                    let started = std::time::Instant::now();
+                    // Prefer the indexer when one is wired up for this
+                    // chain (one HTTP round-trip vs. several on-chain
+                    // reads + per-token pool lookups). When it isn't
+                    // (Blockscout/Etherscan on L2, or `None` anywhere),
+                    // `build_indexer_for` returns `NoopIndexer` and we
+                    // fall back to the on-chain walk.
+                    let indexer = crate::indexer::build_indexer_for(chain);
+                    let from_indexer = indexer
                         .balances(address)
                         .await
-                        .map(crate::indexer::into_live_tokens)
-                };
-                debug!(
-                    elapsed = ?started.elapsed(),
-                    ok = result.is_ok(),
-                    count = result.as_ref().map(|v| v.len()).unwrap_or(0),
-                    "portfolio fetch completed",
-                );
-                result
-            },
-            Message::PortfolioFetched,
-        )
+                        .ok()
+                        .filter(|v| !v.is_empty());
+                    let result = if let Some(tokens) = from_indexer {
+                        Ok(crate::indexer::into_live_tokens(chain, tokens))
+                    } else {
+                        match network.provider(chain).await {
+                            Some(p) => {
+                                crate::portfolio::fetch_portfolio(address, chain, &p).await
+                            }
+                            None => Err(format!(
+                                "no execution RPCs configured for {}",
+                                chain.label()
+                            )),
+                        }
+                    };
+                    debug!(
+                        elapsed = ?started.elapsed(),
+                        chain = %chain.label(),
+                        ok = result.is_ok(),
+                        count = result.as_ref().map(|v: &Vec<LiveToken>| v.len()).unwrap_or(0),
+                        "portfolio fetch completed",
+                    );
+                    (chain, result)
+                },
+                |(chain, result)| Message::PortfolioFetched(chain, result),
+            ));
+        }
+        Task::batch(tasks)
     }
 
     /// Reverse-resolve the active address against ENS (forward-verified)
@@ -374,7 +415,7 @@ impl WalletScreen {
             async move {
                 debug!(addr = %short_address(address), "ens reverse lookup");
                 let started = std::time::Instant::now();
-                let result = match network.provider().await {
+                let result = match network.provider(crate::chain::Chain::Mainnet).await {
                     Some(provider) => crate::ens::lookup_address(&provider, address).await,
                     None => Err("no execution RPCs configured".to_string()),
                 };
@@ -393,18 +434,44 @@ impl WalletScreen {
         match message {
             Message::BalanceFetched(r) => {
                 self.balance = r;
-                self.verification = self.network.last_status();
+                self.verification = self.network.last_status(crate::chain::Chain::Mainnet);
             }
-            Message::PortfolioFetched(result) => {
+            Message::PortfolioFetched(chain, result) => {
+                // Loading flag clears once *any* chain lands; the user
+                // sees results stream in rather than wait for the
+                // slowest chain.
                 self.portfolio_loading = false;
                 match result {
                     Ok(tokens) => {
                         if let Ok(mut cache) = self.portfolio_cache.lock() {
-                            cache.insert(self.address, tokens.clone());
+                            cache.insert((self.address, chain), tokens.clone());
                         }
-                        self.portfolio = tokens;
+                        // Merge by chain: replace the rows belonging to
+                        // `chain` with the new ones, leave other chains'
+                        // rows untouched. Re-sort ETH-first then by USD
+                        // value descending so a late-landing chain
+                        // doesn't shuffle a stable row order — the
+                        // original portfolio sort already maintained this.
+                        self.portfolio.retain(|t| t.chain != chain);
+                        self.portfolio.extend(tokens);
+                        self.portfolio.sort_by(|a, b| {
+                            // Native ETH bubbles up first per chain.
+                            let a_native = a.contract.is_none();
+                            let b_native = b.contract.is_none();
+                            match b_native.cmp(&a_native) {
+                                std::cmp::Ordering::Equal => b
+                                    .usd_value
+                                    .partial_cmp(&a.usd_value)
+                                    .unwrap_or(std::cmp::Ordering::Equal),
+                                other => other,
+                            }
+                        });
                     }
-                    Err(e) => warn!(error = %e, "portfolio fetch failed"),
+                    Err(e) => warn!(
+                        chain = %chain.label(),
+                        error = %e,
+                        "portfolio fetch failed",
+                    ),
                 }
             }
             Message::HistoryFetched(result) => {
@@ -909,7 +976,7 @@ fn spawn_ens_resolve_task(
 ) -> Task<Message> {
     Task::perform(
         async move {
-            let result = match network.provider().await {
+            let result = match network.provider(crate::chain::Chain::Mainnet).await {
                 Some(provider) => crate::ens::resolve_name(&provider, &name).await,
                 None => Err("no execution RPCs configured".to_string()),
             };
@@ -927,7 +994,7 @@ fn spawn_quote_task(
 ) -> Task<Message> {
     Task::perform(
         async move {
-            match network.provider().await {
+            match network.provider(crate::chain::Chain::Mainnet).await {
                 Some(provider) => crate::wallet::tx::build_quote(&provider, &plan).await,
                 None => Err("no execution RPCs configured".into()),
             }
@@ -949,7 +1016,7 @@ fn spawn_broadcast_task(
     let inner = handoff.clone();
     Task::perform(
         async move {
-            let provider = match network.provider().await {
+            let provider = match network.provider(crate::chain::Chain::Mainnet).await {
                 Some(p) => p,
                 None => return Err::<TxHash, String>("no execution RPCs configured".into()),
             };
