@@ -62,8 +62,10 @@ pub struct SendPlan {
 }
 
 impl SendPlan {
-    /// Resolve the (to, value, calldata) triple for this plan.
-    fn tx_target(&self) -> (Address, U256, Bytes) {
+    /// Resolve the (to, value, calldata) triple for this plan. Public
+    /// because the dashboard's clear-signing decode kickoff needs the
+    /// same (to, calldata) pair the broadcast path will eventually use.
+    pub fn tx_target(&self) -> (Address, U256, Bytes) {
         match &self.token {
             SendToken::Native => (self.recipient, self.amount_units, Bytes::new()),
             SendToken::Erc20 { contract, .. } => (

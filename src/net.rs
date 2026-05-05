@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{Provider, RootProvider};
 use alloy_eips::BlockId;
 use async_trait::async_trait;
@@ -119,6 +119,43 @@ pub trait BalanceFetcher: Send + Sync + std::fmt::Debug {
     /// dashboard rebuild. `None` only when no RPCs are configured for
     /// the chain or the chosen URL won't parse.
     async fn provider(&self, chain: Chain) -> Option<RootProvider<Ethereum>>;
+    /// Verified contract bytecode at `addr`. Tries Helios first; on error,
+    /// falls back to a raw `eth_getCode` and starts the same cooldown
+    /// `balance` uses. The returned `verified` flag tells the caller
+    /// whether the bytecode crossed the light-client proof path — the
+    /// clear-signing pipeline surfaces an "unverified bytecode" warning
+    /// when `verified == false`.
+    ///
+    /// Does not touch `last_status`; that badge tracks balance reads
+    /// only, otherwise the verification badge would flicker with every
+    /// proxy walk.
+    async fn get_code(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String>;
+    /// Verified storage slot read. Same fallback / verification shape as
+    /// `get_code`. Used by the proxy walker to follow EIP-1967 / beacon
+    /// implementation pointers.
+    async fn get_storage_at(
+        &self,
+        addr: Address,
+        slot: U256,
+        chain: Chain,
+    ) -> Result<VerifiedRead<B256>, String>;
+    /// Verified `eth_call`: Helios re-executes locally against
+    /// proof-verified state, so the returned bytes were computed from
+    /// bytecode and storage the light client vouched for. Used by
+    /// clear-signing's `symbol()` / `decimals()` probes — without this
+    /// the user signs based on cosmetic metadata an RPC chose to
+    /// return, which is exactly the spoofing surface the rest of the
+    /// pipeline closes.
+    async fn call(
+        &self,
+        to: Address,
+        data: Bytes,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,14 +179,73 @@ enum HeliosBackend {
 }
 
 impl HeliosBackend {
-    async fn get_balance(&self, addr: Address, block: BlockId) -> Result<alloy::primitives::U256, String> {
+    async fn get_balance(&self, addr: Address, block: BlockId) -> Result<U256, String> {
         match self {
             Self::Eth(c) => c.get_balance(addr, block).await.map_err(|e| e.to_string()),
             Self::Op(c) => c.get_balance(addr, block).await.map_err(|e| e.to_string()),
         }
     }
 
-    async fn get_block_number(&self) -> Result<alloy::primitives::U256, String> {
+    async fn get_code(&self, addr: Address, block: BlockId) -> Result<Bytes, String> {
+        match self {
+            Self::Eth(c) => c.get_code(addr, block).await.map_err(|e| e.to_string()),
+            Self::Op(c) => c.get_code(addr, block).await.map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn get_storage_at(
+        &self,
+        addr: Address,
+        slot: U256,
+        block: BlockId,
+    ) -> Result<B256, String> {
+        match self {
+            Self::Eth(c) => c
+                .get_storage_at(addr, slot, block)
+                .await
+                .map_err(|e| e.to_string()),
+            Self::Op(c) => c
+                .get_storage_at(addr, slot, block)
+                .await
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Verified `eth_call` against `to` with `data`. Helios re-executes
+    /// the call locally against proof-verified state — so what comes
+    /// back has been computed against bytecode and storage that the
+    /// light client cryptographically vouched for, not values an RPC
+    /// provider chose to return.
+    ///
+    /// The boundary on this method is the type swap: our crate uses
+    /// alloy 2.x but Helios's `call` takes alloy 1's `TransactionRequest`
+    /// (or `OpTransactionRequest` on OP-Stack). Both share the same
+    /// alloy-primitives 1.5.7 for `Address`, `Bytes`, etc., so we
+    /// build the v1 request inside this method and never expose the v1
+    /// type to callers.
+    async fn call(&self, to: Address, data: Bytes, block: BlockId) -> Result<Bytes, String> {
+        match self {
+            Self::Eth(c) => {
+                let req = alloy_rpc_types_eth::TransactionRequest::default()
+                    .to(to)
+                    .input(alloy_rpc_types_eth::TransactionInput::new(data));
+                c.call(&req, block, None).await.map_err(|e| e.to_string())
+            }
+            Self::Op(c) => {
+                let inner = alloy_rpc_types_eth::TransactionRequest::default()
+                    .to(to)
+                    .input(alloy_rpc_types_eth::TransactionInput::new(data));
+                // `OpTransactionRequest::from(addr)` is the inherent
+                // setter for the `from` field — distinct from the
+                // `From<TransactionRequest>` trait we want. Use
+                // `Into::into` so the trait impl is selected.
+                let req: op_alloy_rpc_types::OpTransactionRequest = inner.into();
+                c.call(&req, block, None).await.map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    async fn get_block_number(&self) -> Result<U256, String> {
         match self {
             Self::Eth(c) => c.get_block_number().await.map_err(|e| e.to_string()),
             Self::Op(c) => c.get_block_number().await.map_err(|e| e.to_string()),
@@ -162,6 +258,17 @@ impl HeliosBackend {
             Self::Op(c) => c.shutdown().await,
         }
     }
+}
+
+/// A state read paired with whether it came through Helios's verified
+/// path (`true`) or the raw-RPC fallback (`false`). The badge state on
+/// the dashboard tracks balance reads only — clear-signing surfaces this
+/// per call so an "unverified bytecode" warning can render alongside a
+/// decoded function body without affecting the global verification UI.
+#[derive(Debug, Clone)]
+pub struct VerifiedRead<T> {
+    pub value: T,
+    pub verified: bool,
 }
 
 #[derive(Default)]
@@ -393,9 +500,205 @@ impl BalanceFetcher for NetworkClient {
         s.chosen_rpc = Some(url);
         Some(provider)
     }
+
+    async fn get_code(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        if self.in_cooldown(chain).await {
+            return self.fallback_get_code(addr, chain).await;
+        }
+        match self.get(chain).await {
+            Ok(client) => match client.get_code(addr, BlockId::latest()).await {
+                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Err(e) => {
+                    debug!(
+                        chain = %chain.label(),
+                        addr = %short_address(addr),
+                        error = %e,
+                        "helios get_code failed; falling back to raw RPC",
+                    );
+                    self.start_cooldown(chain).await;
+                    self.fallback_get_code(addr, chain).await
+                }
+            },
+            Err(e) => {
+                warn!(
+                    chain = %chain.label(),
+                    error = %e,
+                    "helios unavailable for get_code; falling back to raw RPC",
+                );
+                self.start_cooldown(chain).await;
+                self.fallback_get_code(addr, chain).await
+            }
+        }
+    }
+
+    async fn get_storage_at(
+        &self,
+        addr: Address,
+        slot: U256,
+        chain: Chain,
+    ) -> Result<VerifiedRead<B256>, String> {
+        if self.in_cooldown(chain).await {
+            return self.fallback_get_storage_at(addr, slot, chain).await;
+        }
+        match self.get(chain).await {
+            Ok(client) => match client.get_storage_at(addr, slot, BlockId::latest()).await {
+                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Err(e) => {
+                    debug!(
+                        chain = %chain.label(),
+                        addr = %short_address(addr),
+                        error = %e,
+                        "helios get_storage_at failed; falling back to raw RPC",
+                    );
+                    self.start_cooldown(chain).await;
+                    self.fallback_get_storage_at(addr, slot, chain).await
+                }
+            },
+            Err(e) => {
+                warn!(
+                    chain = %chain.label(),
+                    error = %e,
+                    "helios unavailable for get_storage_at; falling back to raw RPC",
+                );
+                self.start_cooldown(chain).await;
+                self.fallback_get_storage_at(addr, slot, chain).await
+            }
+        }
+    }
+
+    async fn call(
+        &self,
+        to: Address,
+        data: Bytes,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        if self.in_cooldown(chain).await {
+            return self.fallback_call(to, data, chain).await;
+        }
+        match self.get(chain).await {
+            Ok(client) => match client.call(to, data.clone(), BlockId::latest()).await {
+                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Err(e) => {
+                    debug!(
+                        chain = %chain.label(),
+                        addr = %short_address(to),
+                        error = %e,
+                        "helios call failed; falling back to raw RPC",
+                    );
+                    self.start_cooldown(chain).await;
+                    self.fallback_call(to, data, chain).await
+                }
+            },
+            Err(e) => {
+                warn!(
+                    chain = %chain.label(),
+                    error = %e,
+                    "helios unavailable for call; falling back to raw RPC",
+                );
+                self.start_cooldown(chain).await;
+                self.fallback_call(to, data, chain).await
+            }
+        }
+    }
 }
 
 impl NetworkClient {
+    /// Plain `eth_getCode` against the chosen exec RPC. The
+    /// `verified=false` flag in the returned `VerifiedRead` lets the
+    /// clear-signing UI surface "unverified bytecode" without affecting
+    /// the global balance verification badge.
+    async fn fallback_get_code(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        let provider = self.fallback_provider(chain).await?;
+        provider
+            .get_code_at(addr)
+            .await
+            .map(|value| VerifiedRead { value, verified: false })
+            .map_err(|e| {
+                debug!(
+                    chain = %chain.label(),
+                    addr = %short_address(addr),
+                    error = %e,
+                    "fallback get_code failed",
+                );
+                e.to_string()
+            })
+    }
+
+    async fn fallback_get_storage_at(
+        &self,
+        addr: Address,
+        slot: U256,
+        chain: Chain,
+    ) -> Result<VerifiedRead<B256>, String> {
+        let provider = self.fallback_provider(chain).await?;
+        provider
+            .get_storage_at(addr, slot)
+            .await
+            .map(|raw| VerifiedRead {
+                value: B256::from(raw),
+                verified: false,
+            })
+            .map_err(|e| {
+                debug!(
+                    chain = %chain.label(),
+                    addr = %short_address(addr),
+                    error = %e,
+                    "fallback get_storage_at failed",
+                );
+                e.to_string()
+            })
+    }
+
+    /// Plain `eth_call` against the chosen exec RPC. The `verified=false`
+    /// flag in the returned `VerifiedRead` lets clear-signing surface
+    /// "metadata read couldn't be verified" — symbol/decimals ARE
+    /// inert metadata the user reviews, but a deliberately-misnaming
+    /// attacker would happily flip "ScamToken" to "USDC" if we trusted
+    /// an unverified return blindly. The flag lets the UI flag that
+    /// gap; the symbol still renders, just with a warning attached.
+    async fn fallback_call(
+        &self,
+        to: Address,
+        data: Bytes,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        let provider = self.fallback_provider(chain).await?;
+        let req = alloy::rpc::types::TransactionRequest::default()
+            .to(to)
+            .input(alloy::rpc::types::TransactionInput::new(data));
+        provider
+            .call(req)
+            .await
+            .map(|value| VerifiedRead { value, verified: false })
+            .map_err(|e| {
+                debug!(
+                    chain = %chain.label(),
+                    addr = %short_address(to),
+                    error = %e,
+                    "fallback call failed",
+                );
+                e.to_string()
+            })
+    }
+
+    /// Resolve the cached fallback provider for `chain`. Used by every
+    /// `fallback_*` method; threads "no RPCs configured" / "URL parse
+    /// failure" through as `Err`.
+    async fn fallback_provider(&self, chain: Chain) -> Result<RootProvider<Ethereum>, String> {
+        let s = self.state_for(chain).lock().await;
+        s.fallback
+            .clone()
+            .ok_or_else(|| format!("no fallback RPC available for {}", chain.label()))
+    }
+
     /// Plain `eth_getBalance` against the chosen exec RPC. No proof, no
     /// verification — used during the cooldown window after a helios
     /// failure.
@@ -627,6 +930,32 @@ impl BalanceFetcher for MockFetcher {
 
     async fn provider(&self, _chain: Chain) -> Option<RootProvider<Ethereum>> {
         None
+    }
+
+    async fn get_code(
+        &self,
+        _addr: Address,
+        _chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        Ok(VerifiedRead { value: Bytes::new(), verified: true })
+    }
+
+    async fn get_storage_at(
+        &self,
+        _addr: Address,
+        _slot: U256,
+        _chain: Chain,
+    ) -> Result<VerifiedRead<B256>, String> {
+        Ok(VerifiedRead { value: B256::ZERO, verified: true })
+    }
+
+    async fn call(
+        &self,
+        _to: Address,
+        _data: Bytes,
+        _chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        Ok(VerifiedRead { value: Bytes::new(), verified: true })
     }
 }
 

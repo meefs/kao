@@ -1,3 +1,5 @@
+mod sync_4byte;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -38,8 +40,9 @@ fn chain_dir(chain_id: u64) -> Option<&'static str> {
 async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("sync-tokens") => sync_tokens().await,
+        Some("sync-4byte-db") => sync_4byte::sync_4byte_db().await,
         _ => {
-            eprintln!("usage: cargo xtask sync-tokens");
+            eprintln!("usage: cargo xtask <sync-tokens | sync-4byte-db>");
             std::process::exit(1);
         }
     }

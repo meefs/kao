@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 mod account_dropdown;
 mod activity;
 mod appearance;
+mod function_panel;
 mod header;
 mod home;
 mod modal_chrome;
@@ -561,14 +562,22 @@ impl WalletScreen {
                 }
 
                 // Step(2): user clicked "Review →". Spawn a quote task
-                // (gas + 1559 fees + nonce) using the same plan the
-                // pane will eventually broadcast.
+                // (gas + 1559 fees + nonce) AND a clear-signing decode
+                // task — both against the same plan the pane will
+                // eventually broadcast.
                 if let send::Message::Step(2) = &child_msg {
                     let plan = p.build_plan(&self.portfolio);
                     let pre_task = match plan {
                         Some(pl) => {
                             p.quote_started();
-                            spawn_quote_task(self.network.clone(), pl)
+                            let decode_seq = p.decode_started();
+                            let quote_task = spawn_quote_task(self.network.clone(), pl.clone());
+                            let decode_task = spawn_decode_task(
+                                self.network.clone(),
+                                decode_seq,
+                                pl,
+                            );
+                            Task::batch([quote_task, decode_task])
                         }
                         None => Task::none(),
                     };
@@ -1019,6 +1028,37 @@ fn spawn_ens_resolve_task(
             (seq, name, result)
         },
         |(seq, name, result)| Message::Send(send::Message::EnsResolved { seq, name, result }),
+    )
+}
+
+/// Spawn a clear-signing decode task. Walks the proxy chain rooted at
+/// the plan's target, fetches verified bytecode, runs evmole + 4byte +
+/// matcher, and humanizes the resulting args. Result message carries
+/// `seq` so the SendPane can drop stale completions if the user backed
+/// out of review and built a different plan.
+fn spawn_decode_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    plan: SendPlan,
+) -> Task<Message> {
+    let (to, _value, calldata) = plan.tx_target();
+    Task::perform(
+        async move {
+            let decoded = crate::decode::render::decode_call(
+                network.as_ref(),
+                crate::chain::Chain::Mainnet,
+                to,
+                calldata,
+            )
+            .await;
+            (seq, decoded)
+        },
+        |(seq, decoded)| {
+            Message::Send(send::Message::DecodedReady {
+                seq,
+                decoded: Box::new(decoded),
+            })
+        },
     )
 }
 

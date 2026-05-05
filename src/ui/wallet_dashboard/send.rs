@@ -15,14 +15,15 @@ use iced::keyboard;
 use iced::widget::{Space, column, container, mouse_area, row, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
+use crate::decode::render::DecodedCall;
 use crate::ens;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    avatar, black, bold, colored_address, divider, kao_fit, kao_text, kaomoji_for_index,
-    modal_wrapper, mono, mono_black, primary_button, review_row, secondary_button,
-    text_input_style,
+    avatar, black, bold, colored_address, kao_fit, kao_text, kaomoji_for_index, modal_wrapper,
+    mono, mono_black, primary_button, review_row, secondary_button, text_input_style,
 };
+use crate::ui::wallet_dashboard::function_panel;
 use crate::wallet::CHAIN_ID;
 use crate::wallet::tx::{SendPlan, SendToken, TxQuote, parse_amount_units};
 
@@ -57,6 +58,12 @@ pub enum Message {
     Confirm,
     QuoteFetched(Result<TxQuote, String>),
     BroadcastDone(Result<TxHash, String>),
+    /// Result of a clear-signing decode spawned by the dashboard.
+    /// `seq` is the decode-generation counter; stale results dropped.
+    DecodedReady {
+        seq: u64,
+        decoded: Box<DecodedCall>,
+    },
     /// Result of an ENS forward-resolution task spawned by the dashboard.
     /// `seq` is the input-generation counter that was current when the task
     /// was spawned; results carrying a stale seq are dropped so the user's
@@ -139,6 +146,15 @@ pub struct SendPane {
     error: Option<String>,
     /// Set by `BroadcastDone(Ok(_))`; rendered on the success step.
     last_tx_hash: Option<TxHash>,
+    /// Clear-signing result for the current SendPlan. `None` while a
+    /// decode is in flight (with `decoded_loading = true`) or when the
+    /// plan has empty calldata (native send — no decode needed).
+    decoded: Option<Box<DecodedCall>>,
+    decoded_loading: bool,
+    /// Bumped each time the dashboard kicks a fresh decode. Stale
+    /// results (slow decoder finishing after the plan changed) are
+    /// dropped via this same sequence-number pattern as ENS resolves.
+    decoded_seq: u64,
 }
 
 impl SendPane {
@@ -157,6 +173,9 @@ impl SendPane {
             quote_loading: false,
             error: None,
             last_tx_hash: None,
+            decoded: None,
+            decoded_loading: false,
+            decoded_seq: 0,
         }
     }
 
@@ -311,6 +330,16 @@ impl SendPane {
                 }
                 (Task::none(), None)
             }
+            Message::DecodedReady { seq, decoded } => {
+                // Drop stale results — the user might have backed out
+                // of the review step and built a different plan before
+                // this future resolved.
+                if seq == self.decoded_seq {
+                    self.decoded_loading = false;
+                    self.decoded = Some(decoded);
+                }
+                (Task::none(), None)
+            }
             Message::CopyHash => match self.last_tx_hash {
                 Some(h) => (
                     Task::none(),
@@ -381,6 +410,17 @@ impl SendPane {
     pub fn quote_started(&mut self) {
         self.quote_loading = true;
         self.error = None;
+    }
+
+    /// Bump the decode seq, mark in flight, and return the new seq.
+    /// The dashboard tags its `decode_call` task with this value; the
+    /// matching `DecodedReady` message carries it back, and we drop
+    /// any result whose seq doesn't match the latest.
+    pub fn decode_started(&mut self) -> u64 {
+        self.decoded_seq = self.decoded_seq.wrapping_add(1);
+        self.decoded_loading = true;
+        self.decoded = None;
+        self.decoded_seq
     }
 
     pub fn view<'a>(
@@ -857,12 +897,31 @@ impl SendPane {
             _ => Space::new().height(0).into(),
         };
 
+        // Clear-signing panel: only renders when the call has calldata.
+        // Native ETH transfers return `None` from `function_panel::view`
+        // and we keep the surrounding vertical rhythm consistent so the
+        // review card doesn't pop when the panel lands.
+        let function_block: Element<'_, Message> = match function_panel::view::<Message>(
+            t,
+            self.decoded.as_deref(),
+            self.decoded_loading,
+        ) {
+            Some(panel) => column![Space::new().height(14), panel].spacing(0).into(),
+            None => Space::new().height(0).into(),
+        };
+
+        // No dividers between sections — `divider()` renders as a
+        // ~25px solid bar (its 12px vertical padding gets the border
+        // color baked in), which on the review card overwhelms the
+        // actual content. Plain vertical space gives the same visual
+        // separation without the heavy strip.
         let review_box = column![
             sending_row,
-            divider(t),
+            Space::new().height(14),
             to_block,
-            divider(t),
+            Space::new().height(14),
             gas_row,
+            function_block,
             insufficient_eth_warning,
         ]
         .spacing(0);
@@ -1038,16 +1097,28 @@ fn short_form(addr: &str) -> String {
     }
 }
 
-/// Trim trailing zeros from an ether-formatted decimal string while
-/// preserving readability ("0.000210000000000000" -> "0.00021").
+/// Compact an ether-formatted decimal string for display next to a USD
+/// total. Used for gas — values are typically sub-millieth, where the
+/// raw `format_units` output runs to 18 fractional digits and wraps to
+/// two lines on the review card.
+///
+/// Strategy: keep up to 3 significant digits past the leading zeros in
+/// the fractional part, then trim trailing zeros. So
+/// `"0.000014239683110688"` becomes `"0.0000142"` and
+/// `"0.000210000000000000"` stays `"0.00021"`.
 fn trim_eth_display(s: &str) -> String {
-    if !s.contains('.') {
+    let Some(dot) = s.find('.') else {
         return s.to_string();
-    }
-    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() {
-        "0".to_string()
+    };
+    let (int_part, dot_frac) = s.split_at(dot);
+    let frac = &dot_frac[1..];
+    let leading_zeros = frac.bytes().take_while(|b| *b == b'0').count();
+    let keep = leading_zeros + 3;
+    let truncated: String = frac.chars().take(keep).collect();
+    let final_frac = truncated.trim_end_matches('0');
+    if final_frac.is_empty() {
+        int_part.to_string()
     } else {
-        trimmed.to_string()
+        format!("{int_part}.{final_frac}")
     }
 }

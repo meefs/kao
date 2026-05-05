@@ -480,15 +480,22 @@ pub fn align_center<'a, M: 'a>(content: Element<'a, M>) -> Element<'a, M> {
 // ── Layout primitives ──────────────────────────────────────────────────────
 
 /// Horizontal hairline separator with vertical breathing room.
+/// 1px horizontal line with 12px clear space on each side. The earlier
+/// implementation set the background color on the outer container with
+/// 12px vertical padding inside, which made the WHOLE 25px box render
+/// as a solid border-color strip instead of a thin line — looked like
+/// a heavy bar on the Send review card. The shape below mirrors
+/// `thin_divider` (only the inner 1px container takes the border
+/// color) at the original spacing.
+#[allow(dead_code)]
 pub fn divider<'a, M: 'a>(t: KaoTheme) -> Element<'a, M> {
-    container(Space::new().width(Length::Fill).height(1))
+    let line = container(Space::new().width(Length::Fill).height(1))
         .width(Length::Fill)
-        .padding(Padding::from([12, 0]))
         .style(move |_| container::Style {
             background: Some(Background::Color(t.border)),
             ..container::Style::default()
-        })
-        .into()
+        });
+    column![Space::new().height(12), line, Space::new().height(12)].into()
 }
 
 /// Tighter sibling of `divider` — just a 1px line, no padding. Used inside
