@@ -50,10 +50,11 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use zeroize::Zeroizing;
 
-use super::{AccountDescriptor, WalletDescriptor, WalletError, keyring as kr};
+use super::{AccountDescriptor, Contact, WalletDescriptor, WalletError, keyring as kr};
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const ACCOUNTS_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("accounts");
+const CONTACTS_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("contacts");
 
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
@@ -63,6 +64,7 @@ const HEADER_KEY: &str = "header";
 const ACTIVE_INDEX_KEY: &str = "active_index";
 const HEADER_AAD: &[u8] = b"header:auth_check";
 const ACCOUNT_AAD_PREFIX: &[u8] = b"accounts:";
+const CONTACT_AAD_PREFIX: &[u8] = b"contacts:";
 
 const AUTH_CONSTANT: &[u8] = b"KAO_AUTH";
 
@@ -593,6 +595,149 @@ fn account_aad(idx: u32) -> Vec<u8> {
     out.extend_from_slice(ACCOUNT_AAD_PREFIX);
     out.extend_from_slice(&idx.to_le_bytes());
     out
+}
+
+fn contact_aad(idx: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(CONTACT_AAD_PREFIX.len() + 4);
+    out.extend_from_slice(CONTACT_AAD_PREFIX);
+    out.extend_from_slice(&idx.to_le_bytes());
+    out
+}
+
+/// Persist the contacts list under the existing wallet's master key.
+///
+/// Reuses the same per-row AEAD pattern as accounts but lives in its own
+/// `contacts` table — a contact edit doesn't re-encrypt every account row
+/// (and an account edit doesn't re-encrypt every contact). The save does
+/// NOT bump the rollback-protection epoch: contact data isn't security-
+/// load-bearing for rollback (an attacker rolling back contacts would
+/// already need to roll back the whole file, which the existing accounts-
+/// epoch covers), and bumping per contact-save would be needless wear on
+/// the keyring write path. The `contacts:` AAD prefix prevents a contact
+/// ciphertext from being silently swapped into the accounts table or vice
+/// versa.
+pub fn save_contacts(contacts: &[Contact], passphrase: &SecretString) -> Result<(), WalletError> {
+    save_contacts_to(&db_path(), contacts, passphrase)
+}
+
+pub fn load_contacts(passphrase: &SecretString) -> Result<Vec<Contact>, WalletError> {
+    load_contacts_from(&db_path(), passphrase)
+}
+
+fn save_contacts_to(
+    path: &Path,
+    contacts: &[Contact],
+    pw: &SecretString,
+) -> Result<(), WalletError> {
+    let db = Database::create(path).map_err(redb_err)?;
+    restrict_to_owner(path, 0o600)?;
+    let txn = db.begin_write().map_err(redb_err)?;
+
+    // Verify password against the existing header. Contacts are only
+    // stored alongside an existing wallet — a contacts save without a
+    // header is a logic error elsewhere (the App should never dispatch
+    // this before a successful unlock).
+    let header = {
+        let meta = txn.open_table(META_TABLE).map_err(redb_err)?;
+        match meta.get(HEADER_KEY).map_err(redb_err)? {
+            Some(v) => deserialize_header(v.value())?,
+            None => {
+                return Err(WalletError::Encryption(
+                    "save_contacts called before wallet exists".into(),
+                ));
+            }
+        }
+    };
+    let master_key = derive_master_key(
+        pw,
+        &header.salt,
+        header.argon2_m_cost_kib,
+        header.argon2_t_cost,
+        header.argon2_p_cost,
+    )?;
+    decrypt_blob(master_key.as_slice(), &header_aad(header.epoch), &header.auth_check)
+        .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
+
+    {
+        let mut tbl = txn.open_table(CONTACTS_TABLE).map_err(redb_err)?;
+        // Wipe the table, then re-insert. Same shape as the accounts save
+        // path so a smaller list correctly drops removed rows.
+        let existing_keys: Vec<u32> = {
+            let mut acc = Vec::new();
+            for entry in tbl.iter().map_err(redb_err)? {
+                let (k, _) = entry.map_err(redb_err)?;
+                acc.push(k.value());
+            }
+            acc
+        };
+        for k in existing_keys {
+            tbl.remove(k).map_err(redb_err)?;
+        }
+        for (i, contact) in contacts.iter().enumerate() {
+            let idx = i as u32;
+            let plaintext = bincode::serialize(contact)
+                .map_err(|e| WalletError::Encryption(format!("serialize contact {i}: {e}")))?;
+            let aad = contact_aad(idx);
+            let blob = encrypt_blob(master_key.as_slice(), &aad, &plaintext)?;
+            tbl.insert(idx, blob.as_slice()).map_err(redb_err)?;
+        }
+    }
+
+    txn.commit().map_err(redb_err)?;
+    Ok(())
+}
+
+fn load_contacts_from(path: &Path, pw: &SecretString) -> Result<Vec<Contact>, WalletError> {
+    let db = match Database::open(path) {
+        Ok(db) => db,
+        Err(redb::DatabaseError::Storage(redb::StorageError::Io(e)))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Err(WalletError::NotFound);
+        }
+        Err(e) => return Err(redb_err(e)),
+    };
+    let txn = db.begin_read().map_err(redb_err)?;
+
+    let meta = txn.open_table(META_TABLE).map_err(redb_err)?;
+    let header_guard = meta
+        .get(HEADER_KEY)
+        .map_err(redb_err)?
+        .ok_or_else(|| WalletError::Encryption("missing header in store".into()))?;
+    let header = deserialize_header(header_guard.value())?;
+
+    let master_key = derive_master_key(
+        pw,
+        &header.salt,
+        header.argon2_m_cost_kib,
+        header.argon2_t_cost,
+        header.argon2_p_cost,
+    )?;
+    decrypt_blob(master_key.as_slice(), &header_aad(header.epoch), &header.auth_check)
+        .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
+
+    // Treat a missing contacts table as empty — fresh-since-feature
+    // wallets have never saved contacts, and the table is created lazily
+    // on first save. `open_table` on a read txn returns
+    // `TableError::TableDoesNotExist` for missing tables; collapse to []
+    // rather than bubbling that up as an error.
+    let contacts_tbl = match txn.open_table(CONTACTS_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(redb_err(e)),
+    };
+    let mut entries: Vec<(u32, Contact)> = Vec::new();
+    for entry in contacts_tbl.iter().map_err(redb_err)? {
+        let (k, v) = entry.map_err(redb_err)?;
+        let idx = k.value();
+        let aad = contact_aad(idx);
+        let plaintext = decrypt_blob(master_key.as_slice(), &aad, v.value())?;
+        let contact: Contact = bincode::deserialize(&plaintext)
+            .map_err(|e| WalletError::Encryption(format!("deserialize contact {idx}: {e}")))?;
+        entries.push((idx, contact));
+    }
+    entries.sort_by_key(|(i, _)| *i);
+    Ok(entries.into_iter().map(|(_, c)| c).collect())
 }
 
 fn redb_err<E: std::fmt::Display>(e: E) -> WalletError {
@@ -1153,5 +1298,148 @@ mod tests {
             WalletError::Encryption(msg) => assert!(msg.contains("decrypt")),
             other => panic!("expected Encryption error, got {other:?}"),
         }
+    }
+
+    // ── Contacts tests ───────────────────────────────────────────────────
+
+    use crate::wallet::{Contact, ContactEns};
+
+    fn sample_contact(seed: u8, name: &str) -> Contact {
+        Contact {
+            name: name.into(),
+            address: [seed; 20],
+            kaomoji: "(◕‿◕)".into(),
+            notes: format!("seed {seed}"),
+            ens: None,
+        }
+    }
+
+    #[test]
+    fn contacts_save_and_load_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        let contacts = vec![
+            sample_contact(0x01, "A"),
+            Contact {
+                name: "vitalik.eth".into(),
+                address: [0xab; 20],
+                kaomoji: "(◕‿◕✿)".into(),
+                notes: String::new(),
+                ens: Some(ContactEns {
+                    name: "vitalik.eth".into(),
+                    last_resolved_addr: [0xab; 20],
+                }),
+            },
+        ];
+        save_contacts_to(&path, &contacts, &pw("pw")).unwrap();
+        let loaded = load_contacts_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded, contacts);
+    }
+
+    #[test]
+    fn contacts_load_returns_empty_when_table_missing() {
+        // A wallet saved before the contacts feature has no contacts
+        // table at all. `load_contacts` must collapse that to an empty
+        // vec rather than erroring — otherwise unlock would fail
+        // post-feature on every pre-feature wallet.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("pw")).unwrap();
+        let loaded = load_contacts_from(&path, &pw("pw")).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn contacts_save_overwrite_replaces_set() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        let big = vec![
+            sample_contact(0x01, "A"),
+            sample_contact(0x02, "B"),
+            sample_contact(0x03, "C"),
+        ];
+        save_contacts_to(&path, &big, &pw("pw")).unwrap();
+        let small = vec![sample_contact(0x09, "Solo")];
+        save_contacts_to(&path, &small, &pw("pw")).unwrap();
+        let loaded = load_contacts_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Solo");
+    }
+
+    #[test]
+    fn contacts_save_does_not_bump_epoch() {
+        // The accounts-epoch is the rollback-protection anchor; bumping
+        // it on every contact save would burn the keyring write path
+        // for no security benefit (a contact rollback already implies a
+        // file-level rollback, which the existing accounts-epoch covers).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("pw")).unwrap();
+        let salt = read_salt_from_file(&path);
+        let entry = keyring_entry_name(&salt);
+        let before = epoch_from_keyring(&entry);
+        save_contacts_to(&path, &[sample_contact(0x01, "A")], &pw("pw")).unwrap();
+        save_contacts_to(&path, &[sample_contact(0x01, "A2")], &pw("pw")).unwrap();
+        let after = epoch_from_keyring(&entry);
+        assert_eq!(before, after, "contacts saves must not bump the accounts epoch");
+    }
+
+    #[test]
+    fn contacts_save_refuses_wrong_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0x42; 32],
+        });
+        save_to(&path, &desc, &pw("right")).unwrap();
+        let err = save_contacts_to(&path, &[sample_contact(0x01, "A")], &pw("wrong")).unwrap_err();
+        match err {
+            WalletError::Encryption(msg) => assert!(msg.contains("incorrect password")),
+            other => panic!("expected wrong-password error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contact_aad_namespaces_against_account_aad() {
+        // A blob encrypted under the contacts AAD must not decrypt under
+        // the accounts AAD (and vice versa). This is the mechanism that
+        // stops a copy-paste attack across tables — the AEAD tag binds
+        // the row to its table.
+        let key = [0x77u8; 32];
+        let plaintext = b"hello";
+        let blob_c = encrypt_blob(&key, &contact_aad(0), plaintext).unwrap();
+        let blob_a = encrypt_blob(&key, &account_aad(0), plaintext).unwrap();
+        assert!(decrypt_blob(&key, &account_aad(0), &blob_c).is_err());
+        assert!(decrypt_blob(&key, &contact_aad(0), &blob_a).is_err());
+        // Sanity: same AAD on both sides round-trips.
+        assert_eq!(
+            decrypt_blob(&key, &contact_aad(0), &blob_c).unwrap(),
+            plaintext,
+        );
+        assert_eq!(
+            decrypt_blob(&key, &account_aad(0), &blob_a).unwrap(),
+            plaintext,
+        );
     }
 }

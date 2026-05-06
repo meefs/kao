@@ -15,8 +15,8 @@ use iced::{Alignment, Element, Length, Padding};
 use crate::indexer::{IndexedTx, TokenTransfer, TxDirection};
 use crate::portfolio::format_token_balance;
 use crate::ui::kao_theme::KaoTheme;
-use crate::ui::kao_widgets::{avatar, bold, card_style, mono, mono_black};
-use crate::wallet::short_address;
+use crate::ui::kao_widgets::{avatar, bold, card_style, kao_scrollable_style, mono, mono_black};
+use crate::wallet::{ContactsBook, short_address};
 
 use super::Message;
 
@@ -29,6 +29,7 @@ pub fn view<'a>(
     owner: Address,
     txs: &'a [IndexedTx],
     loading: bool,
+    contacts: &ContactsBook,
 ) -> Element<'a, Message> {
     let body: Element<'_, Message> = if loading {
         container(text("Loading activity…").size(13).color(t.sub))
@@ -49,7 +50,7 @@ pub fn view<'a>(
             .unwrap_or(0);
         let mut col = column![].spacing(5);
         for (idx, tx) in txs.iter().enumerate() {
-            col = col.push(tx_row(t, owner, tx, now, idx));
+            col = col.push(tx_row(t, owner, tx, now, idx, contacts));
         }
         col.into()
     };
@@ -61,6 +62,7 @@ pub fn view<'a>(
     )
     .height(Length::Fill)
     .width(Length::Fill)
+    .style(move |_, s| kao_scrollable_style(t, s))
     .into()
 }
 
@@ -70,6 +72,7 @@ fn tx_row<'a>(
     tx: &IndexedTx,
     now: u64,
     idx: usize,
+    contacts: &ContactsBook,
 ) -> Element<'a, Message> {
     let recv = matches!(tx.direction, TxDirection::In | TxDirection::SelfTransfer);
     let (ab, kao) = match tx.direction {
@@ -86,7 +89,12 @@ fn tx_row<'a>(
     let counterparty = if tx.to.is_none() && matches!(tx.direction, TxDirection::Out) {
         "contract creation".to_string()
     } else {
-        short_address(counterparty_addr)
+        // Prefer the saved contact name when one matches; fall back to
+        // the short hex form for unknown counterparties.
+        contacts
+            .name_for(counterparty_addr)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| short_address(counterparty_addr))
     };
 
     let label = match tx.direction {

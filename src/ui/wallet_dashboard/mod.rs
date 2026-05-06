@@ -6,7 +6,7 @@
 //! modal overlays rendered via `stack`.
 
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use alloy::primitives::{Address, TxHash};
@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 mod account_dropdown;
 mod activity;
 mod appearance;
+mod contacts_settings;
 mod function_panel;
 mod header;
 mod home;
@@ -32,6 +33,7 @@ mod swap;
 mod tx_details;
 
 use account_dropdown::AccountDropdown;
+use contacts_settings::ContactsPane;
 use networks::NetworksPane;
 use receive::ReceivePane;
 use send::SendPane;
@@ -58,7 +60,8 @@ use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::fill_style;
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
-    AccountDescriptor, KaoSigner, SignerHandoff, handoff_with, short_address,
+    AccountDescriptor, Contact, ContactsBook, KaoSigner, SignerHandoff, handoff_with,
+    short_address,
 };
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -108,6 +111,16 @@ pub enum Message {
     Networks(networks::Message),
     OpenAppearanceSettings,
     CloseAppearanceSettings,
+    OpenContactsSettings,
+    /// Open the Contacts pane in Add mode pre-filled with the given
+    /// address (and optional ENS string when known). Wired from the Send
+    /// pane's "Save as contact" CTA so users go straight from a fresh
+    /// recipient to a contact draft.
+    OpenContactsPaneWith {
+        address: Address,
+        ens: Option<String>,
+    },
+    Contacts(contacts_settings::Message),
     /// Header pencil clicked — switch the title slot to an editable text
     /// input pre-filled with the active account's current display name.
     BeginRenameAccount,
@@ -144,6 +157,9 @@ pub enum Outcome {
     /// User edited the active account's display name. Carries the new
     /// value (or `None` to clear back to the indexed default).
     RenameActive(Option<String>),
+    /// User saved a new/edited contacts list. The App writes the vec
+    /// into the shared in-memory book and dispatches a disk save.
+    SaveContacts(Vec<Contact>),
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -165,6 +181,7 @@ enum SettingsPane {
     Root,
     Networks(NetworksPane),
     Appearance,
+    Contacts(ContactsPane),
 }
 
 
@@ -213,6 +230,12 @@ pub struct WalletScreen {
     history: Vec<IndexedTx>,
     /// True while an indexer history fetch is in flight.
     history_loading: bool,
+    /// Shared contacts book. Read by the Send picker, the Send review
+    /// step, the Activity feed (named counterparties), and the tx
+    /// details modal; written by the Contacts settings pane on save.
+    /// `Arc<RwLock<…>>` so a contact edit is visible everywhere on the
+    /// next view tick without rebuilding the dashboard.
+    contacts: Arc<RwLock<ContactsBook>>,
 }
 
 impl WalletScreen {
@@ -222,6 +245,7 @@ impl WalletScreen {
         active_index: usize,
         network: Arc<dyn BalanceFetcher>,
         portfolio_cache: PortfolioCache,
+        contacts: Arc<RwLock<ContactsBook>>,
     ) -> Self {
         let address = signer.address();
         // Seed from the cache when this address has been viewed before:
@@ -262,6 +286,7 @@ impl WalletScreen {
             rename_draft: None,
             history: Vec::new(),
             history_loading: true,
+            contacts,
         }
     }
 
@@ -550,6 +575,20 @@ impl WalletScreen {
                 let Modal::Send(p) = &mut self.modal else {
                     return (Task::none(), None);
                 };
+                // Hold the contacts read guard for the duration of the
+                // pane's update. iced is single-threaded so there is no
+                // contention; the guard exists only because the pane's
+                // `update` signature takes `&ContactsBook`.
+                let contacts_guard = match self.contacts.read() {
+                    Ok(g) => g,
+                    Err(_) => {
+                        warn!("contacts lock poisoned; treating as empty for send update");
+                        // Fall through with a fresh empty book so the
+                        // pane still functions (no contacts shown).
+                        return (Task::none(), None);
+                    }
+                };
+                let book: &ContactsBook = &contacts_guard;
                 // ── Coordinator-side intercepts ────────────────────────
                 //
                 // Some pane messages need data the pane doesn't carry
@@ -588,7 +627,7 @@ impl WalletScreen {
                         }
                         None => Task::none(),
                     };
-                    let (task, _outcome) = p.update(child_msg);
+                    let (task, _outcome) = p.update(child_msg, book);
                     let task = task.map(Message::Send);
                     return (Task::batch([pre_task, task]), None);
                 }
@@ -627,7 +666,7 @@ impl WalletScreen {
                         let handoff = handoff_with(signer);
                         let pre_task =
                             spawn_broadcast_task(self.network.clone(), handoff, plan, quote);
-                        let (task, _outcome) = p.update(child_msg);
+                        let (task, _outcome) = p.update(child_msg, book);
                         let task = task.map(Message::Send);
                         return (Task::batch([pre_task, task]), None);
                     }
@@ -636,11 +675,11 @@ impl WalletScreen {
                     // "send button does nothing" cause (button enabled,
                     // user clicks, no broadcast spawned).
                     warn!("send: confirm dropped — no plan or no quote");
-                    let (task, _outcome) = p.update(child_msg);
+                    let (task, _outcome) = p.update(child_msg, book);
                     return (task.map(Message::Send), None);
                 }
 
-                let (task, outcome) = p.update(child_msg);
+                let (task, outcome) = p.update(child_msg, book);
                 // After pumping the pane, check whether the recipient
                 // input now points at an ENS-shaped value that hasn't been
                 // dispatched yet. The pane bumps a sequence on each
@@ -651,6 +690,9 @@ impl WalletScreen {
                     None => Task::none(),
                 };
                 let task = task.map(Message::Send);
+                // Drop the read guard before mutating self below (which
+                // happens in the SaveAsContact branch via OpenContactsPaneWith).
+                drop(contacts_guard);
                 match outcome {
                     Some(send::Outcome::Closed) => {
                         self.chrome.start_close();
@@ -660,6 +702,20 @@ impl WalletScreen {
                         let copy_task =
                             iced::clipboard::write(s).map(|_: ()| Message::ClipboardWritten);
                         return (Task::batch([task, copy_task, ens_task]), None);
+                    }
+                    Some(send::Outcome::SaveAsContact { address, ens }) => {
+                        // Reuse the existing OpenContactsPaneWith path —
+                        // switches nav, opens contacts pane in Add mode
+                        // pre-filled, and starts the modal close
+                        // animation. We synthesize the same Message
+                        // here and forward it to ourselves on the next
+                        // tick rather than inlining the body to keep
+                        // the two entry points behaviourally identical.
+                        let open_task = Task::done(Message::OpenContactsPaneWith {
+                            address,
+                            ens,
+                        });
+                        return (Task::batch([task, ens_task, open_task]), None);
                     }
                     None => return (Task::batch([task, ens_task]), None),
                 }
@@ -684,7 +740,16 @@ impl WalletScreen {
                         Ok(hash) => info!(hash = %format!("{hash:#x}"), "broadcast ok"),
                         Err(e) => warn!(error = %e, "broadcast failed"),
                     }
-                    let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
+                    let contacts_guard = match self.contacts.read() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            warn!("contacts lock poisoned in broadcast return");
+                            return (Task::none(), None);
+                        }
+                    };
+                    let (task, _outcome) =
+                        p.update(send::Message::BroadcastDone(result), &contacts_guard);
+                    drop(contacts_guard);
                     // Refresh balance + portfolio + history on success so
                     // the dashboard reflects the new state (the hero
                     // balance, held-token list, and activity feed all
@@ -838,6 +903,61 @@ impl WalletScreen {
             Message::CloseAppearanceSettings => {
                 self.settings_pane = SettingsPane::Root;
             }
+            Message::OpenContactsSettings => {
+                self.settings_pane =
+                    SettingsPane::Contacts(ContactsPane::new(self.contacts.clone()));
+            }
+            Message::OpenContactsPaneWith { address, ens } => {
+                // From the Send pane's "Save as contact" CTA. Switch
+                // the nav to Settings, close the Send modal (the chrome
+                // animation drives the swap), and open the contacts
+                // pane in Add mode pre-filled.
+                self.nav = Nav::Settings;
+                self.settings_pane = SettingsPane::Contacts(ContactsPane::new_with_prefill(
+                    self.contacts.clone(),
+                    address,
+                    ens,
+                ));
+                self.chrome.start_close();
+                // Drop the user straight onto the NAME input — they
+                // came here to type one.
+                return (
+                    ContactsPane::focus_initial_task().map(Message::Contacts),
+                    None,
+                );
+            }
+            Message::Contacts(child_msg) => {
+                let SettingsPane::Contacts(p) = &mut self.settings_pane else {
+                    return (Task::none(), None);
+                };
+                let (task, outcome) = p.update(child_msg);
+                // Same dispatch pattern as the Send pane: after pumping
+                // the pane we ask if it has a fresh ENS-shaped input
+                // that hasn't been resolved yet, and spawn a task tagged
+                // with the pane's seq so stale results are dropped.
+                let ens_task = match p.take_pending_ens() {
+                    Some((seq, name)) => spawn_contacts_ens_resolve_task(
+                        self.network.clone(),
+                        seq,
+                        name,
+                    ),
+                    None => Task::none(),
+                };
+                let task = task.map(Message::Contacts);
+                match outcome {
+                    Some(contacts_settings::Outcome::Closed) => {
+                        self.settings_pane = SettingsPane::Root;
+                        return (Task::batch([task, ens_task]), None);
+                    }
+                    Some(contacts_settings::Outcome::SaveRequested(vec)) => {
+                        return (
+                            Task::batch([task, ens_task]),
+                            Some(Outcome::SaveContacts(vec)),
+                        );
+                    }
+                    None => return (Task::batch([task, ens_task]), None),
+                }
+            }
             Message::BeginRenameAccount => {
                 let current = self
                     .accounts
@@ -911,8 +1031,10 @@ impl WalletScreen {
             }
             Modal::None => {}
         }
-        if let SettingsPane::Networks(p) = &self.settings_pane {
-            subs.push(p.subscription().map(Message::Networks));
+        match &self.settings_pane {
+            SettingsPane::Networks(p) => subs.push(p.subscription().map(Message::Networks)),
+            SettingsPane::Contacts(p) => subs.push(p.subscription().map(Message::Contacts)),
+            _ => {}
         }
         if self.chrome.is_animating() {
             // `time::every` actively drives ticks (and therefore redraws)
@@ -945,11 +1067,21 @@ impl WalletScreen {
             .height(Length::Fill)
             .into();
 
+        // Snapshot the contacts book to an owned `ContactsView` for
+        // any modal/pane that wants borrow-free contact data. iced
+        // views are synchronous so the lock is uncontested; this
+        // sidesteps the lifetime issue of holding a read guard across
+        // the widget tree.
+        let contacts_view: send::ContactsView = match self.contacts.read() {
+            Ok(g) => send::ContactsView::from_book(&g),
+            Err(_) => send::ContactsView::default(),
+        };
+
         match &self.modal {
             Modal::None => background,
             Modal::Send(p) => stack![
                 background,
-                p.view(t, &self.portfolio, self.chrome.progress())
+                p.view(t, &self.portfolio, contacts_view, self.chrome.progress())
                     .map(Message::Send),
             ]
             .into(),
@@ -969,11 +1101,18 @@ impl WalletScreen {
                     .map(Message::AccountDropdown),
             ]
             .into(),
-            Modal::TxDetails(p) => stack![
-                background,
-                p.view(t, self.chrome.progress()).map(Message::TxDetails),
-            ]
-            .into(),
+            Modal::TxDetails(p) => {
+                let tx_book = match self.contacts.read() {
+                    Ok(g) => g.clone(),
+                    Err(_) => ContactsBook::new(),
+                };
+                stack![
+                    background,
+                    p.view(t, self.chrome.progress(), &tx_book)
+                        .map(Message::TxDetails),
+                ]
+                .into()
+            }
         }
     }
 
@@ -982,14 +1121,26 @@ impl WalletScreen {
 
     // ── Main pane (header + body) ──────────────────────────────────────────
 
-    fn main_pane(&self, t: KaoTheme) -> Element<'_, Message> {
+    fn main_pane<'a>(&'a self, t: KaoTheme) -> Element<'a, Message> {
+        // Hold the read guard for the duration of `main_pane`. iced
+        // views are synchronous and the lock is uncontested, so the
+        // guard's lifetime safely outlives the returned Element.
+        let contacts_guard = self.contacts.read().ok();
+        let empty_book = ContactsBook::new();
+        let contacts: &ContactsBook = match &contacts_guard {
+            Some(g) => g,
+            None => &empty_book,
+        };
         let body: Element<'_, Message> = match self.nav {
             Nav::Home => home::view(t, &self.signer, &self.portfolio, self.portfolio_loading),
-            Nav::Activity => activity::view(t, self.address, &self.history, self.history_loading),
+            Nav::Activity => {
+                activity::view(t, self.address, &self.history, self.history_loading, contacts)
+            }
             Nav::Settings => match &self.settings_pane {
                 SettingsPane::Root => settings_root::view(t),
                 SettingsPane::Networks(p) => p.view(t).map(Message::Networks),
                 SettingsPane::Appearance => appearance::view(t, self.theme_kind),
+                SettingsPane::Contacts(p) => p.view(t).map(Message::Contacts),
             },
         };
 
@@ -1054,6 +1205,28 @@ fn spawn_ens_resolve_task(
             (seq, name, result)
         },
         |(seq, name, result)| Message::Send(send::Message::EnsResolved { seq, name, result }),
+    )
+}
+
+/// Forward ENS resolve for the Settings → Contacts add/edit form. Same
+/// shape as `spawn_ens_resolve_task`; differs only in the message
+/// constructor it routes the result through.
+fn spawn_contacts_ens_resolve_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    name: String,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = match network.provider(crate::chain::Chain::Mainnet).await {
+                Some(provider) => crate::ens::resolve_name(&provider, &name).await,
+                None => Err("no execution RPCs configured".to_string()),
+            };
+            (seq, name, result)
+        },
+        |(seq, name, result)| {
+            Message::Contacts(contacts_settings::Message::EnsResolved { seq, name, result })
+        },
     )
 }
 
@@ -1190,6 +1363,7 @@ mod tests {
             0,
             Arc::new(MockFetcher::new()),
             cache,
+            Arc::new(RwLock::new(ContactsBook::new())),
         )
     }
 

@@ -21,7 +21,9 @@ use crate::net::BalanceFetcher;
 use crate::settings;
 use crate::chain::{Chain, PerChain};
 use crate::ui::kao_theme::KaoTheme;
-use crate::ui::kao_widgets::{black, bold, primary_button, section, text_input_style};
+use crate::ui::kao_widgets::{
+    black, bold, kao_scrollable_style, primary_button, section, text_input_style,
+};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -238,6 +240,7 @@ impl NetworksPane {
         )
         .height(Length::Fill)
         .width(Length::Fill)
+        .style(move |_, s| kao_scrollable_style(t, s))
         .into()
     }
 }

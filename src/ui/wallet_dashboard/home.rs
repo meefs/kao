@@ -8,8 +8,8 @@ use crate::chain::Chain;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::{KaoTheme, mix, with_alpha};
 use crate::ui::kao_widgets::{
-    bold, kao_fit, kao_text, kaomoji_for_index, mono, mono_black, mono_bold, token_avatar,
-    card_style,
+    bold, card_style, kao_fit, kao_scrollable_style, kao_text, kaomoji_for_index, mono,
+    mono_black, mono_bold, token_avatar,
 };
 use crate::wallet::KaoSigner;
 
@@ -55,6 +55,7 @@ pub fn view<'a>(
     )
     .height(Length::Fill)
     .width(Length::Fill)
+    .style(move |_, s| kao_scrollable_style(t, s))
     .into()
 }
 

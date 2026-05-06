@@ -6,7 +6,7 @@ use iced::widget::{Space, column, container, mouse_area, row, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
-use crate::ui::kao_widgets::{black, bold, card_style, section};
+use crate::ui::kao_widgets::{black, bold, card_style, kao_scrollable_style, section};
 
 use super::Message;
 
@@ -49,6 +49,7 @@ pub fn view<'a>(t: KaoTheme, current: ThemeKind) -> Element<'a, Message> {
     )
     .height(Length::Fill)
     .width(Length::Fill)
+    .style(move |_, s| kao_scrollable_style(t, s))
     .into()
 }
 

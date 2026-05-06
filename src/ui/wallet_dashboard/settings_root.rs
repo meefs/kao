@@ -6,13 +6,14 @@ use iced::widget::{Space, column, container, mouse_area, row, text};
 use iced::{Alignment, Element, Length, Padding};
 
 use crate::ui::kao_theme::KaoTheme;
-use crate::ui::kao_widgets::{avatar, bold, card_style};
+use crate::ui::kao_widgets::{avatar, bold, card_style, kao_scrollable_style};
 
 use super::Message;
 
 const SETTINGS_ROWS: &[(&str, &str, &str)] = &[
     ("Security", "(⌐■_■)", "Seed phrase · lock screen"),
     ("Networks", "( ・∀・)ﾉ", "Mainnet · testnets · L2s"),
+    ("Contacts", "(✿◠‿◠)", "Named addresses · saved recipients"),
     ("Notifications", "ヾ(＾∇＾)", "Price alerts · tx updates"),
     ("Appearance", "(｡◕‿◕｡)", "Theme · palette"),
     ("About Kao", "(´｡• ᵕ •｡`)", "v0.1.0 · kawaii edition"),
@@ -24,6 +25,7 @@ pub fn view<'a>(t: KaoTheme) -> Element<'a, Message> {
         let on_click = match *label {
             "Networks" => Some(Message::OpenNetworksSettings),
             "Appearance" => Some(Message::OpenAppearanceSettings),
+            "Contacts" => Some(Message::OpenContactsSettings),
             _ => None,
         };
         list = list.push(settings_row(t, label, kao, sub, on_click));
@@ -36,6 +38,7 @@ pub fn view<'a>(t: KaoTheme) -> Element<'a, Message> {
     )
     .height(Length::Fill)
     .width(Length::Fill)
+    .style(move |_, s| kao_scrollable_style(t, s))
     .into()
 }
 

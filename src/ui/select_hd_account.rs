@@ -12,8 +12,9 @@ use crate::net::BalanceFetcher;
 use crate::settings;
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    auth_background, auth_card, avatar, black, bold, error_text, hint_pill, kao_hero, link_button,
-    mono, mono_bold, screen_subtitle, screen_title, secondary_button, vspace,
+    auth_background, auth_card, avatar, black, bold, error_text, hint_pill, kao_hero,
+    kao_scrollable_style, link_button, mono, mono_bold, screen_subtitle, screen_title,
+    secondary_button, vspace,
 };
 use crate::wallet::{self, HdParentKey};
 
@@ -251,7 +252,10 @@ impl SelectHdAccountScreen {
             for account in &self.accounts {
                 account_rows = account_rows.push(self.account_row(t, account));
             }
-            scrollable(account_rows).height(Length::Fixed(260.0)).into()
+            scrollable(account_rows)
+                .height(Length::Fixed(260.0))
+                .style(move |_, s| kao_scrollable_style(t, s))
+                .into()
         };
 
         let load_more_btn = secondary_button(t, "Load More Accounts");

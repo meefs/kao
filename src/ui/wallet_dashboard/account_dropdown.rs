@@ -12,7 +12,9 @@ use iced::widget::{Space, column, container, mouse_area, row, scrollable, stack,
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
 use crate::ui::kao_theme::KaoTheme;
-use crate::ui::kao_widgets::{avatar, black, bold, kaomoji_for_account, mono, thin_divider};
+use crate::ui::kao_widgets::{
+    avatar, black, bold, kao_scrollable_style, kaomoji_for_account, mono, thin_divider,
+};
 use crate::wallet::{AccountDescriptor, account_short_address};
 
 #[derive(Debug, Clone)]
@@ -82,7 +84,11 @@ impl AccountDropdown {
         list = list.push(thin_divider(t));
         list = list.push(add_account_row(t));
 
-        let panel = container(scrollable(list).height(Length::Shrink))
+        let panel = container(
+            scrollable(list)
+                .height(Length::Shrink)
+                .style(move |_, s| kao_scrollable_style(t, s)),
+        )
             .padding(Padding::from([10, 8]))
             .width(Length::Fixed(296.0))
             .max_height(360.0)

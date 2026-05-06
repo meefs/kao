@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use iced::widget::operation::focus as focus_widget;
 use iced::{Element, Subscription};
@@ -51,7 +51,7 @@ use crate::ui::verify_seed::{
 use crate::ui::wallet_dashboard::{
     Message as WalletDashboardMessage, Outcome as WalletDashboardOutcome, WalletScreen,
 };
-use crate::wallet::{self, AccountDescriptor, KaoSigner, WalletDescriptor};
+use crate::wallet::{self, AccountDescriptor, Contact, ContactsBook, KaoSigner, WalletDescriptor};
 
 // ── Messages ─────────────────────────────────────────────────────────────────
 
@@ -76,6 +76,14 @@ pub enum Message {
     /// Result of an off-thread `wallet::save_descriptor`. Emitted only to
     /// surface errors — successful saves are silent.
     WalletSaved(Result<(), String>),
+    /// Result of an off-thread `wallet::load_contacts`. Carries the
+    /// loaded vec on success; errors are logged and the in-memory book
+    /// stays empty.
+    ContactsLoaded(Result<Vec<Contact>, String>),
+    /// Result of an off-thread `wallet::save_contacts`. Errors only —
+    /// the in-memory book was already updated synchronously when the
+    /// save was dispatched.
+    ContactsSaved(Result<(), String>),
     WalletError(String),
 }
 
@@ -150,6 +158,13 @@ pub struct App {
     /// reads it on construction (so account switches feel instant) and
     /// writes through every successful fetch.
     portfolio_cache: PortfolioCache,
+    /// Named-address book. Loaded asynchronously after unlock; lives
+    /// behind an `Arc<RwLock<…>>` so the dashboard's view function and
+    /// the Settings → Contacts pane share a single canonical copy
+    /// without rebuilding the dashboard on every edit. iced views are
+    /// single-threaded, so the lock is always uncontested in practice;
+    /// it exists to keep the type plumbing honest, not for contention.
+    contacts: Arc<RwLock<ContactsBook>>,
 }
 
 impl App {
@@ -159,6 +174,7 @@ impl App {
         let network: Arc<dyn BalanceFetcher> = Arc::new(NetworkClient::new());
         let portfolio_cache = portfolio::new_cache();
 
+        let contacts = Arc::new(RwLock::new(ContactsBook::new()));
         if wallet::wallet_exists() {
             let app = App {
                 screen: Screen::Unlock(UnlockScreen::default()),
@@ -168,6 +184,7 @@ impl App {
                 pending_signer: None,
                 network,
                 portfolio_cache,
+                contacts,
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
             (app, task)
@@ -180,6 +197,7 @@ impl App {
                 pending_signer: None,
                 network,
                 portfolio_cache,
+                contacts,
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                 .map(Message::CreatePassword);
@@ -261,6 +279,7 @@ impl App {
             active_index,
             self.network.clone(),
             self.portfolio_cache.clone(),
+            self.contacts.clone(),
         );
         let address = screen.address_for_log();
         let balance_task = screen.fetch_balance_task().map(Message::WalletDashboard);
@@ -461,7 +480,16 @@ impl App {
                     // can re-save the wallet file on add/switch account.
                     self.passphrase = Some(passphrase);
                     self.wallet = Some(descriptor);
-                    return self.enter_active_from_wallet();
+                    let load_contacts = load_contacts_task(
+                        self.passphrase
+                            .as_ref()
+                            .expect("passphrase just set")
+                            .clone(),
+                    );
+                    return iced::Task::batch(vec![
+                        self.enter_active_from_wallet(),
+                        load_contacts,
+                    ]);
                 }
                 cmd.map(Message::Unlock)
             }
@@ -914,6 +942,26 @@ impl App {
                         let save = self.rename_active_account(name);
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
                     }
+                    Some(WalletDashboardOutcome::SaveContacts(new_contacts)) => {
+                        // Update the in-memory book synchronously so the
+                        // dashboard's view picks up the change on the very
+                        // next redraw, then dispatch the disk write off
+                        // the UI thread (Argon2 verifies the password
+                        // before writing — same ~250ms cost as save_descriptor).
+                        if let Ok(mut book) = self.contacts.write() {
+                            *book = ContactsBook::from_vec(new_contacts.clone());
+                        } else {
+                            warn!("contacts lock poisoned; skipping in-memory update");
+                        }
+                        let save = match self.passphrase.as_ref() {
+                            Some(pw) => save_contacts_task(new_contacts, pw.clone()),
+                            None => {
+                                warn!("save contacts: no passphrase held; skipping disk write");
+                                iced::Task::none()
+                            }
+                        };
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
+                    }
                     None => cmd.map(Message::WalletDashboard),
                 }
             }
@@ -922,6 +970,27 @@ impl App {
             Message::WalletSaved(result) => {
                 if let Err(e) = result {
                     error!(error = %e, "wallet save error");
+                }
+                iced::Task::none()
+            }
+
+            // ── Contacts background load/save ───────────────────────
+            Message::ContactsLoaded(result) => {
+                match result {
+                    Ok(vec) => {
+                        if let Ok(mut book) = self.contacts.write() {
+                            *book = ContactsBook::from_vec(vec);
+                        } else {
+                            warn!("contacts lock poisoned; skipping load");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "contacts load failed"),
+                }
+                iced::Task::none()
+            }
+            Message::ContactsSaved(result) => {
+                if let Err(e) = result {
+                    error!(error = %e, "contacts save error");
                 }
                 iced::Task::none()
             }
@@ -1018,6 +1087,47 @@ fn save_descriptor_task(
     )
 }
 
+/// Off-thread `wallet::load_contacts`. The Argon2id KDF runs on the file's
+/// stored params (~250ms in production), so the load must not block the UI
+/// thread. Result lands as `Message::ContactsLoaded`; failures log and
+/// leave the in-memory book empty rather than blocking unlock.
+fn load_contacts_task(passphrase: SecretString) -> iced::Task<Message> {
+    iced::Task::perform(
+        async move {
+            let join = tokio::task::spawn_blocking(move || wallet::load_contacts(&passphrase)).await;
+            match join {
+                Ok(Ok(vec)) => Ok(vec),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(join_err) => Err(format!("contacts load panicked: {join_err}")),
+            }
+        },
+        Message::ContactsLoaded,
+    )
+}
+
+/// Off-thread `wallet::save_contacts`. Mirrors `save_descriptor_task`:
+/// Argon2 verifies the password against the stored auth_check, then the
+/// contacts table is rewritten in a single redb txn. The in-memory book
+/// has already been updated synchronously by the caller, so a save error
+/// only diverges disk from memory until the next save (or the next load
+/// on relaunch).
+fn save_contacts_task(contacts: Vec<Contact>, passphrase: SecretString) -> iced::Task<Message> {
+    iced::Task::perform(
+        async move {
+            let join = tokio::task::spawn_blocking(move || {
+                wallet::save_contacts(&contacts, &passphrase)
+            })
+            .await;
+            match join {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(join_err) => Err(format!("contacts save panicked: {join_err}")),
+            }
+        },
+        Message::ContactsSaved,
+    )
+}
+
 /// Persist the user's indexer choice. Each branch sets the provider plus
 /// any provider-specific config; fields the outcome doesn't carry are left
 /// untouched so a re-run of setup doesn't wipe an unrelated existing key.
@@ -1067,6 +1177,7 @@ mod tests {
             pending_signer: None,
             network,
             portfolio_cache: portfolio::new_cache(),
+            contacts: Arc::new(RwLock::new(ContactsBook::new())),
         }
     }
 

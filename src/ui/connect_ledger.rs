@@ -21,8 +21,9 @@ use crate::net::BalanceFetcher;
 use crate::settings;
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    auth_background, auth_card, avatar, black, bold, error_text, hint_pill, kao_hero, link_button,
-    mono, mono_bold, primary_button, screen_subtitle, screen_title, vspace,
+    auth_background, auth_card, avatar, black, bold, error_text, hint_pill, kao_hero,
+    kao_scrollable_style, link_button, mono, mono_bold, primary_button, screen_subtitle,
+    screen_title, vspace,
 };
 use crate::wallet::{
     AccountDescriptor, KaoSigner, LedgerHdPath, SignerHandoff, handoff_with,
@@ -371,7 +372,9 @@ fn picking_card<'a>(t: KaoTheme, rows: &'a [PickRow]) -> Element<'a, Message> {
         vspace(20),
         header,
         vspace(4),
-        scrollable(list).height(Length::Fixed(260.0)),
+        scrollable(list)
+            .height(Length::Fixed(260.0))
+            .style(move |_, s| kao_scrollable_style(t, s)),
         vspace(14),
         back_hint(t),
     ]

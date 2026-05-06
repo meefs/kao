@@ -17,9 +17,10 @@ use crate::portfolio::format_token_balance;
 use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    black, bold, colored_address, kao_fit, mono, mono_black, mono_bold, modal_wrapper,
-    secondary_button, small_secondary_button,
+    black, bold, colored_address, kao_fit, kao_scrollable_style, mono, mono_black, mono_bold,
+    modal_wrapper, secondary_button, small_secondary_button,
 };
+use crate::wallet::ContactsBook;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -102,7 +103,12 @@ impl TxDetailsPane {
         keyboard::listen().map(Message::Key)
     }
 
-    pub fn view<'a>(&'a self, t: KaoTheme, progress: f32) -> Element<'a, Message> {
+    pub fn view<'a>(
+        &'a self,
+        t: KaoTheme,
+        progress: f32,
+        contacts: &ContactsBook,
+    ) -> Element<'a, Message> {
         let kao = match self.tx.direction {
             TxDirection::In => "(っ◕‿◕)っ",
             TxDirection::Out => "ᕕ( ᐛ )ᕗ",
@@ -162,13 +168,24 @@ impl TxDetailsPane {
         // ── Field stack ──────────────────────────────────────────────────
         let mut fields = column![].spacing(14).width(Length::Fill);
 
-        fields = fields.push(field(t, "From", colored_address(t, self.tx.from), Some(Message::CopyFrom)));
+        // Contact-aware From/To: when the counterparty matches a saved
+        // contact, render the name above the colored chunked address
+        // so the user gets a quick "oh, this is Friend" recognition.
+        // The chunked address remains the load-bearing identifier.
+        let from_name: Option<String> = contacts.name_for(self.tx.from).map(str::to_string);
+        fields = fields.push(field(
+            t,
+            "From",
+            named_address_block(t, from_name, colored_address(t, self.tx.from)),
+            Some(Message::CopyFrom),
+        ));
         match self.tx.to {
             Some(addr) => {
+                let to_name: Option<String> = contacts.name_for(addr).map(str::to_string);
                 fields = fields.push(field(
                     t,
                     "To",
-                    colored_address(t, addr),
+                    named_address_block(t, to_name, colored_address(t, addr)),
                     Some(Message::CopyTo),
                 ));
             }
@@ -283,8 +300,9 @@ impl TxDetailsPane {
         // The full address rendering can push the modal taller than the
         // window in compact themes; wrap in a scrollable so the user can
         // still reach the action buttons.
-        let scrollable_body =
-            scrollable(container(body).width(Length::Fill)).height(Length::Shrink);
+        let scrollable_body = scrollable(container(body).width(Length::Fill))
+            .height(Length::Shrink)
+            .style(move |_, s| kao_scrollable_style(t, s));
 
         modal_wrapper(
             t,
@@ -410,6 +428,28 @@ fn format_when(unix_secs: u64) -> String {
         format!("{days} day{} ago", if days == 1 { "" } else { "s" })
     };
     format!("{abs} ({relative})")
+}
+
+/// Stack a contact name (when present) on top of a colored address
+/// element, returning a single Element suitable for the field-block
+/// `value` slot. When `name` is `None`, the address is returned as-is
+/// so existing layouts (no contact match) stay unchanged.
+fn named_address_block<'a>(
+    t: KaoTheme,
+    name: Option<String>,
+    address: Element<'a, Message>,
+) -> Element<'a, Message> {
+    match name {
+        Some(n) => column![
+            text(n).size(13).color(t.text).font(bold()),
+            iced::widget::Space::new().height(4),
+            address,
+        ]
+        .width(Length::Fill)
+        .spacing(0)
+        .into(),
+        None => address,
+    }
 }
 
 /// `YYYY-MM-DD HH:MM UTC` from unix seconds. Reuses the same civil-day

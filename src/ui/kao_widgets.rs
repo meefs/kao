@@ -5,7 +5,9 @@
 use alloy::primitives::Address;
 use iced::border::Radius;
 use iced::widget::text::Wrapping;
-use iced::widget::{Space, button, column, container, mouse_area, row, stack, svg, text, text_input};
+use iced::widget::{
+    Space, button, column, container, mouse_area, row, scrollable, stack, svg, text, text_input,
+};
 use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Padding};
 
 use crate::chain::Chain;
@@ -127,6 +129,69 @@ pub fn text_input_style(t: KaoTheme, status: text_input::Status) -> text_input::
         placeholder: t.sub,
         value: t.text,
         selection: with_alpha(t.a1, 0.3),
+    }
+}
+
+// ── Scrollable style ───────────────────────────────────────────────────────
+
+/// Kao-themed scrollbar: thin transparent rail with a rounded
+/// kao-accent scroller pill that gets brighter on hover/drag. Drop in
+/// place of the iced default by passing
+/// `move |_, status| kao_scrollable_style(t, status)` to
+/// `scrollable.style(...)`.
+pub fn kao_scrollable_style(t: KaoTheme, status: scrollable::Status) -> scrollable::Style {
+    use iced::widget::scrollable::{Rail, Scroller, Status};
+
+    // Active (idle) scroller — calm, low-contrast so it doesn't fight
+    // the content for attention. Hover/drag bumps it to the primary
+    // accent.
+    let scroller_color = match status {
+        Status::Active { .. } => with_alpha(t.a2, 0.55),
+        Status::Hovered { is_vertical_scrollbar_hovered, .. }
+            if is_vertical_scrollbar_hovered =>
+        {
+            t.a1
+        }
+        Status::Hovered { .. } => with_alpha(t.a2, 0.75),
+        Status::Dragged { .. } => t.a1,
+    };
+
+    let rail = Rail {
+        background: Some(Background::Color(with_alpha(t.border, 0.25))),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(4),
+        },
+        scroller: Scroller {
+            background: Background::Color(scroller_color),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(4),
+            },
+        },
+    };
+
+    scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: rail,
+        horizontal_rail: rail,
+        gap: None,
+        // The auto-scroll overlay is the on-screen indicator iced shows
+        // when a long fling-scroll is decelerating. Tint it so it
+        // matches the rest of the chrome instead of leaking the
+        // default platform palette.
+        auto_scroll: scrollable::AutoScroll {
+            background: Background::Color(with_alpha(t.bg, 0.9)),
+            border: Border {
+                color: with_alpha(t.text, 0.6),
+                width: 1.0,
+                radius: Radius::from(999),
+            },
+            shadow: Default::default(),
+            icon: with_alpha(t.text, 0.8),
+        },
     }
 }
 

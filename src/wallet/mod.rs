@@ -10,17 +10,22 @@ use alloy::signers::trezor::{HDPath as AlloyTrezorHDPath, TrezorSigner};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
+pub mod contacts;
 mod keyring;
 mod store;
 pub mod tx;
 
+pub use contacts::{Contact, ContactEns, ContactsBook};
 pub use store::db_exists as wallet_exists;
 // `load_descriptor_accepting_keyring_reset` has no in-tree consumer until
 // the unlock screen grows the "no record on this machine — accept this
 // wallet?" modal. Re-exported now so the public surface stays stable when
 // that lands; suppress the unused-import warning until then.
 #[allow(unused_imports)]
-pub use store::{load_descriptor, load_descriptor_accepting_keyring_reset, save_descriptor};
+pub use store::{
+    load_contacts, load_descriptor, load_descriptor_accepting_keyring_reset, save_contacts,
+    save_descriptor,
+};
 
 /// Errors that can occur during wallet operations.
 #[derive(Debug)]
