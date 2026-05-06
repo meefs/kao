@@ -329,13 +329,53 @@ pub fn default_consensus_rpcs() -> &'static [&'static str] {
     DEFAULT_CONSENSUS_RPCS
 }
 
+/// Per-chain execution-RPC list. When the user hasn't set one for `chain`,
+/// fall back to a synthesized URL derived from whatever indexer key they
+/// already entered: dRPC and Alchemy both expose Mainnet/Base/Optimism
+/// under one key, so a user with just a dRPC key gets working Helios
+/// builds on all three chains without revisiting the setup flow. Without
+/// this fallback the dashboard's per-chain portfolio fan-out skipped L2s
+/// silently and Base/OP balances never appeared.
 pub fn rpcs(chain: Chain) -> Vec<String> {
-    ensure()
+    let explicit = ensure()
         .lock()
         .expect("settings mutex poisoned")
         .rpcs
         .get(chain)
-        .clone()
+        .clone();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    if let Some(url) = synthesize_exec_url(chain) {
+        return vec![url];
+    }
+    Vec::new()
+}
+
+/// Build a single per-chain execution-RPC URL from the keys the user
+/// already configured. Tried in dRPC-then-Alchemy order: matches the
+/// preference users imply by setting one key vs. the other, and
+/// keeps the synthesis stable across `indexer_provider` toggles (so the
+/// Helios client doesn't get rebuilt mid-session by a UI dropdown
+/// change).
+fn synthesize_exec_url(chain: Chain) -> Option<String> {
+    if let Some(key) = drpc_api_key() {
+        let slug = match chain {
+            Chain::Mainnet => "ethereum",
+            Chain::Base => "base",
+            Chain::Optimism => "optimism",
+        };
+        return Some(format!("https://lb.drpc.live/{slug}/{key}"));
+    }
+    if let Some(key) = alchemy_api_key() {
+        let slug = match chain {
+            Chain::Mainnet => "eth-mainnet",
+            Chain::Base => "base-mainnet",
+            Chain::Optimism => "opt-mainnet",
+        };
+        return Some(format!("https://{slug}.g.alchemy.com/v2/{key}"));
+    }
+    None
 }
 
 pub fn set_rpcs(chain: Chain, list: Vec<String>) {
@@ -347,13 +387,23 @@ pub fn set_rpcs(chain: Chain, list: Vec<String>) {
     write_all();
 }
 
+/// Per-chain consensus-RPC list. Empty falls back to the chain's
+/// hardcoded default (`Chain::default_consensus_url`) — public beacon
+/// endpoint for Mainnet, operationsolarstorm.org's L2 light-client
+/// proxies for Base/Optimism. These don't take an API key, so a user
+/// with only a dRPC exec URL still ends up with a buildable Helios
+/// client on every chain.
 pub fn consensus_rpcs(chain: Chain) -> Vec<String> {
-    ensure()
+    let explicit = ensure()
         .lock()
         .expect("settings mutex poisoned")
         .consensus_rpcs
         .get(chain)
-        .clone()
+        .clone();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    vec![chain.default_consensus_url().to_string()]
 }
 
 pub fn set_consensus_rpcs(chain: Chain, list: Vec<String>) {

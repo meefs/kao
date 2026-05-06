@@ -317,7 +317,7 @@ impl App {
             self.contacts.clone(),
         );
         let address = screen.address_for_log();
-        let balance_task = screen.fetch_balance_task().map(Message::WalletDashboard);
+        let verify_task = screen.refresh_verification_task().map(Message::WalletDashboard);
         let portfolio_task = screen.fetch_portfolio_task().map(Message::WalletDashboard);
         let history_task = screen.fetch_history_task().map(Message::WalletDashboard);
         // Reverse-ENS lookup. No-ops when the active account is already
@@ -328,9 +328,9 @@ impl App {
             active_index,
             addr = %address,
             built_in = ?started.elapsed(),
-            "entered dashboard; balance+portfolio+history+ens fetch queued",
+            "entered dashboard; verify+portfolio+history+ens fetch queued",
         );
-        iced::Task::batch(vec![balance_task, portfolio_task, history_task, ens_task])
+        iced::Task::batch(vec![verify_task, portfolio_task, history_task, ens_task])
     }
 
     /// Routes the active account of `self.wallet` to the right destination.

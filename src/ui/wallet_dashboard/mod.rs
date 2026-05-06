@@ -75,13 +75,11 @@ use crate::wallet::{
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Carries the address the fetch was issued against so a quick
-    /// account switch (or a network/indexer change that kicks fresh
-    /// fetches) can't apply a stale balance to a different account.
-    BalanceFetched {
-        address: Address,
-        result: Result<String, String>,
-    },
+    /// Side-effect ack from the Mainnet Helios verification refresh.
+    /// The handler just samples `network.last_status(Mainnet)` to drive
+    /// the header badge — no per-address state changes here, so a stale
+    /// fetch landing after an account switch is harmless.
+    VerificationRefreshed,
     /// Per-chain portfolio result. The dashboard issues one fetch per
     /// configured chain in parallel and merges by `chain` as each lands,
     /// so a slow Optimism RPC never blocks the Mainnet rows from
@@ -218,7 +216,6 @@ pub struct WalletScreen {
     /// dropdown. `accounts[active_index]` corresponds to `signer`.
     accounts: Vec<AccountDescriptor>,
     active_index: usize,
-    balance: Result<String, String>,
     theme_kind: ThemeKind,
     nav: Nav,
     modal: Modal,
@@ -227,9 +224,10 @@ pub struct WalletScreen {
     chrome: ModalChrome,
     /// Shared Helios-backed RPC client; cloned into each balance fetch task.
     network: Arc<dyn BalanceFetcher>,
-    /// Verification state of the most recent balance fetch. Sampled from
-    /// `network.last_status()` whenever a `BalanceFetched` lands; rendered in
-    /// the header as a small "Verified by Helios / Unverified RPC" badge.
+    /// Verification state of the most recent Mainnet Helios call. Sampled
+    /// from `network.last_status(Mainnet)` after `VerificationRefreshed`
+    /// lands; rendered in the header as a small "Verified by Helios /
+    /// Unverified RPC" badge.
     verification: VerificationStatus,
     /// Which Settings sub-screen is currently rendered.
     settings_pane: SettingsPane,
@@ -320,7 +318,6 @@ impl WalletScreen {
             address,
             accounts,
             active_index,
-            balance: Ok("—".into()),
             theme_kind: settings::theme(),
             nav: Nav::Home,
             modal: Modal::None,
@@ -390,22 +387,32 @@ impl WalletScreen {
         short_address(self.address)
     }
 
-    pub fn fetch_balance_task(&self) -> Task<Message> {
+    /// Issue a Mainnet `network.balance` call purely to refresh the
+    /// Helios verification badge — the result is discarded; only the
+    /// side-effect on `last_status(Mainnet)` matters. Without this the
+    /// badge would never leave "Connecting…": `get_code`,
+    /// `get_storage_at`, and `call` deliberately don't touch
+    /// `last_status` so the proxy walker can't flicker the badge on
+    /// every clear-signing probe, and the portfolio fetch goes through
+    /// the raw fallback provider rather than helios.
+    pub fn refresh_verification_task(&self) -> Task<Message> {
         let address = self.address;
         let network = self.network.clone();
         Task::perform(
             async move {
-                debug!(addr = %short_address(address), "dashboard: helios get_balance");
+                debug!(addr = %short_address(address), "dashboard: refresh helios verification");
                 let started = std::time::Instant::now();
-                let result = network.balance(address, crate::chain::Chain::Mainnet).await;
+                let ok = network
+                    .balance(address, crate::chain::Chain::Mainnet)
+                    .await
+                    .is_ok();
                 debug!(
                     elapsed = ?started.elapsed(),
-                    ok = result.is_ok(),
-                    "dashboard: helios get_balance completed",
+                    ok,
+                    "dashboard: helios verification refresh completed",
                 );
-                (address, result)
             },
-            |(address, result)| Message::BalanceFetched { address, result },
+            |_| Message::VerificationRefreshed,
         )
     }
 
@@ -552,15 +559,7 @@ impl WalletScreen {
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
         match message {
-            Message::BalanceFetched { address, result } => {
-                // The fetch was issued against `address`; if the user
-                // switched accounts (or invalidated the network client)
-                // before it landed, drop it so the previous account's
-                // balance can't appear under the new one.
-                if address != self.address {
-                    return (Task::none(), None);
-                }
-                self.balance = result;
+            Message::VerificationRefreshed => {
                 self.verification = self.network.last_status(crate::chain::Chain::Mainnet);
             }
             Message::PortfolioFetched { address, chain, result } => {
@@ -644,7 +643,7 @@ impl WalletScreen {
                 // the token tabs and Max button work off fresh numbers
                 // instead of whatever was last cached.
                 return (
-                    Task::batch([self.fetch_balance_task(), self.fetch_portfolio_task()]),
+                    Task::batch([self.refresh_verification_task(), self.fetch_portfolio_task()]),
                     None,
                 );
             }
@@ -833,7 +832,7 @@ impl WalletScreen {
                     let refresh = if success {
                         self.history_loading = true;
                         Task::batch([
-                            self.fetch_balance_task(),
+                            self.refresh_verification_task(),
                             self.fetch_portfolio_task(),
                             self.fetch_history_task(),
                         ])
@@ -1602,32 +1601,6 @@ mod tests {
             usd_value: 1.0,
             chain,
         }
-    }
-
-    #[test]
-    fn balance_fetched_for_other_address_is_dropped() {
-        let active = addr(0xAA);
-        let other = addr(0xBB);
-        let mut s = screen_for(active, new_cache());
-        let before = s.balance.clone();
-        s.update(Message::BalanceFetched {
-            address: other,
-            result: Ok("999".into()),
-        });
-        // Active screen's balance must be untouched — the response was
-        // for a different account.
-        assert_eq!(s.balance, before);
-    }
-
-    #[test]
-    fn balance_fetched_for_active_address_lands() {
-        let active = addr(0xAA);
-        let mut s = screen_for(active, new_cache());
-        s.update(Message::BalanceFetched {
-            address: active,
-            result: Ok("1.23".into()),
-        });
-        assert_eq!(s.balance, Ok("1.23".into()));
     }
 
     #[test]

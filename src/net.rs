@@ -900,10 +900,10 @@ async fn wait_for_head(backend: &HeliosBackend) -> Result<(), String> {
 }
 
 /// Stub `BalanceFetcher` for tests. Returns "0" for every address on
-/// every chain and is a no-op on `invalidate`. Tests that need to
-/// exercise specific balance responses should drive the screen via
-/// `Message::BalanceFetched` directly rather than waiting for an
-/// in-flight `Task::perform`.
+/// every chain and is a no-op on `invalidate`. The dashboard's
+/// verification badge is sampled directly from `last_status` (which
+/// `MockFetcher` pins to `Verified`), so screen tests don't need to
+/// drive any balance-fetched message to update it.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub struct MockFetcher;
