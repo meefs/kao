@@ -25,7 +25,7 @@ use crate::ui::kao_widgets::{
     mono, mono_bold, primary_button, screen_subtitle, screen_title, vspace,
 };
 use crate::wallet::{
-    AccountDescriptor, CHAIN_ID, KaoSigner, LedgerHdPath, SignerHandoff, handoff_with,
+    AccountDescriptor, KaoSigner, LedgerHdPath, SignerHandoff, handoff_with,
 };
 
 const PROBE_COUNT: u32 = 5;
@@ -197,7 +197,7 @@ impl ConnectLedgerScreen {
                         async move {
                             LedgerSigner::new(
                                 LedgerHdPath::LedgerLive(hd_index).to_alloy(),
-                                Some(CHAIN_ID),
+                                None,
                             )
                             .await
                             .map(|s| handoff_with(KaoSigner::Ledger(s)))
@@ -552,7 +552,11 @@ fn select_pill<'a>(t: KaoTheme) -> iced::widget::Button<'a, Message> {
 fn probe_setup_task() -> Task<Message> {
     Task::perform(
         async move {
-            let signer = LedgerSigner::new(LedgerHdPath::LedgerLive(0).to_alloy(), Some(CHAIN_ID))
+            // chain_id = None: the EIP-1559 envelope built in `wallet::tx`
+            // already carries the correct chain id, and leaving it unset
+            // here keeps `TxSigner::sign_transaction` from rejecting L2
+            // sends with a mainnet/L2 mismatch.
+            let signer = LedgerSigner::new(LedgerHdPath::LedgerLive(0).to_alloy(), None)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -574,7 +578,7 @@ fn probe_setup_task() -> Task<Message> {
 fn reconnect_task(path: LedgerHdPath) -> Task<Message> {
     Task::perform(
         async move {
-            LedgerSigner::new(path.to_alloy(), Some(CHAIN_ID))
+            LedgerSigner::new(path.to_alloy(), None)
                 .await
                 .map(|s| handoff_with(KaoSigner::Ledger(s)))
                 .map_err(|e| e.to_string())

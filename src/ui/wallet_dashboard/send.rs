@@ -24,7 +24,6 @@ use crate::ui::kao_widgets::{
     mono, mono_black, primary_button, review_row, secondary_button, text_input_style,
 };
 use crate::ui::wallet_dashboard::function_panel;
-use crate::wallet::CHAIN_ID;
 use crate::wallet::tx::{SendPlan, SendToken, TxQuote, parse_amount_units};
 
 #[derive(Debug, Clone, Copy)]
@@ -401,6 +400,7 @@ impl SendPane {
             recipient,
             token: send_token,
             amount_units,
+            chain: token.chain,
         })
     }
 
@@ -800,6 +800,9 @@ impl SendPane {
         let token = portfolio.get(self.token_idx);
         let token_sym = token.map(|t| t.symbol.as_str()).unwrap_or("ETH");
         let recipient = self.resolution.recipient();
+        // Drive the network label off the actual token's chain so the user
+        // can't review a Base USDC send under a "Mainnet" label.
+        let chain = token.map(|t| t.chain).unwrap_or_default();
 
         // Sending row + chain id label below.
         let sending_row = column![
@@ -813,7 +816,7 @@ impl SendPane {
             row![
                 text("").size(11),
                 Space::new().width(Length::Fill),
-                text(format!("Ethereum Mainnet · chain {}", CHAIN_ID))
+                text(format!("{} · chain {}", chain.display_name(), chain.chain_id()))
                     .size(10)
                     .color(t.sub)
                     .font(mono()),

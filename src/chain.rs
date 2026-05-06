@@ -23,6 +23,28 @@ impl Chain {
         }
     }
 
+    /// EIP-155 chain id. Baked into the EIP-1559 signing hash, so picking the
+    /// wrong one here means the broadcast hits a different network than the
+    /// review screen claimed.
+    pub fn chain_id(self) -> u64 {
+        match self {
+            Chain::Mainnet => 1,
+            Chain::Base => 8453,
+            Chain::Optimism => 10,
+        }
+    }
+
+    /// Human-friendly network label for the review screen
+    /// ("Ethereum Mainnet", "OP Mainnet", "Base"). Distinct from `label()`,
+    /// which is the short navigation-row name.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Chain::Mainnet => "Ethereum Mainnet",
+            Chain::Base => "Base",
+            Chain::Optimism => "OP Mainnet",
+        }
+    }
+
     /// Pre-typed default execution-RPC URL shown in the Custom-RPC inputs.
     /// The Mainnet entry mirrors `settings::DEFAULT_RPCS[0]` so the Custom
     /// flow defaults to the same upstream as the "Use Defaults" path.

@@ -19,7 +19,7 @@ use crate::ui::kao_widgets::{
     mono, mono_bold, primary_button, screen_subtitle, screen_title, vspace,
 };
 use crate::wallet::{
-    AccountDescriptor, CHAIN_ID, KaoSigner, SignerHandoff, TrezorHdPath, handoff_with,
+    AccountDescriptor, KaoSigner, SignerHandoff, TrezorHdPath, handoff_with,
 };
 
 const PROBE_COUNT: u32 = 5;
@@ -183,7 +183,7 @@ impl ConnectTrezorScreen {
                         async move {
                             TrezorSigner::new(
                                 TrezorHdPath::TrezorLive(hd_index).to_alloy(),
-                                Some(CHAIN_ID),
+                                None,
                             )
                             .await
                             .map(|s| handoff_with(KaoSigner::Trezor(s)))
@@ -536,7 +536,8 @@ fn select_pill<'a>(t: KaoTheme) -> iced::widget::Button<'a, Message> {
 fn probe_setup_task() -> Task<Message> {
     Task::perform(
         async move {
-            let signer = TrezorSigner::new(TrezorHdPath::TrezorLive(0).to_alloy(), Some(CHAIN_ID))
+            // chain_id = None: see the matching note in connect_ledger.rs.
+            let signer = TrezorSigner::new(TrezorHdPath::TrezorLive(0).to_alloy(), None)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -558,7 +559,7 @@ fn probe_setup_task() -> Task<Message> {
 fn reconnect_task(path: TrezorHdPath) -> Task<Message> {
     Task::perform(
         async move {
-            TrezorSigner::new(path.to_alloy(), Some(CHAIN_ID))
+            TrezorSigner::new(path.to_alloy(), None)
                 .await
                 .map(|s| handoff_with(KaoSigner::Trezor(s)))
                 .map_err(|e| e.to_string())

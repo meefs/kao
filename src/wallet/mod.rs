@@ -1,3 +1,5 @@
+use alloy::consensus::SignableTransaction;
+use alloy::network::TxSigner;
 use alloy::primitives::{Address, B256, Signature};
 use alloy::signers::Signer;
 use alloy::signers::ledger::{HDPath as AlloyLedgerHDPath, LedgerSigner};
@@ -95,9 +97,6 @@ impl From<std::io::Error> for WalletError {
         WalletError::Io(e)
     }
 }
-
-/// Mainnet for now; both LedgerSigner::new and TrezorSigner::new take this.
-pub const CHAIN_ID: u64 = 1;
 
 // ── Descriptor ─────────────────────────────────────────────────────────────
 
@@ -297,16 +296,27 @@ impl KaoSigner {
         !matches!(self, KaoSigner::ViewOnly(_))
     }
 
-    /// Sign a 32-byte hash. Delegates to the inner signer's
-    /// `Signer::sign_hash`. `ViewOnly` returns
-    /// `UnsupportedOperation(SignHash)`.
-    pub async fn sign_hash(&self, hash: &B256) -> Result<Signature, alloy::signers::Error> {
+    /// Sign a SignableTransaction. Dispatches to `TxSigner::sign_transaction`
+    /// on the inner signer — the only path that works for both software and
+    /// hardware. (Ledger and Trezor's `Signer::sign_hash` returns
+    /// `UnsupportedOperation`; the device signs over the RLP-encoded tx, not
+    /// a precomputed hash, so we have to hand it the structured tx.)
+    ///
+    /// Hardware variants are constructed with `chain_id = None`, so the
+    /// chain id baked into the tx envelope is the one that gets signed —
+    /// no per-chain reconstruction of the signer needed.
+    ///
+    /// `ViewOnly` returns `UnsupportedOperation(SignTransaction)`.
+    pub async fn sign_tx(
+        &self,
+        tx: &mut dyn SignableTransaction<Signature>,
+    ) -> Result<Signature, alloy::signers::Error> {
         match self {
-            KaoSigner::Local(s) => s.sign_hash(hash).await,
-            KaoSigner::Ledger(s) => s.sign_hash(hash).await,
-            KaoSigner::Trezor(s) => s.sign_hash(hash).await,
+            KaoSigner::Local(s) => TxSigner::sign_transaction(s, tx).await,
+            KaoSigner::Ledger(s) => TxSigner::sign_transaction(s, tx).await,
+            KaoSigner::Trezor(s) => TxSigner::sign_transaction(s, tx).await,
             KaoSigner::ViewOnly(_) => Err(alloy::signers::Error::UnsupportedOperation(
-                alloy::signers::UnsupportedSignerOperation::SignHash,
+                alloy::signers::UnsupportedSignerOperation::SignTransaction,
             )),
         }
     }

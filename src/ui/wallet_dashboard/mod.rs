@@ -538,6 +538,13 @@ impl WalletScreen {
                 }
                 self.modal = Modal::Send(SendPane::new(self.address));
                 self.chrome.open();
+                // Refresh portfolio + hero balance as the modal opens so
+                // the token tabs and Max button work off fresh numbers
+                // instead of whatever was last cached.
+                return (
+                    Task::batch([self.fetch_balance_task(), self.fetch_portfolio_task()]),
+                    None,
+                );
             }
             Message::Send(child_msg) => {
                 let Modal::Send(p) = &mut self.modal else {
@@ -592,7 +599,23 @@ impl WalletScreen {
                 if let send::Message::Confirm = &child_msg {
                     let plan = p.build_plan(&self.portfolio);
                     let quote = p.quote();
+                    info!(
+                        has_plan = plan.is_some(),
+                        has_quote = quote.is_some(),
+                        "send: confirm clicked",
+                    );
                     if let (Some(plan), Some(quote)) = (plan, quote) {
+                        info!(
+                            chain = %plan.chain.label(),
+                            chain_id = plan.chain.chain_id(),
+                            from = %plan.from,
+                            recipient = %plan.recipient,
+                            amount_units = %plan.amount_units,
+                            erc20 = matches!(plan.token, crate::wallet::tx::SendToken::Erc20 { .. }),
+                            gas_limit = quote.gas_limit,
+                            nonce = quote.nonce,
+                            "send: spawning broadcast task",
+                        );
                         // Move the signer out — only ViewOnly stays
                         // behind so the dashboard view doesn't crash if
                         // it dereferences the signer's address while the
@@ -609,7 +632,10 @@ impl WalletScreen {
                         return (Task::batch([pre_task, task]), None);
                     }
                     // Missing plan or quote — let the pane no-op the
-                    // confirm.
+                    // confirm. Surface this loudly: it's the most common
+                    // "send button does nothing" cause (button enabled,
+                    // user clicks, no broadcast spawned).
+                    warn!("send: confirm dropped — no plan or no quote");
                     let (task, _outcome) = p.update(child_msg);
                     return (task.map(Message::Send), None);
                 }
@@ -655,7 +681,7 @@ impl WalletScreen {
                 if let Modal::Send(p) = &mut self.modal {
                     let success = result.is_ok();
                     match &result {
-                        Ok(hash) => debug!(hash = %format!("{hash:#x}"), "broadcast ok"),
+                        Ok(hash) => info!(hash = %format!("{hash:#x}"), "broadcast ok"),
                         Err(e) => warn!(error = %e, "broadcast failed"),
                     }
                     let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
@@ -1042,11 +1068,12 @@ fn spawn_decode_task(
     plan: SendPlan,
 ) -> Task<Message> {
     let (to, _value, calldata) = plan.tx_target();
+    let chain = plan.chain;
     Task::perform(
         async move {
             let decoded = crate::decode::render::decode_call(
                 network.as_ref(),
-                crate::chain::Chain::Mainnet,
+                chain,
                 to,
                 calldata,
             )
@@ -1063,16 +1090,22 @@ fn spawn_decode_task(
 }
 
 /// Spawn a quote task using the network's shared provider. Returns a
-/// `Task` that resolves to a `Send::QuoteFetched(...)` message.
+/// `Task` that resolves to a `Send::QuoteFetched(...)` message. The
+/// provider is selected by `plan.chain` so an L2 send hits the L2 RPC,
+/// not mainnet.
 fn spawn_quote_task(
     network: Arc<dyn BalanceFetcher>,
     plan: SendPlan,
 ) -> Task<Message> {
+    let chain = plan.chain;
     Task::perform(
         async move {
-            match network.provider(crate::chain::Chain::Mainnet).await {
+            match network.provider(chain).await {
                 Some(provider) => crate::wallet::tx::build_quote(&provider, &plan).await,
-                None => Err("no execution RPCs configured".into()),
+                None => {
+                    warn!(chain = %chain.label(), "quote: no execution RPC configured");
+                    Err("no execution RPCs configured".into())
+                }
             }
         },
         |result| Message::Send(send::Message::QuoteFetched(result)),
@@ -1090,22 +1123,32 @@ fn spawn_broadcast_task(
     quote: crate::wallet::tx::TxQuote,
 ) -> Task<Message> {
     let inner = handoff.clone();
+    let chain = plan.chain;
     Task::perform(
         async move {
-            let provider = match network.provider(crate::chain::Chain::Mainnet).await {
+            let provider = match network.provider(chain).await {
                 Some(p) => p,
-                None => return Err::<TxHash, String>("no execution RPCs configured".into()),
+                None => {
+                    warn!(chain = %chain.label(), "broadcast: no execution RPC configured");
+                    return Err::<TxHash, String>("no execution RPCs configured".into());
+                }
             };
             let signer_taken = {
                 let mut g = match inner.lock() {
                     Ok(g) => g,
-                    Err(e) => return Err(format!("signer cell poisoned: {e}")),
+                    Err(e) => {
+                        warn!(error = %e, "broadcast: signer cell poisoned");
+                        return Err(format!("signer cell poisoned: {e}"));
+                    }
                 };
                 g.take()
             };
             let signer = match signer_taken {
                 Some(s) => s,
-                None => return Err("signer not available".into()),
+                None => {
+                    warn!("broadcast: signer cell empty at task entry");
+                    return Err("signer not available".into());
+                }
             };
             let result =
                 crate::wallet::tx::sign_and_send(&provider, &signer, plan, quote).await;

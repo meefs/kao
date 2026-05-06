@@ -2,8 +2,9 @@
 //! Send flow. Native ETH and ERC-20 transfers go through one path: a
 //! `SendPlan` resolves the destination/value/calldata, `build_quote` asks the
 //! provider for gas and EIP-1559 fees + nonce, and `sign_and_send` fills a
-//! `TxEip1559`, signs the EIP-2718 hash via `KaoSigner::sign_hash`, and
-//! broadcasts the raw envelope.
+//! `TxEip1559`, hands it to `KaoSigner::sign_tx` (which routes to whichever
+//! `TxSigner` impl backs the active account), and broadcasts the raw
+//! envelope.
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy::eips::eip2718::Encodable2718;
@@ -11,8 +12,10 @@ use alloy::network::Ethereum;
 use alloy::primitives::utils::parse_units;
 use alloy::primitives::{Address, Bytes, TxHash, TxKind, U256};
 use alloy::providers::{Provider, RootProvider};
+use tracing::{debug, info, warn};
 
-use crate::wallet::{CHAIN_ID, KaoSigner};
+use crate::chain::Chain;
+use crate::wallet::KaoSigner;
 
 /// `transfer(address,uint256)` — first 4 bytes of keccak256.
 const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
@@ -53,12 +56,17 @@ pub enum SendToken {
 /// Built once in the dashboard from the parsed recipient, parsed amount, and
 /// the active token's metadata; passed to both `build_quote` and
 /// `sign_and_send`.
+///
+/// `chain` is the network the tx will be broadcast on; its EIP-155 id is
+/// baked into the signing hash, so changing the chain after a quote is
+/// fetched would invalidate the review screen's numbers.
 #[derive(Debug, Clone)]
 pub struct SendPlan {
     pub from: Address,
     pub recipient: Address,
     pub token: SendToken,
     pub amount_units: U256,
+    pub chain: Chain,
 }
 
 impl SendPlan {
@@ -111,24 +119,69 @@ pub async fn build_quote(
     plan: &SendPlan,
 ) -> Result<TxQuote, String> {
     let req = plan.to_request();
+    let (target, value, input) = plan.tx_target();
+    let token_kind = match &plan.token {
+        SendToken::Native => "native",
+        SendToken::Erc20 { .. } => "erc20",
+    };
+    info!(
+        chain = %plan.chain.label(),
+        chain_id = plan.chain.chain_id(),
+        token = token_kind,
+        from = %plan.from,
+        to = %target,
+        value_wei = %value,
+        input_len = input.len(),
+        "quote: starting",
+    );
 
-    let gas_limit = provider
-        .estimate_gas(req)
-        .await
-        .map_err(|e| format!("estimate_gas: {e}"))?;
+    let gas_limit = match provider.estimate_gas(req).await {
+        Ok(g) => {
+            debug!(gas_limit = g, "quote: estimate_gas ok");
+            g
+        }
+        Err(e) => {
+            warn!(error = %e, "quote: estimate_gas failed");
+            return Err(format!("estimate_gas: {e}"));
+        }
+    };
 
-    let fees = provider
-        .estimate_eip1559_fees()
-        .await
-        .map_err(|e| format!("estimate_eip1559_fees: {e}"))?;
+    let fees = match provider.estimate_eip1559_fees().await {
+        Ok(f) => {
+            debug!(
+                max_fee_per_gas = f.max_fee_per_gas,
+                max_priority_fee_per_gas = f.max_priority_fee_per_gas,
+                "quote: estimate_eip1559_fees ok",
+            );
+            f
+        }
+        Err(e) => {
+            warn!(error = %e, "quote: estimate_eip1559_fees failed");
+            return Err(format!("estimate_eip1559_fees: {e}"));
+        }
+    };
 
-    let nonce = provider
-        .get_transaction_count(plan.from)
-        .pending()
-        .await
-        .map_err(|e| format!("get_transaction_count: {e}"))?;
+    let nonce = match provider.get_transaction_count(plan.from).pending().await {
+        Ok(n) => {
+            debug!(nonce = n, "quote: pending nonce ok");
+            n
+        }
+        Err(e) => {
+            warn!(error = %e, "quote: get_transaction_count failed");
+            return Err(format!("get_transaction_count: {e}"));
+        }
+    };
 
     let eth_cost_wei = U256::from(gas_limit).saturating_mul(U256::from(fees.max_fee_per_gas));
+
+    info!(
+        gas_limit,
+        max_fee_per_gas = fees.max_fee_per_gas,
+        max_priority_fee_per_gas = fees.max_priority_fee_per_gas,
+        nonce,
+        eth_cost_wei = %eth_cost_wei,
+        "quote: ready",
+    );
 
     Ok(TxQuote {
         gas_limit,
@@ -150,9 +203,27 @@ pub async fn sign_and_send(
     quote: TxQuote,
 ) -> Result<TxHash, String> {
     let (to, value, input) = plan.tx_target();
+    let token_kind = match &plan.token {
+        SendToken::Native => "native",
+        SendToken::Erc20 { .. } => "erc20",
+    };
+    info!(
+        chain = %plan.chain.label(),
+        chain_id = plan.chain.chain_id(),
+        token = token_kind,
+        from = %plan.from,
+        to = %to,
+        value_wei = %value,
+        input_len = input.len(),
+        nonce = quote.nonce,
+        gas_limit = quote.gas_limit,
+        max_fee_per_gas = quote.max_fee_per_gas,
+        max_priority_fee_per_gas = quote.max_priority_fee_per_gas,
+        "sign+send: signing tx",
+    );
 
-    let tx = TxEip1559 {
-        chain_id: CHAIN_ID,
+    let mut tx = TxEip1559 {
+        chain_id: plan.chain.chain_id(),
         nonce: quote.nonce,
         gas_limit: quote.gas_limit,
         max_fee_per_gas: quote.max_fee_per_gas,
@@ -163,21 +234,30 @@ pub async fn sign_and_send(
         input,
     };
 
-    let signing_hash = tx.signature_hash();
-    let sig = signer
-        .sign_hash(&signing_hash)
-        .await
-        .map_err(|e| format!("sign failed: {e}"))?;
+    let sig = match signer.sign_tx(&mut tx).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "sign+send: sign failed");
+            return Err(format!("sign failed: {e}"));
+        }
+    };
+    debug!("sign+send: signed");
 
     let envelope: TxEnvelope = tx.into_signed(sig).into();
     let raw = envelope.encoded_2718();
+    debug!(raw_len = raw.len(), "sign+send: broadcasting raw envelope");
 
-    let pending = provider
-        .send_raw_transaction(&raw)
-        .await
-        .map_err(|e| format!("broadcast failed: {e}"))?;
+    let pending = match provider.send_raw_transaction(&raw).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "sign+send: broadcast failed");
+            return Err(format!("broadcast failed: {e}"));
+        }
+    };
 
-    Ok(*pending.tx_hash())
+    let hash = *pending.tx_hash();
+    info!(hash = %format!("{hash:#x}"), "sign+send: broadcast ok");
+    Ok(hash)
 }
 
 #[cfg(test)]
@@ -241,6 +321,7 @@ mod tests {
             recipient: to,
             token: SendToken::Native,
             amount_units: U256::from(123u64),
+            chain: Chain::Mainnet,
         };
         let (target, value, input) = plan.tx_target();
         assert_eq!(target, to);
@@ -258,10 +339,19 @@ mod tests {
             recipient: to,
             token: SendToken::Erc20 { contract: usdc },
             amount_units: U256::from(1_000_000u64),
+            chain: Chain::Base,
         };
         let (target, value, input) = plan.tx_target();
         assert_eq!(target, usdc, "contract is the call target for ERC-20");
         assert_eq!(value, U256::ZERO);
         assert_eq!(input.len(), 68);
+    }
+
+    #[test]
+    fn chain_id_is_eip155_canonical() {
+        // Pin the EIP-155 ids — wrong values silently broadcast cross-chain.
+        assert_eq!(Chain::Mainnet.chain_id(), 1);
+        assert_eq!(Chain::Optimism.chain_id(), 10);
+        assert_eq!(Chain::Base.chain_id(), 8453);
     }
 }
