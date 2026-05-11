@@ -11,8 +11,12 @@ use alloy::eips::BlockId;
 use alloy::primitives::{Address, Bytes, U256, address, keccak256};
 use alloy::providers::{Provider, RootProvider};
 use alloy::network::Ethereum;
+use alloy::sol;
+use alloy::sol_types::SolCall;
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
@@ -62,6 +66,33 @@ where
         }
     }
     unreachable!("loop returns on success or final error");
+}
+
+// ── Multicall3 ──────────────────────────────────────────────────────────────
+
+/// Canonical Multicall3 deployment. Same address on every chain we
+/// support — Mainnet, Base, Optimism — so a single constant suffices.
+/// Used to batch every per-refresh `eth_call` (native ETH balance,
+/// ERC-20 `balanceOf`s, Uniswap V3 `slot0()` reads) into one round trip
+/// per batch.
+const MULTICALL3: Address = address!("0xcA11bde05977b3631167028862bE2a173976CA11");
+
+sol! {
+    struct Call3 {
+        address target;
+        bool allowFailure;
+        bytes callData;
+    }
+
+    /// Renamed from the canonical `Result` to dodge the clash with
+    /// `std::result::Result` in generated code paths.
+    struct MultiResult {
+        bool success;
+        bytes returnData;
+    }
+
+    function aggregate3(Call3[] calls) external returns (MultiResult[] memory results);
+    function getEthBalance(address addr) external view returns (uint256 balance);
 }
 
 // ── Uniswap V3 constants ────────────────────────────────────────────────────
@@ -116,13 +147,30 @@ fn usdc_for(chain: Chain) -> Address {
 
 #[derive(Clone, Copy)]
 enum PriceSource {
-    /// Price derived from a Uniswap V3 pool paired with WETH.
+    /// Price derived from a Uniswap V3 pool paired with WETH at a known
+    /// fee tier. Used for staples whose deepest pool is well-known
+    /// (USDC/USDT/DAI on 0.05 %, WBTC/LINK/UNI on 0.3 %, etc.).
     UniswapWethPool { fee: u32 },
+    /// Try Uniswap V3 WETH pools at 0.05 % → 0.3 % → 1 % until one of
+    /// them returns a non-zero `slot0`. Used for tokens sourced from the
+    /// bundled Superchain Token List, which doesn't carry fee-tier info.
+    UniswapWethPoolProbe,
     /// 1:1 peg with ETH (for WETH itself).
     EthPeg,
 }
 
 struct TokenMeta {
+    symbol: Cow<'static, str>,
+    name: Cow<'static, str>,
+    address: Address,
+    decimals: u8,
+    price_source: PriceSource,
+}
+
+/// Compile-time-borrowed shape used by the static `MAINNET_OVERLAY` /
+/// `BASE_OVERLAY` / `OPTIMISM_OVERLAY` arrays. Materialized into
+/// `TokenMeta` (with `Cow::Borrowed`) at `LazyLock` init time.
+struct OverlayEntry {
     symbol: &'static str,
     name: &'static str,
     address: Address,
@@ -130,55 +178,67 @@ struct TokenMeta {
     price_source: PriceSource,
 }
 
-/// Mainnet curated token list. Iterated by the on-chain-walk fallback
-/// path when the user has no indexer configured. The indexer (when
-/// configured) is the source of truth for token *holdings* — this list
-/// is just the metadata + price-source recipe for each token whose
-/// balance we want to surface without an indexer.
-const MAINNET_TOKENS: &[TokenMeta] = &[
-    TokenMeta {
+impl OverlayEntry {
+    fn to_meta(&self) -> TokenMeta {
+        TokenMeta {
+            symbol: Cow::Borrowed(self.symbol),
+            name: Cow::Borrowed(self.name),
+            address: self.address,
+            decimals: self.decimals,
+            price_source: self.price_source,
+        }
+    }
+}
+
+/// Mainnet curated overlay. Today this is the *entire* Mainnet list —
+/// the bundled Superchain tokenlist.json doesn't include the staples
+/// (no USDC/USDT/WETH/UNI/LINK on chainId 1), so swapping Mainnet over
+/// to it would regress coverage. Will be replaced by a richer Mainnet
+/// tokenlist later.
+const MAINNET_OVERLAY: &[OverlayEntry] = &[
+    OverlayEntry {
         symbol: "USDC",
         name: "USD Coin",
         address: address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"),
         decimals: 6,
         price_source: PriceSource::UniswapWethPool { fee: 500 },
     },
-    TokenMeta {
+    OverlayEntry {
         symbol: "USDT",
         name: "Tether",
         address: address!("0xdac17f958d2ee523a2206206994597c13d831ec7"),
         decimals: 6,
         price_source: PriceSource::UniswapWethPool { fee: 500 },
     },
-    TokenMeta {
+    OverlayEntry {
         symbol: "WBTC",
         name: "Wrapped BTC",
         address: address!("0x2260fac5e5542a773aa44fbcfedf7c193bc2c599"),
         decimals: 8,
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
     },
-    TokenMeta {
+    OverlayEntry {
         symbol: "WETH",
         name: "Wrapped Ether",
         address: address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"),
         decimals: 18,
         price_source: PriceSource::EthPeg,
     },
-    TokenMeta {
+    OverlayEntry {
         symbol: "LINK",
         name: "Chainlink",
         address: address!("0x514910771af9ca656af840dff83e8264ecf986ca"),
         decimals: 18,
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
     },
-    TokenMeta {
+    OverlayEntry {
         symbol: "UNI",
         name: "Uniswap",
         address: address!("0x1f9840a85d5af5bf1d1762f925bdaddc4201f984"),
         decimals: 18,
         price_source: PriceSource::UniswapWethPool { fee: 3000 },
     },
-    TokenMeta {
+    OverlayEntry {
         symbol: "DAI",
         name: "Dai",
         address: address!("0x6b175474e89094c44da98b954eedeac495271d0f"),
@@ -187,14 +247,178 @@ const MAINNET_TOKENS: &[TokenMeta] = &[
     },
 ];
 
-/// Per-chain curated token list. L2 lists are intentionally empty: the
-/// indexer is the source of truth at runtime, and a user without an
-/// indexer configured stays scoped to native ETH on L2 rather than
-/// shipping a subset that would diverge from what the indexer reports.
+/// Base core overlay — staples the Superchain Token List omits. Native
+/// USDC + canonical WETH + Coinbase BTC. Other Base tokens come from
+/// the bundled tokenlist.
+const BASE_OVERLAY: &[OverlayEntry] = &[
+    OverlayEntry {
+        symbol: "USDC",
+        name: "USD Coin",
+        address: address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+        decimals: 6,
+        price_source: PriceSource::UniswapWethPool { fee: 500 },
+    },
+    OverlayEntry {
+        symbol: "WETH",
+        name: "Wrapped Ether",
+        address: address!("0x4200000000000000000000000000000000000006"),
+        decimals: 18,
+        price_source: PriceSource::EthPeg,
+    },
+    OverlayEntry {
+        symbol: "cbBTC",
+        name: "Coinbase Wrapped BTC",
+        address: address!("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"),
+        decimals: 8,
+        price_source: PriceSource::UniswapWethPool { fee: 500 },
+    },
+];
+
+/// Optimism core overlay. Like Base, but carries the bridged USDT/WBTC/LINK
+/// the Superchain list also drops, plus the OP token itself.
+const OPTIMISM_OVERLAY: &[OverlayEntry] = &[
+    OverlayEntry {
+        symbol: "USDC",
+        name: "USD Coin",
+        address: address!("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85"),
+        decimals: 6,
+        price_source: PriceSource::UniswapWethPool { fee: 500 },
+    },
+    OverlayEntry {
+        symbol: "USDT",
+        name: "Tether",
+        address: address!("0x94b008aA00579c1307B0EF2c499aD98a8ce58e58"),
+        decimals: 6,
+        price_source: PriceSource::UniswapWethPool { fee: 500 },
+    },
+    OverlayEntry {
+        symbol: "WETH",
+        name: "Wrapped Ether",
+        address: address!("0x4200000000000000000000000000000000000006"),
+        decimals: 18,
+        price_source: PriceSource::EthPeg,
+    },
+    OverlayEntry {
+        symbol: "WBTC",
+        name: "Wrapped BTC",
+        address: address!("0x68f180fcCe6836688e9084f035309E29Bf0A2095"),
+        decimals: 8,
+        price_source: PriceSource::UniswapWethPool { fee: 3000 },
+    },
+    OverlayEntry {
+        symbol: "LINK",
+        name: "Chainlink",
+        address: address!("0x350a791Bfc2C21F9Ed5d10980Dad2e2638ffa7f6"),
+        decimals: 18,
+        price_source: PriceSource::UniswapWethPool { fee: 3000 },
+    },
+    OverlayEntry {
+        symbol: "OP",
+        name: "Optimism",
+        address: address!("0x4200000000000000000000000000000000000042"),
+        decimals: 18,
+        price_source: PriceSource::UniswapWethPool { fee: 3000 },
+    },
+];
+
+// ── Bundled Superchain Token List ───────────────────────────────────────────
+
+/// The Superchain Token List, embedded at compile time. Already shipped
+/// with the binary for SVG-logo lookup; reused here for L2 ERC-20
+/// metadata. Mainnet entries (chainId 1) are dropped at parse time —
+/// the list lacks the L1 staples we care about, so Mainnet relies on
+/// `MAINNET_OVERLAY` exclusively for now.
+const TOKENLIST_JSON: &str = include_str!("../assets/tokenlist.json");
+
+#[derive(serde::Deserialize)]
+struct TokenListFile {
+    #[serde(default)]
+    tokens: Vec<TokenListEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct TokenListEntry {
+    #[serde(rename = "chainId")]
+    chain_id: u64,
+    address: String,
+    #[serde(default)]
+    symbol: String,
+    #[serde(default)]
+    name: String,
+    decimals: u8,
+}
+
+/// Parse the embedded tokenlist into `(Optimism_entries, Base_entries)`.
+/// Returns owned `TokenMeta` rows (Cow::Owned strings). Each entry's
+/// price source is `UniswapWethPoolProbe` — the bundled list doesn't
+/// carry fee tiers, so we pick one at price-time.
+fn parse_tokenlist() -> (Vec<TokenMeta>, Vec<TokenMeta>) {
+    let parsed: TokenListFile = serde_json::from_str(TOKENLIST_JSON)
+        .expect("bundled tokenlist.json must parse");
+    let mut optimism = Vec::new();
+    let mut base = Vec::new();
+    for entry in parsed.tokens {
+        // Only chainIds we actually wire into the wallet today.
+        let bucket = match entry.chain_id {
+            10 => &mut optimism,
+            8453 => &mut base,
+            _ => continue,
+        };
+        let Ok(addr) = Address::from_str(&entry.address) else {
+            continue;
+        };
+        bucket.push(TokenMeta {
+            symbol: Cow::Owned(entry.symbol),
+            name: Cow::Owned(entry.name),
+            address: addr,
+            decimals: entry.decimals,
+            price_source: PriceSource::UniswapWethPoolProbe,
+        });
+    }
+    (optimism, base)
+}
+
+/// Build a per-chain `Vec<TokenMeta>` by union-merging an overlay (small,
+/// hand-curated, with explicit fee tiers) onto the bundled tokenlist.
+/// Dedup by lowercase address; the overlay wins on collision so its
+/// known fee tier sticks instead of falling back to a pool-probe.
+fn merge_overlay(overlay: &[OverlayEntry], tokenlist: Vec<TokenMeta>) -> Vec<TokenMeta> {
+    let mut seen: std::collections::HashSet<Address> =
+        overlay.iter().map(|e| e.address).collect();
+    let mut out: Vec<TokenMeta> =
+        overlay.iter().map(OverlayEntry::to_meta).collect();
+    for tk in tokenlist {
+        if seen.insert(tk.address) {
+            out.push(tk);
+        }
+    }
+    out
+}
+
+static MAINNET_TOKENS: LazyLock<Vec<TokenMeta>> = LazyLock::new(|| {
+    // Mainnet stays on the curated overlay alone — see `MAINNET_OVERLAY`.
+    MAINNET_OVERLAY.iter().map(OverlayEntry::to_meta).collect()
+});
+
+static OPTIMISM_TOKENS: LazyLock<Vec<TokenMeta>> = LazyLock::new(|| {
+    let (optimism, _) = parse_tokenlist();
+    merge_overlay(OPTIMISM_OVERLAY, optimism)
+});
+
+static BASE_TOKENS: LazyLock<Vec<TokenMeta>> = LazyLock::new(|| {
+    let (_, base) = parse_tokenlist();
+    merge_overlay(BASE_OVERLAY, base)
+});
+
+/// Per-chain token metadata used by the on-chain portfolio walk. L2 lists
+/// are union of the chain's core overlay (USDC, USDT, WETH, …) and the
+/// bundled Superchain tokenlist — so a user with no indexer configured
+/// still sees their L2 ERC-20s, not just native ETH.
 fn tokens_for(chain: Chain) -> &'static [TokenMeta] {
     match chain {
-        Chain::Mainnet => MAINNET_TOKENS,
-        Chain::Base | Chain::Optimism => &[],
+        Chain::Mainnet => MAINNET_TOKENS.as_slice(),
+        Chain::Base => BASE_TOKENS.as_slice(),
+        Chain::Optimism => OPTIMISM_TOKENS.as_slice(),
     }
 }
 
@@ -314,29 +538,6 @@ fn pool_address(factory: Address, token_a: Address, token_b: Address, fee: u32) 
 /// `slot0()` selector — first 4 bytes of keccak256("slot0()")
 const SLOT0_SELECTOR: [u8; 4] = [0x38, 0x50, 0xc7, 0xbd];
 
-/// Read `sqrtPriceX96` from a Uniswap V3 pool's `slot0` at `block`.
-async fn read_sqrt_price(
-    provider: &RootProvider<Ethereum>,
-    pool: Address,
-    block: BlockId,
-) -> Result<U256, String> {
-    let label = format!("slot0({pool})");
-    let result = with_rate_limit_retry(&label, || async {
-        let tx = alloy::rpc::types::TransactionRequest::default()
-            .to(pool)
-            .input(alloy::rpc::types::TransactionInput::new(Bytes::from(
-                SLOT0_SELECTOR.to_vec(),
-            )));
-        provider.call(tx).block(block).await
-    })
-    .await
-    .map_err(|e| format!("{label}: {e}"))?;
-    if result.len() < 32 {
-        return Err(format!("{label} returned {} bytes", result.len()));
-    }
-    Ok(U256::from_be_slice(&result[..32]))
-}
-
 /// Convert `sqrtPriceX96` to a float ratio (token1 / token0 in smallest units).
 fn sqrt_price_to_raw(sqrt_price_x96: U256) -> f64 {
     let s: f64 = sqrt_price_x96.to_string().parse().unwrap_or(0.0);
@@ -389,15 +590,84 @@ fn token_price_in_eth(
     }
 }
 
-// ── Fetch portfolio ───────────────────────────────────────────────────────���──
+// ── Fetch portfolio ─────────────────────────────────────────────────────────
 
-/// Fetch the full portfolio for `owner` on `chain`: native ETH plus the
-/// chain's curated ERC-20 list (Mainnet has 7 tokens; L2 lists are empty
-/// — the indexer is the runtime token source on L2). Prices are read
-/// on-chain from the chain's Uniswap V3 deployment (no external API).
-/// Returns live tokens sorted ETH-first then by USD value descending,
-/// every entry stamped with `chain` so the dashboard can group/render
-/// per-chain rows.
+/// Fee tiers tried in order when a token's `PriceSource` is `Probe`.
+/// Order matches Uniswap's TVL distribution: stables sit on 0.05 %,
+/// blue-chip ERC-20s on 0.3 %, exotics on 1 %. We stop at the first
+/// fee tier whose `slot0` returns a non-zero `sqrtPriceX96` — anything
+/// else means the pool isn't deployed (or has no liquidity).
+const PROBE_FEES: [u32; 3] = [500, 3000, 10000];
+
+/// Issue one Multicall3 `aggregate3` round trip. Wraps the call in
+/// `with_rate_limit_retry` so 429s back off instead of zeroing the
+/// portfolio. Returns the per-subcall (success, returnData) rows in the
+/// same order the caller queued them.
+async fn multicall3(
+    provider: &RootProvider<Ethereum>,
+    block: BlockId,
+    label: &str,
+    calls: Vec<Call3>,
+) -> Result<Vec<MultiResult>, String> {
+    let calldata = Bytes::from(aggregate3Call { calls }.abi_encode());
+    let raw = with_rate_limit_retry(label, || async {
+        let tx = alloy::rpc::types::TransactionRequest::default()
+            .to(MULTICALL3)
+            .input(alloy::rpc::types::TransactionInput::new(calldata.clone()));
+        provider.call(tx).block(block).await
+    })
+    .await
+    .map_err(|e| format!("{label}: {e}"))?;
+    let decoded = aggregate3Call::abi_decode_returns(&raw)
+        .map_err(|e| format!("{label} decode: {e}"))?;
+    Ok(decoded)
+}
+
+/// Decode a raw `MultiResult.returnData` as a 32-byte uint. Returns
+/// `U256::ZERO` for `success=false`, short returns, or empty data —
+/// every site that reads a `balanceOf` or `slot0` result wants exactly
+/// this fallback.
+fn decode_u256(r: &MultiResult) -> U256 {
+    if !r.success || r.returnData.len() < 32 {
+        return U256::ZERO;
+    }
+    U256::from_be_slice(&r.returnData[..32])
+}
+
+/// Walk a slice of `slot0` results in fee-tier order and return the
+/// first non-zero `sqrtPriceX96`. Backs `PriceSource::UniswapWethPoolProbe`:
+/// 0.05 % is checked first, then 0.3 %, then 1 %, and the search stops at
+/// the first pool with liquidity. Returns `U256::ZERO` when none of the
+/// candidate pools is deployed.
+fn first_nonzero_sqrt(results: &[MultiResult]) -> U256 {
+    results
+        .iter()
+        .map(decode_u256)
+        .find(|s| !s.is_zero())
+        .unwrap_or(U256::ZERO)
+}
+
+/// Plan describing how to interpret a slice of batch-2 results for one
+/// held token: either no subcall (peg), one subcall (known fee), or
+/// three subcalls (probe 0.05/0.3/1 %).
+enum PricePlan {
+    EthPeg,
+    Single { result_idx: usize },
+    Probe { start_idx: usize },
+}
+
+/// Fetch the full portfolio for `owner` on `chain`: native ETH plus
+/// every ERC-20 in `tokens_for(chain)` the address holds, with prices
+/// quoted on-chain from the chain's Uniswap V3 deployment. No external
+/// APIs, no API keys.
+///
+/// Implementation: two `Multicall3.aggregate3` round trips per refresh.
+/// Batch 1 issues the native-ETH read, the ETH/USD `slot0` read, and
+/// every token's `balanceOf` in one shot. Batch 2 issues `slot0` for
+/// each held token's WETH pool (fixed fee tier when known, or the
+/// 0.05 %/0.3 %/1 % probe when sourced from the bundled tokenlist).
+/// Result: 2 RPC round trips regardless of token-list size, vs. 1+N+M
+/// in the previous sequential design.
 ///
 /// `provider` is supplied by the caller (typically the per-chain
 /// `NetworkClient` fallback) so account switches reuse one HTTP
@@ -416,71 +686,119 @@ pub async fn fetch_portfolio(
     // available on every upstream and gives a consistent state snapshot.
     let block = BlockId::finalized();
 
-    // 1. Fetch native ETH balance
-    let eth_balance_raw = with_rate_limit_retry("eth_getBalance", || async {
-        provider.get_balance(owner).block_id(block).await
-    })
-    .await
-    .map_err(|e| format!("eth_getBalance: {e}"))?;
-
-    trace!(raw = %eth_balance_raw, "ETH raw balance");
-
     let token_list = tokens_for(chain);
     let factory = factory_for(chain);
     let weth = weth_for(chain);
     let usdc = usdc_for(chain);
+    let eth_price_pool = pool_address(factory, usdc, weth, ETH_PRICE_FEE);
 
-    // 2. Fetch ERC-20 balances
-    let mut erc20_balances: Vec<(usize, U256)> = Vec::new();
-    for (i, token) in token_list.iter().enumerate() {
-        let label = format!("balanceOf({})", token.symbol);
-        let outcome = with_rate_limit_retry(&label, || async {
-            let tx = alloy::rpc::types::TransactionRequest::default()
-                .to(token.address)
-                .input(alloy::rpc::types::TransactionInput::new(balance_of_calldata(owner)));
-            provider.call(tx).block(block).await
-        })
-        .await;
-        match outcome {
-            Ok(result) => {
-                let balance = if result.len() >= 32 {
-                    U256::from_be_slice(&result[..32])
-                } else {
-                    U256::ZERO
-                };
-                if !balance.is_zero() {
-                    trace!(symbol = token.symbol, raw = %balance, "ERC-20 raw balance");
-                }
-                erc20_balances.push((i, balance));
-            }
-            Err(e) => {
-                warn!(symbol = token.symbol, error = %e, "balanceOf call failed");
-                erc20_balances.push((i, U256::ZERO));
-            }
-        }
+    // ── Batch 1: native ETH balance + ETH/USD slot0 + every balanceOf ──
+    //
+    // Native ETH goes through Multicall3.getEthBalance so it shares the
+    // same round trip; otherwise we'd need a separate eth_getBalance.
+    let mut batch1: Vec<Call3> = Vec::with_capacity(token_list.len() + 2);
+    batch1.push(Call3 {
+        target: MULTICALL3,
+        allowFailure: false,
+        callData: Bytes::from(getEthBalanceCall { addr: owner }.abi_encode()),
+    });
+    batch1.push(Call3 {
+        target: eth_price_pool,
+        allowFailure: true,
+        callData: Bytes::from(SLOT0_SELECTOR.to_vec()),
+    });
+    for token in token_list {
+        batch1.push(Call3 {
+            target: token.address,
+            allowFailure: true,
+            callData: balance_of_calldata(owner),
+        });
     }
 
-    // 3. ETH/USD price from the chain's Uniswap V3 USDC/WETH pool. ETH
-    // on L2 is bridged 1:1 from L1, so the price reads converge across
-    // chains modulo arbitrage spread; we still query each chain locally
-    // to avoid coupling the L2 fetch to a working mainnet provider.
-    let eth_price_pool = pool_address(factory, usdc, weth, ETH_PRICE_FEE);
-    let eth_usd = match read_sqrt_price(provider, eth_price_pool, block).await {
-        Ok(sqrt) => {
+    let started = std::time::Instant::now();
+    let batch1_results = multicall3(provider, block, "multicall3 balances", batch1).await?;
+    debug!(
+        chain = %chain.label(),
+        elapsed = ?started.elapsed(),
+        subcalls = batch1_results.len(),
+        "multicall3 balances completed",
+    );
+
+    // batch1_results layout: [native_eth, eth_pool_slot0, token0, token1, …]
+    let eth_balance_raw = decode_u256(&batch1_results[0]);
+    let eth_usd = if let Some(pool_result) = batch1_results.get(1) {
+        let sqrt = decode_u256(pool_result);
+        if sqrt.is_zero() {
+            warn!(chain = %chain.label(), "ETH/USD pool returned zero sqrtPriceX96");
+            0.0
+        } else {
             let price = eth_usd_from_sqrt_price(sqrt, usdc, weth);
             debug!(chain = %chain.label(), price = format!("${price:.2}"), "ETH/USD from Uniswap");
             price
         }
-        Err(e) => {
-            warn!(chain = %chain.label(), error = %e, "ETH/USD price read failed");
-            0.0
+    } else {
+        0.0
+    };
+    let token_balances: Vec<U256> = batch1_results
+        .iter()
+        .skip(2)
+        .map(decode_u256)
+        .collect();
+
+    // ── Batch 2: per-token slot0 reads for held positions ───────────────
+    let mut batch2: Vec<Call3> = Vec::new();
+    let mut plans: Vec<(usize, PricePlan)> = Vec::new();
+
+    for (i, raw_balance) in token_balances.iter().enumerate() {
+        if raw_balance.is_zero() {
+            continue;
         }
+        let token = &token_list[i];
+        let plan = match token.price_source {
+            PriceSource::EthPeg => PricePlan::EthPeg,
+            PriceSource::UniswapWethPool { fee } => {
+                let pool = pool_address(factory, token.address, weth, fee);
+                let result_idx = batch2.len();
+                batch2.push(Call3 {
+                    target: pool,
+                    allowFailure: true,
+                    callData: Bytes::from(SLOT0_SELECTOR.to_vec()),
+                });
+                PricePlan::Single { result_idx }
+            }
+            PriceSource::UniswapWethPoolProbe => {
+                let start_idx = batch2.len();
+                for fee in PROBE_FEES {
+                    let pool = pool_address(factory, token.address, weth, fee);
+                    batch2.push(Call3 {
+                        target: pool,
+                        allowFailure: true,
+                        callData: Bytes::from(SLOT0_SELECTOR.to_vec()),
+                    });
+                }
+                PricePlan::Probe { start_idx }
+            }
+        };
+        plans.push((i, plan));
+    }
+
+    let batch2_results: Vec<MultiResult> = if batch2.is_empty() {
+        Vec::new()
+    } else {
+        let started = std::time::Instant::now();
+        let r = multicall3(provider, block, "multicall3 prices", batch2).await?;
+        debug!(
+            chain = %chain.label(),
+            elapsed = ?started.elapsed(),
+            subcalls = r.len(),
+            "multicall3 prices completed",
+        );
+        r
     };
 
-    // 4. Build LiveToken vec, fetching prices only for held tokens
-    let mut tokens: Vec<LiveToken> = Vec::new();
+    // ── Build LiveToken vec ────────────────────────────────────────────
+    let mut tokens: Vec<LiveToken> = Vec::with_capacity(plans.len() + 1);
 
-    // ETH (always included)
     let (eth_bal_str, eth_bal_f64) = format_eth_balance(eth_balance_raw);
     tokens.push(LiveToken {
         symbol: "ETH".into(),
@@ -495,51 +813,46 @@ pub async fn fetch_portfolio(
         chain,
     });
 
-    // ERC-20s (only non-zero balances — skip the price read otherwise)
-    for (i, raw_balance) in &erc20_balances {
-        if raw_balance.is_zero() {
-            continue;
-        }
-        let meta = &token_list[*i];
-        let price = match meta.price_source {
-            PriceSource::EthPeg => eth_usd,
-            PriceSource::UniswapWethPool { fee } => {
-                let pool = pool_address(factory, meta.address, weth, fee);
-                match read_sqrt_price(provider, pool, block).await {
-                    Ok(sqrt) => {
-                        let in_eth = token_price_in_eth(sqrt, meta.address, meta.decimals, weth);
-                        let in_usd = in_eth * eth_usd;
-                        trace!(
-                            symbol = meta.symbol,
-                            eth = format!("{in_eth:.6}"),
-                            usd = format!("${in_usd:.2}"),
-                            "token price",
-                        );
-                        in_usd
-                    }
-                    Err(e) => {
-                        warn!(symbol = meta.symbol, error = %e, "token price read failed");
-                        0.0
-                    }
+    for (token_idx, plan) in plans {
+        let token = &token_list[token_idx];
+        let raw_balance = token_balances[token_idx];
+        let price = match plan {
+            PricePlan::EthPeg => eth_usd,
+            PricePlan::Single { result_idx } => {
+                let sqrt = decode_u256(&batch2_results[result_idx]);
+                if sqrt.is_zero() {
+                    0.0
+                } else {
+                    token_price_in_eth(sqrt, token.address, token.decimals, weth) * eth_usd
+                }
+            }
+            PricePlan::Probe { start_idx } => {
+                let end = start_idx + PROBE_FEES.len();
+                let sqrt = first_nonzero_sqrt(&batch2_results[start_idx..end]);
+                if sqrt.is_zero() {
+                    0.0
+                } else {
+                    token_price_in_eth(sqrt, token.address, token.decimals, weth) * eth_usd
                 }
             }
         };
-        let (bal_str, bal_f64) = format_token_balance(*raw_balance, meta.decimals);
+        let (bal_str, bal_f64) = format_token_balance(raw_balance, token.decimals);
         tokens.push(LiveToken {
-            symbol: meta.symbol.into(),
-            name: meta.name.into(),
+            symbol: token.symbol.to_string(),
+            name: token.name.to_string(),
             balance: bal_str,
             balance_f64: bal_f64,
-            balance_raw: *raw_balance,
-            decimals: meta.decimals,
-            contract: Some(meta.address),
+            balance_raw: raw_balance,
+            decimals: token.decimals,
+            contract: Some(token.address),
             usd_price: price,
             usd_value: bal_f64 * price,
             chain,
         });
     }
 
-    // 5. Sort: ETH first, then by USD value descending
+    // ETH first, then by USD value descending. Matches the per-chain
+    // sort the dashboard relies on for stable row ordering.
     tokens[1..].sort_by(|a, b| {
         b.usd_value
             .partial_cmp(&a.usd_value)
@@ -601,5 +914,202 @@ mod pool_address_tests {
         let canonical: Address =
             address!("0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7b");
         assert_eq!(derived, canonical, "derived: {derived:?}");
+    }
+}
+
+#[cfg(test)]
+mod tokenlist_tests {
+    use super::*;
+
+    /// The bundled Superchain Token List must always parse and yield
+    /// non-empty Base + Optimism vecs. A regression here means the
+    /// L2 on-chain walk is back to ETH-only (no ERC-20 surfaces).
+    #[test]
+    fn parse_tokenlist_yields_l2_entries_and_drops_mainnet() {
+        let (optimism, base) = parse_tokenlist();
+        assert!(!optimism.is_empty(), "Optimism tokenlist must not be empty");
+        assert!(!base.is_empty(), "Base tokenlist must not be empty");
+
+        // cbETH on Optimism is one of the entries we sampled while
+        // designing the change — pin it as a coverage anchor so a future
+        // tokenlist sync that drops L2 entries fails loudly.
+        let cbeth: Address = address!("0xaddb6a0412de1ba0f936dcaeb8aaa24578dcf3b2");
+        assert!(
+            optimism.iter().any(|t| t.address == cbeth),
+            "expected cbETH on Optimism in parsed list",
+        );
+
+        // Every parsed entry should default to probing — fee tiers come
+        // from the overlay, not the tokenlist.
+        assert!(
+            optimism
+                .iter()
+                .all(|t| matches!(t.price_source, PriceSource::UniswapWethPoolProbe)),
+        );
+    }
+
+    /// Overlay must win on address collision — otherwise a tokenlist row
+    /// with `Probe` would shadow a curated entry's known fee tier and
+    /// cost an extra round trip per refresh just to rediscover it.
+    #[test]
+    fn merge_overlay_wins_on_address_collision() {
+        // Reuse a real L2 USDC address from the Optimism overlay so the
+        // collision is a realistic one — same address, different price
+        // source.
+        let usdc_op = address!("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85");
+        let overlay = &[OverlayEntry {
+            symbol: "USDC",
+            name: "USD Coin",
+            address: usdc_op,
+            decimals: 6,
+            price_source: PriceSource::UniswapWethPool { fee: 500 },
+        }];
+        let tokenlist = vec![TokenMeta {
+            symbol: Cow::Owned("FAKE".into()),
+            name: Cow::Owned("Imposter".into()),
+            address: usdc_op,
+            decimals: 18,
+            price_source: PriceSource::UniswapWethPoolProbe,
+        }];
+        let merged = merge_overlay(overlay, tokenlist);
+        assert_eq!(merged.len(), 1, "collision must dedupe to a single row");
+        assert_eq!(merged[0].symbol, "USDC", "overlay symbol wins");
+        assert!(
+            matches!(merged[0].price_source, PriceSource::UniswapWethPool { fee: 500 }),
+            "overlay's known fee tier must beat tokenlist Probe",
+        );
+    }
+
+    /// Tokenlist entries with addresses the overlay doesn't carry must
+    /// pass through unchanged — that's where the bulk of L2 coverage
+    /// comes from.
+    #[test]
+    fn merge_overlay_appends_disjoint_tokenlist_entries() {
+        let only_in_tokenlist = address!("0x000096630066820566162c94874a776532705231");
+        let merged = merge_overlay(
+            BASE_OVERLAY,
+            vec![TokenMeta {
+                symbol: Cow::Owned("OBSCURE".into()),
+                name: Cow::Owned("Obscure Token".into()),
+                address: only_in_tokenlist,
+                decimals: 18,
+                price_source: PriceSource::UniswapWethPoolProbe,
+            }],
+        );
+        assert_eq!(merged.len(), BASE_OVERLAY.len() + 1);
+        assert!(merged.iter().any(|t| t.address == only_in_tokenlist));
+    }
+}
+
+#[cfg(test)]
+mod multicall_tests {
+    use super::*;
+    use alloy::primitives::U256;
+    use alloy::sol_types::SolCall;
+
+    /// Round-trip the `aggregate3` calldata: encoding three balanceOf
+    /// subcalls and decoding the bytes back must yield the same
+    /// addresses + calldata. A silent break here would make every
+    /// portfolio refresh hit the wrong tokens.
+    #[test]
+    fn aggregate3_calldata_round_trips() {
+        let owner: Address = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+        let usdc_op: Address = address!("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85");
+        let usdt_op: Address = address!("0x94b008aA00579c1307B0EF2c499aD98a8ce58e58");
+        let calls = vec![
+            Call3 {
+                target: MULTICALL3,
+                allowFailure: false,
+                callData: Bytes::from(getEthBalanceCall { addr: owner }.abi_encode()),
+            },
+            Call3 {
+                target: usdc_op,
+                allowFailure: true,
+                callData: balance_of_calldata(owner),
+            },
+            Call3 {
+                target: usdt_op,
+                allowFailure: true,
+                callData: balance_of_calldata(owner),
+            },
+        ];
+        let encoded = aggregate3Call { calls: calls.clone() }.abi_encode();
+        let decoded = aggregate3Call::abi_decode(&encoded).expect("input must decode");
+
+        assert_eq!(decoded.calls.len(), 3);
+        assert_eq!(decoded.calls[0].target, MULTICALL3);
+        assert!(!decoded.calls[0].allowFailure);
+        assert_eq!(decoded.calls[1].target, usdc_op);
+        assert!(decoded.calls[1].allowFailure);
+        assert_eq!(decoded.calls[1].callData, calls[1].callData);
+        assert_eq!(decoded.calls[2].target, usdt_op);
+        assert_eq!(decoded.calls[2].callData, calls[2].callData);
+    }
+
+    fn raw_sqrt(value: U256) -> Bytes {
+        let mut buf = vec![0u8; 32];
+        let bytes = value.to_be_bytes::<32>();
+        buf.copy_from_slice(&bytes);
+        Bytes::from(buf)
+    }
+
+    fn ok(data: Bytes) -> MultiResult {
+        MultiResult { success: true, returnData: data }
+    }
+
+    fn failed() -> MultiResult {
+        MultiResult { success: false, returnData: Bytes::new() }
+    }
+
+    /// `decode_u256` is the single chokepoint that translates a
+    /// `MultiResult` row into a U256. Its three failure modes must all
+    /// collapse to zero — short data, empty data, and `success=false`
+    /// — otherwise a malformed pool/token would render as a wildly
+    /// wrong USD value instead of "no price".
+    #[test]
+    fn decode_u256_handles_failure_and_short_data() {
+        let happy = ok(raw_sqrt(U256::from(123_456_789u64)));
+        assert_eq!(decode_u256(&happy), U256::from(123_456_789u64));
+
+        // success=false → zero, regardless of data length.
+        let oops = failed();
+        assert_eq!(decode_u256(&oops), U256::ZERO);
+
+        // success=true but empty data → zero.
+        let empty = ok(Bytes::new());
+        assert_eq!(decode_u256(&empty), U256::ZERO);
+
+        // Short data (<32 bytes) → zero. Catches a Multicall3-style
+        // partial response without misinterpreting the prefix.
+        let short = ok(Bytes::from(vec![0u8; 16]));
+        assert_eq!(decode_u256(&short), U256::ZERO);
+    }
+
+    /// Probe order: 0.05 % is checked first, then 0.3 %, then 1 %.
+    /// `first_nonzero_sqrt` must skip empty/zero pools and return the
+    /// first one with liquidity in that exact order. Anchors the
+    /// `UniswapWethPoolProbe` arm against silent reordering bugs.
+    #[test]
+    fn first_nonzero_sqrt_skips_empty_pools() {
+        // [0.05 % zero, 0.3 % zero, 1 % non-zero] — picks the 1 % pool.
+        let results = vec![
+            ok(raw_sqrt(U256::ZERO)),
+            failed(),
+            ok(raw_sqrt(U256::from(42u64))),
+        ];
+        assert_eq!(first_nonzero_sqrt(&results), U256::from(42u64));
+
+        // [0.05 % non-zero, …] — picks the first one without touching
+        // the rest.
+        let results = vec![
+            ok(raw_sqrt(U256::from(7u64))),
+            ok(raw_sqrt(U256::from(99u64))),
+            ok(raw_sqrt(U256::from(123u64))),
+        ];
+        assert_eq!(first_nonzero_sqrt(&results), U256::from(7u64));
+
+        // No pool has liquidity → zero (caller treats as $0 price).
+        let results = vec![failed(), failed(), ok(raw_sqrt(U256::ZERO))];
+        assert_eq!(first_nonzero_sqrt(&results), U256::ZERO);
     }
 }
