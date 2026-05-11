@@ -8,12 +8,13 @@
 
 use iced::border::Radius;
 use iced::keyboard;
-use iced::widget::{Space, column, container, mouse_area, row, scrollable, stack, text};
+use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, stack, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    avatar, black, bold, kao_scrollable_style, kaomoji_for_account, mono, thin_divider,
+    avatar, black, bold, ghost_button, hover_tint, kao_scrollable_style, kaomoji_for_account,
+    mono, thin_divider,
 };
 use crate::wallet::{AccountDescriptor, account_short_address};
 
@@ -169,25 +170,26 @@ fn account_row<'a>(
         check,
     ]
     .align_y(Alignment::Center)
-    .padding(Padding::from([6, 8]));
+    .width(Length::Fill);
 
     let bg = if active { t.ab1 } else { Color::TRANSPARENT };
-    let styled = container(inner)
+    button(inner)
+        .padding(Padding::from([6, 8]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(bg)),
+        .on_press(Message::Select(idx))
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
+                _ => bg,
+            })),
+            text_color: t.text,
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
                 radius: Radius::from(10),
             },
-            text_color: Some(t.text),
-            ..container::Style::default()
-        });
-
-    mouse_area(styled)
-        .on_press(Message::Select(idx))
-        .interaction(iced::mouse::Interaction::Pointer)
+            ..button::Style::default()
+        })
         .into()
 }
 
@@ -198,23 +200,11 @@ fn add_account_row<'a>(t: KaoTheme) -> Element<'a, Message> {
         text("Add new address").size(13).color(t.text).font(bold()),
     ]
     .align_y(Alignment::Center)
-    .padding(Padding::from([8, 8]));
+    .width(Length::Fill);
 
-    let styled = container(inner)
+    ghost_button(t, inner)
+        .padding(Padding::from([8, 8]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(Color::TRANSPARENT)),
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: Radius::from(10),
-            },
-            text_color: Some(t.text),
-            ..container::Style::default()
-        });
-
-    mouse_area(styled)
         .on_press(Message::Add)
-        .interaction(iced::mouse::Interaction::Pointer)
         .into()
 }

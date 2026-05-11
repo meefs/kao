@@ -2,11 +2,12 @@
 //! Only "Networks" is wired up today; the others are placeholders for future
 //! sub-screens.
 
-use iced::widget::{Space, column, container, mouse_area, row, text};
-use iced::{Alignment, Element, Length, Padding};
+use iced::border::Radius;
+use iced::widget::{Space, button, column, container, row, text};
+use iced::{Alignment, Background, Border, Element, Length, Padding};
 
 use crate::ui::kao_theme::KaoTheme;
-use crate::ui::kao_widgets::{avatar, bold, card_style, kao_scrollable_style};
+use crate::ui::kao_widgets::{avatar, bold, card_style, hover_tint, kao_scrollable_style};
 
 use super::Message;
 
@@ -64,14 +65,32 @@ fn settings_row<'a>(
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
-    let card: Element<'a, Message> = container(row)
-        .padding(Padding::from([15, 17]))
-        .width(Length::Fill)
-        .style(move |_| card_style(t))
-        .into();
-
+    // Clickable categories become buttons so they pick up the canonical
+    // hover tint; placeholder rows (no `on_click`) stay bare containers
+    // so hovering them doesn't promise an action that isn't wired up.
     match on_click {
-        Some(msg) => mouse_area(card).on_press(msg).into(),
-        None => card,
+        Some(msg) => button(row)
+            .padding(Padding::from([15, 17]))
+            .width(Length::Fill)
+            .on_press(msg)
+            .style(move |_theme, status| button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered | button::Status::Pressed => hover_tint(t.card, t.text),
+                    _ => t.card,
+                })),
+                text_color: t.text,
+                border: Border {
+                    color: t.border,
+                    width: 1.0,
+                    radius: Radius::from(14),
+                },
+                ..button::Style::default()
+            })
+            .into(),
+        None => container(row)
+            .padding(Padding::from([15, 17]))
+            .width(Length::Fill)
+            .style(move |_| card_style(t))
+            .into(),
     }
 }

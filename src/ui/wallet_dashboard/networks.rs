@@ -16,7 +16,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use alloy::primitives::B256;
-use iced::widget::{Space, column, container, mouse_area, row, text, text_input};
+use iced::widget::{Space, column, container, row, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
 use crate::net::BalanceFetcher;
@@ -24,7 +24,7 @@ use crate::settings;
 use crate::chain::{Chain, PerChain};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    black, bold, kao_scrollable_style, primary_button, section, text_input_style,
+    black, bold, ghost_button, kao_scrollable_style, primary_button, section, text_input_style,
 };
 
 #[derive(Debug, Clone)]
@@ -146,11 +146,9 @@ impl NetworksPane {
 
     pub fn view<'a>(&'a self, t: KaoTheme) -> Element<'a, Message> {
         let header = row![
-            mouse_area(
-                container(text("← Back").size(12).color(t.sub).font(bold()))
-                    .padding(Padding::from([4, 0])),
-            )
-            .on_press(Message::Back),
+            ghost_button(t, text("← Back").size(12).color(t.sub).font(bold()))
+                .padding(Padding::from([4, 8]))
+                .on_press(Message::Back),
             Space::new().width(Length::Fill),
             text("Networks").size(14).color(t.text).font(black()),
             Space::new().width(Length::Fill),

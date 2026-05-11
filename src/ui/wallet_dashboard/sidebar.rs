@@ -1,11 +1,11 @@
 //! Vertical sidebar — wordmark and nav icons. Stateless view.
 
 use iced::border::Radius;
-use iced::widget::{Space, column, container, mouse_area, text};
+use iced::widget::{Space, button, column, container, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
-use crate::ui::kao_widgets::{bold, kao_fit};
+use crate::ui::kao_widgets::{bold, hover_tint, kao_fit};
 
 use super::{Message, Nav};
 
@@ -87,8 +87,27 @@ fn nav_icon<'a>(
     ]
     .spacing(6)
     .align_x(Alignment::Center);
-    mouse_area(inner)
+    // The icon_box keeps its own active treatment (filled `t.ab1`) so
+    // the active nav cell still reads as the same shape it always has.
+    // The button only contributes the hover affordance: a transparent
+    // idle that lifts to the canonical tint behind the column on hover.
+    button(inner)
+        .padding(0)
         .on_press(Message::SelectNav(id))
-        .interaction(iced::mouse::Interaction::Pointer)
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    hover_tint(Color::TRANSPARENT, t.text)
+                }
+                _ => Color::TRANSPARENT,
+            })),
+            text_color: t.text,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(20),
+            },
+            ..button::Style::default()
+        })
         .into()
 }

@@ -2,21 +2,21 @@
 //! Settings nav slot.
 
 use iced::border::Radius;
-use iced::widget::{Space, column, container, mouse_area, row, text};
+use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
-use crate::ui::kao_widgets::{black, bold, card_style, kao_scrollable_style, section};
+use crate::ui::kao_widgets::{
+    black, bold, ghost_button, hover_tint, kao_scrollable_style, section,
+};
 
 use super::Message;
 
 pub fn view<'a>(t: KaoTheme, current: ThemeKind) -> Element<'a, Message> {
     let header = row![
-        mouse_area(
-            container(text("← Back").size(12).color(t.sub).font(bold()))
-                .padding(Padding::from([4, 0])),
-        )
-        .on_press(Message::CloseAppearanceSettings),
+        ghost_button(t, text("← Back").size(12).color(t.sub).font(bold()))
+            .padding(Padding::from([4, 8]))
+            .on_press(Message::CloseAppearanceSettings),
         Space::new().width(Length::Fill),
         text("Appearance").size(14).color(t.text).font(black()),
         Space::new().width(Length::Fill),
@@ -93,14 +93,22 @@ fn theme_row<'a>(t: KaoTheme, current: ThemeKind, k: ThemeKind) -> Element<'a, M
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
-    let card: Element<'a, Message> = container(row)
+    button(row)
         .padding(Padding::from([12, 14]))
         .width(Length::Fill)
-        .style(move |_| card_style(t))
-        .into();
-
-    mouse_area(card)
         .on_press(Message::SelectTheme(k))
-        .interaction(iced::mouse::Interaction::Pointer)
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => hover_tint(t.card, t.text),
+                _ => t.card,
+            })),
+            text_color: t.text,
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(14),
+            },
+            ..button::Style::default()
+        })
         .into()
 }

@@ -19,7 +19,7 @@ use alloy::primitives::Address;
 use iced::border::Radius;
 use iced::keyboard;
 use iced::widget::operation::{focus as focus_widget, focus_next, focus_previous};
-use iced::widget::{Space, button, column, container, mouse_area, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription, Task};
 
 /// Stable ID for the NAME field so we can auto-focus it when the user
@@ -30,8 +30,8 @@ const NAME_INPUT_ID: &str = "contacts:name";
 
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    black, bold, card_style, colored_address, hover_tint, kao_scrollable_style, mono,
-    primary_button, secondary_button, small_secondary_button, text_input_style,
+    black, bold, card_style, colored_address, ghost_button, hover_tint, kao_scrollable_style,
+    mono, primary_button, secondary_button, small_secondary_button, text_input_style,
 };
 use crate::wallet::{Contact, ContactEns, ContactsBook, short_address};
 
@@ -648,9 +648,9 @@ impl ContactsPane {
         // remaining whitespace on wide desktop windows (`primary_button`
         // is `Length::Fill` internally).
         row![
-            mouse_area(text("← Back").size(13).color(t.a1).font(bold()))
-                .on_press(Message::Back)
-                .interaction(iced::mouse::Interaction::Pointer),
+            ghost_button(t, text("← Back").size(13).color(t.a1).font(bold()))
+                .padding(Padding::from([4, 8]))
+                .on_press(Message::Back),
             Space::new().width(Length::Fill),
             text("Contacts").size(22).color(t.text).font(black()),
             Space::new().width(Length::Fill),
@@ -665,9 +665,9 @@ impl ContactsPane {
     fn edit_header<'a>(&'a self, t: KaoTheme, editing: bool) -> Element<'a, Message> {
         let title = if editing { "Edit contact" } else { "Add contact" };
         row![
-            mouse_area(text("← Back").size(13).color(t.a1).font(bold()))
-                .on_press(Message::Back)
-                .interaction(iced::mouse::Interaction::Pointer),
+            ghost_button(t, text("← Back").size(13).color(t.a1).font(bold()))
+                .padding(Padding::from([4, 8]))
+                .on_press(Message::Back),
             Space::new().width(Length::Fill),
             text(title).size(22).color(t.text).font(black()),
             Space::new().width(Length::Fill),

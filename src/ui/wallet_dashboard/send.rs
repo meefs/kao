@@ -12,7 +12,7 @@ use alloy::primitives::utils::format_units;
 use alloy::primitives::{Address, TxHash};
 use iced::border::Radius;
 use iced::keyboard;
-use iced::widget::{Space, column, container, mouse_area, row, scrollable, text, text_input};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
 use crate::decode::render::DecodedCall;
@@ -20,8 +20,8 @@ use crate::ens;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    avatar, black, bold, colored_address, kao_fit, kao_scrollable_style, kao_text,
-    kaomoji_for_index, modal_wrapper, mono, mono_black, primary_button, review_row,
+    avatar, black, bold, colored_address, ghost_button, hover_tint, kao_fit, kao_scrollable_style,
+    kao_text, kaomoji_for_index, modal_wrapper, mono, mono_black, primary_button, review_row,
     secondary_button, text_input_style,
 };
 use crate::ui::wallet_dashboard::function_panel;
@@ -955,9 +955,9 @@ impl SendPane {
                 .size(12)
                 .color(t.sub),
             Space::new().width(Length::Fill),
-            mouse_area(text("Max").size(12).color(t.a1).font(bold()))
-                .on_press(Message::Max)
-                .interaction(iced::mouse::Interaction::Pointer),
+            ghost_button(t, text("Max").size(12).color(t.a1).font(bold()))
+                .padding(Padding::from([2, 6]))
+                .on_press(Message::Max),
         ]
         .width(Length::Fill);
 
@@ -1011,24 +1011,23 @@ impl SendPane {
         .align_x(Alignment::Center)
         .spacing(0);
 
-        let styled = container(inner)
+        button(inner)
             .width(Length::Fill)
-            .center_x(Length::Fill)
             .padding(Padding::from([8, 4]))
-            .style(move |_| container::Style {
-                background: Some(Background::Color(bg)),
+            .on_press(Message::SetToken(i))
+            .style(move |_theme, status| button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
+                    _ => bg,
+                })),
+                text_color: t.text,
                 border: Border {
                     color: border_col,
                     width: 1.5,
                     radius: Radius::from(10),
                 },
-                text_color: Some(t.text),
-                ..container::Style::default()
-            });
-
-        mouse_area(container(styled).width(Length::Fill))
-            .on_press(Message::SetToken(i))
-            .interaction(iced::mouse::Interaction::Pointer)
+                ..button::Style::default()
+            })
             .into()
     }
 
@@ -1381,23 +1380,23 @@ fn contact_row<'a>(
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
-    let styled = container(row_content)
+    button(row_content)
         .padding(Padding::from([9, 10]))
         .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(bg)),
+        .on_press(Message::PickContact(i))
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
+                _ => bg,
+            })),
+            text_color: t.text,
             border: Border {
                 color: Color::TRANSPARENT,
                 width: 0.0,
                 radius: Radius::from(11),
             },
-            text_color: Some(t.text),
-            ..container::Style::default()
-        });
-
-    mouse_area(styled)
-        .on_press(Message::PickContact(i))
-        .interaction(iced::mouse::Interaction::Pointer)
+            ..button::Style::default()
+        })
         .into()
 }
 

@@ -9,13 +9,14 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
-use iced::widget::{Space, column, container, mouse_area, row, text};
-use iced::{Alignment, Element, Length, Padding};
+use iced::border::Radius;
+use iced::widget::{Space, button, column, container, row, text};
+use iced::{Alignment, Background, Border, Element, Length, Padding};
 
 use crate::indexer::{IndexedTx, TokenTransfer, TxDirection};
 use crate::portfolio::format_token_balance;
 use crate::ui::kao_theme::KaoTheme;
-use crate::ui::kao_widgets::{avatar, bold, card_style, kao_scrollable_style, mono, mono_black};
+use crate::ui::kao_widgets::{avatar, bold, hover_tint, kao_scrollable_style, mono, mono_black};
 use crate::wallet::{ContactsBook, short_address};
 
 use super::Message;
@@ -136,14 +137,27 @@ fn tx_row<'a>(
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
-    let card = container(row)
+    // Card-shaped click target: same idle look as `card_style` but the
+    // whole row is now a button so hover paints the canonical tint and
+    // press → opens the details modal for this row's index.
+    button(row)
         .padding(Padding::from([13, 15]))
         .width(Length::Fill)
-        .style(move |_| card_style(t));
-    // `mouse_area` keeps the existing card style untouched but turns the
-    // whole row into a click target. Press → open the details modal for
-    // this row's index.
-    mouse_area(card).on_press(Message::OpenTxDetails(idx)).into()
+        .on_press(Message::OpenTxDetails(idx))
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => hover_tint(t.card, t.text),
+                _ => t.card,
+            })),
+            text_color: t.text,
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(14),
+            },
+            ..button::Style::default()
+        })
+        .into()
 }
 
 /// Render the amount column. ERC-20 rows use the token's symbol +

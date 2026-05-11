@@ -479,11 +479,13 @@ impl WalletScreen {
                     );
                     let started = std::time::Instant::now();
                     // Prefer the indexer when one is wired up for this
-                    // chain (one HTTP round-trip vs. several on-chain
-                    // reads + per-token pool lookups). When it isn't
-                    // (Blockscout/Etherscan on L2, or `None` anywhere),
-                    // `build_indexer_for` returns `NoopIndexer` and we
-                    // fall back to the on-chain walk.
+                    // chain (one HTTP round-trip vs. two Multicall3
+                    // batches against the chain's RPC). When the user
+                    // picks `IndexerProvider::None`, `build_indexer_for`
+                    // returns `NoopIndexer`; on L2 we then fall back to
+                    // the on-chain walk, which iterates the bundled
+                    // Superchain tokenlist plus a small per-chain
+                    // overlay for staples (USDC, WETH, …).
                     let indexer = crate::indexer::build_indexer_for(chain);
                     let from_indexer = indexer
                         .balances(address)

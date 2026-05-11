@@ -225,6 +225,39 @@ pub fn hover_tint(idle: Color, intent: Color) -> Color {
     }
 }
 
+/// Click target for content that has no idle background of its own —
+/// "← Back" links, the "Max" amount toggle, "+ Add account" rows, the
+/// send-flow contact picker. Wraps `content` in a button styled with a
+/// transparent idle background and the canonical hover tint, so the
+/// element matches the rest of the app's hover language without any
+/// border or chip visuals encroaching on the content's own layout.
+///
+/// Caller controls `text_color` via the wrapped content. The button's
+/// own `text_color` is set to `t.text` only as a fallback for content
+/// that doesn't pin its own color.
+pub fn ghost_button<'a, M: Clone + 'a>(
+    t: KaoTheme,
+    content: impl Into<Element<'a, M>>,
+) -> button::Button<'a, M> {
+    button(content.into())
+        .padding(0)
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    hover_tint(Color::TRANSPARENT, t.text)
+                }
+                _ => Color::TRANSPARENT,
+            })),
+            text_color: t.text,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(10),
+            },
+            ..button::Style::default()
+        })
+}
+
 pub fn primary_button<'a, M: Clone + 'a>(
     t: KaoTheme,
     label: &'a str,
