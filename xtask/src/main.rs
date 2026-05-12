@@ -71,13 +71,8 @@ async fn sync_tokens() -> Result<()> {
                 .and_then(Value::as_u64)
                 .is_some_and(|id| chain_dir(id).is_some())
         })
-        .filter(|t| {
-            t.get("logoURI")
-                .and_then(Value::as_str)
-                .is_some_and(|u| u.to_ascii_lowercase().ends_with(".svg"))
-        })
         .collect();
-    println!("filtered to {} tokens (svg + chains 1/10/8453)", tokens.len());
+    println!("filtered to {} tokens (chains 1/10/8453)", tokens.len());
 
     let assets = workspace_root()?.join("assets");
     let list_path = assets.join("tokenlist.json");
@@ -90,19 +85,18 @@ async fn sync_tokens() -> Result<()> {
 
     let mut work: Vec<(u64, String, String)> = tokens
         .into_iter()
-        .map(|t| {
+        .filter_map(|t| {
+            let logo = t.get("logoURI").and_then(Value::as_str)?;
+            if !logo.to_ascii_lowercase().ends_with(".svg") {
+                return None;
+            }
             let chain_id = t.get("chainId").and_then(Value::as_u64).expect("filtered");
             let address = t
                 .get("address")
                 .and_then(Value::as_str)
                 .map(str::to_ascii_lowercase)
                 .unwrap_or_default();
-            let logo = t
-                .get("logoURI")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_default();
-            (chain_id, address, logo)
+            Some((chain_id, address, logo.to_owned()))
         })
         .collect();
     work.extend(
