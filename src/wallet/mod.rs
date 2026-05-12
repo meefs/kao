@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod contacts;
 mod keyring;
+pub mod sim;
 mod store;
 pub mod tx;
 

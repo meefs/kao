@@ -61,6 +61,22 @@ helios-opstack = { git = "https://github.com/a16z/helios", rev = "204c998a927348
 iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg"] }
 rand = "0.8"
 redb = "4.1.0"
+# Local EVM for transaction preflight. Pinned to the same version helios
+# pulls in (cargo unifies them into one build of revm 29.0.1 instead of
+# duplicating). The three `optional_*` features disable basefee / nonce /
+# block-gas validation during simulation — preflight is advisory, so a tx
+# whose nonce is one ahead of the on-chain account or whose max-fee
+# happens to dip below the base-fee window should still simulate, not
+# abort with a config error. Matches helios's own feature set verbatim
+# (helios/Cargo.toml workspace dep, rev 204c998) so the unified build has
+# the same EVM semantics inside Kao as Helios uses for its verified
+# eth_call.
+revm = { version = "29.0.1", default-features = false, features = [
+    "std",
+    "optional_block_gas_limit",
+    "optional_eip3607",
+    "optional_no_base_fee",
+] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }

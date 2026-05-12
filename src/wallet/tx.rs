@@ -6,6 +6,8 @@
 //! `TxSigner` impl backs the active account), and broadcasts the raw
 //! envelope.
 
+use std::sync::Arc;
+
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope};
 use alloy::eips::eip2718::Encodable2718;
 use alloy::network::Ethereum;
@@ -15,7 +17,9 @@ use alloy::providers::{Provider, RootProvider};
 use tracing::{debug, info, warn};
 
 use crate::chain::Chain;
+use crate::net::BalanceFetcher;
 use crate::wallet::KaoSigner;
+use crate::wallet::sim::{self, SimulationResult};
 
 /// `transfer(address,uint256)` — first 4 bytes of keccak256.
 const TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
@@ -101,7 +105,7 @@ impl SendPlan {
 /// EIP-1559 gas + fee + nonce snapshot. Fetched once when the user enters
 /// the review step, then reused by `sign_and_send` so the user signs the
 /// same numbers they reviewed.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TxQuote {
     pub gas_limit: u64,
     pub max_fee_per_gas: u128,
@@ -111,11 +115,23 @@ pub struct TxQuote {
     /// charged (actual cost is usually lower because base fee + tip < max
     /// fee). Displayed on the review step.
     pub eth_cost_wei: U256,
+    /// Local revm preflight. On supported chains it carries the revert
+    /// reason (if any), the EVM-metered gas, and any ERC-20/721 transfers
+    /// the tx would emit; on unsupported chains or after a sim failure
+    /// it's a `SimulationResult::unavailable()` placeholder. Sim is
+    /// always advisory — the review screen never blocks on it.
+    pub sim: SimulationResult,
 }
 
-/// Quote a send: estimate gas, fetch 1559 fees, fetch the pending nonce.
+/// Quote a send: estimate gas, fetch 1559 fees, fetch the pending nonce,
+/// and (where supported) run a local revm preflight. The `network` is
+/// only used for the preflight — gas / fees / nonce go through the
+/// raw provider, matching today's broadcast path. A simulation failure
+/// is never fatal; the quote returns with `SimulationResult::unavailable()`
+/// so the review screen can still render.
 pub async fn build_quote(
     provider: &RootProvider<Ethereum>,
+    network: Arc<dyn BalanceFetcher>,
     plan: &SendPlan,
 ) -> Result<TxQuote, String> {
     let req = plan.to_request();
@@ -174,12 +190,39 @@ pub async fn build_quote(
 
     let eth_cost_wei = U256::from(gas_limit).saturating_mul(U256::from(fees.max_fee_per_gas));
 
+    // Local revm preflight. On supported chains we run it; on
+    // unsupported chains (Base/Optimism in v1) or on any sim failure
+    // we fall back to the `unavailable()` placeholder so the review
+    // screen renders the existing gas/cost numbers exactly as before.
+    let sim = if plan.chain.supports_simulation() {
+        // Note: `fees` aren't passed to `simulate_tx` — preflight runs
+        // with gas_price = 0 to avoid revm's upfront balance-reservation
+        // check evicting users with less than `gas_limit × max_fee`
+        // worth of ETH. Real fees still drive the broadcast path and
+        // the eth_cost_wei the user reviews.
+        match sim::simulate_tx(network, plan, nonce).await {
+            Ok(s) => s,
+            Err(e) => {
+                // Advisory: degrade to "unavailable" rather than fail the
+                // quote — the user can still review and send.
+                warn!(error = %e, "quote: simulate_tx failed, marking sim unavailable");
+                SimulationResult::unavailable()
+            }
+        }
+    } else {
+        debug!(chain = %plan.chain.label(), "quote: chain doesn't support simulation");
+        SimulationResult::unavailable()
+    };
+
     info!(
         gas_limit,
         max_fee_per_gas = fees.max_fee_per_gas,
         max_priority_fee_per_gas = fees.max_priority_fee_per_gas,
         nonce,
         eth_cost_wei = %eth_cost_wei,
+        sim_gas_used = sim.gas_used,
+        sim_reverted = sim.is_revert(),
+        sim_verified = sim.verified,
         "quote: ready",
     );
 
@@ -189,6 +232,7 @@ pub async fn build_quote(
         max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
         nonce,
         eth_cost_wei,
+        sim,
     })
 }
 

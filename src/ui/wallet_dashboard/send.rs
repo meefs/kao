@@ -26,6 +26,7 @@ use crate::ui::kao_widgets::{
 };
 use crate::ui::wallet_dashboard::function_panel;
 use super::home::format_symbol;
+use crate::wallet::sim::{SimOutcome, SimulationResult, TokenTransfer};
 use crate::wallet::tx::{SendPlan, SendToken, TxQuote, parse_amount_units};
 use crate::wallet::{Contact, ContactsBook};
 
@@ -233,8 +234,8 @@ impl SendPane {
         self.token_idx
     }
 
-    pub fn quote(&self) -> Option<TxQuote> {
-        self.quote
+    pub fn quote(&self) -> Option<&TxQuote> {
+        self.quote.as_ref()
     }
 
     /// Coordinator hook: returns `Some((seq, name))` exactly once per
@@ -1101,7 +1102,7 @@ impl SendPane {
         let gas_row: Element<'_, Message> = if self.quote_loading {
             review_row(t, "Gas fee", "(；・∀・) estimating…", false, true)
         } else {
-            match self.quote {
+            match &self.quote {
                 Some(q) => {
                     let eth_str = format_units(q.eth_cost_wei, 18u8)
                         .unwrap_or_else(|_| "—".into());
@@ -1130,7 +1131,7 @@ impl SendPane {
         // mid-flight. Look up the native-ETH entry on the same chain as the
         // selected token; if we can't locate it (cold cache, fetch failed)
         // skip the check rather than false-warn.
-        let insufficient_eth_warning: Element<'_, Message> = match (token, self.quote) {
+        let insufficient_eth_warning: Element<'_, Message> = match (token, self.quote.as_ref()) {
             (Some(tk), Some(q)) => {
                 let eth_balance = portfolio
                     .iter()
@@ -1175,6 +1176,17 @@ impl SendPane {
             None => Space::new().height(0).into(),
         };
 
+        // Simulation block: revm preflight outcome. Rendered as part of
+        // the review card whenever a quote is loaded; for the
+        // `Unavailable` outcome on a non-Mainnet chain it shrinks to a
+        // small grey inline notice so L2 sends don't look "missing
+        // something". On revert/halt the block grows into a red banner
+        // and the Confirm button below relabels to "Sign anyway ⚠".
+        let sim_block: Element<'_, Message> = match self.quote.as_ref().map(|q| &q.sim) {
+            Some(sim) => simulation_block(t, sim, chain, portfolio),
+            None => Space::new().height(0).into(),
+        };
+
         // No dividers between sections — `divider()` renders as a
         // ~25px solid bar (its 12px vertical padding gets the border
         // color baked in), which on the review card overwhelms the
@@ -1186,6 +1198,8 @@ impl SendPane {
             to_block,
             Space::new().height(14),
             gas_row,
+            Space::new().height(10),
+            sim_block,
             function_block,
             insufficient_eth_warning,
         ]
@@ -1219,8 +1233,21 @@ impl SendPane {
 
         let back_btn = secondary_button(t, "← Back").on_press(Message::Step(1));
         let confirm_enabled = !self.busy && self.quote.is_some();
+        // Soft warning: when the simulator predicts a revert/halt we
+        // re-label the confirm button to "Sign anyway ⚠". The click
+        // emits the same Confirm message (the user has read a different
+        // label and a red banner above) — we don't gate signing on a
+        // separate acknowledgement toggle, because a stale-state false
+        // negative shouldn't strand a legitimate tx.
+        let sim_reverted = self
+            .quote
+            .as_ref()
+            .map(|q| q.sim.is_revert())
+            .unwrap_or(false);
         let confirm_label = if self.busy {
             "(・・;)ゞ sending…"
+        } else if sim_reverted {
+            "Sign anyway ⚠"
         } else {
             "Confirm Send ✓"
         };
@@ -1460,5 +1487,155 @@ fn trim_eth_display(s: &str) -> String {
         int_part.to_string()
     } else {
         format!("{int_part}.{final_frac}")
+    }
+}
+
+/// Render the revm-preflight block above the function panel. Layouts:
+/// - **Unavailable + L2**: small inline "Simulation unavailable on this chain".
+/// - **Unavailable + Mainnet**: small inline "Simulation unavailable" (sim
+///   errored — still display so the user knows what *didn't* happen).
+/// - **Success**: header + per-transfer rows + verification badge.
+/// - **Revert / Halt**: red banner with the decoded reason. The Confirm
+///   button above relabels to "Sign anyway ⚠"; this block carries the
+///   *why*.
+fn simulation_block<'a>(
+    t: KaoTheme,
+    sim: &'a SimulationResult,
+    chain: crate::chain::Chain,
+    portfolio: &'a [LiveToken],
+) -> Element<'a, Message> {
+    match &sim.outcome {
+        SimOutcome::Unavailable => {
+            let msg = if !chain.supports_simulation() {
+                "Simulation unavailable on this chain"
+            } else {
+                "Simulation unavailable"
+            };
+            container(text(msg).size(11).color(t.sub).font(mono()))
+                .padding(Padding::from([4, 0]))
+                .width(Length::Fill)
+                .into()
+        }
+        SimOutcome::Success { .. } => {
+            let badge_label = if sim.verified {
+                "✓ Verified by Helios"
+            } else {
+                "⚠ Unverified simulation"
+            };
+            let badge_color = if sim.verified { t.up } else { t.sub };
+            let header_label = if sim.transfers.is_empty() {
+                "Simulation passed ヾ(＾∇＾)"
+            } else {
+                "Will execute:"
+            };
+            let header = row![
+                text(header_label).size(13).color(t.sub),
+                Space::new().width(Length::Fill),
+                text(badge_label)
+                    .size(11)
+                    .color(badge_color)
+                    .font(bold()),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
+            let mut col = column![header].spacing(4);
+            for transfer in sim.transfers.iter() {
+                col = col.push(transfer_row(t, transfer, chain, portfolio));
+            }
+            container(col)
+                .padding(Padding::from([4, 0]))
+                .width(Length::Fill)
+                .into()
+        }
+        SimOutcome::Revert { reason, .. } | SimOutcome::Halt { reason } => {
+            let title = match &sim.outcome {
+                SimOutcome::Halt { .. } => "(╥﹏╥) Tx would halt",
+                _ => "(╥﹏╥) Tx would revert",
+            };
+            let body: Element<'_, Message> = column![
+                text(title).size(13).color(t.down).font(bold()),
+                Space::new().height(2),
+                text(reason.clone()).size(12).color(t.down).font(mono()),
+            ]
+            .spacing(0)
+            .into();
+            container(body)
+                .padding(Padding::from([8, 12]))
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(Color {
+                        a: 0.10,
+                        ..t.down
+                    })),
+                    border: Border {
+                        color: t.down,
+                        width: 1.0,
+                        radius: Radius::from(8),
+                    },
+                    text_color: Some(t.down),
+                    ..container::Style::default()
+                })
+                .into()
+        }
+    }
+}
+
+/// Single "+/- amount SYMBOL" row inside the simulation block.
+/// Looks the token contract up in the active portfolio for a nice symbol
+/// + decimals; falls back to "raw / short-address" so unknown tokens
+/// still render something meaningful.
+fn transfer_row<'a>(
+    t: KaoTheme,
+    transfer: &'a TokenTransfer,
+    chain: crate::chain::Chain,
+    portfolio: &'a [LiveToken],
+) -> Element<'a, Message> {
+    // Match by (chain, contract). The portfolio is multi-chain, so we
+    // can't just match on address — that'd cross-contaminate identical
+    // contract addresses across L1 and L2.
+    let known = portfolio
+        .iter()
+        .find(|p| p.chain == chain && p.contract == Some(transfer.token));
+    let (label, decimals) = match known {
+        Some(tk) => (tk.symbol.clone(), tk.decimals),
+        None => {
+            let bytes = transfer.token.as_slice();
+            let head = alloy::hex::encode(&bytes[..4]);
+            let tail = alloy::hex::encode(&bytes[bytes.len() - 4..]);
+            (format!("0x{head}…{tail}"), 0u8)
+        }
+    };
+    let amount_str = if transfer.is_nft {
+        format!("#{}", transfer.value)
+    } else if decimals == 0 {
+        // Unknown token: show raw integer (the user can verify against
+        // a block explorer rather than have us guess decimals).
+        format!("{} units", transfer.value)
+    } else {
+        match alloy::primitives::utils::format_units(transfer.value, decimals) {
+            Ok(s) => trim_trailing_decimal_zeros(&s),
+            Err(_) => transfer.value.to_string(),
+        }
+    };
+    row![
+        text(format!("→ {amount_str} {label}"))
+            .size(12)
+            .color(t.text)
+            .font(mono()),
+    ]
+    .padding(Padding::from([0, 0]))
+    .width(Length::Fill)
+    .into()
+}
+
+fn trim_trailing_decimal_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return s.to_string();
+    }
+    let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
     }
 }

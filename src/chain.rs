@@ -66,6 +66,17 @@ impl Chain {
         }
     }
 
+    /// Whether the send flow runs local revm preflight on this chain.
+    /// Mainnet-only in v1: OP-stack adds bespoke precompiles (e.g.
+    /// `0x4200000000000000000000000000000000000015` for L1 fee) and a
+    /// separate L1 calldata-cost component that revm + helios's
+    /// stock-mainnet config doesn't account for, so showing a sim
+    /// result on Base/Optimism would mislead more than help. L2
+    /// follow-up reverses this once the OP-stack EVM is wired in.
+    pub fn supports_simulation(self) -> bool {
+        matches!(self, Chain::Mainnet)
+    }
+
     /// Canonical Blockscout instance for the chain. Used by the indexer
     /// layer to route per-chain portfolio/history queries when the user
     /// picks Blockscout — Blockscout runs as a separate deployment per

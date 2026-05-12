@@ -156,6 +156,29 @@ pub trait BalanceFetcher: Send + Sync + std::fmt::Debug {
         data: Bytes,
         chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String>;
+    /// Verified balance as a raw `U256` — distinct from `balance()`,
+    /// which formats to a UI-facing ether string and bumps the global
+    /// verification badge. The simulator needs the integer for revm's
+    /// `AccountInfo.balance`, and it must not race the dashboard's
+    /// balance reads on the badge.
+    async fn get_balance_raw(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<U256>, String>;
+    /// Verified `eth_getTransactionCount` at the latest verified head.
+    /// The simulator uses this for `from`'s on-chain nonce — distinct
+    /// from the *pending* nonce the broadcast path needs.
+    async fn get_transaction_count(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<u64>, String>;
+    /// Verified subset of the latest block header — populates revm's
+    /// `BlockEnv`. The `hash` field pins the block the simulator's
+    /// state reads run against, so a reorg mid-simulation can't mix
+    /// proofs across two heads.
+    async fn latest_block(&self, chain: Chain) -> Result<VerifiedRead<LatestBlock>, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,6 +275,44 @@ impl HeliosBackend {
         }
     }
 
+    /// Verified `eth_getTransactionCount` at the given block. The
+    /// simulator reads this for `from` so revm's `TxEnv.nonce` matches
+    /// what the EVM would observe at the same height. Pending nonces
+    /// belong on the broadcast path, not preflight.
+    async fn get_nonce(&self, addr: Address, block: BlockId) -> Result<u64, String> {
+        match self {
+            Self::Eth(c) => c.get_nonce(addr, block).await.map_err(|e| e.to_string()),
+            Self::Op(c) => c.get_nonce(addr, block).await.map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Fetch the latest verified block header and extract the subset
+    /// revm needs for `BlockEnv`. `full_tx = false` keeps the response
+    /// small — we only read the header. Returns `Err` if Helios reports
+    /// no head yet (`wait_for_head` should prevent that, but a reorg
+    /// window or shutdown race can leave the cache empty).
+    async fn latest_block(&self) -> Result<LatestBlock, String> {
+        let id = BlockId::latest();
+        match self {
+            Self::Eth(c) => {
+                let block = c
+                    .get_block(id, false)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "helios: no latest block".to_string())?;
+                Ok(latest_from_rpc_header(&block.header))
+            }
+            Self::Op(c) => {
+                let block = c
+                    .get_block(id, false)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "helios: no latest block".to_string())?;
+                Ok(latest_from_rpc_header(&block.header))
+            }
+        }
+    }
+
     async fn shutdown(&self) {
         match self {
             Self::Eth(c) => c.shutdown().await,
@@ -269,6 +330,24 @@ impl HeliosBackend {
 pub struct VerifiedRead<T> {
     pub value: T,
     pub verified: bool,
+}
+
+/// Subset of block-header fields that revm's `BlockEnv` needs to simulate
+/// a transaction. Pulled out so the simulator never reaches into a
+/// network-specific `BlockResponse` type — both Mainnet and OP-Stack
+/// flatten to this same shape. `hash` pins the block the simulator's
+/// state reads run against, so a reorg mid-simulation doesn't mix proofs
+/// across two heads.
+#[derive(Debug, Clone)]
+pub struct LatestBlock {
+    pub number: u64,
+    pub hash: B256,
+    pub timestamp: u64,
+    pub gas_limit: u64,
+    pub base_fee_per_gas: u64,
+    pub prevrandao: B256,
+    pub beneficiary: Address,
+    pub excess_blob_gas: Option<u64>,
 }
 
 #[derive(Default)]
@@ -604,6 +683,103 @@ impl BalanceFetcher for NetworkClient {
             }
         }
     }
+
+    async fn get_balance_raw(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<U256>, String> {
+        if self.in_cooldown(chain).await {
+            return self.fallback_get_balance_raw(addr, chain).await;
+        }
+        match self.get(chain).await {
+            Ok(client) => match client.get_balance(addr, BlockId::latest()).await {
+                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Err(e) => {
+                    debug!(
+                        chain = %chain.label(),
+                        addr = %short_address(addr),
+                        error = %e,
+                        "helios get_balance_raw failed; falling back to raw RPC",
+                    );
+                    self.start_cooldown(chain).await;
+                    self.fallback_get_balance_raw(addr, chain).await
+                }
+            },
+            Err(e) => {
+                warn!(
+                    chain = %chain.label(),
+                    error = %e,
+                    "helios unavailable for get_balance_raw; falling back to raw RPC",
+                );
+                self.start_cooldown(chain).await;
+                self.fallback_get_balance_raw(addr, chain).await
+            }
+        }
+    }
+
+    async fn get_transaction_count(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<u64>, String> {
+        if self.in_cooldown(chain).await {
+            return self.fallback_get_transaction_count(addr, chain).await;
+        }
+        match self.get(chain).await {
+            Ok(client) => match client.get_nonce(addr, BlockId::latest()).await {
+                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Err(e) => {
+                    debug!(
+                        chain = %chain.label(),
+                        addr = %short_address(addr),
+                        error = %e,
+                        "helios get_transaction_count failed; falling back to raw RPC",
+                    );
+                    self.start_cooldown(chain).await;
+                    self.fallback_get_transaction_count(addr, chain).await
+                }
+            },
+            Err(e) => {
+                warn!(
+                    chain = %chain.label(),
+                    error = %e,
+                    "helios unavailable for get_transaction_count; falling back to raw RPC",
+                );
+                self.start_cooldown(chain).await;
+                self.fallback_get_transaction_count(addr, chain).await
+            }
+        }
+    }
+
+    async fn latest_block(&self, chain: Chain) -> Result<VerifiedRead<LatestBlock>, String> {
+        if self.in_cooldown(chain).await {
+            return self.fallback_latest_block(chain).await;
+        }
+        match self.get(chain).await {
+            Ok(client) => match client.latest_block().await {
+                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Err(e) => {
+                    debug!(
+                        chain = %chain.label(),
+                        error = %e,
+                        "helios latest_block failed; falling back to raw RPC",
+                    );
+                    self.start_cooldown(chain).await;
+                    self.fallback_latest_block(chain).await
+                }
+            },
+            Err(e) => {
+                warn!(
+                    chain = %chain.label(),
+                    error = %e,
+                    "helios unavailable for latest_block; falling back to raw RPC",
+                );
+                self.start_cooldown(chain).await;
+                self.fallback_latest_block(chain).await
+            }
+        }
+    }
 }
 
 impl NetworkClient {
@@ -689,6 +865,85 @@ impl NetworkClient {
             })
     }
 
+    async fn fallback_get_balance_raw(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<U256>, String> {
+        let provider = self.fallback_provider(chain).await?;
+        provider
+            .get_balance(addr)
+            .await
+            .map(|value| VerifiedRead { value, verified: false })
+            .map_err(|e| {
+                debug!(
+                    chain = %chain.label(),
+                    addr = %short_address(addr),
+                    error = %e,
+                    "fallback get_balance_raw failed",
+                );
+                e.to_string()
+            })
+    }
+
+    async fn fallback_get_transaction_count(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<u64>, String> {
+        let provider = self.fallback_provider(chain).await?;
+        // Default selector is `latest` — matches the verified path
+        // above. `.pending()` would mismatch the simulation block and
+        // race the broadcast path's pending lookup.
+        provider
+            .get_transaction_count(addr)
+            .await
+            .map(|value| VerifiedRead { value, verified: false })
+            .map_err(|e| {
+                debug!(
+                    chain = %chain.label(),
+                    addr = %short_address(addr),
+                    error = %e,
+                    "fallback get_transaction_count failed",
+                );
+                e.to_string()
+            })
+    }
+
+    async fn fallback_latest_block(
+        &self,
+        chain: Chain,
+    ) -> Result<VerifiedRead<LatestBlock>, String> {
+        let provider = self.fallback_provider(chain).await?;
+        let block = provider
+            .get_block(alloy::eips::BlockId::latest())
+            .await
+            .map_err(|e| {
+                debug!(
+                    chain = %chain.label(),
+                    error = %e,
+                    "fallback latest_block failed",
+                );
+                e.to_string()
+            })?
+            .ok_or_else(|| format!("no latest block on {}", chain.label()))?;
+        // alloy 2.x's `Block.header` is the same `Header<H>` shape as
+        // alloy 1.x (header struct lives in `alloy-consensus`, which
+        // shares the same primitives crate across major versions), so
+        // the helper takes the wire-shape from either path.
+        let header = LatestBlock {
+            number: block.header.inner.number,
+            hash: block.header.hash,
+            timestamp: block.header.inner.timestamp,
+            gas_limit: block.header.inner.gas_limit,
+            base_fee_per_gas: block.header.inner.base_fee_per_gas.unwrap_or(0),
+            prevrandao: block.header.inner.mix_hash,
+            beneficiary: block.header.inner.beneficiary,
+            excess_blob_gas: block.header.inner.excess_blob_gas,
+        };
+        Ok(VerifiedRead { value: header, verified: false })
+    }
+
     /// Resolve the cached fallback provider for `chain`. Used by every
     /// `fallback_*` method; threads "no RPCs configured" / "URL parse
     /// failure" through as `Err`.
@@ -727,6 +982,25 @@ impl NetworkClient {
                 Err(e.to_string())
             }
         }
+    }
+}
+
+/// Flatten an alloy-1 RPC `Header` (used by both Helios and the raw
+/// fallback's deserialized response) into our network-agnostic
+/// `LatestBlock`. Pre-merge blocks have no base fee and no prevrandao;
+/// for Kao's send-flow simulator both default to zero — the wallet
+/// won't ship a tx against a pre-London chain, but defaulting is
+/// cheaper than threading an extra error case through the trait.
+fn latest_from_rpc_header(header: &alloy_rpc_types_eth::Header) -> LatestBlock {
+    LatestBlock {
+        number: header.inner.number,
+        hash: header.hash,
+        timestamp: header.inner.timestamp,
+        gas_limit: header.inner.gas_limit,
+        base_fee_per_gas: header.inner.base_fee_per_gas.unwrap_or(0),
+        prevrandao: header.inner.mix_hash,
+        beneficiary: header.inner.beneficiary,
+        excess_blob_gas: header.inner.excess_blob_gas,
     }
 }
 
@@ -956,6 +1230,38 @@ impl BalanceFetcher for MockFetcher {
         _chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String> {
         Ok(VerifiedRead { value: Bytes::new(), verified: true })
+    }
+
+    async fn get_balance_raw(
+        &self,
+        _addr: Address,
+        _chain: Chain,
+    ) -> Result<VerifiedRead<U256>, String> {
+        Ok(VerifiedRead { value: U256::ZERO, verified: true })
+    }
+
+    async fn get_transaction_count(
+        &self,
+        _addr: Address,
+        _chain: Chain,
+    ) -> Result<VerifiedRead<u64>, String> {
+        Ok(VerifiedRead { value: 0, verified: true })
+    }
+
+    async fn latest_block(&self, _chain: Chain) -> Result<VerifiedRead<LatestBlock>, String> {
+        Ok(VerifiedRead {
+            value: LatestBlock {
+                number: 0,
+                hash: B256::ZERO,
+                timestamp: 0,
+                gas_limit: 30_000_000,
+                base_fee_per_gas: 0,
+                prevrandao: B256::ZERO,
+                beneficiary: Address::ZERO,
+                excess_blob_gas: None,
+            },
+            verified: true,
+        })
     }
 }
 

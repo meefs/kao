@@ -715,7 +715,10 @@ impl WalletScreen {
                 // a task, and route the signer back via `SignerHandoff`.
                 if let send::Message::Confirm = &child_msg {
                     let plan = p.build_plan(&self.portfolio);
-                    let quote = p.quote();
+                    // Clone the quote — TxQuote stopped being Copy when it
+                    // grew the SimulationResult field; spawn_broadcast_task
+                    // still takes ownership.
+                    let quote = p.quote().cloned();
                     info!(
                         has_plan = plan.is_some(),
                         has_quote = quote.is_some(),
@@ -1516,7 +1519,9 @@ fn spawn_quote_task(
     Task::perform(
         async move {
             match network.provider(chain).await {
-                Some(provider) => crate::wallet::tx::build_quote(&provider, &plan).await,
+                Some(provider) => {
+                    crate::wallet::tx::build_quote(&provider, network.clone(), &plan).await
+                }
                 None => {
                     warn!(chain = %chain.label(), "quote: no execution RPC configured");
                     Err("no execution RPCs configured".into())

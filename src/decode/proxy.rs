@@ -282,6 +282,44 @@ mod tests {
                 verified: true,
             })
         }
+        async fn get_balance_raw(
+            &self,
+            _: Address,
+            _: Chain,
+        ) -> Result<VerifiedRead<U256>, String> {
+            Ok(VerifiedRead {
+                value: U256::ZERO,
+                verified: true,
+            })
+        }
+        async fn get_transaction_count(
+            &self,
+            _: Address,
+            _: Chain,
+        ) -> Result<VerifiedRead<u64>, String> {
+            Ok(VerifiedRead {
+                value: 0,
+                verified: true,
+            })
+        }
+        async fn latest_block(
+            &self,
+            _: Chain,
+        ) -> Result<VerifiedRead<crate::net::LatestBlock>, String> {
+            Ok(VerifiedRead {
+                value: crate::net::LatestBlock {
+                    number: 0,
+                    hash: B256::ZERO,
+                    timestamp: 0,
+                    gas_limit: 30_000_000,
+                    base_fee_per_gas: 0,
+                    prevrandao: B256::ZERO,
+                    beneficiary: Address::ZERO,
+                    excess_blob_gas: None,
+                },
+                verified: true,
+            })
+        }
     }
 
     fn slot_with_address(addr: Address) -> B256 {
