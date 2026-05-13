@@ -6,6 +6,7 @@ exclude = ["vendor/op-alloy-network"]
 name = "kao"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
 alloy = { version = "2.0.1", features = ["full", "signer-mnemonic", "signer-ledger", "signer-trezor"] }
@@ -31,7 +32,7 @@ alloy-rpc-types-eth = "1"
 # so we can construct values.
 op-alloy-rpc-types = "0.20"
 argon2 = "0.5.3"
-bincode = "1.3"
+postcard = { version = "1.1", default-features = false, features = ["use-std"] }
 chacha20poly1305 = "0.10.1"
 dirs = "6"
 # UTS-46 / ENSIP-15 normalization for ENS names. Rejects bidi controls,
