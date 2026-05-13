@@ -19,6 +19,8 @@ use serde::Deserialize;
 
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
+use crate::chain::Chain;
+
 use super::{
     Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
     parse_iso8601, redact_url_in_err,
@@ -323,6 +325,7 @@ fn convert_tx(r: RawTx, owner: Address) -> Option<IndexedTx> {
         direction: classify_direction(from, to, owner),
         method: r.method,
         token: None,
+        chain: Chain::Mainnet,
     })
 }
 
@@ -370,7 +373,10 @@ fn convert_token_transfer(r: RawTokenTransfer, owner: Address) -> Option<Indexed
             symbol: r.token.symbol.unwrap_or_default(),
             decimals,
             amount_raw,
+            is_nft: false,
+            token_id: None,
         }),
+        chain: Chain::Mainnet,
     })
 }
 

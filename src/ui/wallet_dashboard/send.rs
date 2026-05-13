@@ -1588,7 +1588,7 @@ fn simulation_block<'a>(
 
 /// Single "+/- amount SYMBOL" row inside the simulation block.
 /// Looks the token contract up in the active portfolio for a nice symbol
-/// + decimals; falls back to "raw / short-address" so unknown tokens
+/// and decimals; falls back to "raw / short-address" so unknown tokens
 /// still render something meaningful.
 fn transfer_row<'a>(
     t: KaoTheme,

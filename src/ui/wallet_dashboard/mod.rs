@@ -58,10 +58,11 @@ const CLIPBOARD_CLEAR_SECS: u64 = 10;
 use modal_chrome::ModalChrome;
 pub use nav::Nav;
 
+use crate::chain::PerChain;
 use crate::indexer::IndexedTx;
 use crate::net::{BalanceFetcher, VerificationStatus};
 use crate::portfolio::{LiveToken, PortfolioCache};
-use crate::settings;
+use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_widgets::{fill_style, mono};
@@ -90,12 +91,17 @@ pub enum Message {
         chain: crate::chain::Chain,
         result: Result<Vec<LiveToken>, String>,
     },
-    /// Result of an indexer transaction-history fetch. `address` is
-    /// the address it was issued against; dropped on mismatch.
+    /// Result of a per-chain history fetch. `address` is the address it
+    /// was issued against (dropped on mismatch); `chain` is the network
+    /// it was fetched from. Each configured chain emits its own message
+    /// so a slow L2 RPC can't stall Mainnet rows from rendering.
     HistoryFetched {
         address: Address,
+        chain: crate::chain::Chain,
         result: Result<Vec<IndexedTx>, String>,
     },
+    /// User clicked the "couldn't load activity" retry button.
+    RetryHistory,
     SelectNav(Nav),
     SelectTheme(ThemeKind),
     OpenSend,
@@ -243,12 +249,26 @@ pub struct WalletScreen {
     /// header is showing the rename text input; `None` means it's showing
     /// the static name + pencil affordance.
     rename_draft: Option<String>,
-    /// Most recent transactions for the active address, newest first. Empty
-    /// while a fetch is in flight or when the active provider returns
-    /// nothing (e.g. `IndexerProvider::None`).
+    /// Merged transactions across every configured chain, newest first
+    /// (sorted by timestamp). Empty while every chain is still in flight
+    /// or when no source returned rows.
     history: Vec<IndexedTx>,
-    /// True while an indexer history fetch is in flight.
+    /// `true` while at least one per-chain history fetch is still in
+    /// flight. Cleared when *every* chain has reported back.
     history_loading: bool,
+    /// `true` once *any* per-chain history fetch has completed (Ok or
+    /// Err) for this dashboard. Drives lazy-load: the first switch to
+    /// Activity kicks off the fetch; subsequent switches re-render the
+    /// cached rows. Reset to `false` only by building a fresh screen.
+    history_loaded: bool,
+    /// Per-chain error captured when both the indexer and the on-chain
+    /// fallback failed. The activity pane shows the retry affordance
+    /// only when the merged feed is empty *and* at least one chain
+    /// errored — partial successes still render rows.
+    history_errors: PerChain<Option<String>>,
+    /// Set of chains we're still waiting on. As each chain lands the
+    /// chain is removed; `history_loading` flips to `false` once empty.
+    history_pending: Vec<crate::chain::Chain>,
     /// Shared contacts book. Read by the Send picker, the Send review
     /// step, the Activity feed (named counterparties), and the tx
     /// details modal; written by the Contacts settings pane on save.
@@ -285,6 +305,13 @@ struct ClipboardClearState {
 }
 
 impl WalletScreen {
+    /// Build a fresh dashboard.
+    ///
+    /// `initial_nav` selects the tab the dashboard lands on. `None`
+    /// defaults to Home (first-unlock and add-account flows);
+    /// `Some(_)` is passed by `App::switch_account` so switching
+    /// accounts while reading the Activity feed doesn't yank the user
+    /// back to Home.
     pub fn new(
         signer: KaoSigner,
         accounts: Vec<AccountDescriptor>,
@@ -292,6 +319,7 @@ impl WalletScreen {
         network: Arc<dyn BalanceFetcher>,
         portfolio_cache: PortfolioCache,
         contacts: Arc<RwLock<ContactsBook>>,
+        initial_nav: Option<Nav>,
     ) -> Self {
         let address = signer.address();
         // Seed from the cache when this address has been viewed before:
@@ -319,7 +347,7 @@ impl WalletScreen {
             accounts,
             active_index,
             theme_kind: settings::theme(),
-            nav: Nav::Home,
+            nav: initial_nav.unwrap_or(Nav::Home),
             modal: Modal::None,
             chrome: ModalChrome::new(),
             network,
@@ -330,7 +358,10 @@ impl WalletScreen {
             portfolio_cache,
             rename_draft: None,
             history: Vec::new(),
-            history_loading: true,
+            history_loading: false,
+            history_loaded: false,
+            history_errors: PerChain::default(),
+            history_pending: Vec::new(),
             contacts,
             clipboard_clear: None,
             clipboard_clear_gen: 0,
@@ -387,6 +418,13 @@ impl WalletScreen {
         short_address(self.address)
     }
 
+    /// Currently-selected sidebar tab. The App threads this through
+    /// `enter_dashboard` on account switch so the user stays on the tab
+    /// they were reading instead of being yanked back to Home.
+    pub fn current_nav(&self) -> Nav {
+        self.nav
+    }
+
     /// Issue a Mainnet `network.balance` call purely to refresh the
     /// Helios verification badge — the result is discarded; only the
     /// side-effect on `last_status(Mainnet)` matters. Without this the
@@ -416,38 +454,85 @@ impl WalletScreen {
         )
     }
 
-    /// Pull the most recent transactions for the active address from the
-    /// configured indexer. `IndexerProvider::None` short-circuits to an empty
-    /// list — there's no on-chain fallback the way `fetch_portfolio_task`
-    /// has, since reconstructing history from logs/blocks is way out of
-    /// scope for a wallet UI.
+    /// Issue one history fetch per configured chain in parallel. Mirrors
+    /// the portfolio fan-out: each chain emits its own
+    /// `HistoryFetched { address, chain, result }`, and the handler
+    /// merges the result so a slow L2 RPC can't block Mainnet rows from
+    /// rendering. Each chain tries the configured indexer first; on
+    /// `IndexerProvider::None` or any error, falls back to the on-chain
+    /// `eth_getLogs` walk.
     pub fn fetch_history_task(&self) -> Task<Message> {
         let address = self.address;
-        let provider = settings::indexer_provider();
-        Task::perform(
-            async move {
-                debug!(
-                    addr = %short_address(address),
-                    indexer = ?provider,
-                    "fetching history",
-                );
-                let started = std::time::Instant::now();
-                // History stays mainnet-only for now — Etherscan and
-                // Blockscout don't have per-chain plumbing yet, and
-                // showing a half-baked L2 history would be worse than
-                // none. Per-chain history is a follow-up.
-                let indexer = crate::indexer::build_indexer_for(crate::chain::Chain::Mainnet);
-                let result = indexer.transactions(address, HISTORY_LIMIT).await;
-                debug!(
-                    elapsed = ?started.elapsed(),
-                    ok = result.is_ok(),
-                    count = result.as_ref().map(|v| v.len()).unwrap_or(0),
-                    "history fetch completed",
-                );
-                (address, result)
-            },
-            |(address, result)| Message::HistoryFetched { address, result },
-        )
+        let provider_kind = settings::indexer_provider();
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        for chain in crate::chain::Chain::ALL {
+            if settings::rpcs(chain).is_empty() {
+                // L2 chain that the user never configured — skip silently.
+                continue;
+            }
+            let network = self.network.clone();
+            tasks.push(Task::perform(
+                async move {
+                    debug!(
+                        addr = %short_address(address),
+                        chain = %chain.label(),
+                        indexer = ?provider_kind,
+                        "fetching history",
+                    );
+                    let started = std::time::Instant::now();
+                    // NoopIndexer always returns Ok([]), which would never
+                    // trigger the fallback. Skip it explicitly so the on-chain
+                    // walk runs.
+                    let primary = if matches!(provider_kind, IndexerProvider::None) {
+                        Err("indexer disabled".to_string())
+                    } else {
+                        crate::indexer::build_indexer_for(chain)
+                            .transactions(address, HISTORY_LIMIT)
+                            .await
+                    };
+                    let result = match primary {
+                        Ok(v) => Ok(v),
+                        Err(primary_err) => {
+                            debug!(
+                                chain = %chain.label(),
+                                error = %primary_err,
+                                "indexer failed; falling back to on-chain",
+                            );
+                            match network.provider(chain).await {
+                                Some(p) => crate::indexer::onchain::fetch_onchain_history(
+                                    &p, address, chain, HISTORY_LIMIT,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    format!("indexer: {primary_err}; on-chain: {e}")
+                                }),
+                                None => Err(primary_err),
+                            }
+                        }
+                    };
+                    // Stamp the chain on every row regardless of source —
+                    // indexer impls default to Mainnet, the on-chain walk
+                    // already sets it, but stamping unconditionally keeps
+                    // the merged feed honest if any source forgets.
+                    let result = result.map(|mut v| {
+                        for r in v.iter_mut() {
+                            r.chain = chain;
+                        }
+                        v
+                    });
+                    debug!(
+                        elapsed = ?started.elapsed(),
+                        chain = %chain.label(),
+                        ok = result.is_ok(),
+                        count = result.as_ref().map(|v| v.len()).unwrap_or(0),
+                        "history fetch completed",
+                    );
+                    (address, chain, result)
+                },
+                |(address, chain, result)| Message::HistoryFetched { address, chain, result },
+            ));
+        }
+        Task::batch(tasks)
     }
 
     /// Issue one portfolio fetch per configured chain in parallel.
@@ -641,21 +726,79 @@ impl WalletScreen {
                     ),
                 }
             }
-            Message::HistoryFetched { address, result } => {
+            Message::HistoryFetched { address, chain, result } => {
                 if address != self.address {
                     return (Task::none(), None);
                 }
-                self.history_loading = false;
-                match result {
-                    Ok(txs) => self.history = txs,
-                    Err(e) => warn!(error = %e, "history fetch failed"),
+                self.history_loaded = true;
+                // Drop this chain from the pending set; once empty,
+                // history_loading flips to false. The user sees the
+                // fastest chain's rows appear immediately while slower
+                // chains keep loading in the background.
+                self.history_pending.retain(|c| *c != chain);
+                if self.history_pending.is_empty() {
+                    self.history_loading = false;
                 }
+                match result {
+                    Ok(txs) => {
+                        self.history_errors.set(chain, None);
+                        // Replace this chain's rows in the merged feed
+                        // and re-sort newest-first by timestamp (block
+                        // numbers aren't comparable across chains).
+                        self.history.retain(|r| r.chain != chain);
+                        self.history.extend(txs);
+                        self.history.sort_by(|a, b| {
+                            b.timestamp
+                                .cmp(&a.timestamp)
+                                .then_with(|| b.hash.cmp(&a.hash))
+                        });
+                        // Cap to HISTORY_LIMIT after merging so a quiet
+                        // chain doesn't get squeezed out by a busy one
+                        // (each chain fetched up to HISTORY_LIMIT; the
+                        // merged view shows the top N by recency).
+                        self.history.truncate(HISTORY_LIMIT);
+                    }
+                    Err(e) => {
+                        warn!(
+                            chain = %chain.label(),
+                            error = %e,
+                            "history fetch failed",
+                        );
+                        self.history_errors.set(chain, Some(e));
+                    }
+                }
+            }
+            Message::RetryHistory => {
+                if self.history_loading {
+                    return (Task::none(), None);
+                }
+                self.history_loading = true;
+                self.history_errors = PerChain::default();
+                self.history_pending = crate::chain::Chain::ALL
+                    .iter()
+                    .copied()
+                    .filter(|c| !settings::rpcs(*c).is_empty())
+                    .collect();
+                return (self.fetch_history_task(), None);
             }
             Message::SelectNav(nav) => {
                 if self.nav != nav {
                     self.settings_pane = SettingsPane::Root;
                 }
                 self.nav = nav;
+                // Lazy-load the activity feed on the first switch into
+                // the Activity tab so the dashboard doesn't pay the
+                // indexer (and on-chain fallback) round-trips on every
+                // account switch.
+                if matches!(nav, Nav::Activity) && !self.history_loaded && !self.history_loading {
+                    self.history_loading = true;
+                    self.history_pending = crate::chain::Chain::ALL
+                        .iter()
+                        .copied()
+                        .filter(|c| !settings::rpcs(*c).is_empty())
+                        .collect();
+                    return (self.fetch_history_task(), None);
+                }
             }
             Message::SelectTheme(k) => {
                 self.theme_kind = k;
@@ -863,14 +1006,24 @@ impl WalletScreen {
                     // Refresh balance + portfolio + history on success so
                     // the dashboard reflects the new state (the hero
                     // balance, held-token list, and activity feed all
-                    // shift).
+                    // shift). History is gated on `history_loaded`: if
+                    // the user never opened the Activity tab there's no
+                    // point paying for a fetch they won't see.
                     let refresh = if success {
-                        self.history_loading = true;
-                        Task::batch([
+                        let mut tasks = vec![
                             self.refresh_verification_task(),
                             self.fetch_portfolio_task(),
-                            self.fetch_history_task(),
-                        ])
+                        ];
+                        if self.history_loaded {
+                            self.history_loading = true;
+                            self.history_pending = crate::chain::Chain::ALL
+                                .iter()
+                                .copied()
+                                .filter(|c| !settings::rpcs(*c).is_empty())
+                                .collect();
+                            tasks.push(self.fetch_history_task());
+                        }
+                        Task::batch(tasks)
                     } else {
                         Task::none()
                     };
@@ -1222,43 +1375,32 @@ impl WalletScreen {
             Err(_) => send::ContactsView::default(),
         };
 
-        let composed: Element<'_, Message> = match &self.modal {
-            Modal::None => background,
-            Modal::Send(p) => stack![
-                background,
-                p.view(t, &self.portfolio, contacts_view, self.chrome.progress())
-                    .map(Message::Send),
-            ]
-            .into(),
-            Modal::Receive(p) => stack![
-                background,
-                p.view(t, self.chrome.progress()).map(Message::Receive),
-            ]
-            .into(),
-            Modal::Swap(p) => stack![
-                background,
-                p.view(t, self.chrome.progress()).map(Message::Swap),
-            ]
-            .into(),
-            Modal::AccountDropdown(d) => stack![
-                background,
-                d.view(t, &self.accounts, self.active_index)
-                    .map(Message::AccountDropdown),
-            ]
-            .into(),
+        // Always render the same `stack![background, modal_layer]` tree
+        // shape so iced doesn't reset child widget state when a modal
+        // opens or closes. Without this, opening a modal changes the
+        // tree from `Container` to `Stack(Container, Modal)`, and the
+        // activity feed's scroll position (and any other internal
+        // widget state below) snaps back to its default.
+        let modal_layer: Element<'_, Message> = match &self.modal {
+            Modal::None => Space::new().width(0).height(0).into(),
+            Modal::Send(p) => p
+                .view(t, &self.portfolio, contacts_view, self.chrome.progress())
+                .map(Message::Send),
+            Modal::Receive(p) => p.view(t, self.chrome.progress()).map(Message::Receive),
+            Modal::Swap(p) => p.view(t, self.chrome.progress()).map(Message::Swap),
+            Modal::AccountDropdown(d) => d
+                .view(t, &self.accounts, self.active_index)
+                .map(Message::AccountDropdown),
             Modal::TxDetails(p) => {
                 let tx_book = match self.contacts.read() {
                     Ok(g) => g.clone(),
                     Err(_) => ContactsBook::new(),
                 };
-                stack![
-                    background,
-                    p.view(t, self.chrome.progress(), &tx_book)
-                        .map(Message::TxDetails),
-                ]
-                .into()
+                p.view(t, self.chrome.progress(), &tx_book)
+                    .map(Message::TxDetails)
             }
         };
+        let composed: Element<'_, Message> = stack![background, modal_layer].into();
 
         // Bottom-right clipboard auto-clear chip rides on top of
         // whatever modal layer is currently visible. The chip is a
@@ -1289,7 +1431,27 @@ impl WalletScreen {
         let body: Element<'_, Message> = match self.nav {
             Nav::Home => home::view(t, &self.signer, &self.portfolio, self.portfolio_loading),
             Nav::Activity => {
-                activity::view(t, self.address, &self.history, self.history_loading, contacts)
+                // Show the error placeholder only when every configured
+                // chain failed *and* nothing rendered. Otherwise partial
+                // successes carry the feed even with one source down.
+                let any_err = crate::chain::Chain::ALL
+                    .iter()
+                    .any(|c| self.history_errors.get(*c).is_some());
+                let merged_error: Option<&str> = if any_err && self.history.is_empty() {
+                    crate::chain::Chain::ALL
+                        .iter()
+                        .find_map(|c| self.history_errors.get(*c).as_deref())
+                } else {
+                    None
+                };
+                activity::view(
+                    t,
+                    self.address,
+                    &self.history,
+                    self.history_loading,
+                    merged_error,
+                    contacts,
+                )
             }
             Nav::Settings => match &self.settings_pane {
                 SettingsPane::Root => settings_root::view(t),
@@ -1641,6 +1803,7 @@ mod tests {
             Arc::new(MockFetcher::new()),
             cache,
             Arc::new(RwLock::new(ContactsBook::new())),
+            None,
         )
     }
 
@@ -1724,25 +1887,37 @@ mod tests {
         let active = addr(0xAA);
         let other = addr(0xBB);
         let mut s = screen_for(active, new_cache());
-        // Pre-seed history so we can detect any clobber.
+        // Pre-seed history so we can detect any clobber. The Mainnet
+        // response empties the pending set, so loading flips to false.
+        s.history_pending = vec![Chain::Mainnet];
+        s.history_loading = true;
         s.update(Message::HistoryFetched {
             address: active,
+            chain: Chain::Mainnet,
             result: Ok(Vec::new()),
         });
         let baseline_loading = s.history_loading;
-        s.history_loading = true; // simulate a fresh fetch in flight
+        // Simulate a fresh fetch in flight for both chains.
+        s.history_pending = vec![Chain::Mainnet, Chain::Base];
+        s.history_loading = true;
         s.update(Message::HistoryFetched {
             address: other,
+            chain: Chain::Mainnet,
             result: Ok(Vec::new()),
         });
-        // The dropped response must not flip `history_loading` off —
-        // otherwise the spinner would disappear before the *real*
-        // fetch for `active` lands.
+        // The dropped response must not shrink the pending set or flip
+        // `history_loading` off — otherwise the spinner would disappear
+        // before the *real* fetch for `active` lands.
         assert!(
             s.history_loading,
             "history_loading must stay true when a foreign-address response is dropped",
         );
-        // Sanity: the initial active-address response did clear it.
+        assert_eq!(
+            s.history_pending.len(),
+            2,
+            "pending set must be untouched by a foreign-address response",
+        );
+        // Sanity: the initial active-address response did clear loading.
         assert!(!baseline_loading);
     }
 

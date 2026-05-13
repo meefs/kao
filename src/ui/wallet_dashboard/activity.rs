@@ -11,11 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy::primitives::Address;
 use iced::border::Radius;
 use iced::widget::{Space, button, column, container, row, text};
-use iced::{Alignment, Background, Border, Element, Length, Padding};
+use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
+use crate::chain::Chain;
 use crate::indexer::{IndexedTx, TokenTransfer, TxDirection};
 use crate::portfolio::format_token_balance;
-use crate::ui::kao_theme::KaoTheme;
+use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{avatar, bold, hover_tint, kao_scrollable_style, mono, mono_black};
 use crate::wallet::{ContactsBook, short_address};
 
@@ -30,6 +31,7 @@ pub fn view<'a>(
     owner: Address,
     txs: &'a [IndexedTx],
     loading: bool,
+    error: Option<&'a str>,
     contacts: &ContactsBook,
 ) -> Element<'a, Message> {
     let body: Element<'_, Message> = if loading {
@@ -37,6 +39,31 @@ pub fn view<'a>(
             .padding(Padding::from([20, 0]))
             .width(Length::Fill)
             .center_x(Length::Fill)
+            .into()
+    } else if txs.is_empty() && error.is_some() {
+        // Both the indexer and the on-chain fallback failed — give the
+        // user a way out instead of a misleading "No transactions yet".
+        let msg = text("Couldn't load activity.").size(13).color(t.sub);
+        let retry = button(text("Retry").size(13).color(t.text).font(bold()))
+            .padding(Padding::from([6, 14]))
+            .on_press(Message::RetryHistory)
+            .style(move |_theme, status| button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered | button::Status::Pressed => hover_tint(t.card, t.text),
+                    _ => t.card,
+                })),
+                text_color: t.text,
+                border: Border {
+                    color: t.border,
+                    width: 1.0,
+                    radius: Radius::from(10),
+                },
+                ..button::Style::default()
+            });
+        column![msg, Space::new().height(10), retry]
+            .align_x(Alignment::Center)
+            .padding(Padding::from([20, 0]))
+            .width(Length::Fill)
             .into()
     } else if txs.is_empty() {
         container(text("No transactions yet.").size(13).color(t.sub))
@@ -111,11 +138,18 @@ fn tx_row<'a>(
     };
     let amount_color = if recv && nonzero { t.up } else { t.text };
 
-    let left = column![
-        text(label).size(14).color(t.text).font(bold()),
+    let meta_row = row![
+        chain_chip(t, tx.chain),
+        Space::new().width(6),
         text(format_relative(now, tx.timestamp))
             .size(11)
             .color(t.sub),
+    ]
+    .align_y(Alignment::Center);
+    let left = column![
+        text(label).size(14).color(t.text).font(bold()),
+        Space::new().height(2),
+        meta_row,
     ]
     .spacing(0);
 
@@ -179,10 +213,19 @@ fn format_amount(tx: &IndexedTx, recv: bool) -> String {
 
 fn format_token_amount(tok: &TokenTransfer, recv: bool) -> String {
     let symbol = if tok.symbol.is_empty() {
-        "tokens".to_string()
+        if tok.is_nft { "NFT".to_string() } else { "tokens".to_string() }
     } else {
         tok.symbol.clone()
     };
+    if tok.is_nft {
+        // ERC-721: render as `SYMBOL #N` (or just `#N` for unknowns).
+        let id = tok
+            .token_id
+            .map(|id| format!("#{id}"))
+            .unwrap_or_default();
+        let sign = if recv { "+" } else { "−" };
+        return format!("{sign}{symbol} {id}").trim_end().to_string();
+    }
     if tok.amount_raw.is_zero() {
         return format!("0 {symbol}");
     }
@@ -201,6 +244,41 @@ fn trim_amount(f: f64) -> String {
         let s = format!("{f:.6}");
         s.trim_end_matches('0').trim_end_matches('.').to_string()
     }
+}
+
+/// Per-chain accent color for the badge tint. Mainnet stays in the
+/// theme's neutral sub color (signals "this is the default"); L2s pull
+/// from the kao accent palette so the merged feed reads at a glance.
+fn chain_tint(t: KaoTheme, chain: Chain) -> Color {
+    match chain {
+        Chain::Mainnet => t.sub,
+        Chain::Base => t.a1,
+        Chain::Optimism => t.a2,
+    }
+}
+
+/// Small filled chip showing the chain's short label. Sized to match
+/// the secondary metadata row so it doesn't visually outweigh the
+/// counterparty line.
+fn chain_chip<'a>(t: KaoTheme, chain: Chain) -> Element<'a, Message> {
+    let accent = chain_tint(t, chain);
+    container(
+        text(chain.label().to_string())
+            .size(10)
+            .color(accent)
+            .font(bold()),
+    )
+    .padding(Padding::from([2, 6]))
+    .style(move |_| iced::widget::container::Style {
+        background: Some(Background::Color(with_alpha(accent, 0.12))),
+        border: Border {
+            color: with_alpha(accent, 0.3),
+            width: 1.0,
+            radius: Radius::from(6),
+        },
+        ..iced::widget::container::Style::default()
+    })
+    .into()
 }
 
 /// "2 min ago" / "3 hrs ago" / "Yesterday" / "5 days ago". Stays roughly

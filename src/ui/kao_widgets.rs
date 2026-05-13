@@ -804,7 +804,14 @@ pub fn modal_wrapper<'a, M: Clone + 'a>(
             ..container::Style::default()
         });
 
-    let positioned = mouse_area(box_).on_press(on_box_click);
+    // `interaction(Idle)` on both layers makes iced's `stack` "levitate"
+    // the cursor for widgets behind the modal so hover styles below
+    // (e.g. activity-row buttons) don't light up while the modal is open.
+    // See iced_widget::stack::update — the cursor is levitated only when
+    // an upper layer reports a non-`None` mouse interaction.
+    let positioned = mouse_area(box_)
+        .on_press(on_box_click)
+        .interaction(iced::mouse::Interaction::Idle);
 
     let backdrop_alpha = (if t.dark { 0.55 } else { 0.35 }) * progress;
     let backdrop = mouse_area(
@@ -821,7 +828,8 @@ pub fn modal_wrapper<'a, M: Clone + 'a>(
                 ..container::Style::default()
             }),
     )
-    .on_press(on_backdrop);
+    .on_press(on_backdrop)
+    .interaction(iced::mouse::Interaction::Idle);
 
     let modal_layer = container(positioned)
         .width(Length::Fill)

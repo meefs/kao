@@ -30,6 +30,7 @@ mod alchemy;
 mod blockscout;
 mod drpc;
 mod etherscan;
+pub mod onchain;
 
 pub use alchemy::AlchemyClient;
 pub use blockscout::BlockscoutClient;
@@ -77,18 +78,30 @@ pub struct IndexedTx {
     /// usually zero (the actual amount lives in `token.amount_raw`); the
     /// renderer should prefer the token fields when present.
     pub token: Option<TokenTransfer>,
+    /// Chain this row was fetched from. Stamped by the caller after the
+    /// per-chain `Indexer` returns its rows so the merged activity feed
+    /// can render a chain badge per row and route the explorer URL to
+    /// the right network.
+    pub chain: Chain,
 }
 
-/// ERC-20 transfer details attached to an `IndexedTx`. Captured from the
-/// indexer's token-transfer endpoint so the activity feed can format
-/// `1.23 USDC` instead of `0 ETH` for an ERC-20 send.
+/// Token transfer details attached to an `IndexedTx`. Captured from the
+/// indexer's token-transfer endpoint (or the on-chain log fallback) so
+/// the activity feed can format `1.23 USDC` or `BAYC #4321` instead of
+/// `0 ETH` for a token send.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct TokenTransfer {
     pub contract: Address,
     pub symbol: String,
     pub decimals: u8,
+    /// ERC-20 amount in smallest unit; for ERC-721 this is `1`.
     pub amount_raw: U256,
+    /// `true` for ERC-721 / NFT rows. Renderer shows `SYMBOL #N` instead
+    /// of decimal-formatted amount.
+    pub is_nft: bool,
+    /// `Some(id)` for ERC-721; `None` for ERC-20.
+    pub token_id: Option<U256>,
 }
 
 /// Provider-agnostic token holding. Mirrors `portfolio::LiveToken` but is
@@ -315,7 +328,7 @@ pub fn into_live_tokens(chain: Chain, tokens: Vec<IndexedToken>) -> Vec<LiveToke
 
 /// Classify a tx's direction relative to `owner`. Centralized so each impl
 /// doesn't reimplement the self-transfer edge case.
-pub(crate) fn classify_direction(from: Address, to: Option<Address>, owner: Address) -> TxDirection {
+pub fn classify_direction(from: Address, to: Option<Address>, owner: Address) -> TxDirection {
     let from_owner = from == owner;
     let to_owner = to == Some(owner);
     match (from_owner, to_owner) {

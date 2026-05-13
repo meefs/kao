@@ -41,7 +41,7 @@ fn is_rate_limited(msg: &str) -> bool {
         || msg.contains("Too Many Requests")
 }
 
-async fn with_rate_limit_retry<T, E, F, Fut>(label: &str, f: F) -> Result<T, E>
+pub(crate) async fn with_rate_limit_retry<T, E, F, Fut>(label: &str, f: F) -> Result<T, E>
 where
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
@@ -662,7 +662,7 @@ const MIN_POOL_WETH_WEI: U256 =
 /// `with_rate_limit_retry` so 429s back off instead of zeroing the
 /// portfolio. Returns the per-subcall (success, returnData) rows in the
 /// same order the caller queued them.
-async fn multicall3(
+pub(crate) async fn multicall3(
     provider: &RootProvider<Ethereum>,
     block: BlockId,
     label: &str,
@@ -680,6 +680,30 @@ async fn multicall3(
     let decoded = aggregate3Call::abi_decode_returns(&raw)
         .map_err(|e| format!("{label} decode: {e}"))?;
     Ok(decoded)
+}
+
+/// Crate-internal façade over `multicall3` that hides the sol-generated
+/// `Call3`/`MultiResult` types so callers in other modules don't need to
+/// import them. Each input is `(target, calldata)`; each output is
+/// `(success, returnData)` in the same order. All subcalls are issued
+/// with `allowFailure = true` so a single reverting token doesn't blank
+/// the whole batch.
+pub(crate) async fn multicall_pairs(
+    provider: &RootProvider<Ethereum>,
+    block: BlockId,
+    label: &str,
+    calls: Vec<(Address, Bytes)>,
+) -> Result<Vec<(bool, Bytes)>, String> {
+    let calls3: Vec<Call3> = calls
+        .into_iter()
+        .map(|(target, data)| Call3 {
+            target,
+            allowFailure: true,
+            callData: data,
+        })
+        .collect();
+    let raw = multicall3(provider, block, label, calls3).await?;
+    Ok(raw.into_iter().map(|r| (r.success, r.returnData)).collect())
 }
 
 /// Decode a raw `MultiResult.returnData` as a 32-byte uint. Returns

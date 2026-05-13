@@ -398,6 +398,7 @@ fn convert_tx(t: RawTx, owner: Address) -> Option<IndexedTx> {
         direction: classify_direction(from, to, owner),
         method: Some(t.r#type),
         token,
+        chain: Chain::Mainnet,
     })
 }
 
@@ -444,6 +445,8 @@ fn decode_transfer(tr: &RawTransfer) -> (U256, Option<TokenTransfer>) {
                 symbol,
                 decimals,
                 amount_raw: raw_amount,
+                is_nft: false,
+                token_id: None,
             }),
         )
     } else {

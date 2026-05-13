@@ -296,13 +296,20 @@ impl App {
         self.setup_context = None;
         self.pending_signer = None;
         self.wallet = Some(descriptor);
-        iced::Task::batch(vec![save, self.enter_dashboard(signer)])
+        iced::Task::batch(vec![save, self.enter_dashboard(signer, None)])
     }
 
     /// Build the dashboard for the currently-loaded wallet and the given
     /// active signer. Caller is responsible for ensuring `self.wallet` is
-    /// set and its `active_index` matches `signer`.
-    fn enter_dashboard(&mut self, signer: KaoSigner) -> iced::Task<Message> {
+    /// set and its `active_index` matches `signer`. `initial_nav` lets
+    /// callers preserve the user's current tab across rebuilds (account
+    /// switch); `None` lands on Home, the default for first-unlock and
+    /// post-setup flows.
+    fn enter_dashboard(
+        &mut self,
+        signer: KaoSigner,
+        initial_nav: Option<crate::ui::wallet_dashboard::Nav>,
+    ) -> iced::Task<Message> {
         let (accounts, active_index) = match &self.wallet {
             Some(w) => (w.accounts.clone(), w.active_index),
             None => (Vec::new(), 0),
@@ -315,11 +322,13 @@ impl App {
             self.network.clone(),
             self.portfolio_cache.clone(),
             self.contacts.clone(),
+            initial_nav,
         );
         let address = screen.address_for_log();
         let verify_task = screen.refresh_verification_task().map(Message::WalletDashboard);
         let portfolio_task = screen.fetch_portfolio_task().map(Message::WalletDashboard);
-        let history_task = screen.fetch_history_task().map(Message::WalletDashboard);
+        // History is fetched lazily on the first switch to the Activity
+        // tab — no eager round-trip on dashboard entry.
         // Reverse-ENS lookup. No-ops when the active account is already
         // named, so account switches don't pile up redundant lookups.
         let ens_task = screen.fetch_ens_name_task().map(Message::WalletDashboard);
@@ -328,16 +337,19 @@ impl App {
             active_index,
             addr = %address,
             built_in = ?started.elapsed(),
-            "entered dashboard; verify+portfolio+history+ens fetch queued",
+            "entered dashboard; verify+portfolio+ens fetch queued",
         );
-        iced::Task::batch(vec![verify_task, portfolio_task, history_task, ens_task])
+        iced::Task::batch(vec![verify_task, portfolio_task, ens_task])
     }
 
     /// Routes the active account of `self.wallet` to the right destination.
     /// Local: build signer synchronously and enter dashboard immediately.
     /// Hardware: push the matching connect screen in reconnect mode while
     /// the device handshake runs.
-    fn enter_active_from_wallet(&mut self) -> iced::Task<Message> {
+    fn enter_active_from_wallet(
+        &mut self,
+        initial_nav: Option<crate::ui::wallet_dashboard::Nav>,
+    ) -> iced::Task<Message> {
         let Some(wallet) = self.wallet.as_ref() else {
             return iced::Task::perform(
                 async { "no wallet loaded".to_string() },
@@ -348,7 +360,7 @@ impl App {
             AccountDescriptor::Local { key_bytes, .. } => {
                 let b = alloy::primitives::B256::from_slice(&key_bytes);
                 match wallet::signer_from_bytes(&b) {
-                    Ok(s) => self.enter_dashboard(KaoSigner::Local(s)),
+                    Ok(s) => self.enter_dashboard(KaoSigner::Local(s), initial_nav),
                     Err(e) => {
                         iced::Task::perform(async move { e.to_string() }, Message::WalletError)
                     }
@@ -370,7 +382,7 @@ impl App {
             }
             AccountDescriptor::ViewOnly { address, .. } => {
                 let addr = alloy::primitives::Address::from(address);
-                self.enter_dashboard(KaoSigner::ViewOnly(addr))
+                self.enter_dashboard(KaoSigner::ViewOnly(addr), initial_nav)
             }
         }
     }
@@ -381,11 +393,11 @@ impl App {
     fn cancel_add_account(&mut self) -> iced::Task<Message> {
         self.setup_context = None;
         if let Some(signer) = self.pending_signer.take() {
-            return self.enter_dashboard(signer);
+            return self.enter_dashboard(signer, None);
         }
         // No parked signer (shouldn't happen) — fall back to a full reload
         // of the active account.
-        self.enter_active_from_wallet()
+        self.enter_active_from_wallet(None)
     }
 
     /// Persist `active_index = idx` and rebuild the dashboard for that
@@ -421,7 +433,15 @@ impl App {
             }
         };
         self.pending_signer = None;
-        let enter = self.enter_active_from_wallet();
+        // Preserve the active dashboard tab across the rebuild — switching
+        // accounts while reading the Activity feed shouldn't yank the
+        // user back to Home.
+        let preserved_nav = if let Screen::Wallet(screen) = &self.screen {
+            Some(screen.current_nav())
+        } else {
+            None
+        };
+        let enter = self.enter_active_from_wallet(preserved_nav);
         debug!(
             scheduled_in = ?switch_started.elapsed(),
             "switch: dashboard handoff scheduled (argon2 save runs in background)",
@@ -522,7 +542,7 @@ impl App {
                             .clone(),
                     );
                     return iced::Task::batch(vec![
-                        self.enter_active_from_wallet(),
+                        self.enter_active_from_wallet(None),
                         load_contacts,
                     ]);
                 }
@@ -917,7 +937,7 @@ impl App {
                         self.save_account_and_enter_dashboard(account, signer)
                     }
                     Some(ConnectLedgerOutcome::ReconnectComplete { signer }) => {
-                        self.enter_dashboard(signer)
+                        self.enter_dashboard(signer, None)
                     }
                     Some(ConnectLedgerOutcome::Back) => {
                         // Setup mode: back to the hardware-wallet picker.
@@ -948,7 +968,7 @@ impl App {
                         self.save_account_and_enter_dashboard(account, signer)
                     }
                     Some(ConnectTrezorOutcome::ReconnectComplete { signer }) => {
-                        self.enter_dashboard(signer)
+                        self.enter_dashboard(signer, None)
                     }
                     Some(ConnectTrezorOutcome::Back) => {
                         self.screen = if wallet::wallet_exists() {

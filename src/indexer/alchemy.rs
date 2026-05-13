@@ -434,6 +434,8 @@ fn convert_transfer(t: RawTransfer, owner: Address) -> Option<IndexedTx> {
                     symbol,
                     decimals,
                     amount_raw: raw_amount,
+                    is_nft: false,
+                    token_id: None,
                 }),
             )
         }
@@ -455,6 +457,7 @@ fn convert_transfer(t: RawTransfer, owner: Address) -> Option<IndexedTx> {
         direction: classify_direction(from, to, owner),
         method: Some(t.category),
         token,
+        chain: Chain::Mainnet,
     })
 }
 

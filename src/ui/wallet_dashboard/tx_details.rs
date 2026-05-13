@@ -12,7 +12,7 @@ use iced::keyboard;
 use iced::widget::{Space, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
-use crate::indexer::{IndexedTx, TokenTransfer, TxDirection, TxStatus};
+use crate::indexer::{IndexedTx, TxDirection, TxStatus};
 use crate::portfolio::format_token_balance;
 use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::KaoTheme;
@@ -28,6 +28,9 @@ pub enum Message {
     CopyExplorerUrl,
     CopyFrom,
     CopyTo,
+    /// User tapped copy on the Token contract / Collection field. Only
+    /// emitted when the row carries an ERC-20 / NFT contract.
+    CopyAsset,
     Close,
     BoxClickIgnored,
     Key(keyboard::Event),
@@ -86,6 +89,13 @@ impl TxDetailsPane {
                 ),
                 None => (Task::none(), None),
             },
+            Message::CopyAsset => match self.tx.token.as_ref() {
+                Some(tok) => (
+                    Task::none(),
+                    Some(Outcome::CopyText(tok.contract.to_checksum(None))),
+                ),
+                None => (Task::none(), None),
+            },
             Message::Close => (Task::none(), Some(Outcome::Closed)),
             Message::BoxClickIgnored => (Task::none(), None),
             Message::Key(keyboard::Event::KeyPressed { key, .. }) => {
@@ -125,31 +135,43 @@ impl TxDetailsPane {
         };
         let title = container(
             text(direction_label)
-                .size(21)
-                .color(t.text)
-                .font(black()),
+                .size(14)
+                .color(t.sub)
+                .font(bold()),
         )
         .width(Length::Fill)
         .center_x(Length::Fill);
 
+        // ── Hero amount block ────────────────────────────────────────────
+        // Two-line presentation: big signed number on top, token symbol
+        // (or "ETH"/"NFT #N") underneath, so the eye lands on the
+        // magnitude first and the asset second. Splitting the previous
+        // single-line `±X.YYY SYM` into discrete lines is the change the
+        // user asked for — "what token + what amount" is now scannable.
+        let parts = amount_parts(&self.tx, self.tx.direction);
         let amount_color = match self.tx.direction {
             TxDirection::In if self.has_movement() => t.up,
             _ => t.text,
         };
-        let amount_text = format_amount(&self.tx, self.tx.direction);
+        let amount_top = text(parts.amount)
+            .size(34)
+            .color(amount_color)
+            .font(mono_black());
+        let amount_bottom = text(parts.label)
+            .size(16)
+            .color(t.text)
+            .font(black());
         let amount = container(
-            text(amount_text)
-                .size(28)
-                .color(amount_color)
-                .font(mono_black()),
+            column![amount_top, Space::new().height(2), amount_bottom]
+                .align_x(Alignment::Center),
         )
         .width(Length::Fill)
         .center_x(Length::Fill);
 
         let status_text = match self.tx.status {
-            TxStatus::Success => "Success",
-            TxStatus::Failure => "Failed",
-            TxStatus::Pending => "Pending",
+            TxStatus::Success => "✓ Success",
+            TxStatus::Failure => "× Failed",
+            TxStatus::Pending => "⋯ Pending",
         };
         let status_color = match self.tx.status {
             TxStatus::Success => t.up,
@@ -167,6 +189,19 @@ impl TxDetailsPane {
 
         // ── Field stack ──────────────────────────────────────────────────
         let mut fields = column![].spacing(14).width(Length::Fill);
+
+        // Asset: only present for ERC-20 / ERC-721. Showing the token
+        // contract address is the load-bearing detail for verifying that
+        // a "USDC" label isn't a look-alike scam token. Native ETH rows
+        // skip this block entirely — the contract is meaningless there.
+        if let Some(tok) = &self.tx.token {
+            fields = fields.push(field(
+                t,
+                if tok.is_nft { "Collection" } else { "Token contract" },
+                colored_address(t, tok.contract),
+                Some(Message::CopyAsset),
+            ));
+        }
 
         // Contact-aware From/To: when the counterparty matches a saved
         // contact, render the name above the colored chunked address
@@ -203,16 +238,12 @@ impl TxDetailsPane {
             }
         }
 
-        fields = fields.push(field(
+        // Chain (always shown so a merged feed is unambiguous about which
+        // network a tx settled on).
+        fields = fields.push(simple_field(
             t,
-            "Hash",
-            text(format!("{:#x}", self.tx.hash))
-                .size(14)
-                .color(t.text)
-                .font(mono())
-                .wrapping(text::Wrapping::WordOrGlyph)
-                .into(),
-            Some(Message::CopyHash),
+            "Network",
+            self.tx.chain.display_name().to_string(),
         ));
 
         if self.tx.block_number > 0 {
@@ -249,23 +280,19 @@ impl TxDetailsPane {
                 fields = fields.push(simple_field(t, "Method", method.clone()));
             }
 
-        // ── Explorer URL block ───────────────────────────────────────────
-        let url_label = text("Explorer")
-            .size(13)
-            .color(t.sub)
-            .font(bold());
-        let url_value = text(self.explorer_url.clone())
-            .size(13)
-            .color(t.a1)
-            .font(mono())
-            .wrapping(text::Wrapping::WordOrGlyph);
-        let url_block = column![
-            url_label,
-            Space::new().height(4),
-            url_value,
-        ]
-        .width(Length::Fill)
-        .spacing(0);
+        // Hash: short form (0x1111…1111). The full 66-char hash used to
+        // wrap to two ugly lines and dwarf every other field. Users who
+        // need the canonical form get it from Copy or the explorer.
+        fields = fields.push(field(
+            t,
+            "Hash",
+            text(short_hash(&self.tx.hash))
+                .size(14)
+                .color(t.text)
+                .font(mono_bold())
+                .into(),
+            Some(Message::CopyHash),
+        ));
 
         // ── Action buttons ───────────────────────────────────────────────
         let actions = row![
@@ -283,15 +310,13 @@ impl TxDetailsPane {
             header_kao,
             Space::new().height(8),
             title,
-            Space::new().height(2),
-            status,
-            Space::new().height(14),
+            Space::new().height(10),
             amount,
-            Space::new().height(20),
+            Space::new().height(8),
+            status,
+            Space::new().height(22),
             fields,
             Space::new().height(20),
-            url_block,
-            Space::new().height(14),
             actions,
         ]
         .width(Length::Fill)
@@ -365,32 +390,71 @@ fn simple_field<'a>(t: KaoTheme, label: &'a str, value: String) -> Element<'a, M
 
 // ── Formatting helpers ──────────────────────────────────────────────────────
 
-fn format_amount(tx: &IndexedTx, direction: TxDirection) -> String {
+/// Hero-amount split: top line is the signed magnitude (`+5.000`,
+/// `−0.0024`, or `BAYC` for NFTs); bottom line is the asset label
+/// (`USDC`, `ETH`, `#4321`). Splitting them lets the modal hierarchy
+/// answer "how much" and "what" with two distinct visual weights.
+struct AmountParts {
+    amount: String,
+    label: String,
+}
+
+fn amount_parts(tx: &IndexedTx, direction: TxDirection) -> AmountParts {
     let recv = matches!(direction, TxDirection::In | TxDirection::SelfTransfer);
+    let sign = if recv { "+" } else { "−" };
     if let Some(tok) = &tx.token {
-        return format_token_amount(tok, recv);
+        let symbol = if tok.symbol.is_empty() {
+            if tok.is_nft { "NFT" } else { "tokens" }.to_string()
+        } else {
+            tok.symbol.clone()
+        };
+        if tok.is_nft {
+            // ERC-721: top line carries the collection symbol (the most
+            // recognizable handle), bottom line carries the token id so
+            // both pieces render at distinct sizes.
+            let id = tok
+                .token_id
+                .map(|id| format!("#{id}"))
+                .unwrap_or_else(|| "—".to_string());
+            return AmountParts {
+                amount: format!("{sign}{symbol}"),
+                label: id,
+            };
+        }
+        let amount = if tok.amount_raw.is_zero() {
+            "0".to_string()
+        } else {
+            let (_, f) = format_token_balance(tok.amount_raw, tok.decimals);
+            format!("{sign}{}", trim_amount(f))
+        };
+        return AmountParts {
+            amount,
+            label: symbol,
+        };
     }
     if tx.value.is_zero() {
-        return "0 ETH".into();
+        return AmountParts {
+            amount: "0".to_string(),
+            label: "ETH".to_string(),
+        };
     }
     let raw = alloy::primitives::utils::format_ether(tx.value);
     let f = raw.parse::<f64>().unwrap_or(0.0);
-    let sign = if recv { "+" } else { "−" };
-    format!("{sign}{} ETH", trim_amount(f))
+    AmountParts {
+        amount: format!("{sign}{}", trim_amount(f)),
+        label: "ETH".to_string(),
+    }
 }
 
-fn format_token_amount(tok: &TokenTransfer, recv: bool) -> String {
-    let symbol = if tok.symbol.is_empty() {
-        "tokens".to_string()
-    } else {
-        tok.symbol.clone()
-    };
-    if tok.amount_raw.is_zero() {
-        return format!("0 {symbol}");
+/// Short-hash form for the modal's Hash field: `0x1111…1111`. The full
+/// hash is still copyable via the field's Copy affordance and the
+/// "Copy hash" action button.
+fn short_hash(hash: &alloy::primitives::B256) -> String {
+    let full = format!("{hash:#x}");
+    if full.len() <= 12 {
+        return full;
     }
-    let (_, f) = format_token_balance(tok.amount_raw, tok.decimals);
-    let sign = if recv { "+" } else { "−" };
-    format!("{sign}{} {symbol}", trim_amount(f))
+    format!("{}…{}", &full[..6], &full[full.len() - 4..])
 }
 
 fn trim_amount(f: f64) -> String {
@@ -481,22 +545,35 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (y, m, d)
 }
 
-/// Build a `(url, label)` pair for the active indexer's web explorer.
-/// Blockscout users get the configured Blockscout instance; everyone
-/// else falls back to Etherscan, which is the universal default the
-/// existing Send pane already links to.
+/// Build a `(url, label)` pair for the active indexer's web explorer,
+/// routed to the chain the row came from. Blockscout users get the
+/// canonical Blockscout instance for the chain (their mainnet override
+/// applies only to Mainnet rows); everyone else gets the canonical
+/// per-chain Etherscan-family explorer.
 fn explorer_for(tx: &IndexedTx) -> (String, String) {
+    use crate::chain::Chain;
     let hash = format!("{:#x}", tx.hash);
     match settings::indexer_provider() {
         IndexerProvider::Blockscout => {
-            let base = settings::blockscout_base_url()
-                .unwrap_or_else(|| "https://eth.blockscout.com".to_string());
+            let base = if tx.chain == Chain::Mainnet {
+                settings::blockscout_base_url()
+                    .unwrap_or_else(|| tx.chain.default_blockscout_url().to_string())
+            } else {
+                tx.chain.default_blockscout_url().to_string()
+            };
             let trimmed = base.trim_end_matches('/');
             (format!("{trimmed}/tx/{hash}"), "Blockscout".to_string())
         }
-        _ => (
-            format!("https://etherscan.io/tx/{hash}"),
-            "Etherscan".to_string(),
-        ),
+        _ => {
+            let (url, label) = match tx.chain {
+                Chain::Mainnet => ("https://etherscan.io", "Etherscan"),
+                Chain::Base => ("https://basescan.org", "BaseScan"),
+                Chain::Optimism => (
+                    "https://optimistic.etherscan.io",
+                    "Optimistic Etherscan",
+                ),
+            };
+            (format!("{url}/tx/{hash}"), label.to_string())
+        }
     }
 }
