@@ -398,4 +398,60 @@ mod tests {
         assert_eq!(Chain::Optimism.chain_id(), 10);
         assert_eq!(Chain::Base.chain_id(), 8453);
     }
+
+    #[test]
+    fn erc20_transfer_calldata_max_u256_amount() {
+        // The amount field is a full U256; encoding must occupy all 32
+        // bytes without truncation. Pinning MAX guards against a future
+        // change that accidentally narrows the slot (e.g. swapping
+        // `to_be_bytes::<32>()` for a smaller width).
+        let to = address!("000000000000000000000000000000000000dEaD");
+        let calldata = erc20_transfer_calldata(to, U256::MAX);
+        let bytes: &[u8] = calldata.as_ref();
+        assert_eq!(bytes.len(), 68);
+        assert_eq!(&bytes[36..68], &[0xFFu8; 32]);
+    }
+
+    /// Pins a known sharp edge: alloy's `parse_units` accepts `"-N"`
+    /// and `<ParseUnits as Into<U256>>` calls `get_absolute()`, which
+    /// despite its name does NOT take the absolute value — it
+    /// reinterprets the signed I256's raw two's-complement bytes as a
+    /// U256. So `-1` (18 decimals) round-trips to `2^256 - 1e18`, an
+    /// astronomically large amount that would always exceed the
+    /// sender's balance and bounce upstream. The Send screen guards
+    /// against this *additionally* (its amount field only accepts
+    /// digits + one decimal point), but if a future caller bypasses
+    /// the UI it must not assume `parse_amount_units` rejects negatives.
+    #[test]
+    fn parse_amount_units_negative_reinterprets_as_huge_u256() {
+        let neg = parse_amount_units("-1", 18).expect("alloy accepts negative");
+        let one_eth = U256::from(10).pow(U256::from(18));
+        // -1e18 as I256, raw bytes reinterpreted as U256, is 2^256 - 1e18.
+        assert_eq!(neg, U256::MAX - one_eth + U256::from(1u8));
+    }
+
+    #[test]
+    fn parse_amount_units_rejects_garbage() {
+        assert!(parse_amount_units("abc", 18).is_err());
+        assert!(parse_amount_units("1.2.3", 18).is_err());
+    }
+
+    #[test]
+    fn parse_amount_units_trims_whitespace() {
+        // The Send screen passes raw text-field input; users can paste
+        // amounts with stray whitespace. Trim before delegating.
+        let parsed = parse_amount_units("  1  ", 18).unwrap();
+        assert_eq!(parsed, U256::from(10).pow(U256::from(18)));
+    }
+
+    #[test]
+    fn parse_amount_units_more_decimals_than_token_truncates_or_errors() {
+        // 7 decimals on a 6-decimal token — alloy may either truncate
+        // the extra digit or refuse. Pin our reliance: if it succeeds,
+        // the value still fits the token's scale (≤ 1e7 base units for
+        // "1.2345678").
+        if let Ok(v) = parse_amount_units("1.2345678", 6) {
+            assert!(v <= U256::from(1_234_568u64), "must not over-allocate");
+        }
+    }
 }

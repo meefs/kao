@@ -1506,10 +1506,16 @@ fn simulation_block<'a>(
 ) -> Element<'a, Message> {
     match &sim.outcome {
         SimOutcome::Unavailable => {
+            // `supports_simulation()` now returns `true` on every Kao
+            // chain (preflight runs for Mainnet, Base, Optimism), so
+            // the only way to land in this branch is a genuine sim
+            // failure — Helios unreachable, fallback RPC errored, or
+            // revm rejected the tx env. Phrase the notice as a
+            // transient miss rather than a chain-level gate.
             let msg = if !chain.supports_simulation() {
                 "Simulation unavailable on this chain"
             } else {
-                "Simulation unavailable"
+                "Simulation unavailable — couldn't preflight this tx"
             };
             container(text(msg).size(11).color(t.sub).font(mono()))
                 .padding(Padding::from([4, 0]))

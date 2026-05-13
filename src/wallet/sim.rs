@@ -774,30 +774,367 @@ mod tests {
     /// test fails because the upfront balance check rejects the tx.
     #[tokio::test]
     async fn simulate_native_transfer_with_zero_balance_caller_succeeds() {
+        // Sweep every chain Kao supports. Mainnet exercises the original
+        // `LackOfFundForMaxFee` regression (gas_price=0 fix); Base and
+        // Optimism additionally exercise the L2 path — stock revm with
+        // `SpecId::PRAGUE` correctly meters a native ETH transfer on
+        // OP-stack chains because the send flow touches no OP-specific
+        // precompiles. If a future revm bump introduces chain-id
+        // -conditional behavior that breaks L2 sim, this test fails
+        // loudly here instead of silently in production.
+        for chain in Chain::ALL {
+            assert_simulate_native_succeeds_on(chain).await;
+        }
+    }
+
+    async fn assert_simulate_native_succeeds_on(chain: Chain) {
         use crate::net::MockFetcher;
         use crate::wallet::tx::{SendPlan, SendToken};
         use alloy::primitives::address;
 
+        assert!(
+            chain.supports_simulation(),
+            "{} no longer supports simulation — update or remove this test",
+            chain.label(),
+        );
         let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
         let plan = SendPlan {
             from: address!("000000000000000000000000000000000000beEF"),
             recipient: address!("000000000000000000000000000000000000dEaD"),
             token: SendToken::Native,
             amount_units: U256::ZERO,
+            chain,
+        };
+        let result = simulate_tx(network, &plan, /* nonce */ 0)
+            .await
+            .unwrap_or_else(|e| panic!("{} sim should not fail: {e}", chain.label()));
+        assert!(
+            matches!(result.outcome, SimOutcome::Success { .. }),
+            "{}: expected Success, got {:?}",
+            chain.label(),
+            result.outcome,
+        );
+        assert_eq!(
+            result.gas_used,
+            21000,
+            "{}: native transfer should meter 21000 gas",
+            chain.label(),
+        );
+        assert!(result.transfers.is_empty());
+    }
+
+    #[test]
+    fn decode_error_string_empty_message() {
+        // `revert("")` — selector + offset(0x20) + length(0). No string
+        // body. Must decode to an empty string, not None.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&ERROR_STRING_SELECTOR);
+        let mut offset = [0u8; 32];
+        offset[31] = 0x20;
+        buf.extend_from_slice(&offset);
+        buf.extend_from_slice(&[0u8; 32]); // length = 0
+        let decoded = decode_revert_reason(&Bytes::from(buf)).expect("decoded");
+        assert_eq!(decoded, "");
+    }
+
+    #[test]
+    fn decode_error_string_length_overflows_body_returns_none() {
+        // selector + offset(0x20) + length(0xFF) but only one byte of data —
+        // a malicious or truncated revert payload must not panic or read
+        // past the buffer. We return None and the caller falls back to a
+        // hex dump.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&ERROR_STRING_SELECTOR);
+        let mut offset = [0u8; 32];
+        offset[31] = 0x20;
+        buf.extend_from_slice(&offset);
+        let mut len = [0u8; 32];
+        len[31] = 0xFF;
+        buf.extend_from_slice(&len);
+        buf.push(0x41); // single 'A' — not 0xFF bytes of data
+        assert!(decode_revert_reason(&Bytes::from(buf)).is_none());
+    }
+
+    #[test]
+    fn decode_error_string_invalid_utf8_returns_none() {
+        // A revert string isn't required to be valid UTF-8 — Solidity
+        // emits whatever bytes the contract gave it. We don't try to
+        // sanitize; we just refuse to decode and let the caller fall
+        // back to the hex dump.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&ERROR_STRING_SELECTOR);
+        let mut offset = [0u8; 32];
+        offset[31] = 0x20;
+        buf.extend_from_slice(&offset);
+        let mut len = [0u8; 32];
+        len[31] = 2;
+        buf.extend_from_slice(&len);
+        // 0xFF 0xFE is not valid UTF-8 (continuation bytes only).
+        buf.extend_from_slice(&[0xFF, 0xFE]);
+        buf.extend_from_slice(&[0u8; 30]);
+        assert!(decode_revert_reason(&Bytes::from(buf)).is_none());
+    }
+
+    #[test]
+    fn decode_panic_division_by_zero_label() {
+        // Pin Solidity's documented Panic(0x12) — `1 / 0` or `1 % 0`.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&PANIC_UINT_SELECTOR);
+        let mut code = [0u8; 32];
+        code[31] = 0x12;
+        buf.extend_from_slice(&code);
+        let decoded = decode_revert_reason(&Bytes::from(buf)).expect("decoded");
+        assert!(decoded.contains("0x12"), "got {decoded}");
+        assert!(
+            decoded.contains("division") || decoded.contains("modulo"),
+            "got {decoded}",
+        );
+    }
+
+    #[test]
+    fn decode_panic_array_oob_label() {
+        // Solidity's Panic(0x32) — array index out of bounds.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&PANIC_UINT_SELECTOR);
+        let mut code = [0u8; 32];
+        code[31] = 0x32;
+        buf.extend_from_slice(&code);
+        let decoded = decode_revert_reason(&Bytes::from(buf)).expect("decoded");
+        assert!(decoded.contains("0x32"), "got {decoded}");
+        assert!(decoded.contains("out of bounds"), "got {decoded}");
+    }
+
+    #[test]
+    fn decode_panic_unknown_small_code_falls_through_to_unknown() {
+        // 0x99 is not in Solidity's documented panic table. We still
+        // surface the code so the user can look it up, but the label is
+        // "unknown panic" rather than something misleading.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&PANIC_UINT_SELECTOR);
+        let mut code = [0u8; 32];
+        code[31] = 0x99;
+        buf.extend_from_slice(&code);
+        let decoded = decode_revert_reason(&Bytes::from(buf)).expect("decoded");
+        assert!(decoded.contains("0x99"), "got {decoded}");
+        assert!(decoded.contains("unknown panic"), "got {decoded}");
+    }
+
+    #[test]
+    fn decode_panic_oversized_code_renders_hex() {
+        // A panic code above 0xff doesn't fit Solidity's single-byte
+        // table at all; we degrade to the raw hex form so the message
+        // doesn't claim a label we can't justify.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&PANIC_UINT_SELECTOR);
+        let mut code = [0u8; 32];
+        // 0x0100 — one bit past the documented range.
+        code[30] = 0x01;
+        buf.extend_from_slice(&code);
+        let decoded = decode_revert_reason(&Bytes::from(buf)).expect("decoded");
+        assert_eq!(decoded, "panic 0x100");
+    }
+
+    #[test]
+    fn decode_panic_short_body_returns_none() {
+        // Selector matches but body is < 32 bytes — must not panic.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&PANIC_UINT_SELECTOR);
+        buf.extend_from_slice(&[0u8; 16]);
+        assert!(decode_revert_reason(&Bytes::from(buf)).is_none());
+    }
+
+    #[test]
+    fn extract_transfer_with_two_topics_is_skipped() {
+        // A 2-topic log with the Transfer signature is malformed for both
+        // ERC-20 (3 topics) and ERC-721 (4 topics). Don't fabricate a
+        // transfer from a zero-`to`.
+        let topic0 = transfer_topic();
+        let from: Address = address!("000000000000000000000000000000000000beEF");
+        let mut topic1_bytes = [0u8; 32];
+        topic1_bytes[12..].copy_from_slice(from.as_slice());
+        let log = Log {
+            address: Address::ZERO,
+            data: LogData::new_unchecked(
+                vec![topic0, B256::from(topic1_bytes)],
+                Bytes::new(),
+            ),
+        };
+        assert!(extract_transfers(&[log]).is_empty());
+    }
+
+    #[test]
+    fn extract_erc20_transfer_with_short_data_is_skipped() {
+        // ERC-20 Transfer logs encode the amount as the first 32 bytes of
+        // data. A truncated log (e.g. a buggy or hostile contract that
+        // emits the right topics but a short payload) must not produce a
+        // bogus zero-amount transfer.
+        let topic0 = transfer_topic();
+        let from: Address = address!("000000000000000000000000000000000000beEF");
+        let to: Address = address!("000000000000000000000000000000000000dEaD");
+        let mut topic1_bytes = [0u8; 32];
+        topic1_bytes[12..].copy_from_slice(from.as_slice());
+        let mut topic2_bytes = [0u8; 32];
+        topic2_bytes[12..].copy_from_slice(to.as_slice());
+        let log = Log {
+            address: Address::ZERO,
+            data: LogData::new_unchecked(
+                vec![topic0, B256::from(topic1_bytes), B256::from(topic2_bytes)],
+                Bytes::from(vec![0u8; 8]), // only 8 bytes of data, not 32
+            ),
+        };
+        assert!(extract_transfers(&[log]).is_empty());
+    }
+
+    #[test]
+    fn extract_returns_only_transfers_from_mixed_logs() {
+        // A typical ERC-20 transfer emits an Approval *and* a Transfer
+        // (or other unrelated events in the same call). Make sure the
+        // filter returns exactly the Transfer rows in order.
+        let usdc: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let from: Address = address!("000000000000000000000000000000000000beEF");
+        let to: Address = address!("000000000000000000000000000000000000dEaD");
+        let unrelated_topic: B256 =
+            b256!("dead0000beef0000dead0000beef0000dead0000beef0000dead0000beef0000");
+        let topic0 = transfer_topic();
+        let mut topic1_bytes = [0u8; 32];
+        topic1_bytes[12..].copy_from_slice(from.as_slice());
+        let mut topic2_bytes = [0u8; 32];
+        topic2_bytes[12..].copy_from_slice(to.as_slice());
+        let mut data = [0u8; 32];
+        data[24..].copy_from_slice(&5u64.to_be_bytes());
+
+        let unrelated = Log {
+            address: usdc,
+            data: LogData::new_unchecked(vec![unrelated_topic], Bytes::new()),
+        };
+        let transfer = Log {
+            address: usdc,
+            data: LogData::new_unchecked(
+                vec![topic0, B256::from(topic1_bytes), B256::from(topic2_bytes)],
+                Bytes::from(data.to_vec()),
+            ),
+        };
+        let transfers = extract_transfers(&[unrelated, transfer]);
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].value, U256::from(5u64));
+    }
+
+    #[test]
+    fn extract_address_from_topic_ignores_high_bytes() {
+        // EVM topics are 32 bytes; an indexed `address` is right-aligned
+        // with the upper 12 bytes typically zero. But the EVM doesn't
+        // *require* those bytes to be zero — a hand-crafted log via
+        // assembly can leave dirty padding. Make sure decode ignores
+        // bytes 0..12 instead of mixing them into the address.
+        let to: Address = address!("000000000000000000000000000000000000dEaD");
+        let from: Address = address!("000000000000000000000000000000000000beEF");
+        let topic0 = transfer_topic();
+        // Dirty upper 12 bytes — should be ignored.
+        let mut topic1_bytes = [0xFFu8; 32];
+        topic1_bytes[12..].copy_from_slice(from.as_slice());
+        let mut topic2_bytes = [0u8; 32];
+        topic2_bytes[12..].copy_from_slice(to.as_slice());
+        let mut data = [0u8; 32];
+        data[31] = 1;
+        let log = Log {
+            address: Address::ZERO,
+            data: LogData::new_unchecked(
+                vec![topic0, B256::from(topic1_bytes), B256::from(topic2_bytes)],
+                Bytes::from(data.to_vec()),
+            ),
+        };
+        let transfers = extract_transfers(&[log]);
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(transfers[0].from, from, "high bytes must be discarded");
+    }
+
+    #[test]
+    fn is_revert_true_for_halt_outcome() {
+        // The UI branches on `is_revert()` to decide whether to soften
+        // the Confirm button to "Sign anyway". A Halt (OOG, invalid
+        // opcode, stack overflow) is just as bad as a Revert from the
+        // user's POV — pin that grouping.
+        let halted = SimulationResult {
+            outcome: SimOutcome::Halt {
+                reason: "OutOfGas".into(),
+            },
+            gas_used: 30_000_000,
+            transfers: Vec::new(),
+            verified: true,
+        };
+        assert!(halted.is_revert());
+        assert!(!halted.is_unavailable());
+    }
+
+    #[test]
+    fn is_revert_false_for_success() {
+        let ok = SimulationResult {
+            outcome: SimOutcome::Success {
+                output: Bytes::new(),
+            },
+            gas_used: 21000,
+            transfers: Vec::new(),
+            verified: true,
+        };
+        assert!(!ok.is_revert());
+        assert!(!ok.is_unavailable());
+    }
+
+    /// Calling an address that has no deployed bytecode is, per the
+    /// EVM, a successful no-op call. A real ERC-20 transfer on a chain
+    /// where the token contract is missing (or where state is empty —
+    /// e.g. our `MockFetcher`) would therefore *appear* to succeed
+    /// without emitting any Transfer event. Pin that quirk so a future
+    /// change to revm or the mock doesn't silently flip it to a
+    /// Revert/Halt that would mislead the review screen.
+    #[tokio::test]
+    async fn simulate_erc20_transfer_to_codeless_target_is_silent_success() {
+        use crate::net::MockFetcher;
+        use crate::wallet::tx::{SendPlan, SendToken};
+        use alloy::primitives::address;
+
+        let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
+        let usdc: Address = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let plan = SendPlan {
+            from: address!("000000000000000000000000000000000000beEF"),
+            recipient: address!("000000000000000000000000000000000000dEaD"),
+            token: SendToken::Erc20 { contract: usdc },
+            amount_units: U256::from(1_000_000u64),
             chain: Chain::Mainnet,
         };
         let result = simulate_tx(network, &plan, /* nonce */ 0)
             .await
             .expect("sim should not fail");
-        // Mock returns zero state across the board, so the EVM
-        // executes a value=0 send to a zero-code recipient: 21000 gas,
-        // success, no transfers.
         assert!(
             matches!(result.outcome, SimOutcome::Success { .. }),
-            "expected Success, got {:?}",
+            "EVM treats calls to codeless accounts as silent success, got {:?}",
             result.outcome,
         );
-        assert_eq!(result.gas_used, 21000);
-        assert!(result.transfers.is_empty());
+        assert!(
+            result.transfers.is_empty(),
+            "no Transfer event because no contract code ran",
+        );
+    }
+
+    /// `verified` propagates upward when *any* state read fell through
+    /// to the unverified fallback path. We can't exercise the full sim
+    /// against a partly-unverified mock easily (the mock doesn't
+    /// distinguish), but a `SimulationResult` constructed with
+    /// `verified = false` must survive `is_revert` / `is_unavailable`
+    /// inspection without being misclassified — the UI sources its
+    /// trust badge directly from this field.
+    #[test]
+    fn unverified_success_still_reports_success() {
+        let r = SimulationResult {
+            outcome: SimOutcome::Success {
+                output: Bytes::new(),
+            },
+            gas_used: 21000,
+            transfers: Vec::new(),
+            verified: false,
+        };
+        assert!(!r.is_revert());
+        assert!(!r.is_unavailable());
+        assert!(!r.verified);
     }
 }
