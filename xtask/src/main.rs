@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod check;
 mod sync_4byte;
 
 use std::path::{Path, PathBuf};
@@ -58,8 +59,9 @@ async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("sync-tokens") => sync_tokens().await,
         Some("sync-4byte-db") => sync_4byte::sync_4byte_db().await,
+        Some("check") => check::check(&workspace_root()?),
         _ => {
-            eprintln!("usage: cargo xtask <sync-tokens | sync-4byte-db>");
+            eprintln!("usage: cargo xtask <sync-tokens | sync-4byte-db | check>");
             std::process::exit(1);
         }
     }

@@ -150,7 +150,7 @@ pub async fn fetch_onchain_history(
     enrich_receipts_and_timestamps(provider, &mut rows, owner).await;
     enrich_token_metadata(provider, &mut rows).await;
 
-    rows.sort_by(|a, b| b.block_number.cmp(&a.block_number));
+    rows.sort_by_key(|row| std::cmp::Reverse(row.block_number));
     debug!(rows = rows.len(), "onchain history fetch complete");
     Ok(rows)
 }

@@ -57,7 +57,7 @@ jobs:
     name: cargo-vet
     runs-on: ubuntu-latest
     env:
-      CARGO_VET_VERSION: 0.10.0
+      CARGO_VET_VERSION: 0.10.2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

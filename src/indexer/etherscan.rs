@@ -440,7 +440,7 @@ fn merge_normal_and_token(
         }
         out.push(tx);
     }
-    out.sort_by(|a, b| b.block_number.cmp(&a.block_number));
+    out.sort_by_key(|tx| std::cmp::Reverse(tx.block_number));
     out.truncate(limit);
     out
 }
