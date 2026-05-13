@@ -642,9 +642,21 @@ fn token_price_in_eth(
 /// Fee tiers tried in order when a token's `PriceSource` is `Probe`.
 /// Order matches Uniswap's TVL distribution: stables sit on 0.05 %,
 /// blue-chip ERC-20s on 0.3 %, exotics on 1 %. We stop at the first
-/// fee tier whose `slot0` returns a non-zero `sqrtPriceX96` — anything
-/// else means the pool isn't deployed (or has no liquidity).
+/// fee tier whose `slot0` returns a non-zero `sqrtPriceX96` AND whose
+/// pool holds at least `MIN_POOL_WETH_WEI` of WETH — anything else means
+/// the pool isn't deployed, has no liquidity, or has been abandoned with
+/// an out-of-band spot price.
 const PROBE_FEES: [u32; 3] = [500, 3000, 10000];
+
+/// Minimum WETH balance a Uniswap V3 pool must hold for us to trust its
+/// `slot0` quote. Pools below this floor are abandoned single-sided
+/// positions whose spot can be off by 10+ orders of magnitude (see e.g.
+/// the Base WALLET/WETH 1 % pool, which sat at ~$64 of TVL and quoted
+/// WALLET at ~10^19 USD/token). 0.1 WETH is roughly $200–$400 across the
+/// chains we support — high enough to filter dead pools, low enough that
+/// legitimately thin long-tail pools still price.
+const MIN_POOL_WETH_WEI: U256 =
+    U256::from_limbs([100_000_000_000_000_000u64, 0, 0, 0]); // 1e17 = 0.1 WETH
 
 /// Issue one Multicall3 `aggregate3` round trip. Wraps the call in
 /// `with_rate_limit_retry` so 429s back off instead of zeroing the
@@ -681,17 +693,20 @@ fn decode_u256(r: &MultiResult) -> U256 {
     U256::from_be_slice(&r.returnData[..32])
 }
 
-/// Walk a slice of `slot0` results in fee-tier order and return the
-/// first non-zero `sqrtPriceX96`. Backs `PriceSource::UniswapWethPoolProbe`:
-/// 0.05 % is checked first, then 0.3 %, then 1 %, and the search stops at
-/// the first pool with liquidity. Returns `U256::ZERO` when none of the
-/// candidate pools is deployed.
-fn first_nonzero_sqrt(results: &[MultiResult]) -> U256 {
-    results
-        .iter()
-        .map(decode_u256)
-        .find(|s| !s.is_zero())
-        .unwrap_or(U256::ZERO)
+/// Walk `(slot0, weth_balance)` pairs in fee-tier order and return the
+/// first `sqrtPriceX96` whose pool holds at least `MIN_POOL_WETH_WEI`.
+/// Backs `PriceSource::UniswapWethPoolProbe`: 0.05 % is checked first,
+/// then 0.3 %, then 1 %. Returns `U256::ZERO` when no candidate pool is
+/// both deployed and liquid enough to trust.
+fn first_liquid_sqrt(results: &[MultiResult]) -> U256 {
+    for pair in results.chunks_exact(2) {
+        let sqrt = decode_u256(&pair[0]);
+        let weth_bal = decode_u256(&pair[1]);
+        if !sqrt.is_zero() && weth_bal >= MIN_POOL_WETH_WEI {
+            return sqrt;
+        }
+    }
+    U256::ZERO
 }
 
 /// Plan describing how to interpret a slice of batch-2 results for one
@@ -820,9 +835,27 @@ async fn fetch_portfolio_for_tokens(
         .map(decode_u256)
         .collect();
 
-    // ── Batch 2: per-token slot0 reads for held positions ───────────────
+    // ── Batch 2: per-token slot0 + pool-WETH-balance reads ──────────────
+    //
+    // For every candidate Uniswap V3 pool we queue two subcalls back-to-back:
+    // `slot0()` (the spot-price quote) and `WETH.balanceOf(pool)` (the
+    // liquidity sanity check). The `MIN_POOL_WETH_WEI` floor on the latter
+    // discards abandoned single-sided pools whose `slot0` is junk.
     let mut batch2: Vec<Call3> = Vec::new();
     let mut plans: Vec<(usize, PricePlan)> = Vec::new();
+
+    let push_pool_pair = |batch: &mut Vec<Call3>, pool: Address| {
+        batch.push(Call3 {
+            target: pool,
+            allowFailure: true,
+            callData: Bytes::from(SLOT0_SELECTOR.to_vec()),
+        });
+        batch.push(Call3 {
+            target: weth,
+            allowFailure: true,
+            callData: balance_of_calldata(pool),
+        });
+    };
 
     for (i, raw_balance) in token_balances.iter().enumerate() {
         if raw_balance.is_zero() {
@@ -834,22 +867,14 @@ async fn fetch_portfolio_for_tokens(
             PriceSource::UniswapWethPool { fee } => {
                 let pool = pool_address(factory, token.address, weth, fee);
                 let result_idx = batch2.len();
-                batch2.push(Call3 {
-                    target: pool,
-                    allowFailure: true,
-                    callData: Bytes::from(SLOT0_SELECTOR.to_vec()),
-                });
+                push_pool_pair(&mut batch2, pool);
                 PricePlan::Single { result_idx }
             }
             PriceSource::UniswapWethPoolProbe => {
                 let start_idx = batch2.len();
                 for fee in PROBE_FEES {
                     let pool = pool_address(factory, token.address, weth, fee);
-                    batch2.push(Call3 {
-                        target: pool,
-                        allowFailure: true,
-                        callData: Bytes::from(SLOT0_SELECTOR.to_vec()),
-                    });
+                    push_pool_pair(&mut batch2, pool);
                 }
                 PricePlan::Probe { start_idx }
             }
@@ -895,15 +920,16 @@ async fn fetch_portfolio_for_tokens(
             PricePlan::EthPeg => eth_usd,
             PricePlan::Single { result_idx } => {
                 let sqrt = decode_u256(&batch2_results[result_idx]);
-                if sqrt.is_zero() {
+                let weth_bal = decode_u256(&batch2_results[result_idx + 1]);
+                if sqrt.is_zero() || weth_bal < MIN_POOL_WETH_WEI {
                     0.0
                 } else {
                     token_price_in_eth(sqrt, token.address, token.decimals, weth) * eth_usd
                 }
             }
             PricePlan::Probe { start_idx } => {
-                let end = start_idx + PROBE_FEES.len();
-                let sqrt = first_nonzero_sqrt(&batch2_results[start_idx..end]);
+                let end = start_idx + PROBE_FEES.len() * 2;
+                let sqrt = first_liquid_sqrt(&batch2_results[start_idx..end]);
                 if sqrt.is_zero() {
                     0.0
                 } else {
@@ -1226,30 +1252,48 @@ mod multicall_tests {
     }
 
     /// Probe order: 0.05 % is checked first, then 0.3 %, then 1 %.
-    /// `first_nonzero_sqrt` must skip empty/zero pools and return the
-    /// first one with liquidity in that exact order. Anchors the
-    /// `UniswapWethPoolProbe` arm against silent reordering bugs.
+    /// `first_liquid_sqrt` walks `(slot0, weth_balance)` pairs in that
+    /// order and must skip any pool that's missing, has zero `slot0`,
+    /// or holds less than `MIN_POOL_WETH_WEI`. Anchors the
+    /// `UniswapWethPoolProbe` arm against silent reordering and against
+    /// regressions of the abandoned-pool bug (Base WALLET/WETH 1 %).
     #[test]
-    fn first_nonzero_sqrt_skips_empty_pools() {
-        // [0.05 % zero, 0.3 % zero, 1 % non-zero] — picks the 1 % pool.
+    fn first_liquid_sqrt_skips_empty_and_thin_pools() {
+        let liquid = MIN_POOL_WETH_WEI; // exactly at the floor must qualify
+        let thin = MIN_POOL_WETH_WEI - U256::from(1u64);
+
+        // [0.05 % zero, 0.3 % failed, 1 % liquid non-zero] — picks 1 %.
         let results = vec![
             ok(raw_sqrt(U256::ZERO)),
+            ok(raw_sqrt(liquid)),
+            failed(),
             failed(),
             ok(raw_sqrt(U256::from(42u64))),
+            ok(raw_sqrt(liquid)),
         ];
-        assert_eq!(first_nonzero_sqrt(&results), U256::from(42u64));
+        assert_eq!(first_liquid_sqrt(&results), U256::from(42u64));
 
-        // [0.05 % non-zero, …] — picks the first one without touching
-        // the rest.
+        // [0.05 % non-zero but THIN, 0.3 % non-zero and liquid, …] —
+        // skips the thin abandoned pool and picks 0.3 %.
         let results = vec![
-            ok(raw_sqrt(U256::from(7u64))),
             ok(raw_sqrt(U256::from(99u64))),
+            ok(raw_sqrt(thin)),
+            ok(raw_sqrt(U256::from(7u64))),
+            ok(raw_sqrt(liquid)),
             ok(raw_sqrt(U256::from(123u64))),
+            ok(raw_sqrt(liquid)),
         ];
-        assert_eq!(first_nonzero_sqrt(&results), U256::from(7u64));
+        assert_eq!(first_liquid_sqrt(&results), U256::from(7u64));
 
-        // No pool has liquidity → zero (caller treats as $0 price).
-        let results = vec![failed(), failed(), ok(raw_sqrt(U256::ZERO))];
-        assert_eq!(first_nonzero_sqrt(&results), U256::ZERO);
+        // Every pool is either dead or thin → zero ($0 price).
+        let results = vec![
+            failed(),
+            failed(),
+            ok(raw_sqrt(U256::from(5u64))),
+            ok(raw_sqrt(thin)),
+            ok(raw_sqrt(U256::ZERO)),
+            ok(raw_sqrt(liquid)),
+        ];
+        assert_eq!(first_liquid_sqrt(&results), U256::ZERO);
     }
 }
