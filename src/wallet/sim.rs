@@ -305,10 +305,7 @@ pub async fn simulate_tx(
         "sim: starting",
     );
 
-    let latest = network
-        .latest_block(chain)
-        .await
-        .map_err(SimError::State)?;
+    let latest = network.latest_block(chain).await.map_err(SimError::State)?;
     let block_verified = latest.verified;
     let block = latest.value;
     debug!(
@@ -338,9 +335,7 @@ pub async fn simulate_tx(
             .with_tx(tx_env)
             .with_cfg(cfg);
         let mut evm = ctx.with_db(&mut db).build_mainnet();
-        let res = evm
-            .replay()
-            .map_err(|e| SimError::Evm(format!("{e:?}")))?;
+        let res = evm.replay().map_err(|e| SimError::Evm(format!("{e:?}")))?;
         let verified = db.all_verified;
         Ok(materialize(res.result, verified))
     })
@@ -461,7 +456,13 @@ fn materialize(result: ExecutionResult, verified: bool) -> SimulationResult {
                     format!("0x{}", alloy::hex::encode(output.as_ref()))
                 }
             });
-            (SimOutcome::Revert { reason, raw: output }, Vec::new())
+            (
+                SimOutcome::Revert {
+                    reason,
+                    raw: output,
+                },
+                Vec::new(),
+            )
         }
         ExecutionResult::Halt { reason, .. } => (
             SimOutcome::Halt {
@@ -661,7 +662,8 @@ mod tests {
 
     #[test]
     fn decode_unknown_selector_returns_none() {
-        let out = bytes!("deadbeef0000000000000000000000000000000000000000000000000000000000000000");
+        let out =
+            bytes!("deadbeef0000000000000000000000000000000000000000000000000000000000000000");
         assert!(decode_revert_reason(&out).is_none());
     }
 
@@ -759,8 +761,7 @@ mod tests {
         // Pin the topic-0 hash for ERC-20 Transfer events. If alloy ever
         // changes its keccak implementation, this guards against silently
         // mis-matching live event filters.
-        let expected =
-            b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
+        let expected = b256!("ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
         assert_eq!(transfer_topic(), expected);
     }
 
@@ -954,10 +955,7 @@ mod tests {
         topic1_bytes[12..].copy_from_slice(from.as_slice());
         let log = Log {
             address: Address::ZERO,
-            data: LogData::new_unchecked(
-                vec![topic0, B256::from(topic1_bytes)],
-                Bytes::new(),
-            ),
+            data: LogData::new_unchecked(vec![topic0, B256::from(topic1_bytes)], Bytes::new()),
         };
         assert!(extract_transfers(&[log]).is_empty());
     }

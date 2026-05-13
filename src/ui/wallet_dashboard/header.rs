@@ -152,9 +152,7 @@ fn rename_input<'a>(t: KaoTheme, draft: &'a str) -> Element<'a, Message> {
         .on_press(Message::CommitRename)
         .style(move |_theme, status| button::Style {
             background: Some(Background::Color(match status {
-                button::Status::Hovered | button::Status::Pressed => {
-                    hover_tint(commit_idle, t.up)
-                }
+                button::Status::Hovered | button::Status::Pressed => hover_tint(commit_idle, t.up),
                 _ => commit_idle,
             })),
             text_color: t.up,
@@ -185,7 +183,13 @@ fn rename_input<'a>(t: KaoTheme, draft: &'a str) -> Element<'a, Message> {
             ..button::Style::default()
         });
 
-    row![input, Space::new().width(6), commit, Space::new().width(4), cancel]
-        .align_y(Alignment::Center)
-        .into()
+    row![
+        input,
+        Space::new().width(6),
+        commit,
+        Space::new().width(4),
+        cancel
+    ]
+    .align_y(Alignment::Center)
+    .into()
 }

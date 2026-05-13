@@ -20,7 +20,7 @@ use crate::chain::Chain;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
-    Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
     redact_url_in_err,
 };
 
@@ -435,9 +435,7 @@ fn decode_transfer(tr: &RawTransfer) -> (U256, Option<TokenTransfer>) {
         (raw_amount, None)
     } else if let Ok(contract) = Address::from_str(address) {
         let decimals = tr.decimals.unwrap_or(18);
-        let symbol = token
-            .and_then(|t| t.symbol.clone())
-            .unwrap_or_default();
+        let symbol = token.and_then(|t| t.symbol.clone()).unwrap_or_default();
         (
             U256::ZERO,
             Some(TokenTransfer {
@@ -544,7 +542,9 @@ mod tests {
 
     #[test]
     fn convert_tx_decodes_native_eth_transfer() {
-        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap();
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
         let raw: RawTx = serde_json::from_str(
             r#"{
                 "type": "receive",
@@ -576,7 +576,9 @@ mod tests {
 
     #[test]
     fn convert_tx_picks_erc20_transfer_over_native() {
-        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap();
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
         // The fee transfer (native ETH) shouldn't shadow the USDC send.
         let raw: RawTx = serde_json::from_str(
             r#"{
@@ -626,7 +628,9 @@ mod tests {
 
     #[test]
     fn convert_tx_marks_failed_status() {
-        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap();
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
         let raw: RawTx = serde_json::from_str(
             r#"{
                 "type": "execute",
@@ -648,7 +652,9 @@ mod tests {
     fn balances_url_contains_chain_key_and_address() {
         let client = DrpcClient::new("MYKEY".into(), Chain::Base);
         let url = client.balances_url(
-            "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap(),
+            "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+                .parse()
+                .unwrap(),
         );
         assert!(url.starts_with(
             "https://lb.drpc.live/base/MYKEY/lambda/v2/wallets/0xd8da6bf26964af9d7eed9e03e53415d37aa96045/balances"
@@ -658,7 +664,9 @@ mod tests {
     #[test]
     fn redact_drpc_key_replaces_key_segment() {
         assert_eq!(
-            redact_drpc_key("https://lb.drpc.live/ethereum/SECRET/lambda/v2/wallets/0xabc/balances"),
+            redact_drpc_key(
+                "https://lb.drpc.live/ethereum/SECRET/lambda/v2/wallets/0xabc/balances"
+            ),
             "https://lb.drpc.live/ethereum/****/lambda/v2/wallets/0xabc/balances",
         );
     }

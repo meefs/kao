@@ -8,9 +8,9 @@
 //! WETH pool.
 
 use alloy::eips::BlockId;
+use alloy::network::Ethereum;
 use alloy::primitives::{Address, Bytes, U256, address, keccak256};
 use alloy::providers::{Provider, RootProvider};
-use alloy::network::Ethereum;
 use alloy::sol;
 use alloy::sol_types::SolCall;
 use std::borrow::Cow;
@@ -353,8 +353,8 @@ struct TokenListEntry {
 /// price source is `UniswapWethPoolProbe` — the bundled list doesn't
 /// carry fee tiers, so we pick one at price-time.
 fn parse_tokenlist() -> (Vec<TokenMeta>, Vec<TokenMeta>) {
-    let parsed: TokenListFile = serde_json::from_str(TOKENLIST_JSON)
-        .expect("bundled tokenlist.json must parse");
+    let parsed: TokenListFile =
+        serde_json::from_str(TOKENLIST_JSON).expect("bundled tokenlist.json must parse");
     let mut optimism = Vec::new();
     let mut base = Vec::new();
     for entry in parsed.tokens {
@@ -383,10 +383,8 @@ fn parse_tokenlist() -> (Vec<TokenMeta>, Vec<TokenMeta>) {
 /// Dedup by lowercase address; the overlay wins on collision so its
 /// known fee tier sticks instead of falling back to a pool-probe.
 fn merge_overlay(overlay: &[OverlayEntry], tokenlist: Vec<TokenMeta>) -> Vec<TokenMeta> {
-    let mut seen: std::collections::HashSet<Address> =
-        overlay.iter().map(|e| e.address).collect();
-    let mut out: Vec<TokenMeta> =
-        overlay.iter().map(OverlayEntry::to_meta).collect();
+    let mut seen: std::collections::HashSet<Address> = overlay.iter().map(|e| e.address).collect();
+    let mut out: Vec<TokenMeta> = overlay.iter().map(OverlayEntry::to_meta).collect();
     for tk in tokenlist {
         if seen.insert(tk.address) {
             out.push(tk);
@@ -416,8 +414,7 @@ pub struct DiscoveredToken {
 /// Discovered tokens default to `UniswapWethPoolProbe` because the
 /// indexer doesn't carry fee-tier info.
 fn merge_discovered(base: &[TokenMeta], discovered: &[DiscoveredToken]) -> Vec<TokenMeta> {
-    let mut seen: std::collections::HashSet<Address> =
-        base.iter().map(|t| t.address).collect();
+    let mut seen: std::collections::HashSet<Address> = base.iter().map(|t| t.address).collect();
     let mut out: Vec<TokenMeta> = base
         .iter()
         .map(|t| TokenMeta {
@@ -598,11 +595,7 @@ fn sqrt_price_to_raw(sqrt_price_x96: U256) -> f64 {
 /// Mainnet and Optimism have `USDC < WETH` (USDC is token0). Routing
 /// through `token_price_in_eth` handles both cases without us
 /// hand-tracking the inversion per chain.
-fn eth_usd_from_sqrt_price(
-    sqrt_price_x96: U256,
-    usdc_addr: Address,
-    weth_addr: Address,
-) -> f64 {
+fn eth_usd_from_sqrt_price(sqrt_price_x96: U256, usdc_addr: Address, weth_addr: Address) -> f64 {
     let usdc_in_eth = token_price_in_eth(sqrt_price_x96, usdc_addr, 6, weth_addr);
     if usdc_in_eth == 0.0 {
         return 0.0;
@@ -655,8 +648,7 @@ const PROBE_FEES: [u32; 3] = [500, 3000, 10000];
 /// WALLET at ~10^19 USD/token). 0.1 WETH is roughly $200–$400 across the
 /// chains we support — high enough to filter dead pools, low enough that
 /// legitimately thin long-tail pools still price.
-const MIN_POOL_WETH_WEI: U256 =
-    U256::from_limbs([100_000_000_000_000_000u64, 0, 0, 0]); // 1e17 = 0.1 WETH
+const MIN_POOL_WETH_WEI: U256 = U256::from_limbs([100_000_000_000_000_000u64, 0, 0, 0]); // 1e17 = 0.1 WETH
 
 /// Issue one Multicall3 `aggregate3` round trip. Wraps the call in
 /// `with_rate_limit_retry` so 429s back off instead of zeroing the
@@ -677,8 +669,8 @@ pub(crate) async fn multicall3(
     })
     .await
     .map_err(|e| format!("{label}: {e}"))?;
-    let decoded = aggregate3Call::abi_decode_returns(&raw)
-        .map_err(|e| format!("{label} decode: {e}"))?;
+    let decoded =
+        aggregate3Call::abi_decode_returns(&raw).map_err(|e| format!("{label} decode: {e}"))?;
     Ok(decoded)
 }
 
@@ -853,11 +845,7 @@ async fn fetch_portfolio_for_tokens(
     } else {
         0.0
     };
-    let token_balances: Vec<U256> = batch1_results
-        .iter()
-        .skip(2)
-        .map(decode_u256)
-        .collect();
+    let token_balances: Vec<U256> = batch1_results.iter().skip(2).map(decode_u256).collect();
 
     // ── Batch 2: per-token slot0 + pool-WETH-balance reads ──────────────
     //
@@ -1009,8 +997,7 @@ mod pool_address_tests {
         let usdc = usdc_for(Chain::Mainnet);
         let weth = weth_for(Chain::Mainnet);
         let derived = pool_address(factory, usdc, weth, 500);
-        let canonical: Address =
-            address!("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+        let canonical: Address = address!("0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
         assert_eq!(derived, canonical, "derived: {derived:?}");
     }
 
@@ -1023,8 +1010,7 @@ mod pool_address_tests {
         let usdc = usdc_for(Chain::Base);
         let weth = weth_for(Chain::Base);
         let derived = pool_address(factory, usdc, weth, 500);
-        let canonical: Address =
-            address!("0xd0b53D9277642d899DF5C87A3966A349A798F224");
+        let canonical: Address = address!("0xd0b53D9277642d899DF5C87A3966A349A798F224");
         assert_eq!(derived, canonical, "derived: {derived:?}");
     }
 
@@ -1036,8 +1022,7 @@ mod pool_address_tests {
         let usdc = usdc_for(Chain::Optimism);
         let weth = weth_for(Chain::Optimism);
         let derived = pool_address(factory, usdc, weth, 500);
-        let canonical: Address =
-            address!("0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7b");
+        let canonical: Address = address!("0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7b");
         assert_eq!(derived, canonical, "derived: {derived:?}");
     }
 }
@@ -1100,7 +1085,10 @@ mod tokenlist_tests {
         assert_eq!(merged.len(), 1, "collision must dedupe to a single row");
         assert_eq!(merged[0].symbol, "USDC", "overlay symbol wins");
         assert!(
-            matches!(merged[0].price_source, PriceSource::UniswapWethPool { fee: 500 }),
+            matches!(
+                merged[0].price_source,
+                PriceSource::UniswapWethPool { fee: 500 }
+            ),
             "overlay's known fee tier must beat tokenlist Probe",
         );
     }
@@ -1171,10 +1159,16 @@ mod discovery_tests {
             }],
         );
         assert_eq!(merged.len(), MAINNET_TOKENS.len() + 1);
-        let row = merged.iter().find(|t| t.address == only_in_indexer).unwrap();
+        let row = merged
+            .iter()
+            .find(|t| t.address == only_in_indexer)
+            .unwrap();
         assert_eq!(row.symbol, "BEEF");
         assert_eq!(row.decimals, 9);
-        assert!(matches!(row.price_source, PriceSource::UniswapWethPoolProbe));
+        assert!(matches!(
+            row.price_source,
+            PriceSource::UniswapWethPoolProbe
+        ));
     }
 
     /// Empty-discovery must collapse to the curated overlay exactly —
@@ -1223,7 +1217,10 @@ mod multicall_tests {
                 callData: balance_of_calldata(owner),
             },
         ];
-        let encoded = aggregate3Call { calls: calls.clone() }.abi_encode();
+        let encoded = aggregate3Call {
+            calls: calls.clone(),
+        }
+        .abi_encode();
         let decoded = aggregate3Call::abi_decode(&encoded).expect("input must decode");
 
         assert_eq!(decoded.calls.len(), 3);
@@ -1244,11 +1241,17 @@ mod multicall_tests {
     }
 
     fn ok(data: Bytes) -> MultiResult {
-        MultiResult { success: true, returnData: data }
+        MultiResult {
+            success: true,
+            returnData: data,
+        }
     }
 
     fn failed() -> MultiResult {
-        MultiResult { success: false, returnData: Bytes::new() }
+        MultiResult {
+            success: false,
+            returnData: Bytes::new(),
+        }
     }
 
     /// `decode_u256` is the single chokepoint that translates a

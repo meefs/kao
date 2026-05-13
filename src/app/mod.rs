@@ -10,8 +10,6 @@ use tracing::{debug, error, warn};
 use crate::net::{BalanceFetcher, NetworkClient};
 use crate::portfolio::{self, PortfolioCache};
 use crate::settings;
-use crate::ui::kao_theme::{KaoTheme, with_alpha};
-use crate::ui::kao_widgets::bold;
 use crate::ui::connect_ledger::{
     ConnectLedgerScreen, Message as ConnectLedgerMessage, Outcome as ConnectLedgerOutcome,
 };
@@ -30,6 +28,8 @@ use crate::ui::import_private_key::{
 use crate::ui::import_seed_phrase::{
     ImportSeedPhraseScreen, Message as ImportSeedPhraseMessage, Outcome as ImportSeedPhraseOutcome,
 };
+use crate::ui::kao_theme::{KaoTheme, with_alpha};
+use crate::ui::kao_widgets::bold;
 use crate::ui::select_hardware_wallet::{
     Message as SelectHardwareWalletMessage, Outcome as SelectHardwareWalletOutcome,
     SelectHardwareWalletScreen,
@@ -94,7 +94,9 @@ pub enum Message {
     /// generation counter the timer was spawned with — a newer error
     /// supersedes by bumping the counter, which makes the older
     /// timer's dismissal a no-op when it fires.
-    DismissError { generation: u64 },
+    DismissError {
+        generation: u64,
+    },
 }
 
 // ── Screens ──────────────────────────────────────────────────────────────────
@@ -325,7 +327,9 @@ impl App {
             initial_nav,
         );
         let address = screen.address_for_log();
-        let verify_task = screen.refresh_verification_task().map(Message::WalletDashboard);
+        let verify_task = screen
+            .refresh_verification_task()
+            .map(Message::WalletDashboard);
         let portfolio_task = screen.fetch_portfolio_task().map(Message::WalletDashboard);
         // History is fetched lazily on the first switch to the Activity
         // tab — no eager round-trip on dashboard entry.
@@ -600,19 +604,14 @@ impl App {
                             }
                             let c = consensus.get(chain).trim();
                             if !c.is_empty() {
-                                crate::settings::set_consensus_rpcs(
-                                    chain,
-                                    vec![c.to_string()],
-                                );
+                                crate::settings::set_consensus_rpcs(chain, vec![c.to_string()]);
                             }
                         }
                         // SelectIndexer's auto-detect keys off the
                         // Mainnet RPC URL (Alchemy / Etherscan reuse).
-                        let mainnet_url =
-                            exec.get(crate::chain::Chain::Mainnet).clone();
-                        self.screen = Screen::SelectIndexer(SelectIndexerScreen::new(
-                            Some(&mainnet_url),
-                        ));
+                        let mainnet_url = exec.get(crate::chain::Chain::Mainnet).clone();
+                        self.screen =
+                            Screen::SelectIndexer(SelectIndexerScreen::new(Some(&mainnet_url)));
                         iced::Task::none()
                     }
                     Some(SelectRpcOutcome::Back) => {
@@ -699,9 +698,8 @@ impl App {
                             let rpc = crate::settings::rpcs(crate::chain::Chain::Mainnet)
                                 .into_iter()
                                 .next();
-                            self.screen = Screen::SelectIndexer(SelectIndexerScreen::new(
-                                rpc.as_deref(),
-                            ));
+                            self.screen =
+                                Screen::SelectIndexer(SelectIndexerScreen::new(rpc.as_deref()));
                             iced::Task::none()
                         }
                     }
@@ -1055,27 +1053,26 @@ impl App {
                 error!(error = %e, "wallet error");
                 self.toast_gen = self.toast_gen.wrapping_add(1);
                 let generation = self.toast_gen;
-                self.toast = Some(ToastState {
-                    msg: e,
-                    generation,
-                });
+                self.toast = Some(ToastState { msg: e, generation });
                 // Schedule the auto-dismiss tick. Generation-tagged so a
                 // late firing can't clear a newer toast: replacement
                 // bumps the counter, and the stale `DismissError`
                 // arrives with `g != self.toast_gen` and no-ops.
                 iced::Task::perform(
                     async move {
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            TOAST_LIFETIME_SECS,
-                        ))
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_secs(TOAST_LIFETIME_SECS))
+                            .await;
                         generation
                     },
                     |generation| Message::DismissError { generation },
                 )
             }
             Message::DismissError { generation } => {
-                if self.toast.as_ref().is_some_and(|s| s.generation == generation) {
+                if self
+                    .toast
+                    .as_ref()
+                    .is_some_and(|s| s.generation == generation)
+                {
                     self.toast = None;
                 }
                 iced::Task::none()
@@ -1149,8 +1146,7 @@ impl App {
 fn error_toast<'a>(t: KaoTheme, state: &'a ToastState) -> Element<'a, Message> {
     let generation = state.generation;
     let dismiss = mouse_area(
-        container(text("✕").size(13).color(t.down).font(bold()))
-            .padding(Padding::from([2, 6])),
+        container(text("✕").size(13).color(t.down).font(bold())).padding(Padding::from([2, 6])),
     )
     .on_press(Message::DismissError { generation })
     .interaction(iced::mouse::Interaction::Pointer);
@@ -1158,8 +1154,7 @@ fn error_toast<'a>(t: KaoTheme, state: &'a ToastState) -> Element<'a, Message> {
     let body = row![
         text("⚠").size(14).color(t.down).font(bold()),
         Space::new().width(8),
-        container(text(state.msg.as_str()).size(12).color(t.down).font(bold()))
-            .width(Length::Fill),
+        container(text(state.msg.as_str()).size(12).color(t.down).font(bold())).width(Length::Fill),
         Space::new().width(10),
         dismiss,
     ]
@@ -1243,7 +1238,8 @@ fn save_descriptor_task(
 fn load_contacts_task(passphrase: SecretString) -> iced::Task<Message> {
     iced::Task::perform(
         async move {
-            let join = tokio::task::spawn_blocking(move || wallet::load_contacts(&passphrase)).await;
+            let join =
+                tokio::task::spawn_blocking(move || wallet::load_contacts(&passphrase)).await;
             match join {
                 Ok(Ok(vec)) => Ok(vec),
                 Ok(Err(e)) => Err(e.to_string()),
@@ -1263,10 +1259,9 @@ fn load_contacts_task(passphrase: SecretString) -> iced::Task<Message> {
 fn save_contacts_task(contacts: Vec<Contact>, passphrase: SecretString) -> iced::Task<Message> {
     iced::Task::perform(
         async move {
-            let join = tokio::task::spawn_blocking(move || {
-                wallet::save_contacts(&contacts, &passphrase)
-            })
-            .await;
+            let join =
+                tokio::task::spawn_blocking(move || wallet::save_contacts(&contacts, &passphrase))
+                    .await;
             match join {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e.to_string()),

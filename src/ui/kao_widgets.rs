@@ -147,11 +147,10 @@ pub fn kao_scrollable_style(t: KaoTheme, status: scrollable::Status) -> scrollab
     // accent.
     let scroller_color = match status {
         Status::Active { .. } => with_alpha(t.a2, 0.55),
-        Status::Hovered { is_vertical_scrollbar_hovered, .. }
-            if is_vertical_scrollbar_hovered =>
-        {
-            t.a1
-        }
+        Status::Hovered {
+            is_vertical_scrollbar_hovered,
+            ..
+        } if is_vertical_scrollbar_hovered => t.a1,
         Status::Hovered { .. } => with_alpha(t.a2, 0.75),
         Status::Dragged { .. } => t.a1,
     };
@@ -665,32 +664,24 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
     // smooth gradient does, and keeps homoglyph swaps from blending into
     // a same-coloured neighbour.
     let chunk_colors: [Color; 10] = [
-        t.a1,                          // 0: bright a1
-        mix(t.a3, t.text, 0.55),       // 1: deep a3
-        t.a2,                          // 2: bright a2
-        mix(t.a1, t.text, 0.55),       // 3: deep a1
-        t.a3,                          // 4: bright a3
-        mix(t.a2, t.text, 0.55),       // 5: deep a2
-        mix(t.a1, t.a3, 0.5),          // 6: bright a1+a3
-        mix(t.a2, t.text, 0.75),       // 7: very deep a2
-        mix(t.a2, t.a3, 0.5),          // 8: bright a2+a3
-        mix(t.a1, t.text, 0.75),       // 9: very deep a1
+        t.a1,                    // 0: bright a1
+        mix(t.a3, t.text, 0.55), // 1: deep a3
+        t.a2,                    // 2: bright a2
+        mix(t.a1, t.text, 0.55), // 3: deep a1
+        t.a3,                    // 4: bright a3
+        mix(t.a2, t.text, 0.55), // 5: deep a2
+        mix(t.a1, t.a3, 0.5),    // 6: bright a1+a3
+        mix(t.a2, t.text, 0.75), // 7: very deep a2
+        mix(t.a2, t.a3, 0.5),    // 8: bright a2+a3
+        mix(t.a1, t.text, 0.75), // 9: very deep a1
     ];
 
-    let mut spans = row![
-        text("0x").size(14).color(t.sub).font(mono_bold())
-    ]
-    .spacing(0);
+    let mut spans = row![text("0x").size(14).color(t.sub).font(mono_bold())].spacing(0);
 
     for (i, color) in chunk_colors.iter().enumerate() {
         let start = i * 4;
         let chunk = body[start..start + 4].to_string();
-        spans = spans.push(
-            text(chunk)
-                .size(14)
-                .color(*color)
-                .font(mono_bold()),
-        );
+        spans = spans.push(text(chunk).size(14).color(*color).font(mono_bold()));
     }
 
     container(spans)

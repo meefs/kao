@@ -30,8 +30,8 @@ const NAME_INPUT_ID: &str = "contacts:name";
 
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    black, bold, card_style, colored_address, ghost_button, hover_tint, kao_scrollable_style,
-    mono, primary_button, secondary_button, small_secondary_button, text_input_style,
+    black, bold, card_style, colored_address, ghost_button, hover_tint, kao_scrollable_style, mono,
+    primary_button, secondary_button, small_secondary_button, text_input_style,
 };
 use crate::wallet::{Contact, ContactEns, ContactsBook, short_address};
 
@@ -250,9 +250,7 @@ impl ContactsPane {
         address: Address,
         ens: Option<String>,
     ) -> Self {
-        let address_input = ens
-            .clone()
-            .unwrap_or_else(|| address.to_checksum(None));
+        let address_input = ens.clone().unwrap_or_else(|| address.to_checksum(None));
         let mut pane = Self {
             book,
             mode: Mode::Edit { editing_addr: None },
@@ -350,7 +348,10 @@ impl ContactsPane {
                     Err(_) => return (Task::none(), None),
                 };
                 snapshot.remove(idx);
-                (Task::none(), Some(Outcome::SaveRequested(snapshot.into_vec())))
+                (
+                    Task::none(),
+                    Some(Outcome::SaveRequested(snapshot.into_vec())),
+                )
             }
             Message::CancelDelete => {
                 self.pending_delete = None;
@@ -593,7 +594,10 @@ impl ContactsPane {
         // updated entry.
         self.reset_to_list();
 
-        (Task::none(), Some(Outcome::SaveRequested(snapshot.into_vec())))
+        (
+            Task::none(),
+            Some(Outcome::SaveRequested(snapshot.into_vec())),
+        )
     }
 
     pub fn view<'a>(&'a self, t: KaoTheme) -> Element<'a, Message> {
@@ -602,11 +606,7 @@ impl ContactsPane {
         // the far-right corner. The body sits beneath at a capped
         // width so forms / card grids don't sprawl on wide screens.
         let (header, body, max_width) = match &self.mode {
-            Mode::List => (
-                self.list_header(t),
-                self.view_list(t),
-                MAX_LIST_WIDTH,
-            ),
+            Mode::List => (self.list_header(t), self.view_list(t), MAX_LIST_WIDTH),
             Mode::Edit { editing_addr } => (
                 self.edit_header(t, editing_addr.is_some()),
                 self.view_edit(t),
@@ -622,12 +622,7 @@ impl ContactsPane {
         .width(Length::Fill)
         .center_x(Length::Fill);
 
-        let content = column![
-            header,
-            Space::new().height(16),
-            body_centered,
-        ]
-        .width(Length::Fill);
+        let content = column![header, Space::new().height(16), body_centered,].width(Length::Fill);
 
         scrollable(
             container(content)
@@ -663,7 +658,11 @@ impl ContactsPane {
     }
 
     fn edit_header<'a>(&'a self, t: KaoTheme, editing: bool) -> Element<'a, Message> {
-        let title = if editing { "Edit contact" } else { "Add contact" };
+        let title = if editing {
+            "Edit contact"
+        } else {
+            "Add contact"
+        };
         row![
             ghost_button(t, text("← Back").size(13).color(t.a1).font(bold()))
                 .padding(Padding::from([4, 8]))
@@ -814,51 +813,56 @@ fn address_parse_hint<'a>(t: KaoTheme, r: &AddressResolution) -> Element<'a, Mes
         AddressResolution::Hex(_) => ctr(text("✓ valid address").size(11).color(t.up).font(bold()))
             .padding(pad)
             .into(),
-        AddressResolution::Resolving { name } => ctr(
-            text(format!("(；・∀・) resolving {name}…"))
+        AddressResolution::Resolving { name } => ctr(text(format!("(；・∀・) resolving {name}…"))
+            .size(11)
+            .color(t.sub)
+            .font(bold()))
+        .padding(pad)
+        .into(),
+        AddressResolution::Resolved { name, addr } => ctr(row![
+            text(format!("✓ {name} →  "))
+                .size(11)
+                .color(t.up)
+                .font(bold()),
+            text(short_address(*addr))
                 .size(11)
                 .color(t.sub)
-                .font(bold()),
-        )
+                .font(mono()),
+        ]
+        .align_y(Alignment::Center))
         .padding(pad)
         .into(),
-        AddressResolution::Resolved { name, addr } => ctr(
-            row![
-                text(format!("✓ {name} →  ")).size(11).color(t.up).font(bold()),
-                text(short_address(*addr)).size(11).color(t.sub).font(mono()),
-            ]
-            .align_y(Alignment::Center),
-        )
-        .padding(pad)
-        .into(),
-        AddressResolution::NotFound { name } => ctr(
-            text(format!("ENS name “{name}” has no address record"))
+        AddressResolution::NotFound { name } => {
+            ctr(text(format!("ENS name “{name}” has no address record"))
                 .size(11)
                 .color(t.down)
-                .font(bold()),
-        )
-        .padding(pad)
-        .into(),
-        AddressResolution::Error { name, msg } => ctr(
-            text(format!("ENS lookup for “{name}” failed: {msg}"))
+                .font(bold()))
+            .padding(pad)
+            .into()
+        }
+        AddressResolution::Error { name, msg } => {
+            ctr(text(format!("ENS lookup for “{name}” failed: {msg}"))
                 .size(11)
                 .color(t.down)
-                .font(bold()),
-        )
-        .padding(pad)
-        .into(),
-        AddressResolution::Invalid => ctr(
-            text("Not a valid 0x… address or ENS name")
-                .size(11)
-                .color(t.down)
-                .font(bold()),
-        )
+                .font(bold()))
+            .padding(pad)
+            .into()
+        }
+        AddressResolution::Invalid => ctr(text("Not a valid 0x… address or ENS name")
+            .size(11)
+            .color(t.down)
+            .font(bold()))
         .padding(pad)
         .into(),
     }
 }
 
-fn list_card<'a>(t: KaoTheme, idx: usize, c: Contact, pending_delete: bool) -> Element<'a, Message> {
+fn list_card<'a>(
+    t: KaoTheme,
+    idx: usize,
+    c: Contact,
+    pending_delete: bool,
+) -> Element<'a, Message> {
     let kao_glyph = if c.kaomoji.is_empty() {
         DEFAULT_KAOMOJI.to_string()
     } else {

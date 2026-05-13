@@ -31,10 +31,8 @@ use super::{IndexedTx, TokenTransfer, TxStatus, classify_direction};
 /// `keccak256("Transfer(address,address,uint256)")` — shared by ERC-20
 /// and ERC-721 (the latter just adds a 4th indexed `tokenId` topic).
 const TRANSFER_TOPIC: B256 = B256::new([
-    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b,
-    0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d, 0xaa,
-    0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16,
-    0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
+    0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d, 0xaa,
+    0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
 ]);
 
 /// How many blocks back to scan from `latest`. ~7 days on Mainnet at
@@ -97,11 +95,15 @@ pub async fn fetch_onchain_history(
     let mut all_logs: Vec<Log> = Vec::new();
     match sent {
         Ok(v) => all_logs.extend(v),
-        Err(e) => warn!(error = %e, "onchain sent-logs fetch failed; continuing with received only"),
+        Err(e) => {
+            warn!(error = %e, "onchain sent-logs fetch failed; continuing with received only")
+        }
     }
     match recv {
         Ok(v) => all_logs.extend(v),
-        Err(e) => warn!(error = %e, "onchain received-logs fetch failed; continuing with sent only"),
+        Err(e) => {
+            warn!(error = %e, "onchain received-logs fetch failed; continuing with sent only")
+        }
     }
 
     let mut rows: Vec<IndexedTx> = parse_log_rows(&all_logs, owner, chain);
@@ -133,12 +135,15 @@ pub async fn fetch_onchain_history(
             .then_with(|| b.hash.cmp(&a.hash))
     });
     rows.dedup_by(|a, b| {
-        a.block_number == b.block_number && a.hash == b.hash && a.token.is_some() == b.token.is_some() && {
-            // Distinguish multiple token transfers within one tx by their contract+token_id.
-            let ka = a.token.as_ref().map(|t| (t.contract, t.token_id));
-            let kb = b.token.as_ref().map(|t| (t.contract, t.token_id));
-            ka == kb
-        }
+        a.block_number == b.block_number
+            && a.hash == b.hash
+            && a.token.is_some() == b.token.is_some()
+            && {
+                // Distinguish multiple token transfers within one tx by their contract+token_id.
+                let ka = a.token.as_ref().map(|t| (t.contract, t.token_id));
+                let kb = b.token.as_ref().map(|t| (t.contract, t.token_id));
+                ka == kb
+            }
     });
     rows.truncate(limit.max(1));
 
@@ -178,7 +183,11 @@ async fn get_logs_chunked(
 
     match result {
         Ok(v) => Ok(v),
-        Err(e) if depth < MAX_SPLIT_DEPTH && to.saturating_sub(from) >= MIN_RANGE && is_range_cap(&e) => {
+        Err(e)
+            if depth < MAX_SPLIT_DEPTH
+                && to.saturating_sub(from) >= MIN_RANGE
+                && is_range_cap(&e) =>
+        {
             let mid = from + (to - from) / 2;
             debug!(
                 label,
@@ -188,8 +197,24 @@ async fn get_logs_chunked(
             );
             // Sequential — bursting parallel sub-ranges to a public RPC
             // tends to multiply 429s rather than land faster.
-            let lhs = Box::pin(get_logs_chunked(provider, filter, from, mid, depth + 1, label)).await?;
-            let rhs = Box::pin(get_logs_chunked(provider, filter, mid + 1, to, depth + 1, label)).await?;
+            let lhs = Box::pin(get_logs_chunked(
+                provider,
+                filter,
+                from,
+                mid,
+                depth + 1,
+                label,
+            ))
+            .await?;
+            let rhs = Box::pin(get_logs_chunked(
+                provider,
+                filter,
+                mid + 1,
+                to,
+                depth + 1,
+                label,
+            ))
+            .await?;
             let mut out = lhs;
             out.extend(rhs);
             Ok(out)
@@ -226,7 +251,9 @@ fn parse_log_rows(logs: &[Log], owner: Address, chain: Chain) -> Vec<IndexedTx> 
         let from = address_from_topic(&topics[1]);
         let to = address_from_topic(&topics[2]);
         let block_number = log.block_number.unwrap_or(0);
-        let Some(hash) = log.transaction_hash else { continue };
+        let Some(hash) = log.transaction_hash else {
+            continue;
+        };
 
         let (is_nft, token_id, amount_raw) = if topics.len() >= 4 {
             // ERC-721: tokenId is indexed (topic[3]); data is empty.
@@ -395,10 +422,7 @@ async fn fetch_receipts(
     out
 }
 
-async fn fetch_timestamps(
-    provider: &RootProvider<Ethereum>,
-    blocks: &[u64],
-) -> HashMap<u64, u64> {
+async fn fetch_timestamps(provider: &RootProvider<Ethereum>, blocks: &[u64]) -> HashMap<u64, u64> {
     let mut out: HashMap<u64, u64> = HashMap::with_capacity(blocks.len());
     for chunk in blocks.chunks(ENRICH_BATCH) {
         let futs = chunk.iter().map(|b| {
@@ -430,10 +454,7 @@ async fn fetch_timestamps(
 const SYMBOL_SELECTOR: [u8; 4] = [0x95, 0xd8, 0x9b, 0x41];
 const DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
 
-async fn enrich_token_metadata(
-    provider: &RootProvider<Ethereum>,
-    rows: &mut [IndexedTx],
-) {
+async fn enrich_token_metadata(provider: &RootProvider<Ethereum>, rows: &mut [IndexedTx]) {
     let unique_contracts: Vec<Address> = {
         let mut seen: HashSet<Address> = HashSet::new();
         rows.iter()
@@ -453,7 +474,14 @@ async fn enrich_token_metadata(
         calls.push((*c, Bytes::from_static(&DECIMALS_SELECTOR)));
     }
 
-    let results = match multicall_pairs(provider, BlockId::latest(), "onchain history metadata", calls).await {
+    let results = match multicall_pairs(
+        provider,
+        BlockId::latest(),
+        "onchain history metadata",
+        calls,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "token metadata multicall failed; rendering with truncated contracts");
@@ -467,7 +495,13 @@ async fn enrich_token_metadata(
         let dec_idx = i * 2 + 1;
         let symbol = results
             .get(sym_idx)
-            .map(|(ok, data)| if *ok { decode_symbol(data) } else { String::new() })
+            .map(|(ok, data)| {
+                if *ok {
+                    decode_symbol(data)
+                } else {
+                    String::new()
+                }
+            })
             .unwrap_or_default();
         let decimals = results
             .get(dec_idx)
@@ -477,7 +511,9 @@ async fn enrich_token_metadata(
     }
 
     for r in rows.iter_mut() {
-        let Some(tok) = r.token.as_mut() else { continue };
+        let Some(tok) = r.token.as_mut() else {
+            continue;
+        };
         if let Some((sym, dec)) = meta.get(&tok.contract) {
             if !sym.is_empty() {
                 tok.symbol = sym.clone();
@@ -502,7 +538,9 @@ fn decode_symbol(data: &Bytes) -> String {
         if offset == U256::from(32u8) && data.len() >= 96 {
             let len = U256::from_be_slice(&data[32..64]).saturating_to::<usize>();
             let end = 64usize.saturating_add(len);
-            if len > 0 && len <= 256 && end <= data.len()
+            if len > 0
+                && len <= 256
+                && end <= data.len()
                 && let Ok(s) = std::str::from_utf8(&data[64..end])
             {
                 let s = s.trim_end_matches('\0').trim();
@@ -553,10 +591,7 @@ async fn trace_filter_supported(
         "fromBlock": format!("0x{:x}", latest),
         "toBlock": format!("0x{:x}", latest),
     }]);
-    let result: Result<Value, _> = provider
-        .client()
-        .request("trace_filter", params)
-        .await;
+    let result: Result<Value, _> = provider.client().request("trace_filter", params).await;
     let supported = match result {
         Ok(_) => true,
         Err(e) => {
@@ -623,36 +658,44 @@ async fn trace_filter_chunked(
     to: u64,
     depth: u32,
 ) -> Result<Vec<Value>, String> {
-    let key = if is_sender_side { "fromAddress" } else { "toAddress" };
+    let key = if is_sender_side {
+        "fromAddress"
+    } else {
+        "toAddress"
+    };
     let params = json!([{
         "fromBlock": format!("0x{:x}", from),
         "toBlock": format!("0x{:x}", to),
         key: [addr_hex],
     }]);
-    let result: Result<Vec<Value>, _> = provider
-        .client()
-        .request("trace_filter", params)
-        .await;
+    let result: Result<Vec<Value>, _> = provider.client().request("trace_filter", params).await;
     match result {
         Ok(v) => Ok(v),
         Err(e) => {
             let msg = e.to_string();
-            if depth < MAX_SPLIT_DEPTH
-                && to.saturating_sub(from) >= MIN_RANGE
-                && is_range_cap(&msg)
+            if depth < MAX_SPLIT_DEPTH && to.saturating_sub(from) >= MIN_RANGE && is_range_cap(&msg)
             {
                 let mid = from + (to - from) / 2;
                 debug!(
                     side = if is_sender_side { "sent" } else { "recv" },
-                    from, to, mid, depth,
-                    "trace_filter range cap; splitting",
+                    from, to, mid, depth, "trace_filter range cap; splitting",
                 );
                 let lhs = Box::pin(trace_filter_chunked(
-                    provider, addr_hex, is_sender_side, from, mid, depth + 1,
+                    provider,
+                    addr_hex,
+                    is_sender_side,
+                    from,
+                    mid,
+                    depth + 1,
                 ))
                 .await?;
                 let rhs = Box::pin(trace_filter_chunked(
-                    provider, addr_hex, is_sender_side, mid + 1, to, depth + 1,
+                    provider,
+                    addr_hex,
+                    is_sender_side,
+                    mid + 1,
+                    to,
+                    depth + 1,
                 ))
                 .await?;
                 let mut out = lhs;
@@ -668,7 +711,10 @@ async fn trace_filter_chunked(
 fn trace_to_indexed(t: &Value, owner: Address, chain: Chain) -> Option<IndexedTx> {
     let action = t.get("action")?;
     // Only call traces with non-zero value count as native ETH transfers.
-    let call_type = action.get("callType").and_then(|v| v.as_str()).unwrap_or("");
+    let call_type = action
+        .get("callType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if call_type.is_empty() {
         return None; // skip create/suicide for now
     }
@@ -686,10 +732,7 @@ fn trace_to_indexed(t: &Value, owner: Address, chain: Chain) -> Option<IndexedTx
         .get("transactionHash")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<B256>().ok())?;
-    let block_number = t
-        .get("blockNumber")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let block_number = t.get("blockNumber").and_then(|v| v.as_u64()).unwrap_or(0);
     Some(IndexedTx {
         hash,
         block_number,
@@ -746,11 +789,15 @@ mod tests {
     }
 
     fn owner() -> Address {
-        "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap()
+        "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap()
     }
 
     fn other() -> Address {
-        "0x000000000000000000000000000000000000beef".parse().unwrap()
+        "0x000000000000000000000000000000000000beef"
+            .parse()
+            .unwrap()
     }
 
     #[test]

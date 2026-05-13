@@ -158,10 +158,7 @@ mod tests {
 
     #[test]
     fn ambiguous_when_multiple_match_no_bytecode() {
-        let candidates = &[
-            "transfer(address,uint256)",
-            "doppel(address,uint256)",
-        ];
+        let candidates = &["transfer(address,uint256)", "doppel(address,uint256)"];
         match resolve(candidates, None) {
             Resolved::Ambiguous(list) => {
                 assert_eq!(list.len(), 2);
@@ -226,10 +223,7 @@ mod tests {
         // Bytecode says (bool, bool) but no candidate has that shape.
         // The fallback hands back ALL parsed candidates — see the
         // "suspicious — could indicate phishing" branch in resolve().
-        let candidates = &[
-            "transfer(address,uint256)",
-            "approve(address,uint256)",
-        ];
+        let candidates = &["transfer(address,uint256)", "approve(address,uint256)"];
         let bytecode = vec![DynSolType::Bool, DynSolType::Bool];
         match resolve(candidates, Some(&bytecode)) {
             Resolved::Ambiguous(list) => {

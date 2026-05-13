@@ -386,9 +386,12 @@ mod tests {
     /// the user never trusts an unverified balance from the indexer.
     #[test]
     fn into_discovered_tokens_drops_native_eth_and_keeps_metadata() {
-        let usdc: Address =
-            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse().unwrap();
-        let beef: Address = "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let usdc: Address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+            .parse()
+            .unwrap();
+        let beef: Address = "0x000000000000000000000000000000000000beef"
+            .parse()
+            .unwrap();
         let tokens = vec![
             IndexedToken {
                 symbol: "ETH".into(),
@@ -440,9 +443,12 @@ mod tests {
 
     #[test]
     fn into_live_tokens_assigns_native_eth_logo_and_zeroes_missing_prices() {
-        let usdc: Address =
-            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".parse().unwrap();
-        let unknown: Address = "0x000000000000000000000000000000000000beef".parse().unwrap();
+        let usdc: Address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+            .parse()
+            .unwrap();
+        let unknown: Address = "0x000000000000000000000000000000000000beef"
+            .parse()
+            .unwrap();
         let tokens = vec![
             IndexedToken {
                 symbol: "ETH".into(),
@@ -485,7 +491,10 @@ mod tests {
         assert_eq!(live[0].contract, None, "native ETH preserved");
         assert_eq!(live[1].contract, Some(usdc));
         assert_eq!(live[2].contract, Some(unknown));
-        assert_eq!(live[1].usd_price, 0.0, "missing indexer price collapses to 0");
+        assert_eq!(
+            live[1].usd_price, 0.0,
+            "missing indexer price collapses to 0"
+        );
         assert_eq!(live[1].usd_value, 0.0);
         for tk in &live {
             assert_eq!(tk.chain, Chain::Mainnet);

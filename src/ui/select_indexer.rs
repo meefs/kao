@@ -150,9 +150,7 @@ impl SelectIndexerScreen {
                 self.error = None;
                 (Task::none(), Some(Outcome::Back))
             }
-            Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => {
-                self.handle_key(key)
-            }
+            Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => self.handle_key(key),
             Message::KeyboardEvent(_) => (Task::none(), None),
         }
     }
@@ -218,9 +216,7 @@ impl SelectIndexerScreen {
                 self.error = None;
                 (Task::none(), None)
             }
-            (Expanded::None, keyboard::Key::Named(n))
-                if *n == keyboard::key::Named::Escape =>
-            {
+            (Expanded::None, keyboard::Key::Named(n)) if *n == keyboard::key::Named::Escape => {
                 self.error = None;
                 (Task::none(), Some(Outcome::Back))
             }
@@ -289,19 +285,16 @@ impl SelectIndexerScreen {
         // Per-card body: only the expanded card renders one. `None` keeps
         // the card showing just its header.
         let alchemy_body = match self.expanded {
-            Expanded::Alchemy if self.alchemy_key_from_rpc.is_none() => {
-                Some(self.alchemy_body(t))
-            }
+            Expanded::Alchemy if self.alchemy_key_from_rpc.is_none() => Some(self.alchemy_body(t)),
             _ => None,
         };
         let drpc_body = match self.expanded {
             Expanded::Drpc if self.drpc_key_from_rpc.is_none() => Some(self.drpc_body(t)),
             _ => None,
         };
-        let blockscout_body = (self.expanded == Expanded::Blockscout)
-            .then(|| self.blockscout_body(t));
-        let etherscan_body = (self.expanded == Expanded::Etherscan)
-            .then(|| self.etherscan_body(t));
+        let blockscout_body =
+            (self.expanded == Expanded::Blockscout).then(|| self.blockscout_body(t));
+        let etherscan_body = (self.expanded == Expanded::Etherscan).then(|| self.etherscan_body(t));
 
         let alchemy_sub: &str = if self.alchemy_key_from_rpc.is_some() {
             "Reuse the API key from your RPC"
@@ -469,15 +462,17 @@ impl SelectIndexerScreen {
     }
 
     fn blockscout_body(&self, t: KaoTheme) -> Element<'_, Message> {
-        let url_input =
-            text_input("https://eth.blockscout.com (optional)", &self.blockscout_url_input)
-                .id(BLOCKSCOUT_URL_INPUT_ID)
-                .on_input(Message::BlockscoutUrlInput)
-                .on_submit(Message::SubmitCurrent)
-                .padding(Padding::from([10, 12]))
-                .size(13)
-                .font(mono())
-                .style(move |_theme, status| text_input_style(t, status));
+        let url_input = text_input(
+            "https://eth.blockscout.com (optional)",
+            &self.blockscout_url_input,
+        )
+        .id(BLOCKSCOUT_URL_INPUT_ID)
+        .on_input(Message::BlockscoutUrlInput)
+        .on_submit(Message::SubmitCurrent)
+        .padding(Padding::from([10, 12]))
+        .size(13)
+        .font(mono())
+        .style(move |_theme, status| text_input_style(t, status));
         let key_input = text_input(
             "API key (optional, for higher rate limits)",
             &self.blockscout_key_input,
@@ -503,11 +498,10 @@ impl SelectIndexerScreen {
             .size(13)
             .font(mono())
             .style(move |_theme, status| text_input_style(t, status));
-        let warning = text(
-            "Etherscan's address-token-balance endpoint requires the Pro tier (~$50/month).",
-        )
-        .size(11)
-        .color(t.sub);
+        let warning =
+            text("Etherscan's address-token-balance endpoint requires the Pro tier (~$50/month).")
+                .size(11)
+                .color(t.sub);
         let has_key = !self.etherscan_key_input.trim().is_empty();
         let mut submit = primary_button(t, "Use Etherscan →", has_key);
         if has_key {
@@ -583,10 +577,7 @@ impl SelectIndexerScreen {
             .style(move |_| container::Style {
                 background: Some(Background::Color(bg)),
                 border: Border {
-                    color: with_alpha(
-                        accent,
-                        if is_expanded { 0.55 } else { 0.25 },
-                    ),
+                    color: with_alpha(accent, if is_expanded { 0.55 } else { 0.25 }),
                     width: if is_expanded { 2.0 } else { 1.5 },
                     radius: Radius::from(15),
                 },
@@ -764,7 +755,9 @@ mod tests {
     fn blockscout_https_url_passes_through() {
         let mut s = SelectIndexerScreen::new(None);
         s.update(Message::PickBlockscout);
-        s.update(Message::BlockscoutUrlInput("https://base.blockscout.com".into()));
+        s.update(Message::BlockscoutUrlInput(
+            "https://base.blockscout.com".into(),
+        ));
         s.update(Message::BlockscoutKeyInput("KEY".into()));
         let (_, outcome) = s.update(Message::SubmitCurrent);
         match outcome {
@@ -800,10 +793,7 @@ mod tests {
     #[test]
     fn extract_drpc_key_rejects_other_hosts() {
         assert_eq!(extract_drpc_key("https://eth.drpc.org/"), None);
-        assert_eq!(
-            extract_drpc_key("https://lb.drpc.live/ethereum/"),
-            None,
-        );
+        assert_eq!(extract_drpc_key("https://lb.drpc.live/ethereum/"), None,);
         assert_eq!(extract_drpc_key("not-a-url"), None);
     }
 
@@ -846,5 +836,4 @@ mod tests {
             other => panic!("expected Drpc outcome, got {other:?}"),
         }
     }
-
 }

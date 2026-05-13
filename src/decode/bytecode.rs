@@ -93,7 +93,10 @@ mod tests {
     fn extracts_transfer_selector() {
         // Strip whitespace, decode hex; if odd length or invalid, the
         // whole module's broken — surface the parse error.
-        let cleaned: String = TINY_TRANSFER_RUNTIME.chars().filter(|c| !c.is_whitespace()).collect();
+        let cleaned: String = TINY_TRANSFER_RUNTIME
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         let Ok(code) = hex::decode(&cleaned) else {
             panic!("bench bytecode hex is malformed");
         };
@@ -104,7 +107,10 @@ mod tests {
         let transfer = funcs
             .iter()
             .find(|f| f.selector == [0xa9, 0x05, 0x9c, 0xbb]);
-        assert!(transfer.is_some(), "expected transfer selector; got {funcs:?}");
+        assert!(
+            transfer.is_some(),
+            "expected transfer selector; got {funcs:?}"
+        );
         if let Some(f) = transfer {
             // Argument extraction is best-effort; assert two args of
             // the expected types only when evmole gave us anything.
@@ -120,7 +126,10 @@ mod tests {
 
     #[test]
     fn lookup_finds_known_selector() {
-        let cleaned: String = TINY_TRANSFER_RUNTIME.chars().filter(|c| !c.is_whitespace()).collect();
+        let cleaned: String = TINY_TRANSFER_RUNTIME
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         let code = hex::decode(&cleaned).expect("bench bytecode hex");
         let types = lookup(&code, [0xa9, 0x05, 0x9c, 0xbb]);
         // evmole sometimes recovers the selector but not the arg types —
@@ -131,7 +140,10 @@ mod tests {
 
     #[test]
     fn lookup_misses_unknown_selector() {
-        let cleaned: String = TINY_TRANSFER_RUNTIME.chars().filter(|c| !c.is_whitespace()).collect();
+        let cleaned: String = TINY_TRANSFER_RUNTIME
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
         let code = hex::decode(&cleaned).expect("bench bytecode hex");
         // Selector that the contract doesn't expose. evmole should
         // simply not return it.

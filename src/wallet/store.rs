@@ -233,8 +233,7 @@ fn save_to(path: &Path, desc: &WalletDescriptor, pw: &SecretString) -> Result<()
             // legitimate saves — or (b) leave a stale binding that an
             // attacker could exploit by rolling back the file and rewriting
             // the plaintext epoch byte to match.
-            let auth_check =
-                encrypt_blob(key.as_slice(), &header_aad(new_epoch), AUTH_CONSTANT)?;
+            let auth_check = encrypt_blob(key.as_slice(), &header_aad(new_epoch), AUTH_CONSTANT)?;
             Header {
                 epoch: new_epoch,
                 auth_check,
@@ -322,8 +321,11 @@ fn save_to(path: &Path, desc: &WalletDescriptor, pw: &SecretString) -> Result<()
     // rollback anchor stale" — important UX-wise because retrying a
     // SavedKeyringSyncFailed save would just bump the epoch again and
     // re-hit the same condition.
-    kr::write_secret(&keyring_entry_name(&header.salt), &header.epoch.to_le_bytes())
-        .map_err(map_save_keyring_err)?;
+    kr::write_secret(
+        &keyring_entry_name(&header.salt),
+        &header.epoch.to_le_bytes(),
+    )
+    .map_err(map_save_keyring_err)?;
     Ok(())
 }
 
@@ -332,7 +334,10 @@ fn save_to(path: &Path, desc: &WalletDescriptor, pw: &SecretString) -> Result<()
 /// wallets" use case) and so test wallets — each with a fresh random
 /// salt — never collide in the process-global test backend.
 fn keyring_entry_name(salt: &[u8]) -> String {
-    debug_assert!(salt.len() >= 8, "salt must be at least 8 bytes for keyring naming");
+    debug_assert!(
+        salt.len() >= 8,
+        "salt must be at least 8 bytes for keyring naming"
+    );
     format!(
         "wallet-epoch-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         salt[0], salt[1], salt[2], salt[3], salt[4], salt[5], salt[6], salt[7],
@@ -403,14 +408,14 @@ fn enforce_rollback_policy(
 
     match stored {
         None if accept_missing_keyring => {
-            if let Err(e) =
-                kr::write_secret(&entry_name, &header.epoch.to_le_bytes())
-            {
+            if let Err(e) = kr::write_secret(&entry_name, &header.epoch.to_le_bytes()) {
                 warn!("seeding keyring after explicit accept failed: {e}");
             }
             Ok(())
         }
-        None => Err(WalletError::KeyringMissingEntry { file_epoch: header.epoch }),
+        None => Err(WalletError::KeyringMissingEntry {
+            file_epoch: header.epoch,
+        }),
         Some(bytes) => {
             let keyring_epoch = decode_epoch(&bytes)?;
             if header.epoch < keyring_epoch {
@@ -419,9 +424,7 @@ fn enforce_rollback_policy(
                     expected: keyring_epoch,
                 })
             } else if header.epoch > keyring_epoch {
-                if let Err(e) =
-                    kr::write_secret(&entry_name, &header.epoch.to_le_bytes())
-                {
+                if let Err(e) = kr::write_secret(&entry_name, &header.epoch.to_le_bytes()) {
                     warn!("auto-resync keyring write failed: {e}");
                 }
                 Ok(())
@@ -485,8 +488,12 @@ fn load_from_with_policy(
     // this to a decrypt failure that surfaces as "incorrect password".
     // Same surface as a real wrong-password — by design, we don't tell
     // the caller which check failed.
-    decrypt_blob(master_key.as_slice(), &header_aad(header.epoch), &header.auth_check)
-        .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
+    decrypt_blob(
+        master_key.as_slice(),
+        &header_aad(header.epoch),
+        &header.auth_check,
+    )
+    .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
 
     // Password OK — now check rollback policy. We deliberately do this
     // *after* password verification so that a wrong-password attacker
@@ -655,8 +662,12 @@ fn save_contacts_to(
         header.argon2_t_cost,
         header.argon2_p_cost,
     )?;
-    decrypt_blob(master_key.as_slice(), &header_aad(header.epoch), &header.auth_check)
-        .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
+    decrypt_blob(
+        master_key.as_slice(),
+        &header_aad(header.epoch),
+        &header.auth_check,
+    )
+    .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
 
     {
         let mut tbl = txn.open_table(CONTACTS_TABLE).map_err(redb_err)?;
@@ -713,8 +724,12 @@ fn load_contacts_from(path: &Path, pw: &SecretString) -> Result<Vec<Contact>, Wa
         header.argon2_t_cost,
         header.argon2_p_cost,
     )?;
-    decrypt_blob(master_key.as_slice(), &header_aad(header.epoch), &header.auth_check)
-        .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
+    decrypt_blob(
+        master_key.as_slice(),
+        &header_aad(header.epoch),
+        &header.auth_check,
+    )
+    .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
 
     // Treat a missing contacts table as empty — fresh-since-feature
     // wallets have never saved contacts, and the table is created lazily
@@ -810,7 +825,11 @@ mod tests {
             _ => panic!("expected Local"),
         }
         match &loaded.accounts[1] {
-            AccountDescriptor::Ledger { name, path, address } => {
+            AccountDescriptor::Ledger {
+                name,
+                path,
+                address,
+            } => {
                 assert!(name.is_none());
                 assert!(matches!(path, LedgerHdPath::LedgerLive(2)));
                 assert_eq!(*address, [0x33; 20]);
@@ -993,12 +1012,7 @@ mod tests {
         let db = Database::open(path).unwrap();
         let txn = db.begin_read().unwrap();
         let meta = txn.open_table(META_TABLE).unwrap();
-        let header_bytes = meta
-            .get(HEADER_KEY)
-            .unwrap()
-            .unwrap()
-            .value()
-            .to_vec();
+        let header_bytes = meta.get(HEADER_KEY).unwrap().unwrap().value().to_vec();
         deserialize_header(&header_bytes).unwrap().salt
     }
 
@@ -1125,7 +1139,11 @@ mod tests {
         crate::wallet::keyring::write_secret(&entry, &1u64.to_le_bytes()).unwrap();
 
         load_from(&path, &pw("pw")).unwrap();
-        assert_eq!(epoch_from_keyring(&entry), 2, "keyring resynced up to file epoch");
+        assert_eq!(
+            epoch_from_keyring(&entry),
+            2,
+            "keyring resynced up to file epoch"
+        );
     }
 
     #[test]
@@ -1401,7 +1419,10 @@ mod tests {
         save_contacts_to(&path, &[sample_contact(0x01, "A")], &pw("pw")).unwrap();
         save_contacts_to(&path, &[sample_contact(0x01, "A2")], &pw("pw")).unwrap();
         let after = epoch_from_keyring(&entry);
-        assert_eq!(before, after, "contacts saves must not bump the accounts epoch");
+        assert_eq!(
+            before, after,
+            "contacts saves must not bump the accounts epoch"
+        );
     }
 
     #[test]

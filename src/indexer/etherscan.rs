@@ -22,7 +22,7 @@ use crate::portfolio::{format_eth_balance, format_token_balance};
 use crate::chain::Chain;
 
 use super::{
-    Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
     redact_url_in_err,
 };
 
@@ -486,7 +486,9 @@ mod tests {
 
     #[test]
     fn convert_tx_handles_contract_creation_and_post_byzantium_failure() {
-        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap();
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
 
         // Contract creation: empty `to` field.
         let creation = RawTx {
@@ -565,7 +567,9 @@ mod tests {
 
     #[test]
     fn classifies_pre_byzantium_tx_as_success_when_no_error() {
-        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap();
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
         let raw = RawTx {
             block_number: "100".into(),
             timestamp: "1700000000".into(),

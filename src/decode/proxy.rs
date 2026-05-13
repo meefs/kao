@@ -139,7 +139,11 @@ fn address_from_slot(slot: B256) -> Option<Address> {
         return None;
     }
     let addr = Address::from_slice(&bytes[12..]);
-    if addr == Address::ZERO { None } else { Some(addr) }
+    if addr == Address::ZERO {
+        None
+    } else {
+        Some(addr)
+    }
 }
 
 #[cfg(test)]
@@ -276,7 +280,12 @@ mod tests {
                 .unwrap_or((B256::ZERO, true));
             Ok(VerifiedRead { value, verified })
         }
-        async fn call(&self, _: Address, _: Bytes, _: Chain) -> Result<VerifiedRead<Bytes>, String> {
+        async fn call(
+            &self,
+            _: Address,
+            _: Bytes,
+            _: Chain,
+        ) -> Result<VerifiedRead<Bytes>, String> {
             Ok(VerifiedRead {
                 value: Bytes::new(),
                 verified: true,
@@ -411,10 +420,16 @@ mod tests {
         // Build a chain longer than MAX_DEPTH and verify the walker
         // stops at exactly MAX_DEPTH hops without looping forever.
         let mock = StorageMock::new();
-        let chain_addrs: Vec<Address> =
-            (0..(MAX_DEPTH + 3)).map(|i| Address::from([i as u8 + 1; 20])).collect();
+        let chain_addrs: Vec<Address> = (0..(MAX_DEPTH + 3))
+            .map(|i| Address::from([i as u8 + 1; 20]))
+            .collect();
         for pair in chain_addrs.windows(2) {
-            mock.set(pair[0], EIP_1967_IMPL_SLOT, slot_with_address(pair[1]), true);
+            mock.set(
+                pair[0],
+                EIP_1967_IMPL_SLOT,
+                slot_with_address(pair[1]),
+                true,
+            );
         }
         let res = resolve_implementation(&mock, Chain::Mainnet, chain_addrs[0]).await;
         assert_eq!(res.hops.len(), MAX_DEPTH);

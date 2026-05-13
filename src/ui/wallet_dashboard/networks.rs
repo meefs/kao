@@ -19,9 +19,9 @@ use alloy::primitives::B256;
 use iced::widget::{Space, column, container, row, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
+use crate::chain::{Chain, PerChain};
 use crate::net::BalanceFetcher;
 use crate::settings;
-use crate::chain::{Chain, PerChain};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
     black, bold, ghost_button, kao_scrollable_style, primary_button, section, text_input_style,
@@ -259,8 +259,8 @@ fn labeled_row<'a>(
     label: &'a str,
     input: Element<'a, Message>,
 ) -> Element<'a, Message> {
-    let label_box = container(text(label).size(12).color(t.text).font(bold()))
-        .width(Length::Fixed(80.0));
+    let label_box =
+        container(text(label).size(12).color(t.text).font(bold())).width(Length::Fixed(80.0));
     row![label_box, input]
         .spacing(8)
         .align_y(Alignment::Center)

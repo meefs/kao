@@ -180,11 +180,12 @@ impl ImportAddressScreen {
         } else {
             "Watch Address →"
         };
-        let add_btn = primary_button(t, btn_label, !resolving_now).on_press_maybe(if resolving_now {
-            None
-        } else {
-            Some(Message::AddPressed)
-        });
+        let add_btn =
+            primary_button(t, btn_label, !resolving_now).on_press_maybe(if resolving_now {
+                None
+            } else {
+                Some(Message::AddPressed)
+            });
 
         let hint = container(
             row![
@@ -205,7 +206,10 @@ impl ImportAddressScreen {
             vspace(10),
             screen_title(t, "Watch an Address"),
             vspace(6),
-            screen_subtitle(t, "Track any wallet read-only — paste an address or ENS name."),
+            screen_subtitle(
+                t,
+                "Track any wallet read-only — paste an address or ENS name."
+            ),
             vspace(22),
             address_input,
             vspace(18),

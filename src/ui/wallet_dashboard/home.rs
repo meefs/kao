@@ -8,8 +8,8 @@ use crate::chain::Chain;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::{KaoTheme, mix, with_alpha};
 use crate::ui::kao_widgets::{
-    bold, card_style, hover_fill, kao_fit, kao_scrollable_style, kao_text, kaomoji_for_index,
-    mono, mono_black, mono_bold, token_avatar,
+    bold, card_style, hover_fill, kao_fit, kao_scrollable_style, kao_text, kaomoji_for_index, mono,
+    mono_black, mono_bold, token_avatar,
 };
 use crate::wallet::KaoSigner;
 
@@ -177,10 +177,14 @@ fn token_row<'a>(t: KaoTheme, tk: &'a LiveToken, idx: usize) -> Element<'a, Mess
     let avatar = token_avatar(t, tk.chain, tk.contract, kao, 40.0, ab);
     let info = column![
         text(&tk.name).size(14).color(t.text).font(bold()),
-        text(format!("{} {}", tk.balance, format_symbol(&tk.symbol, tk.chain)))
-            .size(11)
-            .color(t.sub)
-            .font(mono()),
+        text(format!(
+            "{} {}",
+            tk.balance,
+            format_symbol(&tk.symbol, tk.chain)
+        ))
+        .size(11)
+        .color(t.sub)
+        .font(mono()),
     ]
     .spacing(0);
 

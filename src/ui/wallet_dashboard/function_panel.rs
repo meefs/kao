@@ -104,7 +104,10 @@ fn header<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
     let label = text("Function").size(11).color(t.sub).font(bold());
     let title = match &d.function_name {
         Some(name) => format!("{}(…)", name),
-        None => format!("0x{:02x}{:02x}{:02x}{:02x}", d.selector[0], d.selector[1], d.selector[2], d.selector[3]),
+        None => format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            d.selector[0], d.selector[1], d.selector[2], d.selector[3]
+        ),
     };
     // For Ambiguous the title is just one of several plausible names —
     // mute it so the chunk doesn't visually claim authority. The banner
@@ -141,21 +144,13 @@ fn header<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
         // than reassurance. The fact that bytecode was Helios-verified
         // is implicit — `UnverifiedBytecode` would have fired
         // otherwise.
-        col = col.push(
-            text("(via proxy)")
-                .size(10)
-                .color(t.sub)
-                .font(mono()),
-        );
+        col = col.push(text("(via proxy)").size(10).color(t.sub).font(mono()));
     }
     col.into()
 }
 
 fn arg_row<'a, M: 'a>(t: KaoTheme, arg: &'a DecodedArg) -> Element<'a, M> {
-    let name = arg
-        .name
-        .as_deref()
-        .unwrap_or(""); // bytecode introspection rarely has names
+    let name = arg.name.as_deref().unwrap_or(""); // bytecode introspection rarely has names
     let ty_label = ty_short(&arg.ty);
     let label = if name.is_empty() {
         format!("· {ty_label}")

@@ -57,7 +57,10 @@ fn header() -> &'static Header {
         let count = u32::from_le_bytes(BLOB[8..12].try_into().unwrap()) as usize;
         let strings_start = HEADER_LEN + count * INDEX_RECORD_LEN;
         assert!(BLOB.len() >= strings_start, "4byte.bin: truncated index");
-        Header { count, strings_start }
+        Header {
+            count,
+            strings_start,
+        }
     })
 }
 

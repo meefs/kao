@@ -18,8 +18,8 @@ pub fn main() -> iced::Result {
     // stays at warn so their per-request chatter doesn't spam stderr. Override
     // via RUST_LOG, e.g. `RUST_LOG=kao=debug` to see redacted addresses or
     // `RUST_LOG=kao=trace` to see raw addresses and per-token reads.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("kao=info,warn"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("kao=info,warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)

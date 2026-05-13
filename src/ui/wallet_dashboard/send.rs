@@ -15,6 +15,7 @@ use iced::keyboard;
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
+use super::home::format_symbol;
 use crate::decode::render::DecodedCall;
 use crate::ens;
 use crate::portfolio::LiveToken;
@@ -25,7 +26,6 @@ use crate::ui::kao_widgets::{
     secondary_button, text_input_style,
 };
 use crate::ui::wallet_dashboard::function_panel;
-use super::home::format_symbol;
 use crate::wallet::sim::{SimOutcome, SimulationResult, TokenTransfer};
 use crate::wallet::tx::{SendPlan, SendToken, TxQuote, parse_amount_units};
 use crate::wallet::{Contact, ContactsBook};
@@ -340,7 +340,10 @@ impl SendPane {
                             Err(msg) => Resolution::Error { name, msg },
                         };
                     }
-                    Resolution::AddressVerifying { pinned, name: pending } if pending == &name => {
+                    Resolution::AddressVerifying {
+                        pinned,
+                        name: pending,
+                    } if pending == &name => {
                         let pinned = *pinned;
                         self.resolution = match result {
                             Ok(Some(fresh)) if fresh == pinned => {
@@ -385,10 +388,7 @@ impl SendPane {
                 };
                 (
                     Task::none(),
-                    Some(Outcome::SaveAsContact {
-                        address: addr,
-                        ens,
-                    }),
+                    Some(Outcome::SaveAsContact { address: addr, ens }),
                 )
             }
             Message::SetAmount(s) => {
@@ -462,18 +462,13 @@ impl SendPane {
                 (Task::none(), None)
             }
             Message::CopyHash => match self.last_tx_hash {
-                Some(h) => (
-                    Task::none(),
-                    Some(Outcome::CopyText(format!("{h:#x}"))),
-                ),
+                Some(h) => (Task::none(), Some(Outcome::CopyText(format!("{h:#x}")))),
                 None => (Task::none(), None),
             },
             Message::CopyEtherscan => match self.last_tx_hash {
                 Some(h) => (
                     Task::none(),
-                    Some(Outcome::CopyText(format!(
-                        "https://etherscan.io/tx/{h:#x}"
-                    ))),
+                    Some(Outcome::CopyText(format!("https://etherscan.io/tx/{h:#x}"))),
                 ),
                 None => (Task::none(), None),
             },
@@ -667,7 +662,10 @@ impl SendPane {
                 match &recipient_name {
                     Some(name) => container(
                         row![
-                            text(format!("✓ {name}  ·  ")).size(11).color(t.up).font(bold()),
+                            text(format!("✓ {name}  ·  "))
+                                .size(11)
+                                .color(t.up)
+                                .font(bold()),
                             text(short_address_str(&format!("{addr:#x}")))
                                 .size(11)
                                 .color(t.sub)
@@ -677,17 +675,18 @@ impl SendPane {
                     )
                     .padding(Padding::from([4, 0]))
                     .into(),
-                    None => container(
-                        text("✓ valid address").size(11).color(t.up).font(bold()),
-                    )
-                    .padding(Padding::from([4, 0]))
-                    .into(),
+                    None => container(text("✓ valid address").size(11).color(t.up).font(bold()))
+                        .padding(Padding::from([4, 0]))
+                        .into(),
                 }
             }
             Resolution::AddressVerifying { pinned, name } => container(
                 column![
                     row![
-                        text(format!("✓ {name}  ·  ")).size(11).color(t.up).font(bold()),
+                        text(format!("✓ {name}  ·  "))
+                            .size(11)
+                            .color(t.up)
+                            .font(bold()),
                         text(short_address_str(&format!("{pinned:#x}")))
                             .size(11)
                             .color(t.sub)
@@ -702,7 +701,10 @@ impl SendPane {
             .into(),
             Resolution::Resolved { name, addr } => container(
                 row![
-                    text(format!("✓ {name} →  ")).size(11).color(t.up).font(bold()),
+                    text(format!("✓ {name} →  "))
+                        .size(11)
+                        .color(t.up)
+                        .font(bold()),
                     text(short_address_str(&format!("{addr:#x}")))
                         .size(11)
                         .color(t.sub)
@@ -736,12 +738,18 @@ impl SendPane {
             )
             .padding(Padding::from([4, 0]))
             .into(),
-            Resolution::EnsDivergence { name, pinned, fresh } => {
+            Resolution::EnsDivergence {
+                name,
+                pinned,
+                fresh,
+            } => {
                 let banner = column![
-                    text(format!("⚠ ENS “{name}” now resolves to a different address"))
-                        .size(12)
-                        .color(t.down)
-                        .font(bold()),
+                    text(format!(
+                        "⚠ ENS “{name}” now resolves to a different address"
+                    ))
+                    .size(12)
+                    .color(t.down)
+                    .font(bold()),
                     Space::new().height(4),
                     row![
                         text("pinned: ").size(11).color(t.sub),
@@ -758,8 +766,7 @@ impl SendPane {
                             .font(mono()),
                     ],
                     Space::new().height(6),
-                    secondary_button(t, "Use new address")
-                        .on_press(Message::AcceptEnsDivergence),
+                    secondary_button(t, "Use new address").on_press(Message::AcceptEnsDivergence),
                 ]
                 .spacing(2);
                 container(banner)
@@ -897,9 +904,14 @@ impl SendPane {
                 col.into()
             }
             None => column![
-                container(text("Recipient parse failed").size(13).color(t.down).font(bold()))
-                    .width(Length::Fill)
-                    .center_x(Length::Fill),
+                container(
+                    text("Recipient parse failed")
+                        .size(13)
+                        .color(t.down)
+                        .font(bold())
+                )
+                .width(Length::Fill)
+                .center_x(Length::Fill),
             ]
             .into(),
         };
@@ -924,8 +936,7 @@ impl SendPane {
 
         // Live amount validation. Rejects unparseable input, zero, and
         // amounts above balance.
-        let parsed_amount = token
-            .and_then(|tk| parse_amount_units(&self.amount, tk.decimals).ok());
+        let parsed_amount = token.and_then(|tk| parse_amount_units(&self.amount, tk.decimals).ok());
         let amount_valid = match (parsed_amount, token) {
             (Some(amt), Some(tk)) => !amt.is_zero() && amt <= tk.balance_raw,
             _ => false,
@@ -963,13 +974,12 @@ impl SendPane {
         .width(Length::Fill);
 
         let back_btn = secondary_button(t, "← Back").on_press(Message::Step(0));
-        let review_btn = primary_button(t, "Review →", amount_valid).on_press_maybe(
-            if amount_valid {
+        let review_btn =
+            primary_button(t, "Review →", amount_valid).on_press_maybe(if amount_valid {
                 Some(Message::Step(2))
             } else {
                 None
-            },
-        );
+            });
 
         let action_row = row![
             container(back_btn).width(Length::FillPortion(1)),
@@ -1057,10 +1067,14 @@ impl SendPane {
             row![
                 text("").size(11),
                 Space::new().width(Length::Fill),
-                text(format!("{} · chain {}", chain.display_name(), chain.chain_id()))
-                    .size(10)
-                    .color(t.sub)
-                    .font(mono()),
+                text(format!(
+                    "{} · chain {}",
+                    chain.display_name(),
+                    chain.chain_id()
+                ))
+                .size(10)
+                .color(t.sub)
+                .font(mono()),
             ]
             .width(Length::Fill),
         ]
@@ -1104,8 +1118,7 @@ impl SendPane {
         } else {
             match &self.quote {
                 Some(q) => {
-                    let eth_str = format_units(q.eth_cost_wei, 18u8)
-                        .unwrap_or_else(|_| "—".into());
+                    let eth_str = format_units(q.eth_cost_wei, 18u8).unwrap_or_else(|_| "—".into());
                     // Trim trailing zeros for display.
                     let eth_short = trim_eth_display(&eth_str);
                     let usd = portfolio
@@ -1151,11 +1164,9 @@ impl SendPane {
                         } else {
                             "Insufficient ETH on this chain to pay gas"
                         };
-                        container(
-                            text(label).size(12).color(t.down).font(bold()),
-                        )
-                        .padding(Padding::from([6, 0]))
-                        .into()
+                        container(text(label).size(12).color(t.down).font(bold()))
+                            .padding(Padding::from([6, 0]))
+                            .into()
                     }
                     _ => Space::new().height(0).into(),
                 }
@@ -1167,14 +1178,12 @@ impl SendPane {
         // Native ETH transfers return `None` from `function_panel::view`
         // and we keep the surrounding vertical rhythm consistent so the
         // review card doesn't pop when the panel lands.
-        let function_block: Element<'_, Message> = match function_panel::view::<Message>(
-            t,
-            self.decoded.as_deref(),
-            self.decoded_loading,
-        ) {
-            Some(panel) => column![Space::new().height(14), panel].spacing(0).into(),
-            None => Space::new().height(0).into(),
-        };
+        let function_block: Element<'_, Message> =
+            match function_panel::view::<Message>(t, self.decoded.as_deref(), self.decoded_loading)
+            {
+                Some(panel) => column![Space::new().height(14), panel].spacing(0).into(),
+                None => Space::new().height(0).into(),
+            };
 
         // Simulation block: revm preflight outcome. Rendered as part of
         // the review card whenever a quote is loaded; for the
@@ -1251,13 +1260,12 @@ impl SendPane {
         } else {
             "Confirm Send ✓"
         };
-        let confirm_btn = primary_button(t, confirm_label, confirm_enabled).on_press_maybe(
-            if confirm_enabled {
+        let confirm_btn =
+            primary_button(t, confirm_label, confirm_enabled).on_press_maybe(if confirm_enabled {
                 Some(Message::Confirm)
             } else {
                 None
-            },
-        );
+            });
 
         let action_row = row![
             container(back_btn).width(Length::FillPortion(1)),
@@ -1324,13 +1332,12 @@ impl SendPane {
             .width(Length::Fill)
             .center_x(Length::Fill);
 
-        let copy_btn = secondary_button(t, "Copy hash").on_press_maybe(
-            if self.last_tx_hash.is_some() {
+        let copy_btn =
+            secondary_button(t, "Copy hash").on_press_maybe(if self.last_tx_hash.is_some() {
                 Some(Message::CopyHash)
             } else {
                 None
-            },
-        );
+            });
         let etherscan_btn = secondary_button(t, "Copy Etherscan link").on_press_maybe(
             if self.last_tx_hash.is_some() {
                 Some(Message::CopyEtherscan)
@@ -1373,12 +1380,7 @@ impl SendPane {
 /// because it owns the `Contact` snapshot (the live book lives behind a
 /// shared `RwLock` and we don't want to hold a read guard across iced's
 /// widget construction).
-fn contact_row<'a>(
-    t: KaoTheme,
-    i: usize,
-    c: Contact,
-    current_input: &str,
-) -> Element<'a, Message> {
+fn contact_row<'a>(t: KaoTheme, i: usize, c: Contact, current_input: &str) -> Element<'a, Message> {
     let addr = c.address();
     let checksum = addr.to_checksum(None);
     let selected = current_input.eq_ignore_ascii_case(&checksum);
@@ -1537,10 +1539,7 @@ fn simulation_block<'a>(
             let header = row![
                 text(header_label).size(13).color(t.sub),
                 Space::new().width(Length::Fill),
-                text(badge_label)
-                    .size(11)
-                    .color(badge_color)
-                    .font(bold()),
+                text(badge_label).size(11).color(badge_color).font(bold()),
             ]
             .align_y(Alignment::Center)
             .width(Length::Fill);
@@ -1569,10 +1568,7 @@ fn simulation_block<'a>(
                 .padding(Padding::from([8, 12]))
                 .width(Length::Fill)
                 .style(move |_| container::Style {
-                    background: Some(Background::Color(Color {
-                        a: 0.10,
-                        ..t.down
-                    })),
+                    background: Some(Background::Color(Color { a: 0.10, ..t.down })),
                     border: Border {
                         color: t.down,
                         width: 1.0,

@@ -213,16 +213,17 @@ fn format_amount(tx: &IndexedTx, recv: bool) -> String {
 
 fn format_token_amount(tok: &TokenTransfer, recv: bool) -> String {
     let symbol = if tok.symbol.is_empty() {
-        if tok.is_nft { "NFT".to_string() } else { "tokens".to_string() }
+        if tok.is_nft {
+            "NFT".to_string()
+        } else {
+            "tokens".to_string()
+        }
     } else {
         tok.symbol.clone()
     };
     if tok.is_nft {
         // ERC-721: render as `SYMBOL #N` (or just `#N` for unknowns).
-        let id = tok
-            .token_id
-            .map(|id| format!("#{id}"))
-            .unwrap_or_default();
+        let id = tok.token_id.map(|id| format!("#{id}")).unwrap_or_default();
         let sign = if recv { "+" } else { "−" };
         return format!("{sign}{symbol} {id}").trim_end().to_string();
     }

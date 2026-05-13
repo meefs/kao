@@ -22,7 +22,7 @@ use crate::portfolio::{format_eth_balance, format_token_balance};
 use crate::chain::Chain;
 
 use super::{
-    Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
     parse_iso8601, redact_url_in_err,
 };
 
@@ -207,22 +207,38 @@ impl Indexer for BlockscoutClient {
                     .await
                     .map_err(|e| format!("blockscout transactions GET: {}", redact_url_in_err(e)))?
                     .error_for_status()
-                    .map_err(|e| format!("blockscout transactions status: {}", redact_url_in_err(e)))?
+                    .map_err(|e| {
+                        format!("blockscout transactions status: {}", redact_url_in_err(e))
+                    })?
                     .json::<TxListResponse>()
                     .await
-                    .map_err(|e| format!("blockscout transactions decode: {}", redact_url_in_err(e)))
+                    .map_err(|e| {
+                        format!("blockscout transactions decode: {}", redact_url_in_err(e))
+                    })
             },
             async {
                 client
                     .get(&token_url)
                     .send()
                     .await
-                    .map_err(|e| format!("blockscout token-transfers GET: {}", redact_url_in_err(e)))?
+                    .map_err(|e| {
+                        format!("blockscout token-transfers GET: {}", redact_url_in_err(e))
+                    })?
                     .error_for_status()
-                    .map_err(|e| format!("blockscout token-transfers status: {}", redact_url_in_err(e)))?
+                    .map_err(|e| {
+                        format!(
+                            "blockscout token-transfers status: {}",
+                            redact_url_in_err(e)
+                        )
+                    })?
                     .json::<TokenTransfersResponse>()
                     .await
-                    .map_err(|e| format!("blockscout token-transfers decode: {}", redact_url_in_err(e)))
+                    .map_err(|e| {
+                        format!(
+                            "blockscout token-transfers decode: {}",
+                            redact_url_in_err(e)
+                        )
+                    })
             },
         )
         .await;
@@ -311,11 +327,7 @@ fn convert_tx(r: RawTx, owner: Address) -> Option<IndexedTx> {
     Some(IndexedTx {
         hash,
         block_number: r.block_number.unwrap_or(0),
-        timestamp: r
-            .timestamp
-            .as_deref()
-            .map(parse_iso8601)
-            .unwrap_or(0),
+        timestamp: r.timestamp.as_deref().map(parse_iso8601).unwrap_or(0),
         from,
         to,
         value,
@@ -354,11 +366,7 @@ fn convert_token_transfer(r: RawTokenTransfer, owner: Address) -> Option<Indexed
     Some(IndexedTx {
         hash,
         block_number: r.block_number.unwrap_or(0),
-        timestamp: r
-            .timestamp
-            .as_deref()
-            .map(parse_iso8601)
-            .unwrap_or(0),
+        timestamp: r.timestamp.as_deref().map(parse_iso8601).unwrap_or(0),
         from,
         to,
         value: U256::ZERO,
@@ -448,12 +456,7 @@ fn parse_balances(detail: AddressDetail, rows: Vec<TokenBalanceRow>) -> Vec<Inde
         if row.token_id.is_some() {
             continue;
         }
-        if row
-            .token
-            .kind
-            .as_deref()
-            .is_some_and(|k| k != "ERC-20")
-        {
+        if row.token.kind.as_deref().is_some_and(|k| k != "ERC-20") {
             continue;
         }
         let Some(contract) = parse_address(&row.token.address_hash) else {

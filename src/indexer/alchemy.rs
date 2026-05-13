@@ -19,7 +19,7 @@ use crate::chain::Chain;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
-    Indexer, IndexedToken, IndexedTx, TokenTransfer, TxStatus, classify_direction, http_client,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
     parse_iso8601, redact_url_in_err,
 };
 
@@ -245,8 +245,18 @@ impl Indexer for AlchemyClient {
             Result<AssetTransfersResult, String>,
             Result<AssetTransfersResult, String>,
         ) = futures::future::join(
-            rpc(&url, "alchemy_getAssetTransfers", from_params, "alchemy transfers (sent)"),
-            rpc(&url, "alchemy_getAssetTransfers", to_params, "alchemy transfers (received)"),
+            rpc(
+                &url,
+                "alchemy_getAssetTransfers",
+                from_params,
+                "alchemy transfers (sent)",
+            ),
+            rpc(
+                &url,
+                "alchemy_getAssetTransfers",
+                to_params,
+                "alchemy transfers (received)",
+            ),
         )
         .await;
 
@@ -393,8 +403,7 @@ fn parse_portfolio(tokens: Vec<PortfolioToken>) -> Vec<IndexedToken> {
 
 fn convert_transfer(t: RawTransfer, owner: Address) -> Option<IndexedTx> {
     let hash = B256::from_str(&t.hash).ok()?;
-    let block_number =
-        u64::from_str_radix(t.block_num.trim_start_matches("0x"), 16).unwrap_or(0);
+    let block_number = u64::from_str_radix(t.block_num.trim_start_matches("0x"), 16).unwrap_or(0);
     let from = t.from.as_deref().and_then(|s| Address::from_str(s).ok())?;
     let to = t.to.as_deref().and_then(|s| Address::from_str(s).ok());
     let raw_amount = t
@@ -492,7 +501,9 @@ mod tests {
 
     #[test]
     fn convert_transfer_decodes_hex_block_and_value() {
-        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap();
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
         let raw: RawTransfer = serde_json::from_str(
             r#"{
                 "hash": "0x4444444444444444444444444444444444444444444444444444444444444444",
@@ -516,7 +527,9 @@ mod tests {
 
     #[test]
     fn convert_transfer_attaches_erc20_token_details() {
-        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045".parse().unwrap();
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
         // 5 USDC (6 decimals) from owner to BEEF.
         let raw: RawTransfer = serde_json::from_str(
             r#"{
@@ -549,7 +562,8 @@ mod tests {
 
     #[test]
     fn rpc_response_decodes_error_envelope() {
-        let json = r#"{ "jsonrpc": "2.0", "id": 1, "error": { "code": -32600, "message": "boom" } }"#;
+        let json =
+            r#"{ "jsonrpc": "2.0", "id": 1, "error": { "code": -32600, "message": "boom" } }"#;
         let resp: RpcResponse<Value> = serde_json::from_str(json).unwrap();
         assert!(resp.result.is_none());
         assert!(resp.error.is_some());

@@ -24,7 +24,9 @@ pub enum UnlockError {
     /// The wallet file exists but the OS keyring has no record for it on
     /// this machine. Could be a legitimate restore from backup OR an
     /// attacker who copied the file — the user must explicitly resolve.
-    KeyringMissingEntry { file_epoch: u64 },
+    KeyringMissingEntry {
+        file_epoch: u64,
+    },
     /// Anything else worth showing verbatim (KeyringUnavailable,
     /// Rollback, IO, …). Pre-formatted so the view doesn't have to
     /// pattern-match on `WalletError`.
@@ -152,7 +154,9 @@ impl UnlockScreen {
                 self.error = Some(msg);
                 (Task::none(), None)
             }
-            Message::KeyringWarningAccept => (self.try_unlock(LoadMode::AcceptingKeyringReset), None),
+            Message::KeyringWarningAccept => {
+                (self.try_unlock(LoadMode::AcceptingKeyringReset), None)
+            }
             Message::KeyringWarningQuit => (iced::exit(), None),
             Message::KeyringWarningDismiss => {
                 self.keyring_warning = None;
@@ -313,8 +317,7 @@ impl UnlockScreen {
             // quit" policy.
             primary_button(t, "Quit", true).on_press(Message::KeyringWarningQuit),
             vspace(10),
-            secondary_button(t, "Accept and unlock anyway")
-                .on_press(Message::KeyringWarningAccept),
+            secondary_button(t, "Accept and unlock anyway").on_press(Message::KeyringWarningAccept),
         ]
         .width(Length::Fill)
         .align_x(Alignment::Center);

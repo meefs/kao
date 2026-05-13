@@ -276,11 +276,7 @@ fn parse(text: &str) -> State {
 /// (which leaves L2 unconfigured) doesn't write `rpcs_base = []` lines that
 /// hint at functionality the user hasn't opted into.
 fn nonempty(v: &[String]) -> Option<Vec<String>> {
-    if v.is_empty() {
-        None
-    } else {
-        Some(v.to_vec())
-    }
+    if v.is_empty() { None } else { Some(v.to_vec()) }
 }
 
 /// Pure serializer: emit TOML for a `State`. Mirrors `parse` — `auto_checkpoint`
@@ -669,9 +665,8 @@ mod tests {
     fn parse_legacy_flat_rpcs_seeds_only_mainnet_slot() {
         // Pre-L2 configs only carry `rpcs` / `consensus_rpcs` — those keys
         // must continue to populate Mainnet and leave L2 slots empty.
-        let s = parse(
-            "rpcs = [\"https://eth.example\"]\nconsensus_rpcs = [\"https://cl.example\"]\n",
-        );
+        let s =
+            parse("rpcs = [\"https://eth.example\"]\nconsensus_rpcs = [\"https://cl.example\"]\n");
         assert_eq!(
             s.rpcs.get(Chain::Mainnet),
             &vec!["https://eth.example".to_string()]

@@ -43,8 +43,7 @@ pub fn parse_amount_units(amount: &str, decimals: u8) -> Result<U256, String> {
     if trimmed.is_empty() {
         return Err("empty amount".into());
     }
-    let parsed = parse_units(trimmed, decimals)
-        .map_err(|e| format!("invalid amount: {e}"))?;
+    let parsed = parse_units(trimmed, decimals).map_err(|e| format!("invalid amount: {e}"))?;
     let value: U256 = parsed.into();
     Ok(value)
 }

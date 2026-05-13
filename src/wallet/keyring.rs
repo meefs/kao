@@ -238,7 +238,10 @@ mod tests {
     fn read_missing_returns_none() {
         test_support::install();
         let got = read_secret("test_read_missing").unwrap();
-        assert!(got.is_none(), "expected None for unwritten entry, got {got:?}");
+        assert!(
+            got.is_none(),
+            "expected None for unwritten entry, got {got:?}"
+        );
     }
 
     #[test]
@@ -328,7 +331,10 @@ mod tests {
         let mapped = map_err(keyring::Error::NoEntry);
         match mapped {
             KeyringError::Backend(msg) => {
-                assert!(msg.contains("NoEntry"), "expected NoEntry breadcrumb, got: {msg}");
+                assert!(
+                    msg.contains("NoEntry"),
+                    "expected NoEntry breadcrumb, got: {msg}"
+                );
             }
             other => panic!("expected Backend, got {other:?}"),
         }

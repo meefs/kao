@@ -63,13 +63,12 @@ use crate::indexer::IndexedTx;
 use crate::net::{BalanceFetcher, VerificationStatus};
 use crate::portfolio::{LiveToken, PortfolioCache};
 use crate::settings::{self, IndexerProvider};
-use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_theme::with_alpha;
+use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::{fill_style, mono};
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
-    AccountDescriptor, Contact, ContactsBook, KaoSigner, SignerHandoff, handoff_with,
-    short_address,
+    AccountDescriptor, Contact, ContactsBook, KaoSigner, SignerHandoff, handoff_with, short_address,
 };
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -163,7 +162,9 @@ pub enum Message {
     /// nothing and returns. Otherwise it kicks the ownership-check
     /// `clipboard::read` so we don't clobber unrelated content the user
     /// copied after the wallet's copy.
-    ClipboardClearArmed { generation: u64 },
+    ClipboardClearArmed {
+        generation: u64,
+    },
     /// Result of the ownership check. Clears the system clipboard only
     /// when its current contents still match what the wallet wrote
     /// (guards against the user copying a phone number five seconds
@@ -208,7 +209,6 @@ enum SettingsPane {
     Appearance,
     Contacts(ContactsPane),
 }
-
 
 #[derive(Debug)]
 pub struct WalletScreen {
@@ -500,12 +500,13 @@ impl WalletScreen {
                             );
                             match network.provider(chain).await {
                                 Some(p) => crate::indexer::onchain::fetch_onchain_history(
-                                    &p, address, chain, HISTORY_LIMIT,
+                                    &p,
+                                    address,
+                                    chain,
+                                    HISTORY_LIMIT,
                                 )
                                 .await
-                                .map_err(|e| {
-                                    format!("indexer: {primary_err}; on-chain: {e}")
-                                }),
+                                .map_err(|e| format!("indexer: {primary_err}; on-chain: {e}")),
                                 None => Err(primary_err),
                             }
                         }
@@ -529,7 +530,11 @@ impl WalletScreen {
                     );
                     (address, chain, result)
                 },
-                |(address, chain, result)| Message::HistoryFetched { address, chain, result },
+                |(address, chain, result)| Message::HistoryFetched {
+                    address,
+                    chain,
+                    result,
+                },
             ));
         }
         Task::batch(tasks)
@@ -629,8 +634,10 @@ impl WalletScreen {
                     );
                     (address, chain, result)
                 },
-                |(address, chain, result)| {
-                    Message::PortfolioFetched { address, chain, result }
+                |(address, chain, result)| Message::PortfolioFetched {
+                    address,
+                    chain,
+                    result,
                 },
             ));
         }
@@ -679,16 +686,21 @@ impl WalletScreen {
             Message::VerificationRefreshed => {
                 self.verification = self.network.last_status(crate::chain::Chain::Mainnet);
             }
-            Message::PortfolioFetched { address, chain, result } => {
+            Message::PortfolioFetched {
+                address,
+                chain,
+                result,
+            } => {
                 // Always write the (address, chain) we issued the fetch
                 // for into the cache — it's still the correct slot for
                 // that account's data even if the user has since
                 // switched away. Only the live portfolio merge is gated
                 // on `address == self.address`.
                 if let Ok(tokens) = &result
-                    && let Ok(mut cache) = self.portfolio_cache.lock() {
-                        cache.insert((address, chain), tokens.clone());
-                    }
+                    && let Ok(mut cache) = self.portfolio_cache.lock()
+                {
+                    cache.insert((address, chain), tokens.clone());
+                }
                 if address != self.address {
                     return (Task::none(), None);
                 }
@@ -726,7 +738,11 @@ impl WalletScreen {
                     ),
                 }
             }
-            Message::HistoryFetched { address, chain, result } => {
+            Message::HistoryFetched {
+                address,
+                chain,
+                result,
+            } => {
                 if address != self.address {
                     return (Task::none(), None);
                 }
@@ -818,7 +834,10 @@ impl WalletScreen {
                 // the token tabs and Max button work off fresh numbers
                 // instead of whatever was last cached.
                 return (
-                    Task::batch([self.refresh_verification_task(), self.fetch_portfolio_task()]),
+                    Task::batch([
+                        self.refresh_verification_task(),
+                        self.fetch_portfolio_task(),
+                    ]),
                     None,
                 );
             }
@@ -869,11 +888,8 @@ impl WalletScreen {
                             p.quote_started();
                             let decode_seq = p.decode_started();
                             let quote_task = spawn_quote_task(self.network.clone(), pl.clone());
-                            let decode_task = spawn_decode_task(
-                                self.network.clone(),
-                                decode_seq,
-                                pl,
-                            );
+                            let decode_task =
+                                spawn_decode_task(self.network.clone(), decode_seq, pl);
                             Task::batch([quote_task, decode_task])
                         }
                         None => Task::none(),
@@ -913,10 +929,8 @@ impl WalletScreen {
                         // behind so the dashboard view doesn't crash if
                         // it dereferences the signer's address while the
                         // task is running. self.address stays correct.
-                        let signer = mem::replace(
-                            &mut self.signer,
-                            KaoSigner::ViewOnly(self.address),
-                        );
+                        let signer =
+                            mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
                         let handoff = handoff_with(signer);
                         let pre_task =
                             spawn_broadcast_task(self.network.clone(), handoff, plan, quote);
@@ -964,10 +978,7 @@ impl WalletScreen {
                         // here and forward it to ourselves on the next
                         // tick rather than inlining the body to keep
                         // the two entry points behaviourally identical.
-                        let open_task = Task::done(Message::OpenContactsPaneWith {
-                            address,
-                            ens,
-                        });
+                        let open_task = Task::done(Message::OpenContactsPaneWith { address, ens });
                         return (Task::batch([task, ens_task, open_task]), None);
                     }
                     None => return (Task::batch([task, ens_task]), None),
@@ -1232,11 +1243,9 @@ impl WalletScreen {
                 // that hasn't been resolved yet, and spawn a task tagged
                 // with the pane's seq so stale results are dropped.
                 let ens_task = match p.take_pending_ens() {
-                    Some((seq, name)) => spawn_contacts_ens_resolve_task(
-                        self.network.clone(),
-                        seq,
-                        name,
-                    ),
+                    Some((seq, name)) => {
+                        spawn_contacts_ens_resolve_task(self.network.clone(), seq, name)
+                    }
                     None => Task::none(),
                 };
                 let task = task.map(Message::Contacts);
@@ -1413,7 +1422,6 @@ impl WalletScreen {
         }
     }
 
-
     // ── Send-flow helpers used by the broadcast Tasks ──────────────────────
 
     // ── Main pane (header + body) ──────────────────────────────────────────
@@ -1481,8 +1489,6 @@ impl WalletScreen {
         .height(Length::Fill)
         .into()
     }
-
-
 }
 
 // ── Clipboard auto-clear chip ──────────────────────────────────────────────
@@ -1492,10 +1498,7 @@ impl WalletScreen {
 /// below. The bar drains as time elapses; when the bar reaches zero
 /// the `ClipboardClearArmed` task fires, the ownership check runs, and
 /// the clipboard is cleared if its contents still match what we wrote.
-fn clipboard_clear_chip<'a>(
-    t: KaoTheme,
-    state: &'a ClipboardClearState,
-) -> Element<'a, Message> {
+fn clipboard_clear_chip<'a>(t: KaoTheme, state: &'a ClipboardClearState) -> Element<'a, Message> {
     let now = Instant::now();
     let total = Duration::from_secs(CLIPBOARD_CLEAR_SECS);
     let remaining = state.deadline.saturating_duration_since(now);
@@ -1549,8 +1552,7 @@ fn clipboard_clear_chip<'a>(
 
     let card = container(
         column![
-            row![text("📋").size(11), Space::new().width(6), label]
-                .align_y(Alignment::Center),
+            row![text("📋").size(11), Space::new().width(6), label].align_y(Alignment::Center),
             Space::new().height(6),
             bar,
         ]
@@ -1672,22 +1674,13 @@ fn spawn_contacts_ens_resolve_task(
 /// matcher, and humanizes the resulting args. Result message carries
 /// `seq` so the SendPane can drop stale completions if the user backed
 /// out of review and built a different plan.
-fn spawn_decode_task(
-    network: Arc<dyn BalanceFetcher>,
-    seq: u64,
-    plan: SendPlan,
-) -> Task<Message> {
+fn spawn_decode_task(network: Arc<dyn BalanceFetcher>, seq: u64, plan: SendPlan) -> Task<Message> {
     let (to, _value, calldata) = plan.tx_target();
     let chain = plan.chain;
     Task::perform(
         async move {
-            let decoded = crate::decode::render::decode_call(
-                network.as_ref(),
-                chain,
-                to,
-                calldata,
-            )
-            .await;
+            let decoded =
+                crate::decode::render::decode_call(network.as_ref(), chain, to, calldata).await;
             (seq, decoded)
         },
         |(seq, decoded)| {
@@ -1703,10 +1696,7 @@ fn spawn_decode_task(
 /// `Task` that resolves to a `Send::QuoteFetched(...)` message. The
 /// provider is selected by `plan.chain` so an L2 send hits the L2 RPC,
 /// not mainnet.
-fn spawn_quote_task(
-    network: Arc<dyn BalanceFetcher>,
-    plan: SendPlan,
-) -> Task<Message> {
+fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, plan: SendPlan) -> Task<Message> {
     let chain = plan.chain;
     Task::perform(
         async move {
@@ -1762,8 +1752,7 @@ fn spawn_broadcast_task(
                     return Err("signer not available".into());
                 }
             };
-            let result =
-                crate::wallet::tx::sign_and_send(&provider, &signer, plan, quote).await;
+            let result = crate::wallet::tx::sign_and_send(&provider, &signer, plan, quote).await;
             // Put the signer back so the dashboard can reclaim it.
             if let Ok(mut g) = inner.lock() {
                 *g = Some(signer);
@@ -1929,7 +1918,10 @@ mod tests {
         assert_eq!(trim_trailing_decimal_zeros("0.500000000000000000"), "0.5");
         assert_eq!(trim_trailing_decimal_zeros("0.000000000000000000"), "0");
         // Non-trailing zeros and integer-only inputs are preserved.
-        assert_eq!(trim_trailing_decimal_zeros("0.123456789012"), "0.123456789012");
+        assert_eq!(
+            trim_trailing_decimal_zeros("0.123456789012"),
+            "0.123456789012"
+        );
         assert_eq!(trim_trailing_decimal_zeros("42"), "42");
     }
 }

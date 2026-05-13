@@ -25,9 +25,7 @@ use crate::ui::kao_widgets::{
     kao_scrollable_style, link_button, mono, mono_bold, primary_button, screen_subtitle,
     screen_title, vspace,
 };
-use crate::wallet::{
-    AccountDescriptor, KaoSigner, LedgerHdPath, SignerHandoff, handoff_with,
-};
+use crate::wallet::{AccountDescriptor, KaoSigner, LedgerHdPath, SignerHandoff, handoff_with};
 
 const PROBE_COUNT: u32 = 5;
 
@@ -196,13 +194,10 @@ impl ConnectLedgerScreen {
                 (
                     Task::perform(
                         async move {
-                            LedgerSigner::new(
-                                LedgerHdPath::LedgerLive(hd_index).to_alloy(),
-                                None,
-                            )
-                            .await
-                            .map(|s| handoff_with(KaoSigner::Ledger(s)))
-                            .map_err(|e| e.to_string())
+                            LedgerSigner::new(LedgerHdPath::LedgerLive(hd_index).to_alloy(), None)
+                                .await
+                                .map(|s| handoff_with(KaoSigner::Ledger(s)))
+                                .map_err(|e| e.to_string())
                         },
                         Message::SignerBuilt,
                     ),

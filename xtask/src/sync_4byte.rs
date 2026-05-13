@@ -206,7 +206,10 @@ mod tests {
     #[test]
     fn header_layout() {
         let mut entries: BTreeMap<[u8; 4], Vec<String>> = BTreeMap::new();
-        entries.insert([0xa9, 0x05, 0x9c, 0xbb], vec!["transfer(address,uint256)".into()]);
+        entries.insert(
+            [0xa9, 0x05, 0x9c, 0xbb],
+            vec!["transfer(address,uint256)".into()],
+        );
         let blob = encode(&entries).unwrap();
         assert_eq!(&blob[0..4], MAGIC);
         assert_eq!(u32::from_le_bytes(blob[4..8].try_into().unwrap()), VERSION);

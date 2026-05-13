@@ -129,11 +129,7 @@ pub trait BalanceFetcher: Send + Sync + std::fmt::Debug {
     /// Does not touch `last_status`; that badge tracks balance reads
     /// only, otherwise the verification badge would flicker with every
     /// proxy walk.
-    async fn get_code(
-        &self,
-        addr: Address,
-        chain: Chain,
-    ) -> Result<VerifiedRead<Bytes>, String>;
+    async fn get_code(&self, addr: Address, chain: Chain) -> Result<VerifiedRead<Bytes>, String>;
     /// Verified storage slot read. Same fallback / verification shape as
     /// `get_code`. Used by the proxy walker to follow EIP-1967 / beacon
     /// implementation pointers.
@@ -389,9 +385,7 @@ impl NetworkClient {
     }
 
     fn set_status(&self, chain: Chain, s: VerificationStatus) {
-        self.statuses
-            .get(chain)
-            .store(s.as_u8(), Ordering::Relaxed);
+        self.statuses.get(chain).store(s.as_u8(), Ordering::Relaxed);
     }
 
     fn state_for(&self, chain: Chain) -> &Mutex<ChainState> {
@@ -412,10 +406,16 @@ impl NetworkClient {
         }
 
         if snapshot.rpcs.is_empty() {
-            return Err(format!("no execution RPCs configured for {}", chain.label()));
+            return Err(format!(
+                "no execution RPCs configured for {}",
+                chain.label()
+            ));
         }
         if snapshot.consensus_rpcs.is_empty() {
-            return Err(format!("no consensus RPCs configured for {}", chain.label()));
+            return Err(format!(
+                "no consensus RPCs configured for {}",
+                chain.label()
+            ));
         }
         let chosen_exec = pick_rpc(&snapshot.rpcs);
         // Build the raw fallback provider eagerly against the same URL
@@ -580,17 +580,16 @@ impl BalanceFetcher for NetworkClient {
         Some(provider)
     }
 
-    async fn get_code(
-        &self,
-        addr: Address,
-        chain: Chain,
-    ) -> Result<VerifiedRead<Bytes>, String> {
+    async fn get_code(&self, addr: Address, chain: Chain) -> Result<VerifiedRead<Bytes>, String> {
         if self.in_cooldown(chain).await {
             return self.fallback_get_code(addr, chain).await;
         }
         match self.get(chain).await {
             Ok(client) => match client.get_code(addr, BlockId::latest()).await {
-                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Ok(value) => Ok(VerifiedRead {
+                    value,
+                    verified: true,
+                }),
                 Err(e) => {
                     debug!(
                         chain = %chain.label(),
@@ -625,7 +624,10 @@ impl BalanceFetcher for NetworkClient {
         }
         match self.get(chain).await {
             Ok(client) => match client.get_storage_at(addr, slot, BlockId::latest()).await {
-                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Ok(value) => Ok(VerifiedRead {
+                    value,
+                    verified: true,
+                }),
                 Err(e) => {
                     debug!(
                         chain = %chain.label(),
@@ -660,7 +662,10 @@ impl BalanceFetcher for NetworkClient {
         }
         match self.get(chain).await {
             Ok(client) => match client.call(to, data.clone(), BlockId::latest()).await {
-                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Ok(value) => Ok(VerifiedRead {
+                    value,
+                    verified: true,
+                }),
                 Err(e) => {
                     debug!(
                         chain = %chain.label(),
@@ -694,7 +699,10 @@ impl BalanceFetcher for NetworkClient {
         }
         match self.get(chain).await {
             Ok(client) => match client.get_balance(addr, BlockId::latest()).await {
-                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Ok(value) => Ok(VerifiedRead {
+                    value,
+                    verified: true,
+                }),
                 Err(e) => {
                     debug!(
                         chain = %chain.label(),
@@ -728,7 +736,10 @@ impl BalanceFetcher for NetworkClient {
         }
         match self.get(chain).await {
             Ok(client) => match client.get_nonce(addr, BlockId::latest()).await {
-                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Ok(value) => Ok(VerifiedRead {
+                    value,
+                    verified: true,
+                }),
                 Err(e) => {
                     debug!(
                         chain = %chain.label(),
@@ -758,7 +769,10 @@ impl BalanceFetcher for NetworkClient {
         }
         match self.get(chain).await {
             Ok(client) => match client.latest_block().await {
-                Ok(value) => Ok(VerifiedRead { value, verified: true }),
+                Ok(value) => Ok(VerifiedRead {
+                    value,
+                    verified: true,
+                }),
                 Err(e) => {
                     debug!(
                         chain = %chain.label(),
@@ -796,7 +810,10 @@ impl NetworkClient {
         provider
             .get_code_at(addr)
             .await
-            .map(|value| VerifiedRead { value, verified: false })
+            .map(|value| VerifiedRead {
+                value,
+                verified: false,
+            })
             .map_err(|e| {
                 debug!(
                     chain = %chain.label(),
@@ -853,7 +870,10 @@ impl NetworkClient {
         provider
             .call(req)
             .await
-            .map(|value| VerifiedRead { value, verified: false })
+            .map(|value| VerifiedRead {
+                value,
+                verified: false,
+            })
             .map_err(|e| {
                 debug!(
                     chain = %chain.label(),
@@ -874,7 +894,10 @@ impl NetworkClient {
         provider
             .get_balance(addr)
             .await
-            .map(|value| VerifiedRead { value, verified: false })
+            .map(|value| VerifiedRead {
+                value,
+                verified: false,
+            })
             .map_err(|e| {
                 debug!(
                     chain = %chain.label(),
@@ -898,7 +921,10 @@ impl NetworkClient {
         provider
             .get_transaction_count(addr)
             .await
-            .map(|value| VerifiedRead { value, verified: false })
+            .map(|value| VerifiedRead {
+                value,
+                verified: false,
+            })
             .map_err(|e| {
                 debug!(
                     chain = %chain.label(),
@@ -941,7 +967,10 @@ impl NetworkClient {
             beneficiary: block.header.inner.beneficiary,
             excess_blob_gas: block.header.inner.excess_blob_gas,
         };
-        Ok(VerifiedRead { value: header, verified: false })
+        Ok(VerifiedRead {
+            value: header,
+            verified: false,
+        })
     }
 
     /// Resolve the cached fallback provider for `chain`. Used by every
@@ -1118,10 +1147,9 @@ async fn build_op_backend(
     // OpStackClientBuilder's `.execution_rpc(...)` / `.consensus_rpc(...)`
     // panic on URL parse failure inside the helios crate. Pre-parse here
     // so a malformed URL surfaces as a Result error, not an abort.
-    let exec_url = url::Url::parse(execution_rpc)
-        .map_err(|e| format!("execution rpc url: {e}"))?;
-    let consensus_url = url::Url::parse(consensus_rpc)
-        .map_err(|e| format!("consensus rpc url: {e}"))?;
+    let exec_url = url::Url::parse(execution_rpc).map_err(|e| format!("execution rpc url: {e}"))?;
+    let consensus_url =
+        url::Url::parse(consensus_rpc).map_err(|e| format!("consensus rpc url: {e}"))?;
     let client = OpStackClientBuilder::new()
         .network(op_network)
         .execution_rpc(exec_url)
@@ -1206,12 +1234,11 @@ impl BalanceFetcher for MockFetcher {
         None
     }
 
-    async fn get_code(
-        &self,
-        _addr: Address,
-        _chain: Chain,
-    ) -> Result<VerifiedRead<Bytes>, String> {
-        Ok(VerifiedRead { value: Bytes::new(), verified: true })
+    async fn get_code(&self, _addr: Address, _chain: Chain) -> Result<VerifiedRead<Bytes>, String> {
+        Ok(VerifiedRead {
+            value: Bytes::new(),
+            verified: true,
+        })
     }
 
     async fn get_storage_at(
@@ -1220,7 +1247,10 @@ impl BalanceFetcher for MockFetcher {
         _slot: U256,
         _chain: Chain,
     ) -> Result<VerifiedRead<B256>, String> {
-        Ok(VerifiedRead { value: B256::ZERO, verified: true })
+        Ok(VerifiedRead {
+            value: B256::ZERO,
+            verified: true,
+        })
     }
 
     async fn call(
@@ -1229,7 +1259,10 @@ impl BalanceFetcher for MockFetcher {
         _data: Bytes,
         _chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String> {
-        Ok(VerifiedRead { value: Bytes::new(), verified: true })
+        Ok(VerifiedRead {
+            value: Bytes::new(),
+            verified: true,
+        })
     }
 
     async fn get_balance_raw(
@@ -1237,7 +1270,10 @@ impl BalanceFetcher for MockFetcher {
         _addr: Address,
         _chain: Chain,
     ) -> Result<VerifiedRead<U256>, String> {
-        Ok(VerifiedRead { value: U256::ZERO, verified: true })
+        Ok(VerifiedRead {
+            value: U256::ZERO,
+            verified: true,
+        })
     }
 
     async fn get_transaction_count(
@@ -1245,7 +1281,10 @@ impl BalanceFetcher for MockFetcher {
         _addr: Address,
         _chain: Chain,
     ) -> Result<VerifiedRead<u64>, String> {
-        Ok(VerifiedRead { value: 0, verified: true })
+        Ok(VerifiedRead {
+            value: 0,
+            verified: true,
+        })
     }
 
     async fn latest_block(&self, _chain: Chain) -> Result<VerifiedRead<LatestBlock>, String> {

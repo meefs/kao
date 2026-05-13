@@ -250,17 +250,17 @@ pub async fn decode_call(
     out.args = humanized;
 
     // Heuristic warnings.
-    if matches!(out.state, ResolutionState::Resolved | ResolutionState::Ambiguous)
-        && out.function_name.as_deref() == Some("approve")
+    if matches!(
+        out.state,
+        ResolutionState::Resolved | ResolutionState::Ambiguous
+    ) && out.function_name.as_deref() == Some("approve")
         && out.args.len() == 2
         && let ArgDisplay::Address { addr: spender, .. } = out.args[0].display
         && let ArgDisplay::Uint { raw, .. } = &out.args[1].display
         && *raw == U256::MAX
     {
-        out.warnings.push(Warning::InfiniteApproval {
-            spender,
-            token: to,
-        });
+        out.warnings
+            .push(Warning::InfiniteApproval { spender, token: to });
     }
     if !out.all_verified {
         out.warnings.push(Warning::UnverifiedBytecode);
@@ -306,10 +306,7 @@ async fn humanize_arg(
             // a second verification layer here.
             let ens = if matches!(chain, Chain::Mainnet) {
                 match net.provider(chain).await {
-                    Some(provider) => ens::lookup_address(&provider, *addr)
-                        .await
-                        .ok()
-                        .flatten(),
+                    Some(provider) => ens::lookup_address(&provider, *addr).await.ok().flatten(),
                     None => None,
                 }
             } else {
@@ -324,7 +321,10 @@ async fn humanize_arg(
                     .unwrap_or_else(|_| raw.to_string()),
                 None => raw.to_string(),
             };
-            ArgDisplay::Uint { raw: *raw, formatted }
+            ArgDisplay::Uint {
+                raw: *raw,
+                formatted,
+            }
         }
         DynSolValue::Int(raw, _) => ArgDisplay::Int {
             raw: *raw,
@@ -427,7 +427,11 @@ async fn call_decode_u8(
     }
     let last = raw[31];
     // Sanity bound: a legitimate token decimals is ≤ ~30.
-    if last > 36 { None } else { Some((last, verified)) }
+    if last > 36 {
+        None
+    } else {
+        Some((last, verified))
+    }
 }
 
 /// Suppress dead-code warnings until pipeline.rs is wired into Phase 7.

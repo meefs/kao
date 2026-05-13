@@ -81,9 +81,7 @@ impl ContactsBook {
     }
 
     pub fn get_by_addr(&self, addr: Address) -> Option<&Contact> {
-        self.by_addr
-            .get(&addr)
-            .and_then(|i| self.contacts.get(*i))
+        self.by_addr.get(&addr).and_then(|i| self.contacts.get(*i))
     }
 
     pub fn iter(&self) -> std::slice::Iter<'_, Contact> {
@@ -169,19 +167,10 @@ mod tests {
 
     #[test]
     fn from_vec_populates_lookup() {
-        let book = ContactsBook::from_vec(vec![
-            contact(0x01, "A"),
-            contact(0x02, "B"),
-        ]);
+        let book = ContactsBook::from_vec(vec![contact(0x01, "A"), contact(0x02, "B")]);
         assert_eq!(book.len(), 2);
-        assert_eq!(
-            book.name_for(Address::from([0x01; 20])),
-            Some("A"),
-        );
-        assert_eq!(
-            book.name_for(Address::from([0x02; 20])),
-            Some("B"),
-        );
+        assert_eq!(book.name_for(Address::from([0x01; 20])), Some("A"),);
+        assert_eq!(book.name_for(Address::from([0x02; 20])), Some("B"),);
         assert!(book.name_for(Address::from([0xff; 20])).is_none());
     }
 
@@ -192,10 +181,7 @@ mod tests {
         book.upsert(contact(0x01, "A renamed"));
         // Still one entry — same address replaces in place.
         assert_eq!(book.len(), 1);
-        assert_eq!(
-            book.name_for(Address::from([0x01; 20])),
-            Some("A renamed"),
-        );
+        assert_eq!(book.name_for(Address::from([0x01; 20])), Some("A renamed"),);
     }
 
     #[test]
@@ -210,14 +196,8 @@ mod tests {
         assert!(book.name_for(Address::from([0x02; 20])).is_none());
         // Lookups for the remaining contacts still resolve correctly even
         // though their indices shifted.
-        assert_eq!(
-            book.name_for(Address::from([0x01; 20])),
-            Some("A"),
-        );
-        assert_eq!(
-            book.name_for(Address::from([0x03; 20])),
-            Some("C"),
-        );
+        assert_eq!(book.name_for(Address::from([0x01; 20])), Some("A"),);
+        assert_eq!(book.name_for(Address::from([0x03; 20])), Some("C"),);
     }
 
     #[test]

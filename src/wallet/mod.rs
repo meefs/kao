@@ -479,7 +479,11 @@ mod tests {
         let encoded = bincode::serialize(&acc).unwrap();
         let decoded: AccountDescriptor = bincode::deserialize(&encoded).unwrap();
         match decoded {
-            AccountDescriptor::Ledger { name, path, address } => {
+            AccountDescriptor::Ledger {
+                name,
+                path,
+                address,
+            } => {
                 assert!(name.is_none());
                 assert!(matches!(path, LedgerHdPath::LedgerLive(3)));
                 assert_eq!(address, [0x11; 20]);
@@ -498,7 +502,11 @@ mod tests {
         let encoded = bincode::serialize(&acc).unwrap();
         let decoded: AccountDescriptor = bincode::deserialize(&encoded).unwrap();
         match decoded {
-            AccountDescriptor::Trezor { name, path, address } => {
+            AccountDescriptor::Trezor {
+                name,
+                path,
+                address,
+            } => {
                 assert!(name.is_none());
                 assert!(matches!(path, TrezorHdPath::TrezorLive(2)));
                 assert_eq!(address, [0x22; 20]);

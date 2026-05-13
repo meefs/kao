@@ -20,9 +20,21 @@ const CHAINS: &[(u64, &str)] = &[(1, "ethereum"), (10, "optimism"), (8453, "base
 const USDC_LOGO_URL: &str =
     "https://upload.wikimedia.org/wikipedia/commons/4/4a/Circle_USDC_Logo.svg";
 const EXCEPTIONS: &[(u64, &str, &str)] = &[
-    (1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", USDC_LOGO_URL),
-    (10, "0x0b2c639c533813f4aa9d7837caf62653d097ff85", USDC_LOGO_URL),
-    (8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", USDC_LOGO_URL),
+    (
+        1,
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        USDC_LOGO_URL,
+    ),
+    (
+        10,
+        "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+        USDC_LOGO_URL,
+    ),
+    (
+        8453,
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        USDC_LOGO_URL,
+    ),
 ];
 
 #[derive(Deserialize, Serialize)]
@@ -33,7 +45,10 @@ struct TokenList {
 }
 
 fn chain_dir(chain_id: u64) -> Option<&'static str> {
-    CHAINS.iter().find(|(id, _)| *id == chain_id).map(|(_, n)| *n)
+    CHAINS
+        .iter()
+        .find(|(id, _)| *id == chain_id)
+        .map(|(_, n)| *n)
 }
 
 #[tokio::main]
@@ -76,7 +91,10 @@ async fn sync_tokens() -> Result<()> {
 
     let assets = workspace_root()?.join("assets");
     let list_path = assets.join("tokenlist.json");
-    let out = TokenList { meta: list.meta, tokens: tokens.clone() };
+    let out = TokenList {
+        meta: list.meta,
+        tokens: tokens.clone(),
+    };
     let json = serde_json::to_vec_pretty(&out)?;
     tokio::fs::write(&list_path, &json)
         .await
@@ -104,7 +122,11 @@ async fn sync_tokens() -> Result<()> {
             .iter()
             .map(|(c, a, l)| (*c, (*a).to_owned(), (*l).to_owned())),
     );
-    println!("queued {} downloads ({} exceptions)", work.len(), EXCEPTIONS.len());
+    println!(
+        "queued {} downloads ({} exceptions)",
+        work.len(),
+        EXCEPTIONS.len()
+    );
 
     let mut iter = work.into_iter();
     let mut inflight = FuturesUnordered::new();

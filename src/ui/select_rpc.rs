@@ -22,8 +22,8 @@ use iced::widget::operation::focus as focus_widget;
 use iced::widget::{Column, Space, column, container, mouse_area, row, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
-use crate::settings;
 use crate::chain::{Chain, PerChain};
+use crate::settings;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     auth_background, auth_card, black, bold, error_text, hint_pill, kao_hero, link_button, mono,
@@ -147,9 +147,7 @@ impl SelectRpcScreen {
                 self.error = None;
                 (Task::none(), Some(Outcome::Back))
             }
-            Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => {
-                self.handle_key(key)
-            }
+            Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => self.handle_key(key),
             Message::KeyboardEvent(_) => (Task::none(), None),
         }
     }
@@ -194,9 +192,7 @@ impl SelectRpcScreen {
                 self.error = None;
                 (Task::none(), None)
             }
-            (Expanded::None, keyboard::Key::Named(n))
-                if *n == keyboard::key::Named::Escape =>
-            {
+            (Expanded::None, keyboard::Key::Named(n)) if *n == keyboard::key::Named::Escape => {
                 self.error = None;
                 (Task::none(), Some(Outcome::Back))
             }
@@ -238,9 +234,8 @@ impl SelectRpcScreen {
                     return None;
                 }
                 let Some(mainnet_url) = parse_rpc_input(mainnet_raw) else {
-                    self.error = Some(
-                        "Mainnet RPC: enter an https:// URL, hostname, or IP address.".into(),
-                    );
+                    self.error =
+                        Some("Mainnet RPC: enter an https:// URL, hostname, or IP address.".into());
                     return None;
                 };
                 // L2 exec inputs are optional — only validate non-empty
@@ -486,15 +481,9 @@ impl SelectRpcScreen {
             submit = submit.on_press(Message::SubmitCurrent);
         }
 
-        column![
-            exec_block,
-            vspace(12),
-            consensus_block,
-            vspace(12),
-            submit,
-        ]
-        .width(Length::Fill)
-        .into()
+        column![exec_block, vspace(12), consensus_block, vspace(12), submit,]
+            .width(Length::Fill)
+            .into()
     }
 
     // ── Card renderer ────────────────────────────────────────────────────
@@ -639,9 +628,13 @@ fn subsection_label<'a>(t: KaoTheme, label: &'a str) -> Element<'a, Message> {
 
 /// Fixed-width chain label (e.g. "Mainnet") next to a URL input. Used to
 /// stack the per-chain rows so the inputs line up under one another.
-fn labeled_row<'a>(t: KaoTheme, label: &'a str, input: Element<'a, Message>) -> Element<'a, Message> {
-    let label_box = container(text(label).size(12).color(t.text).font(bold()))
-        .width(Length::Fixed(72.0));
+fn labeled_row<'a>(
+    t: KaoTheme,
+    label: &'a str,
+    input: Element<'a, Message>,
+) -> Element<'a, Message> {
+    let label_box =
+        container(text(label).size(12).color(t.text).font(bold())).width(Length::Fixed(72.0));
     row![label_box, input]
         .spacing(8)
         .align_y(Alignment::Center)
@@ -731,7 +724,9 @@ fn is_valid_hostname(s: &str) -> bool {
     s.split('.').all(|label| {
         !label.is_empty()
             && label.len() <= 63
-            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
             && !label.starts_with('-')
             && !label.ends_with('-')
     })
@@ -999,7 +994,10 @@ mod tests {
 
     #[test]
     fn parse_accepts_bare_ip() {
-        assert_eq!(parse_rpc_input("192.168.1.5"), Some("http://192.168.1.5".into()));
+        assert_eq!(
+            parse_rpc_input("192.168.1.5"),
+            Some("http://192.168.1.5".into())
+        );
     }
 
     #[test]
@@ -1044,7 +1042,10 @@ mod tests {
 
     #[test]
     fn parse_accepts_localhost_as_http() {
-        assert_eq!(parse_rpc_input("localhost"), Some("http://localhost".into()));
+        assert_eq!(
+            parse_rpc_input("localhost"),
+            Some("http://localhost".into())
+        );
         assert_eq!(
             parse_rpc_input("localhost:8545"),
             Some("http://localhost:8545".into())
@@ -1068,7 +1069,10 @@ mod tests {
     fn accepts_ip_via_submit() {
         let mut s = SelectRpcScreen::default();
         s.update(Message::PickCustom);
-        s.update(Message::CustomExecInput(Chain::Mainnet, "10.0.0.2:8545".into()));
+        s.update(Message::CustomExecInput(
+            Chain::Mainnet,
+            "10.0.0.2:8545".into(),
+        ));
         let (_, outcome) = s.update(Message::SubmitCurrent);
         match outcome {
             Some(Outcome::Custom { exec, .. }) => {

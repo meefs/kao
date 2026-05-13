@@ -406,7 +406,9 @@ mod tests {
     fn looks_like_ens_accepts_dot_names_and_rejects_hex() {
         assert!(looks_like_ens("vitalik.eth"));
         assert!(looks_like_ens("foo.bar.eth"));
-        assert!(!looks_like_ens("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"));
+        assert!(!looks_like_ens(
+            "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+        ));
         assert!(!looks_like_ens("d8dA6BF26964aF9D7eEd9e03E53415D37aA96045"));
         assert!(!looks_like_ens(""));
         assert!(!looks_like_ens("vitalik"));

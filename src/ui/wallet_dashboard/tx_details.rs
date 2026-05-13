@@ -17,8 +17,8 @@ use crate::portfolio::format_token_balance;
 use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    black, bold, colored_address, kao_fit, kao_scrollable_style, mono, mono_black, mono_bold,
-    modal_wrapper, secondary_button, small_secondary_button,
+    black, bold, colored_address, kao_fit, kao_scrollable_style, modal_wrapper, mono, mono_black,
+    mono_bold, secondary_button, small_secondary_button,
 };
 use crate::wallet::ContactsBook;
 
@@ -133,14 +133,9 @@ impl TxDetailsPane {
             TxDirection::Out => "Sent",
             TxDirection::SelfTransfer => "Self transfer",
         };
-        let title = container(
-            text(direction_label)
-                .size(14)
-                .color(t.sub)
-                .font(bold()),
-        )
-        .width(Length::Fill)
-        .center_x(Length::Fill);
+        let title = container(text(direction_label).size(14).color(t.sub).font(bold()))
+            .width(Length::Fill)
+            .center_x(Length::Fill);
 
         // ── Hero amount block ────────────────────────────────────────────
         // Two-line presentation: big signed number on top, token symbol
@@ -157,13 +152,9 @@ impl TxDetailsPane {
             .size(34)
             .color(amount_color)
             .font(mono_black());
-        let amount_bottom = text(parts.label)
-            .size(16)
-            .color(t.text)
-            .font(black());
+        let amount_bottom = text(parts.label).size(16).color(t.text).font(black());
         let amount = container(
-            column![amount_top, Space::new().height(2), amount_bottom]
-                .align_x(Alignment::Center),
+            column![amount_top, Space::new().height(2), amount_bottom].align_x(Alignment::Center),
         )
         .width(Length::Fill)
         .center_x(Length::Fill);
@@ -178,14 +169,9 @@ impl TxDetailsPane {
             TxStatus::Failure => t.down,
             TxStatus::Pending => t.sub,
         };
-        let status = container(
-            text(status_text)
-                .size(12)
-                .color(status_color)
-                .font(bold()),
-        )
-        .width(Length::Fill)
-        .center_x(Length::Fill);
+        let status = container(text(status_text).size(12).color(status_color).font(bold()))
+            .width(Length::Fill)
+            .center_x(Length::Fill);
 
         // ── Field stack ──────────────────────────────────────────────────
         let mut fields = column![].spacing(14).width(Length::Fill);
@@ -197,7 +183,11 @@ impl TxDetailsPane {
         if let Some(tok) = &self.tx.token {
             fields = fields.push(field(
                 t,
-                if tok.is_nft { "Collection" } else { "Token contract" },
+                if tok.is_nft {
+                    "Collection"
+                } else {
+                    "Token contract"
+                },
                 colored_address(t, tok.contract),
                 Some(Message::CopyAsset),
             ));
@@ -247,38 +237,26 @@ impl TxDetailsPane {
         ));
 
         if self.tx.block_number > 0 {
-            fields = fields.push(simple_field(
-                t,
-                "Block",
-                self.tx.block_number.to_string(),
-            ));
+            fields = fields.push(simple_field(t, "Block", self.tx.block_number.to_string()));
         }
 
         if self.tx.timestamp > 0 {
-            fields = fields.push(simple_field(
-                t,
-                "When",
-                format_when(self.tx.timestamp),
-            ));
+            fields = fields.push(simple_field(t, "When", format_when(self.tx.timestamp)));
         }
 
         if let (Some(used), Some(price)) = (self.tx.gas_used, self.tx.gas_price) {
             let fee_wei = (used as u128).saturating_mul(price);
-            let fee = alloy::primitives::utils::format_ether(
-                alloy::primitives::U256::from(fee_wei),
-            );
+            let fee =
+                alloy::primitives::utils::format_ether(alloy::primitives::U256::from(fee_wei));
             let f = fee.parse::<f64>().unwrap_or(0.0);
-            fields = fields.push(simple_field(
-                t,
-                "Fee",
-                format!("{} ETH", trim_amount(f)),
-            ));
+            fields = fields.push(simple_field(t, "Fee", format!("{} ETH", trim_amount(f))));
         }
 
         if let Some(method) = &self.tx.method
-            && !method.is_empty() {
-                fields = fields.push(simple_field(t, "Method", method.clone()));
-            }
+            && !method.is_empty()
+        {
+            fields = fields.push(simple_field(t, "Method", method.clone()));
+        }
 
         // Hash: short form (0x1111…1111). The full 66-char hash used to
         // wrap to two ugly lines and dwarf every other field. Users who
@@ -568,10 +546,7 @@ fn explorer_for(tx: &IndexedTx) -> (String, String) {
             let (url, label) = match tx.chain {
                 Chain::Mainnet => ("https://etherscan.io", "Etherscan"),
                 Chain::Base => ("https://basescan.org", "BaseScan"),
-                Chain::Optimism => (
-                    "https://optimistic.etherscan.io",
-                    "Optimistic Etherscan",
-                ),
+                Chain::Optimism => ("https://optimistic.etherscan.io", "Optimistic Etherscan"),
             };
             (format!("{url}/tx/{hash}"), label.to_string())
         }

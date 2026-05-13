@@ -13,8 +13,8 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subsc
 
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    avatar, black, bold, ghost_button, hover_tint, kao_scrollable_style, kaomoji_for_account,
-    mono, thin_divider,
+    avatar, black, bold, ghost_button, hover_tint, kao_scrollable_style, kaomoji_for_account, mono,
+    thin_divider,
 };
 use crate::wallet::{AccountDescriptor, account_short_address};
 
@@ -90,24 +90,24 @@ impl AccountDropdown {
                 .height(Length::Shrink)
                 .style(move |_, s| kao_scrollable_style(t, s)),
         )
-            .padding(Padding::from([10, 8]))
-            .width(Length::Fixed(296.0))
-            .max_height(360.0)
-            .style(move |_| container::Style {
-                background: Some(Background::Color(t.card)),
-                border: Border {
-                    color: t.border,
-                    width: 1.0,
-                    radius: Radius::from(14),
-                },
-                text_color: Some(t.text),
-                shadow: iced::Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, if t.dark { 0.6 } else { 0.16 }),
-                    offset: iced::Vector::new(0.0, 12.0),
-                    blur_radius: 32.0,
-                },
-                ..container::Style::default()
-            });
+        .padding(Padding::from([10, 8]))
+        .width(Length::Fixed(296.0))
+        .max_height(360.0)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card)),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(14),
+            },
+            text_color: Some(t.text),
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, if t.dark { 0.6 } else { 0.16 }),
+                offset: iced::Vector::new(0.0, 12.0),
+                blur_radius: 32.0,
+            },
+            ..container::Style::default()
+        });
 
         // Anchor the panel under the header address. Sidebar width is 100,
         // header padding is [14, 24] and the address pill sits below the

@@ -19,9 +19,7 @@ use crate::ui::kao_widgets::{
     kao_scrollable_style, link_button, mono, mono_bold, primary_button, screen_subtitle,
     screen_title, vspace,
 };
-use crate::wallet::{
-    AccountDescriptor, KaoSigner, SignerHandoff, TrezorHdPath, handoff_with,
-};
+use crate::wallet::{AccountDescriptor, KaoSigner, SignerHandoff, TrezorHdPath, handoff_with};
 
 const PROBE_COUNT: u32 = 5;
 
@@ -182,13 +180,10 @@ impl ConnectTrezorScreen {
                 (
                     Task::perform(
                         async move {
-                            TrezorSigner::new(
-                                TrezorHdPath::TrezorLive(hd_index).to_alloy(),
-                                None,
-                            )
-                            .await
-                            .map(|s| handoff_with(KaoSigner::Trezor(s)))
-                            .map_err(|e| e.to_string())
+                            TrezorSigner::new(TrezorHdPath::TrezorLive(hd_index).to_alloy(), None)
+                                .await
+                                .map(|s| handoff_with(KaoSigner::Trezor(s)))
+                                .map_err(|e| e.to_string())
                         },
                         Message::SignerBuilt,
                     ),
