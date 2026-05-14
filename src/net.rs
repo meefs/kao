@@ -1304,6 +1304,290 @@ impl BalanceFetcher for MockFetcher {
     }
 }
 
+/// Parameterizable test double for `BalanceFetcher`. Modelled on
+/// `decode::proxy::StorageMock` but adds per-(target, calldata) responses
+/// for `call()` and per-address responses for `get_code()`. Used by
+/// `decode::render` tests to drive the verified `eth_call` path without
+/// standing up a real Helios client.
+///
+/// All methods return degenerate values for inputs that weren't pre-
+/// loaded — that matches `MockFetcher`'s contract and keeps unrelated
+/// tests reading off the configured surface only.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct CallMock {
+    calls: std::sync::Mutex<std::collections::HashMap<(Address, Bytes), (Bytes, bool)>>,
+    code: std::sync::Mutex<std::collections::HashMap<Address, (Bytes, bool)>>,
+    storage: std::sync::Mutex<std::collections::HashMap<(Address, B256), (B256, bool)>>,
+}
+
+#[cfg(test)]
+impl CallMock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Pre-load a response for `eth_call(to, calldata)`.
+    pub fn set_call(&self, to: Address, calldata: Bytes, ret: Bytes, verified: bool) {
+        self.calls
+            .lock()
+            .unwrap()
+            .insert((to, calldata), (ret, verified));
+    }
+
+    pub fn set_code(&self, addr: Address, code: Bytes, verified: bool) {
+        self.code.lock().unwrap().insert(addr, (code, verified));
+    }
+
+    pub fn set_storage(&self, addr: Address, slot: B256, value: B256, verified: bool) {
+        self.storage
+            .lock()
+            .unwrap()
+            .insert((addr, slot), (value, verified));
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl BalanceFetcher for CallMock {
+    async fn balance(&self, _: Address, _: Chain) -> Result<String, String> {
+        Ok("0".into())
+    }
+    async fn invalidate(&self) {}
+    fn last_status(&self, _: Chain) -> VerificationStatus {
+        VerificationStatus::Verified
+    }
+    async fn provider(&self, _: Chain) -> Option<RootProvider<Ethereum>> {
+        None
+    }
+    async fn get_code(
+        &self,
+        addr: Address,
+        _: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        let (value, verified) = self
+            .code
+            .lock()
+            .unwrap()
+            .get(&addr)
+            .cloned()
+            .unwrap_or((Bytes::new(), true));
+        Ok(VerifiedRead { value, verified })
+    }
+    async fn get_storage_at(
+        &self,
+        addr: Address,
+        slot: U256,
+        _: Chain,
+    ) -> Result<VerifiedRead<B256>, String> {
+        let slot_b256 = B256::from(slot.to_be_bytes::<32>());
+        let (value, verified) = self
+            .storage
+            .lock()
+            .unwrap()
+            .get(&(addr, slot_b256))
+            .copied()
+            .unwrap_or((B256::ZERO, true));
+        Ok(VerifiedRead { value, verified })
+    }
+    async fn call(
+        &self,
+        to: Address,
+        data: Bytes,
+        _: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        let (value, verified) = self
+            .calls
+            .lock()
+            .unwrap()
+            .get(&(to, data))
+            .cloned()
+            .unwrap_or((Bytes::new(), true));
+        Ok(VerifiedRead { value, verified })
+    }
+    async fn get_balance_raw(
+        &self,
+        _: Address,
+        _: Chain,
+    ) -> Result<VerifiedRead<U256>, String> {
+        Ok(VerifiedRead {
+            value: U256::ZERO,
+            verified: true,
+        })
+    }
+    async fn get_transaction_count(
+        &self,
+        _: Address,
+        _: Chain,
+    ) -> Result<VerifiedRead<u64>, String> {
+        Ok(VerifiedRead {
+            value: 0,
+            verified: true,
+        })
+    }
+    async fn latest_block(&self, _: Chain) -> Result<VerifiedRead<LatestBlock>, String> {
+        Ok(VerifiedRead {
+            value: LatestBlock {
+                number: 0,
+                hash: B256::ZERO,
+                timestamp: 0,
+                gas_limit: 30_000_000,
+                base_fee_per_gas: 0,
+                prevrandao: B256::ZERO,
+                beneficiary: Address::ZERO,
+                excess_blob_gas: None,
+            },
+            verified: true,
+        })
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    #[test]
+    fn verification_status_round_trip() {
+        for s in [
+            VerificationStatus::Connecting,
+            VerificationStatus::Verified,
+            VerificationStatus::Fallback,
+            VerificationStatus::Unavailable,
+        ] {
+            assert_eq!(VerificationStatus::from_u8(s.as_u8()), s);
+        }
+    }
+
+    #[test]
+    fn verification_status_from_u8_unknown_defaults_to_connecting() {
+        assert_eq!(VerificationStatus::from_u8(0), VerificationStatus::Connecting);
+        assert_eq!(VerificationStatus::from_u8(99), VerificationStatus::Connecting);
+        assert_eq!(VerificationStatus::from_u8(u8::MAX), VerificationStatus::Connecting);
+    }
+
+    #[test]
+    fn build_fallback_valid_url_is_some() {
+        assert!(build_fallback("https://example.com").is_some());
+        assert!(build_fallback("http://127.0.0.1:8545").is_some());
+    }
+
+    #[test]
+    fn build_fallback_invalid_url_is_none() {
+        assert!(build_fallback("not a url").is_none());
+        assert!(build_fallback("").is_none());
+    }
+
+    #[test]
+    fn pick_rpc_empty_returns_empty_string() {
+        assert_eq!(pick_rpc(&[]), "");
+    }
+
+    #[test]
+    fn pick_rpc_single_entry_always_returned() {
+        for _ in 0..10 {
+            assert_eq!(pick_rpc(&["only".into()]), "only");
+        }
+    }
+
+    #[test]
+    fn pick_rpc_picks_a_member() {
+        let pool = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        for _ in 0..50 {
+            let pick = pick_rpc(&pool);
+            assert!(pool.iter().any(|p| p == &pick));
+        }
+    }
+
+    #[test]
+    fn shuffled_is_permutation() {
+        let input: Vec<String> = (0..8).map(|i| format!("rpc{i}")).collect();
+        let out = shuffled(&input);
+        assert_eq!(out.len(), input.len());
+        let mut a = input.clone();
+        let mut b = out.clone();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn shuffled_empty_is_empty() {
+        assert!(shuffled(&[]).is_empty());
+    }
+
+    #[test]
+    fn latest_from_rpc_header_flattens_fields() {
+        // The Header type is `alloy_rpc_types_eth::Header` from alloy v1,
+        // whose `inner` is alloy_consensus v1's `Header` (different crate
+        // version from alloy 2.x's `alloy::consensus::Header`). We
+        // construct via Default::default() and patch the fields we care
+        // about — their numeric/byte types come from alloy_primitives,
+        // which is a single version across the graph.
+        let mut header: alloy_rpc_types_eth::Header = Default::default();
+        header.hash = B256::from([0xbb; 32]);
+        header.inner.number = 12_345;
+        header.inner.gas_limit = 30_000_000;
+        header.inner.timestamp = 1_700_000_000;
+        header.inner.base_fee_per_gas = Some(7);
+        header.inner.mix_hash = B256::from([0xaa; 32]);
+        header.inner.beneficiary = Address::from([0x11; 20]);
+        header.inner.excess_blob_gas = Some(42);
+
+        let lb = latest_from_rpc_header(&header);
+        assert_eq!(lb.number, 12_345);
+        assert_eq!(lb.hash, B256::from([0xbb; 32]));
+        assert_eq!(lb.timestamp, 1_700_000_000);
+        assert_eq!(lb.gas_limit, 30_000_000);
+        assert_eq!(lb.base_fee_per_gas, 7);
+        assert_eq!(lb.prevrandao, B256::from([0xaa; 32]));
+        assert_eq!(lb.beneficiary, Address::from([0x11; 20]));
+        assert_eq!(lb.excess_blob_gas, Some(42));
+    }
+
+    #[test]
+    fn latest_from_rpc_header_defaults_base_fee_to_zero() {
+        let mut header: alloy_rpc_types_eth::Header = Default::default();
+        header.inner.base_fee_per_gas = None;
+        let lb = latest_from_rpc_header(&header);
+        assert_eq!(lb.base_fee_per_gas, 0);
+    }
+
+    #[test]
+    fn current_snapshot_mirrors_settings_for_each_chain() {
+        for chain in Chain::ALL {
+            let snap = current_snapshot(chain);
+            assert_eq!(snap.rpcs, settings::rpcs(chain));
+            assert_eq!(snap.consensus_rpcs, settings::consensus_rpcs(chain));
+            match chain {
+                Chain::Mainnet => assert!(snap.checkpoint.is_some()),
+                Chain::Base | Chain::Optimism => assert!(snap.checkpoint.is_none()),
+            }
+        }
+    }
+
+    #[test]
+    fn current_snapshot_equal_to_itself() {
+        let a = current_snapshot(Chain::Mainnet);
+        let b = current_snapshot(Chain::Mainnet);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn verified_read_carries_value_and_flag() {
+        let vr = VerifiedRead {
+            value: 7u64,
+            verified: true,
+        };
+        assert_eq!(vr.value, 7);
+        assert!(vr.verified);
+        let vr2 = VerifiedRead {
+            value: 0u64,
+            verified: false,
+        };
+        assert!(!vr2.verified);
+    }
+}
+
 /// Spawn a background task that fetches the latest community-fallback
 /// checkpoint and, if our built-in is older than the freshness threshold,
 /// updates `settings::auto_checkpoint`. No-ops when the built-in is

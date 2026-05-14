@@ -136,3 +136,106 @@ impl<T> PerChain<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_three_variants_listed() {
+        assert_eq!(Chain::ALL.len(), 3);
+        assert!(Chain::ALL.contains(&Chain::Mainnet));
+        assert!(Chain::ALL.contains(&Chain::Base));
+        assert!(Chain::ALL.contains(&Chain::Optimism));
+    }
+
+    #[test]
+    fn label_distinct_per_chain() {
+        let labels: Vec<_> = Chain::ALL.iter().map(|c| c.label()).collect();
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len());
+        assert_eq!(Chain::Mainnet.label(), "Mainnet");
+        assert_eq!(Chain::Base.label(), "Base");
+        assert_eq!(Chain::Optimism.label(), "Optimism");
+    }
+
+    #[test]
+    fn chain_id_eip155() {
+        assert_eq!(Chain::Mainnet.chain_id(), 1);
+        assert_eq!(Chain::Base.chain_id(), 8453);
+        assert_eq!(Chain::Optimism.chain_id(), 10);
+    }
+
+    #[test]
+    fn display_name_distinct() {
+        assert_eq!(Chain::Mainnet.display_name(), "Ethereum Mainnet");
+        assert_eq!(Chain::Base.display_name(), "Base");
+        assert_eq!(Chain::Optimism.display_name(), "OP Mainnet");
+    }
+
+    #[test]
+    fn default_exec_urls_https_and_distinct() {
+        for c in Chain::ALL {
+            assert!(c.default_exec_url().starts_with("https://"));
+        }
+        let urls: std::collections::HashSet<_> =
+            Chain::ALL.iter().map(|c| c.default_exec_url()).collect();
+        assert_eq!(urls.len(), 3);
+    }
+
+    #[test]
+    fn default_consensus_urls_https_and_distinct() {
+        for c in Chain::ALL {
+            assert!(c.default_consensus_url().starts_with("https://"));
+        }
+        let urls: std::collections::HashSet<_> =
+            Chain::ALL.iter().map(|c| c.default_consensus_url()).collect();
+        assert_eq!(urls.len(), 3);
+    }
+
+    #[test]
+    fn default_blockscout_urls_per_chain() {
+        assert_eq!(
+            Chain::Mainnet.default_blockscout_url(),
+            "https://eth.blockscout.com"
+        );
+        assert_eq!(
+            Chain::Base.default_blockscout_url(),
+            "https://base.blockscout.com"
+        );
+        assert_eq!(
+            Chain::Optimism.default_blockscout_url(),
+            "https://optimism.blockscout.com"
+        );
+    }
+
+    #[test]
+    fn supports_simulation_all_chains() {
+        for c in Chain::ALL {
+            assert!(c.supports_simulation());
+        }
+    }
+
+    #[test]
+    fn display_matches_label() {
+        for c in Chain::ALL {
+            assert_eq!(format!("{c}"), c.label());
+        }
+    }
+
+    #[test]
+    fn default_chain_is_mainnet() {
+        assert_eq!(Chain::default(), Chain::Mainnet);
+    }
+
+    #[test]
+    fn perchain_get_set_round_trip() {
+        let mut p: PerChain<u32> = PerChain::default();
+        for (i, c) in Chain::ALL.iter().enumerate() {
+            p.set(*c, i as u32);
+        }
+        for (i, c) in Chain::ALL.iter().enumerate() {
+            assert_eq!(*p.get(*c), i as u32);
+        }
+    }
+}

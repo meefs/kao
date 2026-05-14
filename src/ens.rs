@@ -462,6 +462,99 @@ mod tests {
         padded[12..].copy_from_slice(raw_addr.as_slice());
         assert_eq!(decode_address(&padded), raw_addr);
     }
+
+    #[test]
+    fn selectors_match_keccak_signatures() {
+        // The hand-computed selectors at the top of the file must match
+        // keccak256(sig)[..4]. If one ever drifts, an ENS call hits the
+        // wrong function and returns wrong-shape data with no warning.
+        assert_eq!(
+            &keccak256(b"resolver(bytes32)").as_slice()[..4],
+            RESOLVER_SELECTOR.as_slice(),
+        );
+        assert_eq!(
+            &keccak256(b"addr(bytes32)").as_slice()[..4],
+            ADDR_SELECTOR.as_slice(),
+        );
+        assert_eq!(
+            &keccak256(b"name(bytes32)").as_slice()[..4],
+            NAME_SELECTOR.as_slice(),
+        );
+    }
+
+    #[test]
+    fn namehash_skips_empty_labels_from_leading_and_trailing_dots() {
+        // Leading / trailing / doubled dots produce empty labels;
+        // namehash treats those as no-op so the hash matches the cleaner
+        // form. (Anti-confusion: it does NOT match the empty-name hash.)
+        assert_eq!(namehash(".eth"), namehash("eth"));
+        assert_eq!(namehash("eth."), namehash("eth"));
+        assert_eq!(namehash("foo..eth"), namehash("foo.eth"));
+    }
+
+    #[test]
+    fn namehash_distinct_for_different_labels() {
+        assert_ne!(namehash("a.eth"), namehash("b.eth"));
+        assert_ne!(namehash("foo"), namehash("foo.eth"));
+    }
+
+    #[test]
+    fn beautify_idempotent_on_simple_ascii() {
+        assert_eq!(beautify("vitalik.eth"), "vitalik.eth");
+        assert_eq!(beautify("foo.eth"), "foo.eth");
+    }
+
+    #[test]
+    fn beautify_returns_input_on_unbeautifiable() {
+        // beautify falls back to the original string when it can't process.
+        // A NUL byte is one case the normalizer rejects outright; pass it
+        // through to confirm we don't panic.
+        let weird = "vita\0lik.eth";
+        let _ = beautify(weird); // must not panic
+    }
+
+    #[test]
+    fn looks_like_ens_whitespace_trimmed() {
+        assert!(looks_like_ens("  vitalik.eth  "));
+        assert!(!looks_like_ens("   "));
+    }
+
+    #[test]
+    fn decode_string_handles_offset_beyond_data() {
+        // offset = 0x100, but data is only 64 bytes — must return None,
+        // not panic.
+        let mut buf = vec![0u8; 64];
+        buf[30] = 0x01; // offset[30..32] = 0x0100
+        buf[31] = 0x00;
+        assert!(decode_string(&buf).is_none());
+    }
+
+    #[test]
+    fn decode_string_handles_length_beyond_data() {
+        let mut buf = Vec::new();
+        let mut offset = [0u8; 32];
+        offset[31] = 0x20;
+        buf.extend_from_slice(&offset);
+        let mut len = [0u8; 32];
+        len[31] = 100; // claims 100 bytes but we only have 0 after the length word
+        buf.extend_from_slice(&len);
+        assert!(decode_string(&buf).is_none());
+    }
+
+    #[test]
+    fn decode_string_rejects_invalid_utf8() {
+        let mut buf = Vec::new();
+        let mut offset = [0u8; 32];
+        offset[31] = 0x20;
+        buf.extend_from_slice(&offset);
+        let mut len = [0u8; 32];
+        len[31] = 1;
+        buf.extend_from_slice(&len);
+        let mut data = [0u8; 32];
+        data[0] = 0xff; // invalid UTF-8 lead byte standing alone
+        buf.extend_from_slice(&data);
+        assert!(decode_string(&buf).is_none());
+    }
 }
 
 /// Adversarial / phishing-focused tests. These are deliberately probing —

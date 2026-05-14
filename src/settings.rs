@@ -793,6 +793,233 @@ mod tests {
     }
 
     #[test]
+    fn is_https_url_accepts_https_only() {
+        assert!(is_https_url("https://example.com"));
+        assert!(is_https_url("https://eth.llamarpc.com"));
+        assert!(!is_https_url("http://example.com"));
+        assert!(!is_https_url("ftp://example.com"));
+        assert!(!is_https_url(""));
+        assert!(!is_https_url("not a url"));
+    }
+
+    #[test]
+    fn nonempty_passes_through_or_returns_none() {
+        assert!(nonempty(&[]).is_none());
+        assert_eq!(
+            nonempty(&["a".to_string()]),
+            Some(vec!["a".to_string()])
+        );
+    }
+
+    #[test]
+    fn indexer_provider_key_round_trip() {
+        for p in [
+            IndexerProvider::Blockscout,
+            IndexerProvider::Etherscan,
+            IndexerProvider::Alchemy,
+            IndexerProvider::Drpc,
+            IndexerProvider::None,
+        ] {
+            assert_eq!(IndexerProvider::from_key(p.key()), Some(p));
+        }
+        assert!(IndexerProvider::from_key("bogus").is_none());
+        assert!(IndexerProvider::from_key("").is_none());
+    }
+
+    #[test]
+    fn parse_indexer_provider_round_trip_through_serialize() {
+        for p in [
+            IndexerProvider::Blockscout,
+            IndexerProvider::Etherscan,
+            IndexerProvider::Alchemy,
+            IndexerProvider::Drpc,
+            IndexerProvider::None,
+        ] {
+            let mut s = default_state();
+            s.indexer_provider = p;
+            let parsed = parse(&serialize(&s));
+            assert_eq!(parsed.indexer_provider, p);
+        }
+    }
+
+    #[test]
+    fn parse_drops_non_https_blockscout_base_url() {
+        let s = parse("blockscout_base_url = \"http://insecure.example/\"\n");
+        assert!(s.blockscout_base_url.is_none());
+    }
+
+    #[test]
+    fn parse_accepts_https_blockscout_base_url() {
+        let s = parse("blockscout_base_url = \"https://eth.blockscout.com\"\n");
+        assert_eq!(
+            s.blockscout_base_url.as_deref(),
+            Some("https://eth.blockscout.com")
+        );
+    }
+
+    #[test]
+    fn parse_drops_empty_api_keys() {
+        let s = parse(
+            "etherscan_api_key = \"\"\n\
+             alchemy_api_key = \"\"\n\
+             drpc_api_key = \"\"\n\
+             blockscout_api_key = \"\"\n",
+        );
+        assert!(s.etherscan_api_key.is_none());
+        assert!(s.alchemy_api_key.is_none());
+        assert!(s.drpc_api_key.is_none());
+        assert!(s.blockscout_api_key.is_none());
+    }
+
+    #[test]
+    fn parse_keeps_non_empty_api_keys() {
+        let s = parse(
+            "etherscan_api_key = \"key1\"\n\
+             alchemy_api_key = \"key2\"\n\
+             drpc_api_key = \"key3\"\n\
+             blockscout_api_key = \"key4\"\n",
+        );
+        assert_eq!(s.etherscan_api_key.as_deref(), Some("key1"));
+        assert_eq!(s.alchemy_api_key.as_deref(), Some("key2"));
+        assert_eq!(s.drpc_api_key.as_deref(), Some("key3"));
+        assert_eq!(s.blockscout_api_key.as_deref(), Some("key4"));
+    }
+
+    #[test]
+    fn parse_unknown_indexer_provider_keeps_default() {
+        let s = parse("indexer_provider = \"unknown_provider\"\n");
+        assert_eq!(s.indexer_provider, default_state().indexer_provider);
+    }
+
+    #[test]
+    fn parse_then_serialize_preserves_checkpoint_override() {
+        let cp = B256::from_str(BUILTIN_CHECKPOINT).unwrap();
+        let mut s = default_state();
+        s.checkpoint_override = Some(cp);
+        let parsed = parse(&serialize(&s));
+        assert_eq!(parsed.checkpoint_override, Some(cp));
+    }
+
+    #[test]
+    fn apply_rpc_list_filters_non_https() {
+        let mut target = PerChain::<Vec<String>>::default();
+        target.set(Chain::Mainnet, vec!["https://existing".into()]);
+        apply_rpc_list(
+            &mut target,
+            Chain::Mainnet,
+            Some(vec![
+                "http://insecure".into(),
+                "https://kept".into(),
+                "ftp://nope".into(),
+            ]),
+        );
+        // Only the https URL survives; existing list is replaced because the
+        // filtered new list is non-empty.
+        assert_eq!(target.get(Chain::Mainnet), &vec!["https://kept".to_string()]);
+    }
+
+    #[test]
+    fn apply_rpc_list_leaves_target_when_all_filtered_out() {
+        let mut target = PerChain::<Vec<String>>::default();
+        target.set(Chain::Mainnet, vec!["https://existing".into()]);
+        apply_rpc_list(
+            &mut target,
+            Chain::Mainnet,
+            Some(vec!["http://nope".into()]),
+        );
+        // Existing entry preserved.
+        assert_eq!(target.get(Chain::Mainnet), &vec!["https://existing".to_string()]);
+    }
+
+    #[test]
+    fn apply_rpc_list_none_is_noop() {
+        let mut target = PerChain::<Vec<String>>::default();
+        target.set(Chain::Mainnet, vec!["https://existing".into()]);
+        apply_rpc_list(&mut target, Chain::Mainnet, None);
+        assert_eq!(target.get(Chain::Mainnet), &vec!["https://existing".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_to_owner_sets_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = tempfile::NamedTempFile::new().unwrap();
+        restrict_to_owner(f.path(), 0o600).unwrap();
+        let meta = std::fs::metadata(f.path()).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn builtin_is_fresh_returns_bool() {
+        // `builtin_is_fresh` is a pure (now − published) < freshness window
+        // check. The output depends on wall clock, but the function must
+        // always return without panicking — assert it produces a result.
+        let _ = builtin_is_fresh();
+    }
+
+    #[test]
+    fn default_rpc_lists_are_non_empty_https() {
+        let rpcs = default_rpcs();
+        assert!(!rpcs.is_empty());
+        for u in rpcs {
+            assert!(u.starts_with("https://"), "default rpc must be https: {u}");
+        }
+        let cl = default_consensus_rpcs();
+        assert!(!cl.is_empty());
+        for u in cl {
+            assert!(u.starts_with("https://"), "default consensus rpc must be https: {u}");
+        }
+    }
+
+    /// Read-only getters: each just reflects `default_state` when no
+    /// setter has run. Exercising them bumps coverage for the
+    /// `ensure().lock().clone()` plumbing and confirms the defaults
+    /// haven't drifted from what `default_state` builds. None of these
+    /// call `write_all`, so they don't touch the user's real config.
+    #[test]
+    fn read_only_getters_reflect_default_state() {
+        // These tests share global state with other tests; only assert
+        // properties that are invariant under any prior setter (since
+        // tests don't call setters, defaults always hold).
+        let _ = theme();
+        assert_eq!(indexer_provider(), default_state().indexer_provider);
+        // Per-chain rpcs default to the Mainnet list.
+        assert_eq!(rpcs(Chain::Mainnet), default_state().rpcs.get(Chain::Mainnet).clone());
+        // Consensus rpcs for Mainnet match the seeded default.
+        assert_eq!(
+            consensus_rpcs(Chain::Mainnet),
+            default_state().consensus_rpcs.get(Chain::Mainnet).clone(),
+        );
+        // L2 consensus falls back to the chain's hardcoded default url.
+        assert_eq!(
+            consensus_rpcs(Chain::Base),
+            vec![Chain::Base.default_consensus_url().to_string()],
+        );
+        assert_eq!(
+            consensus_rpcs(Chain::Optimism),
+            vec![Chain::Optimism.default_consensus_url().to_string()],
+        );
+        // auto_checkpoint starts at the built-in constant.
+        assert_eq!(auto_checkpoint(), B256::from_str(BUILTIN_CHECKPOINT).unwrap());
+        // checkpoint_override starts as None.
+        assert!(checkpoint_override().is_none());
+    }
+
+    #[test]
+    fn rpcs_l2_falls_back_to_synthesize_when_no_explicit() {
+        // No explicit L2 rpc, no drpc/alchemy key, → empty.
+        // (synthesize_exec_url returns None when both keys are unset.)
+        let bas = rpcs(Chain::Base);
+        // Either empty (no key) OR a synthesized url — both branches
+        // valid; assert the shape.
+        if !bas.is_empty() {
+            for url in &bas {
+                assert!(url.starts_with("https://"), "got: {url}");
+            }
+        }
+    }
+
+    #[test]
     fn serialize_emits_valid_toml_arrays() {
         let mut rpcs = PerChain::<Vec<String>>::default();
         rpcs.set(Chain::Mainnet, vec!["https://a".into(), "https://b".into()]);

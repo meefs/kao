@@ -350,4 +350,43 @@ mod tests {
             "expected Backend, got {mapped:?}",
         );
     }
+
+    #[test]
+    fn display_includes_category_and_detail() {
+        let unav = KeyringError::Unavailable("dbus down".into());
+        let s = format!("{unav}");
+        assert!(s.contains("unavailable"), "got: {s}");
+        assert!(s.contains("dbus down"), "got: {s}");
+
+        let backend = KeyringError::Backend("bad encoding".into());
+        let s = format!("{backend}");
+        assert!(s.contains("backend"), "got: {s}");
+        assert!(s.contains("bad encoding"), "got: {s}");
+    }
+
+    #[test]
+    fn error_trait_is_implemented() {
+        // KeyringError must impl std::error::Error so callers can chain it
+        // through anyhow / Box<dyn Error>. Compile-time guarantee + a quick
+        // dyn round-trip.
+        fn is_error<E: std::error::Error>() {}
+        is_error::<KeyringError>();
+
+        let boxed: Box<dyn std::error::Error> =
+            Box::new(KeyringError::Backend("x".into()));
+        assert!(format!("{boxed}").contains("backend"));
+    }
+
+    #[test]
+    fn empty_value_round_trip() {
+        // Edge case: storing an empty byte slice must round-trip. Some
+        // backends silently reject empty values; the in-memory store here
+        // accepts them. Pin behavior for callers who store length-prefixed
+        // payloads that could be legitimately empty.
+        test_support::install();
+        let name = "test_empty_value";
+        write_secret(name, &[]).unwrap();
+        let got = read_secret(name).unwrap();
+        assert_eq!(got.as_deref(), Some(&[][..]));
+    }
 }

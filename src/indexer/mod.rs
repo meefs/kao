@@ -514,4 +514,49 @@ mod tests {
         assert_eq!(classify_direction(me, None, me), TxDirection::Out);
         assert_eq!(classify_direction(other, None, me), TxDirection::In);
     }
+
+    #[test]
+    fn iso8601_short_returns_zero() {
+        assert_eq!(parse_iso8601(""), 0);
+        assert_eq!(parse_iso8601("2024"), 0);
+        assert_eq!(parse_iso8601("2024-01-01"), 0);
+    }
+
+    #[test]
+    fn iso8601_with_timezone_offset_ignored() {
+        // Only the first 19 chars of the timestamp are parsed — fractions
+        // and timezones are ignored.
+        assert_eq!(
+            parse_iso8601("2024-01-01T00:00:00+05:30"),
+            1_704_067_200,
+        );
+    }
+
+    #[test]
+    fn noop_indexer_returns_empty_vecs() {
+        let n = NoopIndexer;
+        let addr = Address::ZERO;
+        let txs = futures::executor::block_on(n.transactions(addr, 10)).unwrap();
+        let bals = futures::executor::block_on(n.balances(addr)).unwrap();
+        assert!(txs.is_empty());
+        assert!(bals.is_empty());
+    }
+
+    #[test]
+    fn http_client_singleton() {
+        let a = http_client();
+        let b = http_client();
+        assert!(std::ptr::eq(a, b));
+    }
+
+    #[test]
+    fn build_indexer_for_returns_for_every_chain() {
+        // Doesn't matter which provider — just that the function returns
+        // an Arc<dyn Indexer> without panicking for each chain. Settings
+        // state is whatever the process default is; the function falls
+        // back to NoopIndexer when no key is configured.
+        for chain in [Chain::Mainnet, Chain::Base, Chain::Optimism] {
+            let _idx: Arc<dyn Indexer> = build_indexer_for(chain);
+        }
+    }
 }

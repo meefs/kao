@@ -698,6 +698,161 @@ mod tests {
     }
 
     #[test]
+    fn urlencode_unreserved_passes_through() {
+        // RFC 3986 unreserved: ALPHA / DIGIT / "-" / "." / "_" / "~"
+        let s = "abcXYZ012-._~";
+        assert_eq!(urlencode(s), s);
+    }
+
+    #[test]
+    fn urlencode_reserved_percent_encodes() {
+        assert_eq!(urlencode("&=?#/+ "), "%26%3D%3F%23%2F%2B%20");
+    }
+
+    #[test]
+    fn urlencode_utf8_each_byte() {
+        // Pound sign U+00A3 = 0xC2 0xA3 in UTF-8.
+        assert_eq!(urlencode("£"), "%C2%A3");
+    }
+
+    #[test]
+    fn parse_address_valid_hex() {
+        let a = parse_address(OWNER).unwrap();
+        assert_eq!(format!("{a:#x}"), OWNER);
+    }
+
+    #[test]
+    fn parse_address_rejects_malformed() {
+        assert!(parse_address("not-an-address").is_none());
+        assert!(parse_address("0x1234").is_none()); // too short
+        assert!(parse_address("").is_none());
+    }
+
+    #[test]
+    fn strip_trailing_slash_basic() {
+        assert_eq!(strip_trailing_slash("https://x/".into()), "https://x");
+        assert_eq!(strip_trailing_slash("https://x".into()), "https://x");
+        assert_eq!(strip_trailing_slash("".into()), "");
+    }
+
+    #[test]
+    fn strip_trailing_slash_idempotent_for_many_slashes() {
+        assert_eq!(strip_trailing_slash("https://x///".into()), "https://x");
+    }
+
+    #[test]
+    fn convert_token_transfer_erc20_happy_path() {
+        let json = format!(
+            r#"{{
+              "transaction_hash": "0xaaaa0000000000000000000000000000000000000000000000000000000000aa",
+              "block_number": 19000000,
+              "timestamp": "2024-08-01T00:00:00.000000Z",
+              "from":   {{ "hash": "{OWNER}" }},
+              "to":     {{ "hash": "{OTHER}" }},
+              "total":  {{ "value": "1500000", "decimals": "6" }},
+              "token":  {{
+                  "address_hash": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                  "symbol": "USDC",
+                  "decimals": "6",
+                  "type": "ERC-20"
+              }},
+              "token_type": "ERC-20",
+              "method": "transfer"
+            }}"#
+        );
+        let raw: RawTokenTransfer = serde_json::from_str(&json).unwrap();
+        let tx = convert_token_transfer(raw, owner()).expect("ERC-20 transfer converts");
+        assert_eq!(tx.value, U256::ZERO, "ETH value zero on token transfers");
+        assert!(matches!(tx.status, TxStatus::Success));
+        assert!(matches!(tx.direction, TxDirection::Out));
+        assert_eq!(tx.block_number, 19_000_000);
+        let token = tx.token.unwrap();
+        assert_eq!(token.symbol, "USDC");
+        assert_eq!(token.decimals, 6);
+        assert_eq!(token.amount_raw, U256::from(1_500_000u64));
+        assert!(!token.is_nft);
+    }
+
+    #[test]
+    fn convert_token_transfer_rejects_non_erc20() {
+        let json = format!(
+            r#"{{
+              "transaction_hash": "0xaaaa0000000000000000000000000000000000000000000000000000000000aa",
+              "from":   {{ "hash": "{OWNER}" }},
+              "to":     {{ "hash": "{OTHER}" }},
+              "total":  {{ "value": "1" }},
+              "token":  {{
+                  "address_hash": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                  "type": "ERC-721"
+              }},
+              "token_type": "ERC-721"
+            }}"#
+        );
+        let raw: RawTokenTransfer = serde_json::from_str(&json).unwrap();
+        assert!(convert_token_transfer(raw, owner()).is_none());
+    }
+
+    #[test]
+    fn convert_token_transfer_falls_back_to_token_decimals() {
+        // total.decimals missing — convert_token_transfer must fall back to
+        // token.decimals.
+        let json = format!(
+            r#"{{
+              "transaction_hash": "0xaaaa0000000000000000000000000000000000000000000000000000000000aa",
+              "from":   {{ "hash": "{OWNER}" }},
+              "to":     {{ "hash": "{OTHER}" }},
+              "total":  {{ "value": "1000" }},
+              "token":  {{
+                  "address_hash": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                  "decimals": "3"
+              }}
+            }}"#
+        );
+        let raw: RawTokenTransfer = serde_json::from_str(&json).unwrap();
+        let tx = convert_token_transfer(raw, owner()).unwrap();
+        assert_eq!(tx.token.unwrap().decimals, 3);
+    }
+
+    #[test]
+    fn merge_normal_and_token_drops_outer_when_token_present() {
+        let hash_match = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let hash_other = "0x2222222222222222222222222222222222222222222222222222222222222222";
+
+        let normal_json = format!(
+            r#"[
+              {{ "hash": "{hash_match}", "block_number": 100, "from": {{ "hash": "{OTHER}" }}, "to": {{ "hash": "{OWNER}" }}, "value": "0", "status": "ok" }},
+              {{ "hash": "{hash_other}", "block_number": 99,  "from": {{ "hash": "{OWNER}" }}, "to": {{ "hash": "{OTHER}" }}, "value": "100", "status": "ok" }}
+            ]"#
+        );
+        let token_json = format!(
+            r#"[
+              {{
+                "transaction_hash": "{hash_match}",
+                "from":  {{ "hash": "{OTHER}" }},
+                "to":    {{ "hash": "{OWNER}" }},
+                "total": {{ "value": "5000000", "decimals": "6" }},
+                "token": {{ "address_hash": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "symbol": "USDC", "decimals": "6" }},
+                "token_type": "ERC-20",
+                "block_number": 100
+              }}
+            ]"#
+        );
+        let normal: Vec<RawTx> = serde_json::from_str(&normal_json).unwrap();
+        let tokens: Vec<RawTokenTransfer> = serde_json::from_str(&token_json).unwrap();
+        let merged = merge_normal_and_token(normal, tokens, owner(), 10);
+
+        assert_eq!(merged.len(), 2);
+        // The "match" hash appears once (token row), not twice.
+        let occurrences = merged
+            .iter()
+            .filter(|t| format!("{:#x}", t.hash) == hash_match)
+            .count();
+        assert_eq!(occurrences, 1);
+        // Ordered desc by block_number.
+        assert!(merged[0].block_number >= merged[1].block_number);
+    }
+
+    #[test]
     fn token_meta_accepts_legacy_address_field_alias() {
         // Older Blockscout deployments serve `address` instead of
         // `address_hash`; the alias must keep them working.

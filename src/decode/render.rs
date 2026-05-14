@@ -538,4 +538,297 @@ mod tests {
         assert!(out.warnings.is_empty());
         assert!(out.args.is_empty());
     }
+
+    /// ABI-encode a single dynamic `string` as `(offset, length, bytes)`.
+    fn abi_encode_string(s: &str) -> Bytes {
+        let mut buf = Vec::with_capacity(64 + s.len().next_multiple_of(32));
+        // offset = 32
+        let mut offset = [0u8; 32];
+        offset[31] = 0x20;
+        buf.extend_from_slice(&offset);
+        // length
+        let mut len = [0u8; 32];
+        len[24..32].copy_from_slice(&(s.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&len);
+        // payload, padded to 32-byte boundary
+        buf.extend_from_slice(s.as_bytes());
+        let pad = (32 - (s.len() % 32)) % 32;
+        buf.extend(std::iter::repeat(0u8).take(pad));
+        Bytes::from(buf)
+    }
+
+    /// ABI-encode a single uint8 value (right-padded uint256 wire form).
+    fn abi_encode_uint8(v: u8) -> Bytes {
+        let mut buf = [0u8; 32];
+        buf[31] = v;
+        Bytes::from(buf.to_vec())
+    }
+
+    #[tokio::test]
+    async fn read_token_meta_returns_symbol_and_decimals() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let usdc = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        net.set_call(
+            usdc,
+            Bytes::from_static(&SYMBOL_SELECTOR),
+            abi_encode_string("USDC"),
+            true,
+        );
+        net.set_call(
+            usdc,
+            Bytes::from_static(&DECIMALS_SELECTOR),
+            abi_encode_uint8(6),
+            true,
+        );
+        let (meta, verified) = read_token_meta(&net, Chain::Mainnet, usdc).await.unwrap();
+        assert_eq!(meta.symbol, "USDC");
+        assert_eq!(meta.decimals, 6);
+        assert!(verified);
+    }
+
+    #[tokio::test]
+    async fn read_token_meta_returns_none_when_symbol_missing() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let addr = address!("0000000000000000000000000000000000001234");
+        // Only `decimals()` configured — `symbol()` returns empty bytes,
+        // so the helper must return None.
+        net.set_call(
+            addr,
+            Bytes::from_static(&DECIMALS_SELECTOR),
+            abi_encode_uint8(18),
+            true,
+        );
+        assert!(read_token_meta(&net, Chain::Mainnet, addr).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_token_meta_unverified_flag_propagates() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let addr = address!("0000000000000000000000000000000000001234");
+        net.set_call(
+            addr,
+            Bytes::from_static(&SYMBOL_SELECTOR),
+            abi_encode_string("X"),
+            false, // unverified
+        );
+        net.set_call(
+            addr,
+            Bytes::from_static(&DECIMALS_SELECTOR),
+            abi_encode_uint8(18),
+            true,
+        );
+        let (_, verified) = read_token_meta(&net, Chain::Mainnet, addr).await.unwrap();
+        assert!(!verified, "any unverified probe must propagate as false");
+    }
+
+    #[tokio::test]
+    async fn call_decode_string_falls_back_to_bytes32_form() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let mkr = address!("9f8f72aa9304c8b593d555f12ef6589cc3a579a2");
+        // Legacy MKR-style bytes32 return: "MKR" then zero-padded.
+        let mut bytes32 = [0u8; 32];
+        bytes32[..3].copy_from_slice(b"MKR");
+        net.set_call(
+            mkr,
+            Bytes::from_static(&SYMBOL_SELECTOR),
+            Bytes::from(bytes32.to_vec()),
+            true,
+        );
+        let (s, _) = call_decode_string(&net, Chain::Mainnet, mkr, SYMBOL_SELECTOR)
+            .await
+            .unwrap();
+        assert_eq!(s, "MKR");
+    }
+
+    #[tokio::test]
+    async fn call_decode_string_empty_returns_none() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let addr = address!("0000000000000000000000000000000000001234");
+        // No call configured — CallMock returns empty bytes by default.
+        assert!(
+            call_decode_string(&net, Chain::Mainnet, addr, SYMBOL_SELECTOR)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn call_decode_u8_rejects_implausible_decimals() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let addr = address!("0000000000000000000000000000000000001234");
+        net.set_call(
+            addr,
+            Bytes::from_static(&DECIMALS_SELECTOR),
+            abi_encode_uint8(99), // > 36 sanity bound
+            true,
+        );
+        assert!(
+            call_decode_u8(&net, Chain::Mainnet, addr, DECIMALS_SELECTOR)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn call_decode_u8_accepts_zero_decimals() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let addr = address!("0000000000000000000000000000000000001234");
+        net.set_call(
+            addr,
+            Bytes::from_static(&DECIMALS_SELECTOR),
+            abi_encode_uint8(0),
+            true,
+        );
+        let (v, _) = call_decode_u8(&net, Chain::Mainnet, addr, DECIMALS_SELECTOR)
+            .await
+            .unwrap();
+        assert_eq!(v, 0);
+    }
+
+    #[tokio::test]
+    async fn call_decode_u8_short_response_returns_none() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let addr = address!("0000000000000000000000000000000000001234");
+        net.set_call(
+            addr,
+            Bytes::from_static(&DECIMALS_SELECTOR),
+            Bytes::from(vec![0u8; 16]), // < 32 bytes
+            true,
+        );
+        assert!(
+            call_decode_u8(&net, Chain::Mainnet, addr, DECIMALS_SELECTOR)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_call_propagates_unverified() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let addr = address!("0000000000000000000000000000000000001234");
+        let payload = Bytes::from_static(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        net.set_call(
+            addr,
+            Bytes::from_static(&SYMBOL_SELECTOR),
+            payload.clone(),
+            false,
+        );
+        let (out, verified) = verified_call(&net, Chain::Mainnet, addr, SYMBOL_SELECTOR)
+            .await
+            .unwrap();
+        assert_eq!(out, payload);
+        assert!(!verified);
+    }
+
+    #[tokio::test]
+    async fn decode_call_transfer_resolves_with_token_metadata() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let usdc = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let recipient = address!("000000000000000000000000000000000000dEaD");
+
+        // Pre-load symbol() / decimals() on the target so target_token
+        // populates.
+        net.set_call(
+            usdc,
+            Bytes::from_static(&SYMBOL_SELECTOR),
+            abi_encode_string("USDC"),
+            true,
+        );
+        net.set_call(
+            usdc,
+            Bytes::from_static(&DECIMALS_SELECTOR),
+            abi_encode_uint8(6),
+            true,
+        );
+
+        // transfer(0xdead, 1_000_000) — selector + 32-byte recipient + 32-byte amount
+        let mut cd = Vec::with_capacity(68);
+        cd.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]);
+        cd.extend_from_slice(&[0u8; 12]);
+        cd.extend_from_slice(recipient.as_slice());
+        cd.extend_from_slice(&U256::from(1_000_000u64).to_be_bytes::<32>());
+
+        let out = decode_call(&net, Chain::Mainnet, usdc, Bytes::from(cd)).await;
+        assert!(out.target_token.is_some());
+        let token = out.target_token.unwrap();
+        assert_eq!(token.symbol, "USDC");
+        assert_eq!(token.decimals, 6);
+        assert_eq!(out.function_name.as_deref(), Some("transfer"));
+        assert_eq!(out.args.len(), 2);
+        assert!(out.all_verified, "happy path should be fully verified");
+    }
+
+    #[tokio::test]
+    async fn decode_call_approve_infinite_emits_warning() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let usdc = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let spender = address!("00000000000000000000000000000000000000dE");
+
+        net.set_call(
+            usdc,
+            Bytes::from_static(&SYMBOL_SELECTOR),
+            abi_encode_string("USDC"),
+            true,
+        );
+        net.set_call(
+            usdc,
+            Bytes::from_static(&DECIMALS_SELECTOR),
+            abi_encode_uint8(6),
+            true,
+        );
+
+        // approve(spender, U256::MAX) — selector 0x095ea7b3
+        let mut cd = Vec::with_capacity(68);
+        cd.extend_from_slice(&[0x09, 0x5e, 0xa7, 0xb3]);
+        cd.extend_from_slice(&[0u8; 12]);
+        cd.extend_from_slice(spender.as_slice());
+        cd.extend_from_slice(&U256::MAX.to_be_bytes::<32>());
+
+        let out = decode_call(&net, Chain::Mainnet, usdc, Bytes::from(cd)).await;
+        assert_eq!(out.function_name.as_deref(), Some("approve"));
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| matches!(w, Warning::InfiniteApproval { .. })),
+            "expected InfiniteApproval warning, got: {:?}",
+            out.warnings,
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_call_unverified_bytecode_warning_when_get_code_unverified() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let addr = address!("0000000000000000000000000000000000001234");
+        // Empty bytecode but marked unverified — propagates to
+        // all_verified=false and triggers the UnverifiedBytecode warning.
+        net.set_code(addr, Bytes::new(), false);
+
+        // transfer(addr, 1) — selector 0xa9059cbb
+        let mut cd = Vec::with_capacity(68);
+        cd.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]);
+        cd.extend_from_slice(&[0u8; 32]);
+        cd.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+
+        let out = decode_call(&net, Chain::Mainnet, addr, Bytes::from(cd)).await;
+        assert!(!out.all_verified);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| matches!(w, Warning::UnverifiedBytecode)),
+            "expected UnverifiedBytecode warning, got: {:?}",
+            out.warnings,
+        );
+    }
 }

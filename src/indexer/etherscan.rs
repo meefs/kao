@@ -566,6 +566,170 @@ mod tests {
     }
 
     #[test]
+    fn convert_token_tx_happy_path() {
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
+        let raw = RawTokenTx {
+            block_number: "19000000".into(),
+            timestamp: "1700000000".into(),
+            hash: "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
+            from: "0x000000000000000000000000000000000000beef".into(),
+            to: format!("{owner:#x}"),
+            value: "1500000".into(),
+            contract_address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            token_symbol: "USDC".into(),
+            token_decimal: "6".into(),
+            gas_used: "50000".into(),
+            gas_price: "20000000000".into(),
+        };
+        let tx = convert_token_tx(raw, owner).expect("converts");
+        assert!(matches!(tx.status, TxStatus::Success));
+        assert!(matches!(tx.direction, TxDirection::In));
+        assert_eq!(tx.value, U256::ZERO, "outer-tx ETH value zero on token rows");
+        let token = tx.token.unwrap();
+        assert_eq!(token.symbol, "USDC");
+        assert_eq!(token.decimals, 6);
+        assert_eq!(token.amount_raw, U256::from(1_500_000u64));
+        assert!(!token.is_nft);
+    }
+
+    #[test]
+    fn convert_token_tx_rejects_malformed_hash() {
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
+        let raw = RawTokenTx {
+            block_number: "1".into(),
+            timestamp: "0".into(),
+            hash: "not-a-hash".into(),
+            from: format!("{owner:#x}"),
+            to: "0x000000000000000000000000000000000000beef".into(),
+            value: "0".into(),
+            contract_address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            token_symbol: "X".into(),
+            token_decimal: "18".into(),
+            gas_used: "".into(),
+            gas_price: "".into(),
+        };
+        assert!(convert_token_tx(raw, owner).is_none());
+    }
+
+    #[test]
+    fn convert_token_tx_defaults_decimals_to_eighteen() {
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
+        let raw = RawTokenTx {
+            block_number: "1".into(),
+            timestamp: "0".into(),
+            hash: "0x0000000000000000000000000000000000000000000000000000000000000002".into(),
+            from: format!("{owner:#x}"),
+            to: "0x000000000000000000000000000000000000beef".into(),
+            value: "1".into(),
+            contract_address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            token_symbol: "X".into(),
+            token_decimal: "".into(),
+            gas_used: "".into(),
+            gas_price: "".into(),
+        };
+        let tx = convert_token_tx(raw, owner).unwrap();
+        assert_eq!(tx.token.unwrap().decimals, 18);
+    }
+
+    #[test]
+    fn merge_normal_and_token_dedups_by_hash_and_sorts_desc() {
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
+        let other = "0x000000000000000000000000000000000000beef";
+        let hash_shared = "0x1111111111111111111111111111111111111111111111111111111111111111";
+        let hash_only_normal =
+            "0x2222222222222222222222222222222222222222222222222222222222222222";
+
+        let normal = vec![
+            // shared hash — should be dropped because the token row wins.
+            RawTx {
+                block_number: "200".into(),
+                timestamp: "1700000001".into(),
+                hash: hash_shared.into(),
+                from: other.into(),
+                to: format!("{owner:#x}"),
+                value: "0".into(),
+                gas_used: "21000".into(),
+                gas_price: "1".into(),
+                is_error: "0".into(),
+                txreceipt_status: "1".into(),
+                function_name: String::new(),
+            },
+            // stand-alone outer tx, oldest — newest-first ordering should
+            // place it last.
+            RawTx {
+                block_number: "100".into(),
+                timestamp: "1700000000".into(),
+                hash: hash_only_normal.into(),
+                from: format!("{owner:#x}"),
+                to: other.into(),
+                value: "10".into(),
+                gas_used: "21000".into(),
+                gas_price: "1".into(),
+                is_error: "0".into(),
+                txreceipt_status: "1".into(),
+                function_name: String::new(),
+            },
+        ];
+        let tokens = vec![RawTokenTx {
+            block_number: "200".into(),
+            timestamp: "1700000001".into(),
+            hash: hash_shared.into(),
+            from: other.into(),
+            to: format!("{owner:#x}"),
+            value: "1".into(),
+            contract_address: "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48".into(),
+            token_symbol: "USDC".into(),
+            token_decimal: "6".into(),
+            gas_used: "50000".into(),
+            gas_price: "1".into(),
+        }];
+
+        let merged = merge_normal_and_token(normal, tokens, owner, 10);
+        assert_eq!(merged.len(), 2);
+        // Token row at block 200 ranks first.
+        assert_eq!(merged[0].block_number, 200);
+        assert!(merged[0].token.is_some());
+        // Standalone outer tx at block 100 ranks last.
+        assert_eq!(merged[1].block_number, 100);
+        assert!(merged[1].token.is_none());
+    }
+
+    #[test]
+    fn merge_normal_and_token_respects_limit() {
+        let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+            .parse()
+            .unwrap();
+        let normal: Vec<RawTx> = (0..5u64)
+            .map(|i| RawTx {
+                block_number: (1000 + i).to_string(),
+                timestamp: "0".into(),
+                hash: format!(
+                    "0x{:064x}",
+                    i + 1
+                ),
+                from: format!("{owner:#x}"),
+                to: "0x000000000000000000000000000000000000beef".into(),
+                value: "0".into(),
+                gas_used: "".into(),
+                gas_price: "".into(),
+                is_error: "0".into(),
+                txreceipt_status: "1".into(),
+                function_name: String::new(),
+            })
+            .collect();
+        let out = merge_normal_and_token(normal, vec![], owner, 2);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
     fn classifies_pre_byzantium_tx_as_success_when_no_error() {
         let owner: Address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
             .parse()

@@ -230,4 +230,103 @@ mod tests {
         assert_eq!(parse_hex4("a9059c"), None);
         assert_eq!(parse_hex4("zzzzzzzz"), None);
     }
+
+    #[test]
+    fn parse_hex4_too_long_is_none() {
+        assert!(parse_hex4("a9059cbb00").is_none());
+    }
+
+    fn keccak4(sig: &str) -> [u8; 4] {
+        let mut h = Keccak256::new();
+        h.update(sig.as_bytes());
+        let d = h.finalize();
+        [d[0], d[1], d[2], d[3]]
+    }
+
+    #[test]
+    fn encode_index_is_sorted_by_selector() {
+        // Provoke "unsorted" by inserting in non-canonical order — BTreeMap
+        // re-sorts. Verify the encoded index reflects that sort.
+        let mut entries: BTreeMap<[u8; 4], Vec<String>> = BTreeMap::new();
+        entries.insert([0xff, 0, 0, 0], vec!["b()".into()]);
+        entries.insert([0x00, 0, 0, 0], vec!["a()".into()]);
+        entries.insert([0x80, 0, 0, 0], vec!["c()".into()]);
+
+        let blob = encode(&entries).unwrap();
+        // First selector in the index region (offset 16) must be the
+        // smallest one (0x00...).
+        assert_eq!(blob[16], 0x00);
+        // Second (offset 16+8 = 24): 0x80
+        assert_eq!(blob[24], 0x80);
+        // Third (offset 32): 0xff
+        assert_eq!(blob[32], 0xff);
+    }
+
+    #[test]
+    fn encode_records_correct_count_and_offsets() {
+        let mut entries: BTreeMap<[u8; 4], Vec<String>> = BTreeMap::new();
+        entries.insert([0x00; 4], vec!["a()".into(), "b()".into()]);
+        entries.insert([0x01; 4], vec!["c()".into()]);
+
+        let blob = encode(&entries).unwrap();
+        // count = 2
+        assert_eq!(u32::from_le_bytes(blob[8..12].try_into().unwrap()), 2);
+        // Two index records of 8 bytes each → 16 bytes index after the
+        // 16-byte header → strings region begins at 32.
+        let strings_start = 32;
+        // First entry's offset is 0 (relative to strings region).
+        let off0 = u32::from_le_bytes(blob[20..24].try_into().unwrap()) as usize;
+        assert_eq!(off0, 0);
+        // First entry has 2 sigs ("a()", "b()"): u16 count=2, then per sig
+        // u16 len + bytes. Total = 2 + 2*(2+3) = 12 bytes.
+        let off1 = u32::from_le_bytes(blob[28..32].try_into().unwrap()) as usize;
+        assert_eq!(off1, 12);
+        // sig_count at offset 0 = 2.
+        assert_eq!(
+            u16::from_le_bytes(blob[strings_start..strings_start + 2].try_into().unwrap()),
+            2,
+        );
+    }
+
+    /// The sync logic accepts a signature only when keccak256(signature)[..4]
+    /// matches the file's selector. Validate the round-trip end-to-end on a
+    /// known canonical selector + a corrupted-pair rejection.
+    #[test]
+    fn keccak_selector_round_trip() {
+        // transfer(address,uint256) → 0xa9059cbb
+        assert_eq!(keccak4("transfer(address,uint256)"), [0xa9, 0x05, 0x9c, 0xbb]);
+        // approve(address,uint256) → 0x095ea7b3
+        assert_eq!(keccak4("approve(address,uint256)"), [0x09, 0x5e, 0xa7, 0xb3]);
+        // A bogus pair must NOT round-trip.
+        assert_ne!(keccak4("transfer(address,uint256)"), [0x00, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn encode_empty_map_yields_header_only() {
+        let entries: BTreeMap<[u8; 4], Vec<String>> = BTreeMap::new();
+        let blob = encode(&entries).unwrap();
+        assert_eq!(blob.len(), 16, "header only, no index or strings");
+        assert_eq!(u32::from_le_bytes(blob[8..12].try_into().unwrap()), 0);
+    }
+
+    /// Round-trip: encode → manually re-parse the strings region for one
+    /// selector → assert the signature comes back intact.
+    #[test]
+    fn encode_strings_region_round_trip() {
+        let mut entries: BTreeMap<[u8; 4], Vec<String>> = BTreeMap::new();
+        entries.insert(
+            [0xa9, 0x05, 0x9c, 0xbb],
+            vec!["transfer(address,uint256)".into()],
+        );
+        let blob = encode(&entries).unwrap();
+
+        // strings_offset for the (only) selector.
+        let off = u32::from_le_bytes(blob[20..24].try_into().unwrap()) as usize;
+        let abs = 16 /* header */ + 1 * 8 /* index */ + off;
+        let sig_count = u16::from_le_bytes(blob[abs..abs + 2].try_into().unwrap());
+        assert_eq!(sig_count, 1);
+        let sig_len = u16::from_le_bytes(blob[abs + 2..abs + 4].try_into().unwrap()) as usize;
+        let sig = std::str::from_utf8(&blob[abs + 4..abs + 4 + sig_len]).unwrap();
+        assert_eq!(sig, "transfer(address,uint256)");
+    }
 }

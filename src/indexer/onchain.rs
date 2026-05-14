@@ -903,4 +903,111 @@ mod tests {
         assert_eq!(decode_decimals(&Bytes::from(data)), Some(6));
         assert_eq!(decode_decimals(&Bytes::new()), None);
     }
+
+    #[test]
+    fn parse_addr_string_hex() {
+        let v = serde_json::Value::String("0xd8da6bf26964af9d7eed9e03e53415d37aa96045".into());
+        assert_eq!(parse_addr(&v), Some(owner()));
+    }
+
+    #[test]
+    fn parse_addr_non_string_or_malformed_is_none() {
+        assert!(parse_addr(&serde_json::Value::Null).is_none());
+        assert!(parse_addr(&serde_json::json!(42)).is_none());
+        assert!(parse_addr(&serde_json::Value::String("not-a-hex".into())).is_none());
+        assert!(parse_addr(&serde_json::Value::String("0x12".into())).is_none()); // too short
+    }
+
+    #[test]
+    fn parse_u256_with_and_without_prefix() {
+        let a = parse_u256(&serde_json::Value::String("0x1a".into())).unwrap();
+        let b = parse_u256(&serde_json::Value::String("1a".into())).unwrap();
+        assert_eq!(a, U256::from(26u64));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn parse_u256_zero_and_large() {
+        assert_eq!(
+            parse_u256(&serde_json::Value::String("0x0".into())).unwrap(),
+            U256::ZERO,
+        );
+        let big = parse_u256(&serde_json::Value::String(
+            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into(),
+        ))
+        .unwrap();
+        assert_eq!(big, U256::MAX);
+    }
+
+    #[test]
+    fn parse_u256_rejects_non_hex() {
+        assert!(parse_u256(&serde_json::Value::String("hello".into())).is_none());
+        assert!(parse_u256(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn trace_to_indexed_native_eth_call() {
+        let owner_a = owner();
+        let other_a = other();
+        let t = serde_json::json!({
+            "action": {
+                "callType": "call",
+                "from": format!("{owner_a:#x}"),
+                "to":   format!("{other_a:#x}"),
+                "value": "0xde0b6b3a7640000"  // 1 ETH
+            },
+            "transactionHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "blockNumber": 18_500_000u64,
+        });
+        let tx = trace_to_indexed(&t, owner_a, Chain::Mainnet).expect("converts");
+        assert_eq!(tx.from, owner_a);
+        assert_eq!(tx.to, Some(other_a));
+        assert_eq!(tx.value, U256::from(1_000_000_000_000_000_000u128));
+        assert_eq!(tx.block_number, 18_500_000);
+        assert_eq!(tx.method.as_deref(), Some("call"));
+    }
+
+    #[test]
+    fn trace_to_indexed_skips_zero_value() {
+        let t = serde_json::json!({
+            "action": {
+                "callType": "call",
+                "from": format!("{:#x}", owner()),
+                "to":   format!("{:#x}", other()),
+                "value": "0x0",
+            },
+            "transactionHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "blockNumber": 1u64,
+        });
+        assert!(trace_to_indexed(&t, owner(), Chain::Mainnet).is_none());
+    }
+
+    #[test]
+    fn trace_to_indexed_skips_create_and_suicide() {
+        // callType missing — create/suicide traces.
+        let t = serde_json::json!({
+            "action": {
+                "from": format!("{:#x}", owner()),
+                "to":   format!("{:#x}", other()),
+                "value": "0xff",
+            },
+        });
+        assert!(trace_to_indexed(&t, owner(), Chain::Mainnet).is_none());
+    }
+
+    #[test]
+    fn trace_to_indexed_skips_reverted_traces() {
+        let t = serde_json::json!({
+            "action": {
+                "callType": "call",
+                "from": format!("{:#x}", owner()),
+                "to":   format!("{:#x}", other()),
+                "value": "0x1",
+            },
+            "transactionHash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "blockNumber": 1u64,
+            "error": "Reverted",
+        });
+        assert!(trace_to_indexed(&t, owner(), Chain::Mainnet).is_none());
+    }
 }

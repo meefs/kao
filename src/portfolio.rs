@@ -1186,6 +1186,150 @@ mod discovery_tests {
 }
 
 #[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn is_rate_limited_matches_known_patterns() {
+        assert!(is_rate_limited("HTTP 429 Too Many Requests"));
+        assert!(is_rate_limited("rate-limited by upstream"));
+        assert!(is_rate_limited("rate limit reached"));
+        assert!(is_rate_limited("Too Many Requests"));
+        assert!(!is_rate_limited("connection refused"));
+        assert!(!is_rate_limited("internal server error"));
+    }
+
+    #[test]
+    fn factory_for_distinct_per_chain_except_mainnet_op() {
+        let m = factory_for(Chain::Mainnet);
+        let b = factory_for(Chain::Base);
+        let o = factory_for(Chain::Optimism);
+        // Mainnet and Optimism share the canonical Uniswap factory; Base
+        // is its own deployment.
+        assert_eq!(m, o);
+        assert_ne!(m, b);
+    }
+
+    #[test]
+    fn weth_for_l2_share_predeploy() {
+        assert_eq!(weth_for(Chain::Base), weth_for(Chain::Optimism));
+        assert_ne!(weth_for(Chain::Base), weth_for(Chain::Mainnet));
+    }
+
+    #[test]
+    fn usdc_for_distinct_per_chain() {
+        let m = usdc_for(Chain::Mainnet);
+        let b = usdc_for(Chain::Base);
+        let o = usdc_for(Chain::Optimism);
+        let unique: std::collections::HashSet<_> = [m, b, o].into_iter().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn balance_of_calldata_layout() {
+        let owner = address!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045");
+        let data = balance_of_calldata(owner);
+        let bytes: &[u8] = data.as_ref();
+        // 4-byte selector + 12-byte left padding + 20-byte address = 36 bytes.
+        assert_eq!(bytes.len(), 36);
+        assert_eq!(&bytes[..4], &[0x70, 0xa0, 0x82, 0x31]);
+        assert_eq!(&bytes[4..16], &[0u8; 12]);
+        assert_eq!(&bytes[16..], owner.as_slice());
+    }
+
+    #[test]
+    fn balance_of_selector_matches_keccak() {
+        // First 4 bytes of keccak256("balanceOf(address)").
+        let want = &keccak256(b"balanceOf(address)")[..4];
+        assert_eq!(want, BALANCE_OF_SELECTOR);
+    }
+
+    #[test]
+    fn slot0_selector_matches_keccak() {
+        let want = &keccak256(b"slot0()")[..4];
+        assert_eq!(want, SLOT0_SELECTOR);
+    }
+
+    #[test]
+    fn sqrt_price_to_raw_zero_returns_zero() {
+        assert_eq!(sqrt_price_to_raw(U256::ZERO), 0.0);
+    }
+
+    #[test]
+    fn sqrt_price_to_raw_q96_yields_one() {
+        // sqrt = 2^96 → raw = (2^96 / 2^96)^2 = 1.0
+        let q96 = U256::from(1u128) << 96;
+        let raw = sqrt_price_to_raw(q96);
+        assert!((raw - 1.0).abs() < 1e-9, "got {raw}");
+    }
+
+    #[test]
+    fn token_price_in_eth_token0_branch() {
+        // token < weth: token is token0; raw = (token1/token0) in smallest
+        // units = (weth_raw / token_raw). Pass raw=1.0 (i.e., 1 WETH unit per
+        // token unit), token_decimals=18, so dec_diff=0 → 1.0.
+        let token = address!("0x0000000000000000000000000000000000000001");
+        let weth = address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        let q96 = U256::from(1u128) << 96;
+        let price = token_price_in_eth(q96, token, 18, weth);
+        assert!((price - 1.0).abs() < 1e-9, "got {price}");
+    }
+
+    #[test]
+    fn token_price_in_eth_token1_branch() {
+        // weth < token: token is token1; price = 10^(dec_diff)/raw.
+        // Pick token addr > weth, decimals=18, raw=1 → 1.0.
+        let weth = address!("0x0000000000000000000000000000000000000001");
+        let token = address!("0xffffffffffffffffffffffffffffffffffffffff");
+        let q96 = U256::from(1u128) << 96;
+        let price = token_price_in_eth(q96, token, 18, weth);
+        assert!((price - 1.0).abs() < 1e-9, "got {price}");
+    }
+
+    #[test]
+    fn token_price_in_eth_zero_sqrt_returns_zero() {
+        let token = address!("0x0000000000000000000000000000000000000001");
+        let weth = address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        assert_eq!(token_price_in_eth(U256::ZERO, token, 18, weth), 0.0);
+    }
+
+    #[test]
+    fn eth_usd_from_sqrt_price_zero_returns_zero() {
+        let usdc = address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let weth = address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
+        assert_eq!(eth_usd_from_sqrt_price(U256::ZERO, usdc, weth), 0.0);
+    }
+
+    #[test]
+    fn format_eth_balance_under_thousand_uses_four_decimals() {
+        // 1.5 ETH → "1.5000"
+        let raw = U256::from(15u64) * U256::from(10).pow(U256::from(17));
+        let (s, f) = format_eth_balance(raw);
+        assert_eq!(s, "1.5000");
+        assert!((f - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn format_eth_balance_over_thousand_uses_two_decimals() {
+        // 1234.5 ETH
+        let raw = U256::from(12345u64) * U256::from(10).pow(U256::from(17));
+        let (s, _) = format_eth_balance(raw);
+        assert_eq!(s, "1234.50");
+    }
+
+    #[test]
+    fn new_cache_is_empty_and_shareable() {
+        let c1 = new_cache();
+        let c2 = c1.clone();
+        assert!(c1.lock().unwrap().is_empty());
+        let key = (Address::ZERO, Chain::Mainnet);
+        c1.lock().unwrap().insert(key, Vec::new());
+        // The clone shares the same lock; the insertion is visible.
+        assert!(c2.lock().unwrap().contains_key(&key));
+    }
+}
+
+#[cfg(test)]
 mod multicall_tests {
     use super::*;
     use alloy::primitives::U256;

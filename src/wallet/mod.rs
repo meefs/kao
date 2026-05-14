@@ -718,4 +718,183 @@ mod tests {
             .unwrap();
         assert!(view_only_account(addr).name().is_none());
     }
+
+    #[test]
+    fn account_address_ledger_returns_stored_address() {
+        let bytes = [0xab; 20];
+        let acc = AccountDescriptor::Ledger {
+            name: None,
+            path: LedgerHdPath::LedgerLive(0),
+            address: bytes,
+        };
+        assert_eq!(account_address(&acc), Some(Address::from(bytes)));
+    }
+
+    #[test]
+    fn account_address_trezor_returns_stored_address() {
+        let bytes = [0xcd; 20];
+        let acc = AccountDescriptor::Trezor {
+            name: None,
+            path: TrezorHdPath::TrezorLive(0),
+            address: bytes,
+        };
+        assert_eq!(account_address(&acc), Some(Address::from(bytes)));
+    }
+
+    #[test]
+    fn ledger_hd_path_to_alloy_round_trips_variants() {
+        // Pin each variant's enum-discriminator translation so a future
+        // `AlloyLedgerHDPath` enum reorder can't silently swap LedgerLive
+        // and Legacy paths.
+        let live = LedgerHdPath::LedgerLive(3).to_alloy();
+        assert!(matches!(live, AlloyLedgerHDPath::LedgerLive(3)));
+        let legacy = LedgerHdPath::Legacy(2).to_alloy();
+        assert!(matches!(legacy, AlloyLedgerHDPath::Legacy(2)));
+        let other = LedgerHdPath::Other("m/44'/60'/1'/0/0".into()).to_alloy();
+        match other {
+            AlloyLedgerHDPath::Other(s) => assert_eq!(s, "m/44'/60'/1'/0/0"),
+            _ => panic!("expected Other"),
+        }
+    }
+
+    #[test]
+    fn trezor_hd_path_to_alloy_round_trips_variants() {
+        let live = TrezorHdPath::TrezorLive(7).to_alloy();
+        assert!(matches!(live, AlloyTrezorHDPath::TrezorLive(7)));
+        let other = TrezorHdPath::Other("m/44'/60'/2'/0/0".into()).to_alloy();
+        match other {
+            AlloyTrezorHDPath::Other(s) => assert_eq!(s, "m/44'/60'/2'/0/0"),
+            _ => panic!("expected Other"),
+        }
+    }
+
+    #[test]
+    fn kao_signer_view_only_cannot_sign() {
+        let addr: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        let signer = KaoSigner::ViewOnly(addr);
+        assert!(!signer.can_sign());
+        assert_eq!(signer.address(), addr);
+        // Debug shouldn't leak — ViewOnly intentionally includes the
+        // address (it's not secret).
+        let s = format!("{signer:?}");
+        assert!(s.contains("ViewOnly"));
+    }
+
+    #[test]
+    fn kao_signer_local_signs_and_recovers() {
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        assert!(ks.can_sign());
+        assert_eq!(ks.address(), signer.address());
+        let s = format!("{ks:?}");
+        assert!(s.contains("Local"));
+    }
+
+    #[tokio::test]
+    async fn kao_signer_view_only_sign_tx_returns_unsupported() {
+        use alloy::consensus::{SignableTransaction, TxEip1559};
+        use alloy::primitives::{TxKind, U256};
+        let addr: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        let signer = KaoSigner::ViewOnly(addr);
+        let mut tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(addr),
+            value: U256::ZERO,
+            access_list: Default::default(),
+            input: Default::default(),
+        };
+        let dyn_tx: &mut dyn SignableTransaction<_> = &mut tx;
+        let err = signer.sign_tx(dyn_tx).await.unwrap_err();
+        assert!(matches!(err, alloy::signers::Error::UnsupportedOperation(_)));
+    }
+
+    #[test]
+    fn handoff_with_take_returns_signer_once() {
+        let addr: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        let cell = handoff_with(KaoSigner::ViewOnly(addr));
+        let taken = cell.lock().unwrap().take();
+        assert!(taken.is_some());
+        // Second take returns None.
+        let again = cell.lock().unwrap().take();
+        assert!(again.is_none());
+    }
+
+    #[test]
+    fn generate_mnemonic_yields_distinct_words_each_call() {
+        let (p1, _) = generate_mnemonic().unwrap();
+        let (p2, _) = generate_mnemonic().unwrap();
+        use secrecy::ExposeSecret;
+        // Vanishingly small probability of collision (2^128); functional check
+        // that the RNG actually advances.
+        assert_ne!(p1.expose_secret(), p2.expose_secret());
+    }
+
+    #[test]
+    fn short_address_full_form_truncates() {
+        let addr: Address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+            .parse()
+            .unwrap();
+        let s = short_address(addr);
+        // `format!("{addr}")` uses EIP-55 mixed-case; just check the
+        // shape (head + ellipsis + tail) rather than the exact case.
+        assert!(s.starts_with("0xd8dA"), "got: {s}");
+        assert!(s.ends_with("6045"), "got: {s}");
+        assert!(s.contains('…'));
+    }
+
+    #[test]
+    fn account_short_address_fallback_when_key_invalid() {
+        // Zero-bytes private key — signer_from_bytes rejects it, so
+        // account_address returns None and the fallback string is used.
+        let acc = AccountDescriptor::Local {
+            name: None,
+            key_bytes: [0u8; 32],
+        };
+        assert_eq!(account_short_address(&acc), "0x????…????");
+    }
+
+    #[test]
+    fn account_short_address_for_view_only_uses_short_form() {
+        let addr: Address = "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045"
+            .parse()
+            .unwrap();
+        let acc = view_only_account(addr);
+        let s = account_short_address(&acc);
+        assert!(s.starts_with("0xd8dA"), "got: {s}");
+        assert!(s.ends_with("6045"));
+    }
+
+    #[test]
+    fn signer_address_helper_matches_signer() {
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        assert_eq!(signer_address(signer), signer.address());
+    }
+
+    #[test]
+    fn wallet_descriptor_addresses_lists_all_accounts() {
+        let addr_a: Address = "0x000000000000000000000000000000000000bEEf"
+            .parse()
+            .unwrap();
+        let addr_b: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        let desc = WalletDescriptor {
+            accounts: vec![view_only_account(addr_a), view_only_account(addr_b)],
+            active_index: 0,
+        };
+        let addrs = desc.addresses();
+        assert_eq!(addrs, vec![addr_a, addr_b]);
+    }
 }
