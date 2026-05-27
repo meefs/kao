@@ -39,6 +39,7 @@
 //! so tests can drive the whole path against `CallMock` instead of
 //! standing up Helios.
 
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, Bytes, U256, address, b256};
@@ -47,7 +48,7 @@ use alloy::sol_types::SolCall;
 
 use crate::chain::Chain;
 use crate::net::BalanceFetcher;
-use crate::wallet::{SafeDescriptor, SafeTrust};
+use crate::wallet::{SafeDescriptor, SafeTrust, short_address};
 
 // ── Safe ABI (subset used at onboarding + refresh) ──────────────────────────
 
@@ -395,6 +396,18 @@ impl RefreshDiff {
     }
 }
 
+/// Result of `refresh_all_safes`. One entry per Safe in `wallet.safes`
+/// (in the same positional order), tagged with the source index so the
+/// App handler can splice each new descriptor back into its slot. The
+/// per-safe `Result` lets a single unreachable RPC degrade gracefully
+/// without sinking the rest of the batch.
+///
+/// Aliased to keep `Message::SafesRefreshed` (in `app/mod.rs`) from
+/// becoming the visually-complex tuple type clippy's `type_complexity`
+/// lint refuses.
+#[allow(dead_code)]
+pub type RefreshBatch = Vec<(usize, Result<(SafeDescriptor, RefreshDiff), String>)>;
+
 // ── Public functions ────────────────────────────────────────────────────────
 
 /// Inspect a single address on a single chain. Returns one of the four
@@ -586,6 +599,91 @@ pub async fn refresh_one(
         cached_at: now,
     };
     Ok((new_desc, diff))
+}
+
+/// Fan `refresh_one` across every Safe in `safes` in parallel. Returns
+/// one entry per input safe, paired with its position so the caller can
+/// splice the result back into `wallet.safes[idx]` without losing
+/// ordering. Errors are per-safe — a single unreachable RPC for one
+/// Safe doesn't sink the whole batch.
+///
+/// Spawned by the App after unlock so the dashboard renders against
+/// freshly-verified owner sets / modules / guards. Wallet is saved
+/// once at the App layer after the batch completes (if any diff was
+/// non-empty), which keeps the rollback-protection epoch from
+/// bumping per-Safe.
+#[allow(dead_code)]
+pub async fn refresh_all_safes(
+    net: Arc<dyn BalanceFetcher>,
+    safes: Vec<SafeDescriptor>,
+) -> RefreshBatch {
+    let futures = safes.into_iter().enumerate().map(|(idx, desc)| {
+        let net = net.clone();
+        async move { (idx, refresh_one(net.as_ref(), &desc).await) }
+    });
+    futures::future::join_all(futures).await
+}
+
+/// Summarize a `RefreshDiff` into the short human-readable messages
+/// the UI should surface as a banner / toast. Returns an empty vec
+/// when nothing in the diff is worth interrupting the user with.
+///
+/// What counts as "worth interrupting":
+/// - **Owner removed that is one of the user's linked signers** — the
+///   user just learned their key no longer counts toward a quorum.
+///   Owners removed that the user *doesn't* hold are silent (someone
+///   else's governance, not their problem to react to).
+/// - **Threshold changed** — security parameter of the multisig
+///   moved; deserves explicit confirmation.
+/// - **Unknown module added** — modules can move funds without owner
+///   signatures, so an unrecognized one is a standing backdoor. Modules
+///   matching `classify_module` are silent (recognized = safe enough
+///   not to interrupt — the user has accepted them by prior on-chain
+///   action).
+/// - **Trust demoted Canonical → UnrecognizedImpl** — implies the
+///   proxy was upgraded to an unaudited singleton, which pulls the
+///   trust anchor out from under the user.
+///
+/// Silent diffs (still persisted but no banner): owner added that
+/// isn't ours, recognized module added, module removed, guard /
+/// fallback changes, version bumps within Canonical, threshold drop
+/// that's also a Trust transition (already covered by the trust line),
+/// trust *promotion* UnrecognizedImpl → Canonical (good news, no
+/// interruption needed).
+///
+/// `linked_signer_addresses` is the set of addresses corresponding to
+/// `SafeDescriptor.linked_signer_indices` — resolved by the caller
+/// because the safe module has no view of the wallet's `accounts`.
+#[allow(dead_code)]
+pub fn summarize_user_facing_changes(
+    diff: &RefreshDiff,
+    linked_signer_addresses: &[Address],
+) -> Vec<String> {
+    let mut alerts = Vec::new();
+    for change in &diff.changes {
+        match change {
+            SafeChange::OwnerRemoved(addr) if linked_signer_addresses.contains(addr) => {
+                alerts.push(format!(
+                    "Your signer {} is no longer an owner",
+                    short_address(*addr),
+                ));
+            }
+            SafeChange::ThresholdChanged { from, to } => {
+                alerts.push(format!("Threshold changed: {from} → {to}"));
+            }
+            SafeChange::ModuleAdded(addr) if classify_module(*addr).is_none() => {
+                alerts.push(format!("Unknown module added: {}", short_address(*addr)));
+            }
+            SafeChange::TrustChanged {
+                from: SafeTrust::Canonical,
+                to: SafeTrust::UnrecognizedImpl,
+            } => {
+                alerts.push("Implementation upgraded to an unknown contract".into());
+            }
+            _ => {}
+        }
+    }
+    alerts
 }
 
 // ── Internal helpers: single ABI reads ──────────────────────────────────────
@@ -1417,6 +1515,158 @@ mod tests {
                 to: SafeTrust::UnrecognizedImpl,
             }],
         );
+    }
+
+    // ── summarize_user_facing_changes ────────────────────────────────
+
+    fn diff_with(changes: Vec<SafeChange>) -> RefreshDiff {
+        RefreshDiff { changes }
+    }
+
+    #[test]
+    fn summarize_empty_diff_yields_no_alerts() {
+        // Nothing in the diff → nothing to interrupt the user with.
+        // Pins the contract that an empty refresh result is silent.
+        let alerts = summarize_user_facing_changes(&diff_with(vec![]), &[]);
+        assert!(alerts.is_empty());
+    }
+
+    #[test]
+    fn summarize_owner_removed_alerts_only_when_owner_is_a_linked_signer() {
+        let my_signer = address!("0x000000000000000000000000000000000000beef");
+        let stranger = address!("0x000000000000000000000000000000000000dead");
+
+        // Removing someone else's key — silent. Other people's
+        // governance isn't ours to react to.
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![SafeChange::OwnerRemoved(stranger)]),
+            &[my_signer],
+        );
+        assert!(alerts.is_empty(), "stranger removal should be silent");
+
+        // Removing our own key — loud. The user just lost signing
+        // capability on this Safe and needs to know immediately.
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![SafeChange::OwnerRemoved(my_signer)]),
+            &[my_signer],
+        );
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("no longer an owner"));
+    }
+
+    #[test]
+    fn summarize_threshold_change_always_alerts() {
+        // Threshold is a security parameter — any change deserves an
+        // explicit acknowledgment regardless of whether the user holds
+        // a key.
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![SafeChange::ThresholdChanged { from: 3, to: 1 }]),
+            &[],
+        );
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("Threshold"));
+        assert!(alerts[0].contains("3"));
+        assert!(alerts[0].contains("1"));
+    }
+
+    #[test]
+    fn summarize_module_added_alerts_only_for_unknown_modules() {
+        // Recognized module addition → silent (the user accepted this
+        // module class by prior on-chain action; refreshing doesn't
+        // require re-confirming).
+        let known = address!("0xCFbFaC74C26F8647cBDb8c5caf80BB5b32E43134"); // Allowance Module
+        assert!(classify_module(known).is_some(), "test invariant");
+        let alerts =
+            summarize_user_facing_changes(&diff_with(vec![SafeChange::ModuleAdded(known)]), &[]);
+        assert!(alerts.is_empty(), "known module should be silent");
+
+        // Unknown module → loud. Modules can move funds without owner
+        // signatures, so an unaudited one is a standing backdoor.
+        let unknown = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        assert!(classify_module(unknown).is_none(), "test invariant");
+        let alerts =
+            summarize_user_facing_changes(&diff_with(vec![SafeChange::ModuleAdded(unknown)]), &[]);
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("Unknown module"));
+    }
+
+    #[test]
+    fn summarize_trust_demotion_alerts_but_promotion_is_silent() {
+        // Canonical → UnrecognizedImpl: the trust anchor moved AWAY
+        // from an audited singleton. Alert.
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![SafeChange::TrustChanged {
+                from: SafeTrust::Canonical,
+                to: SafeTrust::UnrecognizedImpl,
+            }]),
+            &[],
+        );
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("unknown"));
+
+        // UnrecognizedImpl → Canonical: good news. The proxy upgraded
+        // to a known singleton. Silent — no reason to interrupt.
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![SafeChange::TrustChanged {
+                from: SafeTrust::UnrecognizedImpl,
+                to: SafeTrust::Canonical,
+            }]),
+            &[],
+        );
+        assert!(alerts.is_empty(), "promotion should be silent");
+    }
+
+    #[test]
+    fn summarize_silent_changes_dont_produce_alerts() {
+        // Everything that's deliberately silent: owner added (someone
+        // else joining governance), module removed (security surface
+        // shrank — good news), guard / fallback transitions, version
+        // bumps within Canonical trust. Bundling them in one diff and
+        // asserting empty alerts pins the silent-by-default policy.
+        let known_module = address!("0xCFbFaC74C26F8647cBDb8c5caf80BB5b32E43134");
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![
+                SafeChange::OwnerAdded(address!("0x000000000000000000000000000000000000aaaa")),
+                SafeChange::ModuleRemoved(known_module),
+                SafeChange::GuardChanged {
+                    from: None,
+                    to: Some(address!("0x000000000000000000000000000000000000bbbb")),
+                },
+                SafeChange::FallbackHandlerChanged {
+                    from: Some(address!("0x000000000000000000000000000000000000cccc")),
+                    to: None,
+                },
+                SafeChange::VersionChanged {
+                    from: "1.3.0".into(),
+                    to: "1.4.1".into(),
+                },
+            ]),
+            &[],
+        );
+        assert!(
+            alerts.is_empty(),
+            "silent changes should produce no alerts, got {alerts:?}"
+        );
+    }
+
+    #[test]
+    fn summarize_aggregates_multiple_alerts_in_order() {
+        // When a single Safe has multiple noisy changes in one
+        // refresh, the alerts come back in the same order they appear
+        // in the diff. The caller concatenates them into one toast —
+        // depending on order means the toast reads sensibly rather
+        // than as a random shuffle.
+        let my_signer = address!("0x000000000000000000000000000000000000beef");
+        let alerts = summarize_user_facing_changes(
+            &diff_with(vec![
+                SafeChange::ThresholdChanged { from: 2, to: 1 },
+                SafeChange::OwnerRemoved(my_signer),
+            ]),
+            &[my_signer],
+        );
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts[0].contains("Threshold"));
+        assert!(alerts[1].contains("no longer an owner"));
     }
 
     // ── End-to-end refresh_one ────────────────────────────────────────

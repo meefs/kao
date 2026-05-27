@@ -86,6 +86,12 @@ pub enum Message {
     /// Result of an off-thread `wallet::save_descriptor`. Emitted only to
     /// surface errors — successful saves are silent.
     WalletSaved(Result<(), String>),
+    /// Result of the post-unlock Safe refresh batch. Carries one entry
+    /// per Safe in the order they live in `wallet.safes`. Each entry
+    /// is `Ok((new_descriptor, diff))` on a successful refresh, or
+    /// `Err(reason)` for that Safe alone (other Safes may have
+    /// succeeded). Fires at most once per unlock.
+    SafesRefreshed(crate::safe::RefreshBatch),
     /// Result of an off-thread `wallet::load_contacts`. Carries the
     /// loaded vec on success; errors are logged and the in-memory book
     /// stays empty.
@@ -520,6 +526,87 @@ impl App {
         iced::Task::batch(vec![save, self.cancel_add_account()])
     }
 
+    /// Process the post-unlock Safe-refresh batch. For each successful
+    /// refresh: replace `wallet.safes[idx]` with the new descriptor;
+    /// collect any user-facing change summaries. After the batch:
+    /// - if any diff was non-empty, save the wallet once (single
+    ///   epoch bump for the whole batch)
+    /// - if any user-facing alerts collected, surface them as a toast
+    /// - push the updated safes vec into the WalletScreen so its
+    ///   dropdown stops rendering stale labels
+    ///
+    /// Refresh errors are logged but never toasted — a single
+    /// unreachable RPC shouldn't interrupt the user every unlock.
+    fn handle_safes_refreshed(
+        &mut self,
+        results: crate::safe::RefreshBatch,
+    ) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_mut() else {
+            // Unlock was undone (re-lock?) between the spawn and the
+            // result landing. Drop the refresh; we'll re-spawn on
+            // next unlock.
+            return iced::Task::none();
+        };
+        let mut any_changed = false;
+        let mut alerts: Vec<String> = Vec::new();
+        // Pre-resolve linked-signer addresses per safe so summarize can
+        // tell apart "your owner removed" from "someone else's owner
+        // removed". Use the existing accounts vec.
+        for (idx, result) in results {
+            match result {
+                Err(e) => {
+                    warn!(safe_idx = idx, error = %e, "Safe refresh failed");
+                }
+                Ok((new_desc, diff)) => {
+                    if let Some(slot) = wallet.safes.get_mut(idx) {
+                        let linked_addrs: Vec<alloy::primitives::Address> = slot
+                            .linked_signer_indices
+                            .iter()
+                            .filter_map(|i| wallet.accounts.get(*i as usize))
+                            .filter_map(wallet::account_address)
+                            .collect();
+                        let mut summarized =
+                            crate::safe::summarize_user_facing_changes(&diff, &linked_addrs);
+                        if !summarized.is_empty() {
+                            // Prefix each alert with the Safe's name so a
+                            // user with multiple Safes can tell which one
+                            // changed.
+                            let safe_name = new_desc.display_name(idx);
+                            for s in summarized.drain(..) {
+                                alerts.push(format!("{safe_name}: {s}"));
+                            }
+                        }
+                        if !diff.is_empty() {
+                            any_changed = true;
+                        }
+                        *slot = new_desc;
+                    } else {
+                        // Safe was removed between spawn and result —
+                        // discard silently.
+                        warn!(safe_idx = idx, "Safe refresh result has no slot to land in");
+                    }
+                }
+            }
+        }
+
+        // Build the follow-up tasks: push the updated safes into the
+        // dashboard, persist if anything changed, surface a toast if
+        // we collected alerts.
+        let updated_safes = wallet.safes.clone();
+        let push_to_dashboard = iced::Task::done(Message::WalletDashboard(
+            crate::ui::wallet_dashboard::Message::SafesUpdated(updated_safes),
+        ));
+        let mut tasks = vec![push_to_dashboard];
+        if any_changed && let Some(passphrase) = self.passphrase.as_ref() {
+            tasks.push(save_descriptor_task(wallet.clone(), passphrase.clone()));
+        }
+        if !alerts.is_empty() {
+            let msg = alerts.join(" · ");
+            tasks.push(iced::Task::done(Message::WalletError(msg)));
+        }
+        iced::Task::batch(tasks)
+    }
+
     fn cancel_add_account(&mut self) -> iced::Task<Message> {
         self.setup_context = None;
         if let Some(signer) = self.pending_signer.take() {
@@ -671,9 +758,28 @@ impl App {
                             .expect("passphrase just set")
                             .clone(),
                     );
+                    // Refresh-on-app-open: kick off a parallel
+                    // re-inspect for every Safe so the dashboard
+                    // renders against verified-fresh owner sets and
+                    // any chain-side changes since last open get
+                    // surfaced (owner removals affecting the user,
+                    // unknown modules added, etc.). Skipped when the
+                    // wallet has zero Safes — no work, no toast risk.
+                    let refresh_safes = match self.wallet.as_ref() {
+                        Some(w) if !w.safes.is_empty() => {
+                            let net = self.network.clone();
+                            let safes = w.safes.clone();
+                            iced::Task::perform(
+                                crate::safe::refresh_all_safes(net, safes),
+                                Message::SafesRefreshed,
+                            )
+                        }
+                        _ => iced::Task::none(),
+                    };
                     return iced::Task::batch(vec![
                         self.enter_active_from_wallet(None),
                         load_contacts,
+                        refresh_safes,
                     ]);
                 }
                 cmd.map(Message::Unlock)
@@ -1194,6 +1300,9 @@ impl App {
                 }
                 iced::Task::none()
             }
+
+            // ── Post-unlock Safe refresh batch ──────────────────────
+            Message::SafesRefreshed(results) => self.handle_safes_refreshed(results),
 
             // ── Contacts background load/save ───────────────────────
             Message::ContactsLoaded(result) => {

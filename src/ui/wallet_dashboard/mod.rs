@@ -81,6 +81,12 @@ pub enum Message {
     /// the header badge — no per-address state changes here, so a stale
     /// fetch landing after an account switch is harmless.
     VerificationRefreshed,
+    /// The App refreshed the wallet's Safes (typically on
+    /// app-open). Carries the new full safes vec — the dashboard
+    /// replaces its stale clone wholesale so the account dropdown
+    /// stops rendering old labels / owner sets / watch-vs-signer
+    /// classifications. Sent at most once per unlock.
+    SafesUpdated(Vec<SafeDescriptor>),
     /// Per-chain portfolio result. The dashboard issues one fetch per
     /// configured chain in parallel and merges by `chain` as each lands,
     /// so a slow Optimism RPC never blocks the Mainnet rows from
@@ -717,6 +723,12 @@ impl WalletScreen {
         match message {
             Message::VerificationRefreshed => {
                 self.verification = self.network.last_status(crate::chain::Chain::Mainnet);
+            }
+            Message::SafesUpdated(safes) => {
+                // Wholesale replace — refresh-on-open runs in batch
+                // and returns the complete updated list, so there's
+                // nothing to merge.
+                self.safes = safes;
             }
             Message::PortfolioFetched {
                 address,
