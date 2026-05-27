@@ -1426,6 +1426,7 @@ mod tests {
         let (_, a1) = local_signer_and_account(2);
         app.wallet = Some(WalletDescriptor {
             accounts: vec![a0, a1],
+            safes: Vec::new(),
             active_index: 0,
         });
         let _ = app.switch_account(1);

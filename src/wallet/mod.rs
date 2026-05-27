@@ -179,10 +179,15 @@ impl AccountDescriptor {
 
 /// Top-level wallet payload. Encrypted at rest inside `wallet.enc`. Holds the
 /// list of accounts the user has set up plus the index of the one currently
-/// in focus on the dashboard.
+/// in focus on the dashboard, plus any Safes the user has onboarded.
+///
+/// `active_index` only refers to `accounts` — Safes are surfaced in the
+/// account list UI but do not claim the active-selection slot in v1. The
+/// future Safe-dashboard plan will introduce a unified `WalletSelection`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletDescriptor {
     pub accounts: Vec<AccountDescriptor>,
+    pub safes: Vec<SafeDescriptor>,
     pub active_index: usize,
 }
 
@@ -190,6 +195,7 @@ impl WalletDescriptor {
     pub fn single(account: AccountDescriptor) -> Self {
         Self {
             accounts: vec![account],
+            safes: Vec::new(),
             active_index: 0,
         }
     }
@@ -206,6 +212,138 @@ impl WalletDescriptor {
 
     pub fn contains_address(&self, target: Address) -> bool {
         self.addresses().contains(&target)
+    }
+
+    /// True if any `(address, chain_id)` Safe descriptor matches. Used to
+    /// keep onboarding from creating a second descriptor for a Safe the
+    /// user already added on the same chain.
+    ///
+    /// Tests exercise it directly; the onboarding flow consumer lands in
+    /// stage 2 of the Safe onboarding work.
+    #[allow(dead_code)]
+    pub fn contains_safe(&self, target: Address, chain_id: u64) -> bool {
+        let target_bytes: [u8; 20] = target.into();
+        self.safes
+            .iter()
+            .any(|s| s.chain_id == chain_id && s.address == target_bytes)
+    }
+}
+
+// ── SafeDescriptor ─────────────────────────────────────────────────────────
+
+/// Whether Kao recognizes the on-chain implementation behind this Safe
+/// proxy. Determined at onboarding by reading proxy storage slot 0 and
+/// looking the address up in the per-chain canonical-singleton registry.
+///
+/// `Canonical` is the only state that will enable signing in the future
+/// Safe-TX flow; `UnrecognizedImpl` is a deliberate "show but don't
+/// trust" mode so a user pasting an exotic Safe deployment isn't locked
+/// out, but also isn't silently led into signing against a contract Kao
+/// has never seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SafeTrust {
+    Canonical,
+    UnrecognizedImpl,
+}
+
+/// Persisted record of a Safe the user has onboarded. Lives in its own
+/// `safes` redb table — Safes have no private key material of their own
+/// (signing happens via linked owner accounts), so commingling with
+/// `AccountDescriptor` would conflate "thing that holds a secret" with
+/// "thing that delegates signing to other accounts".
+///
+/// The cached on-chain fields (`owners`, `threshold`, `modules`, `guard`,
+/// `fallback_handler`) are snapshots from `cached_at`. The dashboard
+/// refreshes them on app open and the Safe-TX flow refreshes synchronously
+/// before quoting transaction parameters, so stale data should never reach
+/// a signing decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafeDescriptor {
+    /// User-assigned label. `None` means "no custom name" — call
+    /// `display_name(idx)` for the rendered fallback.
+    pub name: Option<String>,
+    /// EVM chain ID this deployment lives on. Stored explicitly so the
+    /// `(address, chain_id)` pair uniquely identifies a Safe — the same
+    /// address on a different chain is a different Safe with potentially
+    /// different owners.
+    pub chain_id: u64,
+    /// The Safe proxy's address.
+    pub address: [u8; 20],
+    /// `VERSION()` string returned by the proxy, e.g. "1.4.1". Kept as
+    /// the raw string rather than a parsed semver so a future Safe release
+    /// that adds e.g. "1.5.0-beta" doesn't trip deserialization.
+    pub version: String,
+    pub trust: SafeTrust,
+    /// Signature threshold. Safe returns `uint256`; in practice this is
+    /// ≤ owner count which is ≤ a few dozen, but we store as `u32`
+    /// defensively so a pathological value doesn't truncate.
+    pub threshold: u32,
+    pub owners: Vec<[u8; 20]>,
+    /// Enabled modules. Each one can move funds without any owner
+    /// signature — surfaced loudly in the onboarding UI and treated as
+    /// a standing security surface.
+    pub modules: Vec<[u8; 20]>,
+    /// Transaction guard, if set. A guard can block any transaction
+    /// the owners try to execute, so a malicious guard is a brick of
+    /// the entire Safe.
+    pub guard: Option<[u8; 20]>,
+    /// Fallback handler, if set. Safe delegates unknown function
+    /// selectors to this contract — a malicious one can implement
+    /// arbitrary behavior under the Safe's identity.
+    pub fallback_handler: Option<[u8; 20]>,
+    /// Indices into `WalletDescriptor.accounts` for keys the user has
+    /// chosen to link as signers. Empty = observer/watch-only.
+    pub linked_signer_indices: Vec<u32>,
+    /// Other chain IDs where this same address is also a deployed Safe,
+    /// detected during onboarding's parallel scan. Informational only —
+    /// each sibling, if added, gets its own `SafeDescriptor` because
+    /// owner sets can diverge across chains.
+    pub sibling_chains: Vec<u64>,
+    /// Unix seconds at which the cached on-chain fields above were last
+    /// refreshed. UI uses this to show a staleness indicator.
+    pub cached_at: u64,
+}
+
+// Tests exercise these directly; the UI consumers (account list rendering,
+// the onboarding label step) land in stage 3 of the Safe onboarding work.
+#[allow(dead_code)]
+impl SafeDescriptor {
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Replace the user-assigned name. Mirrors `AccountDescriptor::set_name`:
+    /// trims whitespace and collapses an empty result to `None` so blank
+    /// inputs revert to the "Safe N" default.
+    pub fn set_name(&mut self, name: Option<String>) {
+        let cleaned = name.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
+        self.name = cleaned;
+    }
+
+    /// Rendered name. Falls back to `Safe {idx + 1}` when unnamed.
+    pub fn display_name(&self, idx: usize) -> String {
+        match self.name() {
+            Some(n) => n.to_string(),
+            None => format!("Safe {}", idx + 1),
+        }
+    }
+
+    /// True when the user has linked at least one of their own accounts
+    /// as a signer of this Safe. Watch-only Safes return false and are
+    /// rendered in a visibly non-signing state.
+    pub fn is_signer(&self) -> bool {
+        !self.linked_signer_indices.is_empty()
+    }
+
+    pub fn address(&self) -> Address {
+        Address::from(self.address)
     }
 }
 
@@ -529,6 +667,7 @@ mod tests {
                     address: [0x22; 20],
                 },
             ],
+            safes: Vec::new(),
             active_index: 1,
         };
         let encoded = postcard::to_stdvec(&desc).unwrap();
@@ -653,6 +792,7 @@ mod tests {
                 name: None,
                 key_bytes: [0xab; 32],
             }],
+            safes: Vec::new(),
             // Bogus index larger than accounts.len(); active() must clamp.
             active_index: 99,
         };
@@ -895,6 +1035,7 @@ mod tests {
             .unwrap();
         let desc = WalletDescriptor {
             accounts: vec![view_only_account(addr_a), view_only_account(addr_b)],
+            safes: Vec::new(),
             active_index: 0,
         };
         let addrs = desc.addresses();
