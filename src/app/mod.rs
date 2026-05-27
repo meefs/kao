@@ -326,14 +326,15 @@ impl App {
         signer: KaoSigner,
         initial_nav: Option<crate::ui::wallet_dashboard::Nav>,
     ) -> iced::Task<Message> {
-        let (accounts, active_index) = match &self.wallet {
-            Some(w) => (w.accounts.clone(), w.active_index),
-            None => (Vec::new(), 0),
+        let (accounts, safes, active_index) = match &self.wallet {
+            Some(w) => (w.accounts.clone(), w.safes.clone(), w.active_index),
+            None => (Vec::new(), Vec::new(), 0),
         };
         let started = std::time::Instant::now();
         let screen = WalletScreen::new(
             signer,
             accounts.clone(),
+            safes,
             active_index,
             self.network.clone(),
             self.portfolio_cache.clone(),

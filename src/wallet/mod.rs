@@ -347,6 +347,20 @@ impl SafeDescriptor {
     }
 }
 
+/// True if `account_idx` is listed as a linked signer of any Safe in
+/// `safes`. Drives the dashboard's "Safe signer" cross-badge on
+/// account rows so users can see at a glance which keys are
+/// load-bearing for a multisig.
+///
+/// Free function (not a `WalletDescriptor` method) so the dashboard's
+/// account-list view can call it with just the `&[SafeDescriptor]`
+/// slice it already has — the view doesn't see the whole wallet.
+pub fn account_is_safe_signer(account_idx: u32, safes: &[SafeDescriptor]) -> bool {
+    safes
+        .iter()
+        .any(|s| s.linked_signer_indices.contains(&account_idx))
+}
+
 /// Compute the Ethereum address for an account descriptor. Returns None if a
 /// `Local` variant carries unrecoverable key bytes (shouldn't happen for any
 /// account that survived persistence, but the call is fallible upstream).
@@ -1040,5 +1054,68 @@ mod tests {
         };
         let addrs = desc.addresses();
         assert_eq!(addrs, vec![addr_a, addr_b]);
+    }
+
+    // ── account_is_safe_signer (badge-classification helper) ────────────
+
+    /// Build a `SafeDescriptor` carrying just the link list — the
+    /// other fields are irrelevant to `account_is_safe_signer`, so we
+    /// keep the test data minimal.
+    fn safe_linking(linked: Vec<u32>) -> SafeDescriptor {
+        SafeDescriptor {
+            name: None,
+            chain_id: 1,
+            address: [0; 20],
+            version: "1.4.1".into(),
+            trust: SafeTrust::Canonical,
+            threshold: 1,
+            owners: Vec::new(),
+            modules: Vec::new(),
+            guard: None,
+            fallback_handler: None,
+            linked_signer_indices: linked,
+            sibling_chains: Vec::new(),
+            cached_at: 0,
+        }
+    }
+
+    #[test]
+    fn account_is_safe_signer_false_when_safes_list_is_empty() {
+        // No safes registered → no account can be a signer. Ensures the
+        // dashboard's badge logic doesn't false-positive on a wallet
+        // that has never onboarded a Safe.
+        assert!(!account_is_safe_signer(0, &[]));
+        assert!(!account_is_safe_signer(99, &[]));
+    }
+
+    #[test]
+    fn account_is_safe_signer_true_when_any_safe_links_the_index() {
+        // Multiple safes; only the second one links account 2.
+        // The lookup must find it without caring about the first
+        // safe's empty link list.
+        let safes = [safe_linking(vec![]), safe_linking(vec![0, 2])];
+        assert!(account_is_safe_signer(0, &safes));
+        assert!(account_is_safe_signer(2, &safes));
+    }
+
+    #[test]
+    fn account_is_safe_signer_false_for_unlinked_indices() {
+        // Account 3 is not linked by any safe — the cross-badge must
+        // NOT render for it. This is the negative case for the same
+        // setup as above.
+        let safes = [safe_linking(vec![0, 2]), safe_linking(vec![5])];
+        assert!(!account_is_safe_signer(1, &safes));
+        assert!(!account_is_safe_signer(3, &safes));
+        assert!(!account_is_safe_signer(4, &safes));
+    }
+
+    #[test]
+    fn account_is_safe_signer_false_for_watch_only_safes() {
+        // A watch-only Safe has an empty `linked_signer_indices` — no
+        // account it might list is "linked". Pins the convention that
+        // watch-only = empty list (not a `None` somewhere).
+        let safes = [safe_linking(vec![]), safe_linking(vec![])];
+        assert!(!account_is_safe_signer(0, &safes));
+        assert!(!account_is_safe_signer(7, &safes));
     }
 }

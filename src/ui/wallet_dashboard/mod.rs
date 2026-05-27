@@ -68,7 +68,8 @@ use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::{fill_style, mono};
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
-    AccountDescriptor, Contact, ContactsBook, KaoSigner, SignerHandoff, handoff_with, short_address,
+    AccountDescriptor, Contact, ContactsBook, KaoSigner, SafeDescriptor, SignerHandoff,
+    handoff_with, short_address,
 };
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -227,6 +228,12 @@ pub struct WalletScreen {
     /// All accounts in the unlocked wallet, used to render the account
     /// dropdown. `accounts[active_index]` corresponds to `signer`.
     accounts: Vec<AccountDescriptor>,
+    /// All Safes onboarded into this wallet. Surfaced in the account
+    /// dropdown alongside accounts, both for visibility and so the
+    /// `Safe signer` cross-badge can be computed for accounts that are
+    /// linked owners. Updated whenever the App pushes a new
+    /// `WalletDescriptor` (e.g. after Safe onboarding completes).
+    safes: Vec<SafeDescriptor>,
     active_index: usize,
     theme_kind: ThemeKind,
     nav: Nav,
@@ -318,9 +325,15 @@ impl WalletScreen {
     /// `Some(_)` is passed by `App::switch_account` so switching
     /// accounts while reading the Activity feed doesn't yank the user
     /// back to Home.
+    // The constructor was already at clippy's 7-arg threshold before
+    // safes were added; bundling into a config struct would be a wider
+    // refactor of every WalletScreen::new caller for no real
+    // readability gain (the arg names are already self-documenting).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         signer: KaoSigner,
         accounts: Vec<AccountDescriptor>,
+        safes: Vec<SafeDescriptor>,
         active_index: usize,
         network: Arc<dyn BalanceFetcher>,
         portfolio_cache: PortfolioCache,
@@ -351,6 +364,7 @@ impl WalletScreen {
             signer,
             address,
             accounts,
+            safes,
             active_index,
             theme_kind: settings::theme(),
             nav: initial_nav.unwrap_or(Nav::Home),
@@ -1424,7 +1438,7 @@ impl WalletScreen {
             Modal::Receive(p) => p.view(t, self.chrome.progress()).map(Message::Receive),
             Modal::Swap(p) => p.view(t, self.chrome.progress()).map(Message::Swap),
             Modal::AccountDropdown(d) => d
-                .view(t, &self.accounts, self.active_index)
+                .view(t, &self.accounts, &self.safes, self.active_index)
                 .map(Message::AccountDropdown),
             Modal::TxDetails(p) => {
                 let tx_book = match self.contacts.read() {
@@ -1814,6 +1828,7 @@ mod tests {
         WalletScreen::new(
             KaoSigner::ViewOnly(addr),
             vec![view_only_account(addr)],
+            Vec::new(),
             0,
             Arc::new(MockFetcher::new()),
             cache,
