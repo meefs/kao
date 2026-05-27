@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use alloy::signers::Signer;
-use alloy::signers::ledger::LedgerSigner;
+use alloy::signers::ledger::{LedgerError, LedgerSigner};
 use iced::border::Radius;
 use iced::keyboard;
 use iced::widget::{Space, column, container, row, scrollable, text};
@@ -197,7 +197,7 @@ impl ConnectLedgerScreen {
                             LedgerSigner::new(LedgerHdPath::LedgerLive(hd_index).to_alloy(), None)
                                 .await
                                 .map(|s| handoff_with(KaoSigner::Ledger(s)))
-                                .map_err(|e| e.to_string())
+                                .map_err(ledger_err_message)
                         },
                         Message::SignerBuilt,
                     ),
@@ -296,16 +296,14 @@ fn connecting_card<'a>(t: KaoTheme, mode: &Mode) -> Element<'a, Message> {
         Mode::Setup => "Connect your Ledger",
         Mode::Reconnect { .. } => "Reconnecting to Ledger…",
     };
+
     let body = column![
         kao_hero(t, "(・・;)ゞ", 56.0),
         vspace(12),
         screen_title(t, title),
-        vspace(6),
-        screen_subtitle(
-            t,
-            "Plug in your device, unlock it with your PIN, and open the Ethereum app.",
-        ),
-        vspace(20),
+        vspace(14),
+        instruction_steps(t),
+        vspace(18),
         container(text("…probing device").size(12).color(t.sub).font(mono()))
             .width(Length::Fill)
             .center_x(Length::Fill),
@@ -424,6 +422,8 @@ fn error_card<'a>(t: KaoTheme, msg: &'a str) -> Element<'a, Message> {
         screen_title(t, "Couldn't connect"),
         vspace(6),
         error_text(t, msg),
+        vspace(16),
+        instruction_steps(t),
         vspace(18),
         primary_button(t, "Retry", true).on_press(Message::Retry),
         vspace(12),
@@ -443,6 +443,42 @@ fn error_card<'a>(t: KaoTheme, msg: &'a str) -> Element<'a, Message> {
             .height(Length::Fill)
             .into(),
     )
+}
+
+fn instruction_steps<'a>(t: KaoTheme) -> Element<'a, Message> {
+    container(
+        column![
+            step_row(t, "1.", "Plug your Ledger in via USB"),
+            vspace(6),
+            step_row(t, "2.", "Unlock the device with your PIN"),
+            vspace(6),
+            step_row(t, "3.", "Open the Ethereum app on the device"),
+            vspace(6),
+            container(
+                text("(the Ledger dashboard alone isn't enough — open the app)")
+                    .size(11)
+                    .color(t.sub),
+            )
+            .padding(Padding::default().left(28)),
+        ]
+        .width(Length::Shrink),
+    )
+    .width(Length::Fill)
+    .center_x(Length::Fill)
+    .into()
+}
+
+fn step_row<'a>(t: KaoTheme, num: &'a str, label: &'a str) -> Element<'a, Message> {
+    row![
+        text(num)
+            .size(13)
+            .color(t.a1)
+            .font(mono_bold())
+            .width(Length::Fixed(28.0)),
+        text(label).size(13).color(t.text),
+    ]
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn back_hint<'a>(t: KaoTheme) -> Element<'a, Message> {
@@ -556,7 +592,7 @@ fn probe_setup_task() -> Task<Message> {
             // sends with a mainnet/L2 mismatch.
             let signer = LedgerSigner::new(LedgerHdPath::LedgerLive(0).to_alloy(), None)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(ledger_err_message)?;
 
             let mut out: Vec<(u32, Address)> = Vec::with_capacity(PROBE_COUNT as usize);
             out.push((0, Signer::address(&signer)));
@@ -564,7 +600,7 @@ fn probe_setup_task() -> Task<Message> {
                 let addr = signer
                     .get_address_with_path(&LedgerHdPath::LedgerLive(i).to_alloy())
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(ledger_err_message)?;
                 out.push((i, addr));
             }
             Ok(out)
@@ -579,8 +615,46 @@ fn reconnect_task(path: LedgerHdPath) -> Task<Message> {
             LedgerSigner::new(path.to_alloy(), None)
                 .await
                 .map(|s| handoff_with(KaoSigner::Ledger(s)))
-                .map_err(|e| e.to_string())
+                .map_err(ledger_err_message)
         },
         Message::ReconnectProbed,
     )
+}
+
+/// Convert a `LedgerError` to a user-facing string.
+///
+/// Recognized variants are surfaced as a short *what went wrong* line; the
+/// `error_card` shows the step list below it, so we don't repeat the
+/// recovery instructions in the message itself. Unrecognized variants fall
+/// through to the upstream Display impl.
+fn ledger_err_message(e: LedgerError) -> String {
+    use alloy::signers::ledger::coins_ledger::{
+        errors::LedgerError as CoinsLedgerError,
+        transports::native::NativeTransportError as NativeErr,
+    };
+
+    if matches!(e, LedgerError::UnexpectedNullResponse) {
+        return "The Ethereum app isn't responding (the dashboard isn't enough).".to_string();
+    }
+
+    if let LedgerError::LedgerError(CoinsLedgerError::NativeTransportError(transport)) = &e {
+        match transport {
+            NativeErr::DeviceNotFound => {
+                return "No Ledger detected over USB.".to_string();
+            }
+            NativeErr::CantOpen(_) => {
+                return "Another app is holding the Ledger (close Ledger Live or any \
+                        browser wallet extension)."
+                    .to_string();
+            }
+            NativeErr::Comm(_) => {
+                return "Lost contact with the Ledger mid-exchange — try unplugging \
+                        and re-plugging it."
+                    .to_string();
+            }
+            _ => {}
+        }
+    }
+
+    e.to_string()
 }

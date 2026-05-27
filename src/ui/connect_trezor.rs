@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use alloy::primitives::Address;
 use alloy::signers::Signer;
-use alloy::signers::trezor::TrezorSigner;
+use alloy::signers::trezor::{TrezorError, TrezorSigner};
 use iced::border::Radius;
 use iced::keyboard;
 use iced::widget::{Space, column, container, row, scrollable, text};
@@ -183,7 +183,7 @@ impl ConnectTrezorScreen {
                             TrezorSigner::new(TrezorHdPath::TrezorLive(hd_index).to_alloy(), None)
                                 .await
                                 .map(|s| handoff_with(KaoSigner::Trezor(s)))
-                                .map_err(|e| e.to_string())
+                                .map_err(trezor_err_message)
                         },
                         Message::SignerBuilt,
                     ),
@@ -281,16 +281,14 @@ fn connecting_card<'a>(t: KaoTheme, mode: &Mode) -> Element<'a, Message> {
         Mode::Setup => "Connect your Trezor",
         Mode::Reconnect { .. } => "Reconnecting to Trezor…",
     };
+
     let body = column![
         kao_hero(t, "(・・;)ゞ", 56.0),
         vspace(12),
         screen_title(t, title),
-        vspace(6),
-        screen_subtitle(
-            t,
-            "Plug in your Trezor and unlock it. Confirm any prompts on the device when asked.",
-        ),
-        vspace(20),
+        vspace(14),
+        instruction_steps(t),
+        vspace(18),
         container(text("…probing device").size(12).color(t.sub).font(mono()))
             .width(Length::Fill)
             .center_x(Length::Fill),
@@ -408,6 +406,8 @@ fn error_card<'a>(t: KaoTheme, msg: &'a str) -> Element<'a, Message> {
         screen_title(t, "Couldn't connect"),
         vspace(6),
         error_text(t, msg),
+        vspace(16),
+        instruction_steps(t),
         vspace(18),
         primary_button(t, "Retry", true).on_press(Message::Retry),
         vspace(12),
@@ -427,6 +427,42 @@ fn error_card<'a>(t: KaoTheme, msg: &'a str) -> Element<'a, Message> {
             .height(Length::Fill)
             .into(),
     )
+}
+
+fn instruction_steps<'a>(t: KaoTheme) -> Element<'a, Message> {
+    container(
+        column![
+            step_row(t, "1.", "Plug your Trezor in via USB"),
+            vspace(6),
+            step_row(t, "2.", "Unlock the device with your PIN"),
+            vspace(6),
+            step_row(t, "3.", "Approve prompts on the device when asked"),
+            vspace(6),
+            container(
+                text("(close Trezor Suite first — it can hold the USB handle)")
+                    .size(11)
+                    .color(t.sub),
+            )
+            .padding(Padding::default().left(28)),
+        ]
+        .width(Length::Shrink),
+    )
+    .width(Length::Fill)
+    .center_x(Length::Fill)
+    .into()
+}
+
+fn step_row<'a>(t: KaoTheme, num: &'a str, label: &'a str) -> Element<'a, Message> {
+    row![
+        text(num)
+            .size(13)
+            .color(t.a2)
+            .font(mono_bold())
+            .width(Length::Fixed(28.0)),
+        text(label).size(13).color(t.text),
+    ]
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn back_hint<'a>(t: KaoTheme) -> Element<'a, Message> {
@@ -537,7 +573,7 @@ fn probe_setup_task() -> Task<Message> {
             // chain_id = None: see the matching note in connect_ledger.rs.
             let signer = TrezorSigner::new(TrezorHdPath::TrezorLive(0).to_alloy(), None)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(trezor_err_message)?;
 
             let mut out: Vec<(u32, Address)> = Vec::with_capacity(PROBE_COUNT as usize);
             out.push((0, Signer::address(&signer)));
@@ -545,7 +581,7 @@ fn probe_setup_task() -> Task<Message> {
                 let addr = signer
                     .get_address_with_path(&TrezorHdPath::TrezorLive(i).to_alloy())
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(trezor_err_message)?;
                 out.push((i, addr));
             }
             Ok(out)
@@ -560,8 +596,26 @@ fn reconnect_task(path: TrezorHdPath) -> Task<Message> {
             TrezorSigner::new(path.to_alloy(), None)
                 .await
                 .map(|s| handoff_with(KaoSigner::Trezor(s)))
-                .map_err(|e| e.to_string())
+                .map_err(trezor_err_message)
         },
         Message::ReconnectProbed,
     )
+}
+
+/// Convert a `TrezorError` to a user-facing string.
+///
+/// `Features` fires when the firmware can't return device features — almost
+/// always because the device is locked, asleep, or another process (e.g.
+/// Trezor Suite) is holding the USB handle. Surface that as actionable
+/// instructions rather than the cryptic upstream text.
+fn trezor_err_message(e: TrezorError) -> String {
+    match e {
+        TrezorError::Features => {
+            "Couldn't read your Trezor's features. Make sure it's plugged in, \
+             unlocked with your PIN, and not already in use by Trezor Suite or \
+             another wallet."
+                .to_string()
+        }
+        other => other.to_string(),
+    }
 }

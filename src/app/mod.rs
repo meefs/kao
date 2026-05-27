@@ -184,6 +184,12 @@ pub struct App {
     /// Monotonic counter bumped on every fresh error so an older
     /// dismissal task firing late can no-op against a newer toast.
     toast_gen: u64,
+    /// Set when the user clicked Send on a hardware account whose device
+    /// wasn't connected at unlock. Carries the dashboard nav the user was
+    /// on so a successful reconnect restores it (and a Back drops them
+    /// back to the read-only dashboard with the same tab). `None` means
+    /// the current connect-screen session is not a send-reconnect.
+    send_reconnect: Option<crate::ui::wallet_dashboard::Nav>,
 }
 
 /// Single-toast state. We don't queue — a fresher error replaces the
@@ -220,6 +226,7 @@ impl App {
                 contacts,
                 toast: None,
                 toast_gen: 0,
+                send_reconnect: None,
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
             (app, task)
@@ -235,6 +242,7 @@ impl App {
                 contacts,
                 toast: None,
                 toast_gen: 0,
+                send_reconnect: None,
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                 .map(Message::CreatePassword);
@@ -347,9 +355,12 @@ impl App {
     }
 
     /// Routes the active account of `self.wallet` to the right destination.
-    /// Local: build signer synchronously and enter dashboard immediately.
-    /// Hardware: push the matching connect screen in reconnect mode while
-    /// the device handshake runs.
+    /// Local: build the signer synchronously and enter the dashboard.
+    /// Hardware/ViewOnly: enter the dashboard with a `ViewOnly` placeholder
+    /// signer — the dashboard is read-only by default (balances/history/
+    /// portfolio all use the saved address), so the device only needs to be
+    /// reconnected at sign time. `can_sign()` is false for the placeholder,
+    /// which the dashboard already uses to gate the Send button.
     fn enter_active_from_wallet(
         &mut self,
         initial_nav: Option<crate::ui::wallet_dashboard::Nav>,
@@ -370,25 +381,95 @@ impl App {
                     }
                 }
             }
-            AccountDescriptor::Ledger { path, address, .. } => {
-                let expected = alloy::primitives::Address::from(address);
-                let (screen, task) =
-                    ConnectLedgerScreen::new_reconnect(path, expected, self.network.clone());
-                self.screen = Screen::ConnectLedger(screen);
-                task.map(Message::ConnectLedger)
-            }
-            AccountDescriptor::Trezor { path, address, .. } => {
-                let expected = alloy::primitives::Address::from(address);
-                let (screen, task) =
-                    ConnectTrezorScreen::new_reconnect(path, expected, self.network.clone());
-                self.screen = Screen::ConnectTrezor(screen);
-                task.map(Message::ConnectTrezor)
-            }
-            AccountDescriptor::ViewOnly { address, .. } => {
+            AccountDescriptor::Ledger { address, .. }
+            | AccountDescriptor::Trezor { address, .. }
+            | AccountDescriptor::ViewOnly { address, .. } => {
                 let addr = alloy::primitives::Address::from(address);
                 self.enter_dashboard(KaoSigner::ViewOnly(addr), initial_nav)
             }
         }
+    }
+
+    /// Push the matching hardware-wallet reconnect screen because the user
+    /// clicked Send on a hardware account whose device wasn't connected at
+    /// unlock. `nav` is the dashboard tab to restore on success or Back.
+    /// Falls back to a wallet-error toast when the active account isn't a
+    /// hardware variant (shouldn't happen — the dashboard only emits
+    /// `NeedsHardwareReconnect` for Ledger/Trezor).
+    fn request_send_reconnect(
+        &mut self,
+        nav: crate::ui::wallet_dashboard::Nav,
+    ) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_ref() else {
+            return iced::Task::perform(
+                async { "no wallet loaded".to_string() },
+                Message::WalletError,
+            );
+        };
+        match wallet.active().clone() {
+            AccountDescriptor::Ledger {
+                path, address, ..
+            } => {
+                let expected = alloy::primitives::Address::from(address);
+                let (screen, task) =
+                    ConnectLedgerScreen::new_reconnect(path, expected, self.network.clone());
+                self.screen = Screen::ConnectLedger(screen);
+                self.send_reconnect = Some(nav);
+                task.map(Message::ConnectLedger)
+            }
+            AccountDescriptor::Trezor {
+                path, address, ..
+            } => {
+                let expected = alloy::primitives::Address::from(address);
+                let (screen, task) =
+                    ConnectTrezorScreen::new_reconnect(path, expected, self.network.clone());
+                self.screen = Screen::ConnectTrezor(screen);
+                self.send_reconnect = Some(nav);
+                task.map(Message::ConnectTrezor)
+            }
+            _ => iced::Task::perform(
+                async { "send-reconnect: active account is not a hardware wallet".to_string() },
+                Message::WalletError,
+            ),
+        }
+    }
+
+    /// Land the user back on the dashboard with the freshly-reconnected
+    /// hardware signer and auto-open the Send modal so they don't have to
+    /// click Send a second time. Falls back to entering without auto-open
+    /// when this isn't a send-reconnect session.
+    fn finish_send_reconnect(&mut self, signer: KaoSigner) -> iced::Task<Message> {
+        let nav = self.send_reconnect.take();
+        let enter = self.enter_dashboard(signer, nav);
+        if nav.is_some() {
+            iced::Task::batch(vec![
+                enter,
+                iced::Task::done(Message::WalletDashboard(
+                    crate::ui::wallet_dashboard::Message::OpenSend,
+                )),
+            ])
+        } else {
+            enter
+        }
+    }
+
+    /// Handle the user pressing Back on a connect screen. Sends them
+    /// back to the dashboard if this was a send-triggered reconnect;
+    /// otherwise falls through to the setup-mode behavior (which locks
+    /// the wallet if one exists, or returns to the hardware-wallet
+    /// picker if we're in initial setup).
+    fn connect_back(&mut self) -> iced::Task<Message> {
+        if let Some(nav) = self.send_reconnect.take() {
+            return self.enter_active_from_wallet(Some(nav));
+        }
+        self.screen = if wallet::wallet_exists() {
+            self.passphrase = None;
+            self.wallet = None;
+            Screen::Unlock(UnlockScreen::default())
+        } else {
+            Screen::SelectHardwareWallet(SelectHardwareWalletScreen::default())
+        };
+        iced::Task::none()
     }
 
     /// Drop back to the dashboard without going through setup again, using
@@ -935,22 +1016,9 @@ impl App {
                         self.save_account_and_enter_dashboard(account, signer)
                     }
                     Some(ConnectLedgerOutcome::ReconnectComplete { signer }) => {
-                        self.enter_dashboard(signer, None)
+                        self.finish_send_reconnect(signer)
                     }
-                    Some(ConnectLedgerOutcome::Back) => {
-                        // Setup mode: back to the hardware-wallet picker.
-                        // Reconnect mode (after unlock): back to unlock so the
-                        // user can retry or pick a different wallet file. The
-                        // wallet is locked again in that case.
-                        self.screen = if wallet::wallet_exists() {
-                            self.passphrase = None;
-                            self.wallet = None;
-                            Screen::Unlock(UnlockScreen::default())
-                        } else {
-                            Screen::SelectHardwareWallet(SelectHardwareWalletScreen::default())
-                        };
-                        iced::Task::none()
-                    }
+                    Some(ConnectLedgerOutcome::Back) => self.connect_back(),
                     None => cmd.map(Message::ConnectLedger),
                 }
             }
@@ -966,18 +1034,9 @@ impl App {
                         self.save_account_and_enter_dashboard(account, signer)
                     }
                     Some(ConnectTrezorOutcome::ReconnectComplete { signer }) => {
-                        self.enter_dashboard(signer, None)
+                        self.finish_send_reconnect(signer)
                     }
-                    Some(ConnectTrezorOutcome::Back) => {
-                        self.screen = if wallet::wallet_exists() {
-                            self.passphrase = None;
-                            self.wallet = None;
-                            Screen::Unlock(UnlockScreen::default())
-                        } else {
-                            Screen::SelectHardwareWallet(SelectHardwareWalletScreen::default())
-                        };
-                        iced::Task::none()
-                    }
+                    Some(ConnectTrezorOutcome::Back) => self.connect_back(),
                     None => cmd.map(Message::ConnectTrezor),
                 }
             }
@@ -994,6 +1053,10 @@ impl App {
                     Some(WalletDashboardOutcome::RenameActive(name)) => {
                         let save = self.rename_active_account(name);
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
+                    }
+                    Some(WalletDashboardOutcome::NeedsHardwareReconnect) => {
+                        let nav = screen.current_nav();
+                        self.request_send_reconnect(nav)
                     }
                     Some(WalletDashboardOutcome::SaveContacts(new_contacts)) => {
                         // Update the in-memory book synchronously so the
@@ -1324,6 +1387,7 @@ mod tests {
             contacts: Arc::new(RwLock::new(ContactsBook::new())),
             toast: None,
             toast_gen: 0,
+            send_reconnect: None,
         }
     }
 

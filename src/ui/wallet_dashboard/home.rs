@@ -11,18 +11,16 @@ use crate::ui::kao_widgets::{
     bold, card_style, hover_fill, kao_fit, kao_scrollable_style, kao_text, kaomoji_for_index, mono,
     mono_black, mono_bold, token_avatar,
 };
-use crate::wallet::KaoSigner;
-
 use super::{MOOD, Message};
 
 pub fn view<'a>(
     t: KaoTheme,
-    signer: &'a KaoSigner,
+    can_send: bool,
     portfolio: &'a [LiveToken],
     portfolio_loading: bool,
 ) -> Element<'a, Message> {
     let hero = balance_hero(t, portfolio);
-    let actions = quick_actions(t, signer);
+    let actions = quick_actions(t, can_send);
     let assets_label = text("ASSETS").size(11).color(t.sub).font(bold());
     let mut assets = column![].spacing(5);
     if portfolio_loading {
@@ -99,14 +97,12 @@ fn balance_hero<'a>(t: KaoTheme, portfolio: &[LiveToken]) -> Element<'a, Message
         .into()
 }
 
-fn quick_actions<'a>(t: KaoTheme, signer: &KaoSigner) -> Element<'a, Message> {
+fn quick_actions<'a>(t: KaoTheme, can_send: bool) -> Element<'a, Message> {
     // View-only accounts can't sign, so Send is disabled. Receive still works
-    // because it just shows the address.
-    let send_press = if signer.can_sign() {
-        Some(Message::OpenSend)
-    } else {
-        None
-    };
+    // because it just shows the address. Hardware accounts whose device is
+    // not currently attached are *still* sendable here — clicking Send
+    // escalates to a reconnect flow rather than being a no-op.
+    let send_press = can_send.then_some(Message::OpenSend);
     row![
         quick_action(t, "Send", "ᕕ( ᐛ )ᕗ", t.ab1, t.a1, send_press),
         Space::new().width(10),

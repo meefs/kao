@@ -186,6 +186,12 @@ pub enum Outcome {
     /// User saved a new/edited contacts list. The App writes the vec
     /// into the shared in-memory book and dispatches a disk save.
     SaveContacts(Vec<Contact>),
+    /// User clicked Send on a hardware account whose signer is the
+    /// view-only placeholder (the device wasn't connected at unlock).
+    /// The App pushes the matching reconnect screen and, on success,
+    /// re-enters the dashboard with the live signer and the Send modal
+    /// pre-opened.
+    NeedsHardwareReconnect,
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -423,6 +429,18 @@ impl WalletScreen {
     /// they were reading instead of being yanked back to Home.
     pub fn current_nav(&self) -> Nav {
         self.nav
+    }
+
+    /// Whether the Send button should be live. True when the signer can
+    /// sign directly, or when the active descriptor is a hardware account
+    /// — in the hardware case the click escalates to a reconnect rather
+    /// than opening Send immediately. View-only accounts return false.
+    fn can_send(&self) -> bool {
+        self.signer.can_sign()
+            || matches!(
+                self.accounts.get(self.active_index),
+                Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
+            )
     }
 
     /// Issue a Mainnet `network.balance` call purely to refresh the
@@ -822,9 +840,17 @@ impl WalletScreen {
             }
             Message::OpenSend => {
                 if !self.signer.can_sign() {
-                    // View-only accounts can't broadcast. Open the modal in
-                    // a "this is read-only" state would be nicer; for now,
-                    // refuse to open it at all.
+                    // Hardware accounts can sign — they just need the device
+                    // reconnected. Escalate so the App can push the matching
+                    // connect screen and come back with a live signer +
+                    // Send modal opened. True view-only accounts have no
+                    // signing material at all, so they stay no-op here.
+                    if matches!(
+                        self.accounts.get(self.active_index),
+                        Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
+                    ) {
+                        return (Task::none(), Some(Outcome::NeedsHardwareReconnect));
+                    }
                     info!("send disabled: active account is view-only");
                     return (Task::none(), None);
                 }
@@ -1437,7 +1463,7 @@ impl WalletScreen {
             None => &empty_book,
         };
         let body: Element<'_, Message> = match self.nav {
-            Nav::Home => home::view(t, &self.signer, &self.portfolio, self.portfolio_loading),
+            Nav::Home => home::view(t, self.can_send(), &self.portfolio, self.portfolio_loading),
             Nav::Activity => {
                 // Show the error placeholder only when every configured
                 // chain failed *and* nothing rendered. Otherwise partial
