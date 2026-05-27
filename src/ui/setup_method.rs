@@ -17,6 +17,7 @@ pub enum Message {
     CreateNewWallet,
     ConnectHardwareWallet,
     WatchAddress,
+    AddSafe,
     BackPressed,
     KeyboardEvent(keyboard::Event),
 }
@@ -29,6 +30,7 @@ pub enum SetupMethod {
     CreateNewWallet,
     ConnectHardwareWallet,
     WatchAddress,
+    AddSafe,
 }
 
 /// What happened when the user interacted with the screen.
@@ -68,6 +70,7 @@ impl SetupMethodScreen {
             Message::CreateNewWallet => pick(self, SetupMethod::CreateNewWallet),
             Message::ConnectHardwareWallet => pick(self, SetupMethod::ConnectHardwareWallet),
             Message::WatchAddress => pick(self, SetupMethod::WatchAddress),
+            Message::AddSafe => pick(self, SetupMethod::AddSafe),
             Message::BackPressed => (Task::none(), Some(Outcome::Cancel)),
             Message::KeyboardEvent(event) => match event {
                 keyboard::Event::KeyPressed { key, .. } => match &key {
@@ -85,6 +88,9 @@ impl SetupMethodScreen {
                     }
                     keyboard::Key::Character(c) if c.as_str() == "5" => {
                         pick(self, SetupMethod::WatchAddress)
+                    }
+                    keyboard::Key::Character(c) if c.as_str() == "6" => {
+                        pick(self, SetupMethod::AddSafe)
                     }
                     keyboard::Key::Named(keyboard::key::Named::Escape) => {
                         (Task::none(), Some(Outcome::Cancel))
@@ -154,6 +160,17 @@ impl SetupMethodScreen {
                 on_press: Message::WatchAddress,
             },
         );
+        let safe_card = self.method_card(
+            t,
+            MethodCard {
+                bg: t.ab3,
+                accent: t.a3,
+                number: "6",
+                label: "Add a Safe",
+                sub: "Onboard a Gnosis Safe multisig as signer or observer",
+                on_press: Message::AddSafe,
+            },
+        );
 
         let hint = container(
             row![
@@ -166,6 +183,8 @@ impl SetupMethodScreen {
                 hint_pill(t, "4"),
                 Space::new().width(4),
                 hint_pill(t, "5"),
+                Space::new().width(4),
+                hint_pill(t, "6"),
                 Space::new().width(8),
                 text("pick a method").size(11).color(t.sub).font(mono()),
             ]
@@ -190,6 +209,8 @@ impl SetupMethodScreen {
             hardware_card,
             vspace(10),
             watch_card,
+            vspace(10),
+            safe_card,
             vspace(16),
             hint,
         ]

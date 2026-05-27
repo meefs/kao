@@ -6,6 +6,7 @@ pub mod import_private_key;
 pub mod import_seed_phrase;
 pub mod kao_theme;
 pub mod kao_widgets;
+pub mod safe_onboarding;
 pub mod select_hardware_wallet;
 pub mod select_hd_account;
 pub mod select_indexer;

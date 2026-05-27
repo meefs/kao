@@ -30,6 +30,10 @@ use crate::ui::import_seed_phrase::{
 };
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::bold;
+use crate::ui::safe_onboarding::{
+    ExistingAccount, Message as SafeOnboardingMessage, Outcome as SafeOnboardingOutcome,
+    SafeOnboardingScreen,
+};
 use crate::ui::select_hardware_wallet::{
     Message as SelectHardwareWalletMessage, Outcome as SelectHardwareWalletOutcome,
     SelectHardwareWalletScreen,
@@ -69,6 +73,7 @@ pub enum Message {
     ImportAddress(ImportAddressMessage),
     ImportPrivateKey(ImportPrivateKeyMessage),
     ImportSeedPhrase(ImportSeedPhraseMessage),
+    SafeOnboarding(SafeOnboardingMessage),
     SelectHardwareWallet(SelectHardwareWalletMessage),
     SelectHdAccount(SelectHdAccountMessage),
     SelectIndexer(SelectIndexerMessage),
@@ -123,6 +128,7 @@ pub enum Screen {
     ImportAddress(ImportAddressScreen),
     ImportPrivateKey(ImportPrivateKeyScreen),
     ImportSeedPhrase(ImportSeedPhraseScreen),
+    SafeOnboarding(SafeOnboardingScreen),
     SelectHdAccount(SelectHdAccountScreen),
     ConnectLedger(ConnectLedgerScreen),
     ConnectTrezor(ConnectTrezorScreen),
@@ -471,6 +477,48 @@ impl App {
     /// Drop back to the dashboard without going through setup again, using
     /// the signer the user had before they entered the add-account flow.
     /// Used when the user backs out of the SetupMethod / its sub-screens.
+    /// Append `primary` plus any `siblings` to `wallet.safes`, persist
+    /// the wallet, and route back to the dashboard.
+    ///
+    /// v1 (stage 3a) requires an existing wallet — Safes must be added
+    /// in `AddAccount` context. Calling this with no loaded wallet
+    /// surfaces a toast and bails (the storage layer would refuse
+    /// anyway since a wallet with safes but no accounts can't be
+    /// loaded back). Dedup is (address, chain_id) per `contains_safe`.
+    fn save_safe_and_return_to_dashboard(
+        &mut self,
+        primary: crate::wallet::SafeDescriptor,
+        siblings: Vec<crate::wallet::SafeDescriptor>,
+    ) -> iced::Task<Message> {
+        let Some(passphrase) = self.passphrase.as_ref() else {
+            return iced::Task::perform(
+                async { "missing passphrase; cannot save Safe".to_string() },
+                Message::WalletError,
+            );
+        };
+        let Some(mut wallet) = self.wallet.take() else {
+            return iced::Task::perform(
+                async { "no wallet loaded; add an account before adding a Safe".to_string() },
+                Message::WalletError,
+            );
+        };
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for s in std::iter::once(primary).chain(siblings) {
+            let addr = alloy::primitives::Address::from(s.address);
+            if wallet.contains_safe(addr, s.chain_id) {
+                skipped += 1;
+            } else {
+                wallet.safes.push(s);
+                added += 1;
+            }
+        }
+        debug!(added, skipped, total = wallet.safes.len(), "Safe(s) saved");
+        let save = save_descriptor_task(wallet.clone(), passphrase.clone());
+        self.wallet = Some(wallet);
+        iced::Task::batch(vec![save, self.cancel_add_account()])
+    }
+
     fn cancel_add_account(&mut self) -> iced::Task<Message> {
         self.setup_context = None;
         if let Some(signer) = self.pending_signer.take() {
@@ -764,6 +812,40 @@ impl App {
                             focus_widget(crate::ui::import_address::ADDRESS_INPUT_ID)
                                 .map(Message::ImportAddress)
                         }
+                        SetupMethod::AddSafe => {
+                            // Build the existing-accounts snapshot the
+                            // RoleSelection step needs to intersect with
+                            // the Safe's owner set. Wallet is `None`
+                            // during fresh setup — the empty vec means
+                            // RoleSelection will show "no matched
+                            // owners" and the user proceeds as
+                            // watch-only or backs out.
+                            let existing: Vec<ExistingAccount> = self
+                                .wallet
+                                .as_ref()
+                                .map(|w| {
+                                    w.accounts
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(idx, acc)| {
+                                            wallet::account_address(acc).map(|addr| {
+                                                ExistingAccount {
+                                                    account_idx: idx as u32,
+                                                    address: addr,
+                                                    label: acc.display_name(idx),
+                                                }
+                                            })
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            self.screen = Screen::SafeOnboarding(SafeOnboardingScreen::new(
+                                self.network.clone(),
+                                existing,
+                            ));
+                            focus_widget(crate::ui::safe_onboarding::ADDRESS_INPUT_ID)
+                                .map(Message::SafeOnboarding)
+                        }
                     },
                     Some(SetupMethodOutcome::Cancel) => {
                         if matches!(self.setup_context, Some(SetupContext::AddAccount)) {
@@ -865,6 +947,32 @@ impl App {
                             .map(Message::ImportSeedPhrase)
                     }
                     None => cmd.map(Message::SelectHdAccount),
+                }
+            }
+
+            // ── SafeOnboarding ──────────────────────────────────────
+            Message::SafeOnboarding(msg) => {
+                let Screen::SafeOnboarding(screen) = &mut self.screen else {
+                    return iced::Task::none();
+                };
+                let (cmd, outcome) = screen.update(msg);
+                match outcome {
+                    Some(SafeOnboardingOutcome::Done { primary, siblings }) => {
+                        self.save_safe_and_return_to_dashboard(*primary, siblings)
+                    }
+                    Some(SafeOnboardingOutcome::Back) => {
+                        // Same handling as ImportAddress: backing out
+                        // of the entry step in fresh setup returns to
+                        // the method picker; in AddAccount mode it
+                        // returns to the dashboard.
+                        if matches!(self.setup_context, Some(SetupContext::AddAccount)) {
+                            self.cancel_add_account()
+                        } else {
+                            self.screen = Screen::SetupMethod(SetupMethodScreen::default());
+                            iced::Task::none()
+                        }
+                    }
+                    None => cmd.map(Message::SafeOnboarding),
                 }
             }
 
@@ -1154,6 +1262,7 @@ impl App {
             Screen::ImportAddress(screen) => screen.view().map(Message::ImportAddress),
             Screen::ImportPrivateKey(screen) => screen.view().map(Message::ImportPrivateKey),
             Screen::ImportSeedPhrase(screen) => screen.view().map(Message::ImportSeedPhrase),
+            Screen::SafeOnboarding(screen) => screen.view().map(Message::SafeOnboarding),
             Screen::SelectHdAccount(screen) => screen.view().map(Message::SelectHdAccount),
             Screen::ConnectLedger(screen) => screen.view().map(Message::ConnectLedger),
             Screen::ConnectTrezor(screen) => screen.view().map(Message::ConnectTrezor),
@@ -1187,6 +1296,7 @@ impl App {
             Screen::ImportSeedPhrase(screen) => {
                 screen.subscription().map(Message::ImportSeedPhrase)
             }
+            Screen::SafeOnboarding(screen) => screen.subscription().map(Message::SafeOnboarding),
             Screen::SelectHdAccount(screen) => screen.subscription().map(Message::SelectHdAccount),
             Screen::ConnectLedger(screen) => screen.subscription().map(Message::ConnectLedger),
             Screen::ConnectTrezor(screen) => screen.subscription().map(Message::ConnectTrezor),
