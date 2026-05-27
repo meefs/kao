@@ -4,6 +4,7 @@ use iced::border::Radius;
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
+use super::{MOOD, Message};
 use crate::chain::Chain;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::{KaoTheme, mix, with_alpha};
@@ -11,7 +12,6 @@ use crate::ui::kao_widgets::{
     bold, card_style, hover_fill, kao_fit, kao_scrollable_style, kao_text, kaomoji_for_index, mono,
     mono_black, mono_bold, token_avatar,
 };
-use super::{MOOD, Message};
 
 pub fn view<'a>(
     t: KaoTheme,

@@ -188,8 +188,10 @@ mod tests {
         for c in Chain::ALL {
             assert!(c.default_consensus_url().starts_with("https://"));
         }
-        let urls: std::collections::HashSet<_> =
-            Chain::ALL.iter().map(|c| c.default_consensus_url()).collect();
+        let urls: std::collections::HashSet<_> = Chain::ALL
+            .iter()
+            .map(|c| c.default_consensus_url())
+            .collect();
         assert_eq!(urls.len(), 3);
     }
 

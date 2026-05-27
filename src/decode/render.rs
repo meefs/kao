@@ -553,7 +553,7 @@ mod tests {
         // payload, padded to 32-byte boundary
         buf.extend_from_slice(s.as_bytes());
         let pad = (32 - (s.len() % 32)) % 32;
-        buf.extend(std::iter::repeat(0u8).take(pad));
+        buf.extend(std::iter::repeat_n(0u8, pad));
         Bytes::from(buf)
     }
 

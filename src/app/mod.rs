@@ -407,9 +407,7 @@ impl App {
             );
         };
         match wallet.active().clone() {
-            AccountDescriptor::Ledger {
-                path, address, ..
-            } => {
+            AccountDescriptor::Ledger { path, address, .. } => {
                 let expected = alloy::primitives::Address::from(address);
                 let (screen, task) =
                     ConnectLedgerScreen::new_reconnect(path, expected, self.network.clone());
@@ -417,9 +415,7 @@ impl App {
                 self.send_reconnect = Some(nav);
                 task.map(Message::ConnectLedger)
             }
-            AccountDescriptor::Trezor {
-                path, address, ..
-            } => {
+            AccountDescriptor::Trezor { path, address, .. } => {
                 let expected = alloy::primitives::Address::from(address);
                 let (screen, task) =
                     ConnectTrezorScreen::new_reconnect(path, expected, self.network.clone());

@@ -814,7 +814,10 @@ mod tests {
         };
         let dyn_tx: &mut dyn SignableTransaction<_> = &mut tx;
         let err = signer.sign_tx(dyn_tx).await.unwrap_err();
-        assert!(matches!(err, alloy::signers::Error::UnsupportedOperation(_)));
+        assert!(matches!(
+            err,
+            alloy::signers::Error::UnsupportedOperation(_)
+        ));
     }
 
     #[test]

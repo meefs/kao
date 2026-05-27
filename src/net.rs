@@ -1339,6 +1339,7 @@ impl CallMock {
         self.code.lock().unwrap().insert(addr, (code, verified));
     }
 
+    #[allow(dead_code)]
     pub fn set_storage(&self, addr: Address, slot: B256, value: B256, verified: bool) {
         self.storage
             .lock()
@@ -1360,11 +1361,7 @@ impl BalanceFetcher for CallMock {
     async fn provider(&self, _: Chain) -> Option<RootProvider<Ethereum>> {
         None
     }
-    async fn get_code(
-        &self,
-        addr: Address,
-        _: Chain,
-    ) -> Result<VerifiedRead<Bytes>, String> {
+    async fn get_code(&self, addr: Address, _: Chain) -> Result<VerifiedRead<Bytes>, String> {
         let (value, verified) = self
             .code
             .lock()
@@ -1405,11 +1402,7 @@ impl BalanceFetcher for CallMock {
             .unwrap_or((Bytes::new(), true));
         Ok(VerifiedRead { value, verified })
     }
-    async fn get_balance_raw(
-        &self,
-        _: Address,
-        _: Chain,
-    ) -> Result<VerifiedRead<U256>, String> {
+    async fn get_balance_raw(&self, _: Address, _: Chain) -> Result<VerifiedRead<U256>, String> {
         Ok(VerifiedRead {
             value: U256::ZERO,
             verified: true,
@@ -1442,6 +1435,32 @@ impl BalanceFetcher for CallMock {
     }
 }
 
+/// Spawn a background task that fetches the latest community-fallback
+/// checkpoint and, if our built-in is older than the freshness threshold,
+/// updates `settings::auto_checkpoint`. No-ops when the built-in is
+/// fresh. Mainnet only — L2 chains have no checkpoint concept.
+pub fn refresh_auto_checkpoint() {
+    if settings::builtin_is_fresh() {
+        return;
+    }
+    tokio::spawn(async move {
+        let cf = match CheckpointFallback::new().build().await {
+            Ok(cf) => cf,
+            Err(e) => {
+                warn!(error = %e, "checkpoint fallback build failed");
+                return;
+            }
+        };
+        match cf.fetch_latest_checkpoint(&EthNetwork::Mainnet).await {
+            Ok(latest) => {
+                info!(checkpoint = %latest, "refreshed auto checkpoint");
+                settings::set_auto_checkpoint(latest);
+            }
+            Err(e) => warn!(error = %e, "checkpoint fetch failed"),
+        }
+    });
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::*;
@@ -1460,9 +1479,18 @@ mod pure_tests {
 
     #[test]
     fn verification_status_from_u8_unknown_defaults_to_connecting() {
-        assert_eq!(VerificationStatus::from_u8(0), VerificationStatus::Connecting);
-        assert_eq!(VerificationStatus::from_u8(99), VerificationStatus::Connecting);
-        assert_eq!(VerificationStatus::from_u8(u8::MAX), VerificationStatus::Connecting);
+        assert_eq!(
+            VerificationStatus::from_u8(0),
+            VerificationStatus::Connecting
+        );
+        assert_eq!(
+            VerificationStatus::from_u8(99),
+            VerificationStatus::Connecting
+        );
+        assert_eq!(
+            VerificationStatus::from_u8(u8::MAX),
+            VerificationStatus::Connecting
+        );
     }
 
     #[test]
@@ -1523,8 +1551,10 @@ mod pure_tests {
         // construct via Default::default() and patch the fields we care
         // about — their numeric/byte types come from alloy_primitives,
         // which is a single version across the graph.
-        let mut header: alloy_rpc_types_eth::Header = Default::default();
-        header.hash = B256::from([0xbb; 32]);
+        let mut header: alloy_rpc_types_eth::Header = alloy_rpc_types_eth::Header {
+            hash: B256::from([0xbb; 32]),
+            ..Default::default()
+        };
         header.inner.number = 12_345;
         header.inner.gas_limit = 30_000_000;
         header.inner.timestamp = 1_700_000_000;
@@ -1586,30 +1616,4 @@ mod pure_tests {
         };
         assert!(!vr2.verified);
     }
-}
-
-/// Spawn a background task that fetches the latest community-fallback
-/// checkpoint and, if our built-in is older than the freshness threshold,
-/// updates `settings::auto_checkpoint`. No-ops when the built-in is
-/// fresh. Mainnet only — L2 chains have no checkpoint concept.
-pub fn refresh_auto_checkpoint() {
-    if settings::builtin_is_fresh() {
-        return;
-    }
-    tokio::spawn(async move {
-        let cf = match CheckpointFallback::new().build().await {
-            Ok(cf) => cf,
-            Err(e) => {
-                warn!(error = %e, "checkpoint fallback build failed");
-                return;
-            }
-        };
-        match cf.fetch_latest_checkpoint(&EthNetwork::Mainnet).await {
-            Ok(latest) => {
-                info!(checkpoint = %latest, "refreshed auto checkpoint");
-                settings::set_auto_checkpoint(latest);
-            }
-            Err(e) => warn!(error = %e, "checkpoint fetch failed"),
-        }
-    });
 }

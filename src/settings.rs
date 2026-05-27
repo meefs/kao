@@ -805,10 +805,7 @@ mod tests {
     #[test]
     fn nonempty_passes_through_or_returns_none() {
         assert!(nonempty(&[]).is_none());
-        assert_eq!(
-            nonempty(&["a".to_string()]),
-            Some(vec!["a".to_string()])
-        );
+        assert_eq!(nonempty(&["a".to_string()]), Some(vec!["a".to_string()]));
     }
 
     #[test]
@@ -915,7 +912,10 @@ mod tests {
         );
         // Only the https URL survives; existing list is replaced because the
         // filtered new list is non-empty.
-        assert_eq!(target.get(Chain::Mainnet), &vec!["https://kept".to_string()]);
+        assert_eq!(
+            target.get(Chain::Mainnet),
+            &vec!["https://kept".to_string()]
+        );
     }
 
     #[test]
@@ -928,7 +928,10 @@ mod tests {
             Some(vec!["http://nope".into()]),
         );
         // Existing entry preserved.
-        assert_eq!(target.get(Chain::Mainnet), &vec!["https://existing".to_string()]);
+        assert_eq!(
+            target.get(Chain::Mainnet),
+            &vec!["https://existing".to_string()]
+        );
     }
 
     #[test]
@@ -936,7 +939,10 @@ mod tests {
         let mut target = PerChain::<Vec<String>>::default();
         target.set(Chain::Mainnet, vec!["https://existing".into()]);
         apply_rpc_list(&mut target, Chain::Mainnet, None);
-        assert_eq!(target.get(Chain::Mainnet), &vec!["https://existing".to_string()]);
+        assert_eq!(
+            target.get(Chain::Mainnet),
+            &vec!["https://existing".to_string()]
+        );
     }
 
     #[cfg(unix)]
@@ -967,7 +973,10 @@ mod tests {
         let cl = default_consensus_rpcs();
         assert!(!cl.is_empty());
         for u in cl {
-            assert!(u.starts_with("https://"), "default consensus rpc must be https: {u}");
+            assert!(
+                u.starts_with("https://"),
+                "default consensus rpc must be https: {u}"
+            );
         }
     }
 
@@ -984,7 +993,10 @@ mod tests {
         let _ = theme();
         assert_eq!(indexer_provider(), default_state().indexer_provider);
         // Per-chain rpcs default to the Mainnet list.
-        assert_eq!(rpcs(Chain::Mainnet), default_state().rpcs.get(Chain::Mainnet).clone());
+        assert_eq!(
+            rpcs(Chain::Mainnet),
+            default_state().rpcs.get(Chain::Mainnet).clone()
+        );
         // Consensus rpcs for Mainnet match the seeded default.
         assert_eq!(
             consensus_rpcs(Chain::Mainnet),
@@ -1000,7 +1012,10 @@ mod tests {
             vec![Chain::Optimism.default_consensus_url().to_string()],
         );
         // auto_checkpoint starts at the built-in constant.
-        assert_eq!(auto_checkpoint(), B256::from_str(BUILTIN_CHECKPOINT).unwrap());
+        assert_eq!(
+            auto_checkpoint(),
+            B256::from_str(BUILTIN_CHECKPOINT).unwrap()
+        );
         // checkpoint_override starts as None.
         assert!(checkpoint_override().is_none());
     }
