@@ -807,7 +807,7 @@ fn view_address_input<'a>(
     .center_x(Length::Fill);
 
     let mut content = column![
-        kao_hero(t, "(◉‿◉)", 56.0),
+        kao_hero(t, "(˶>⩊<˶)", 56.0),
         vspace(10),
         screen_title(t, "Add a Safe"),
         vspace(6),
@@ -833,7 +833,7 @@ fn view_address_input<'a>(
 
 fn view_scanning<'a>(t: KaoTheme, what: &'a str) -> Element<'a, Message> {
     column![
-        kao_hero(t, "(◔_◔)", 56.0),
+        kao_hero(t, "ദ്ദി◝ ⩊ ◜.ᐟ", 56.0),
         vspace(10),
         screen_title(t, "Scanning…"),
         vspace(6),
@@ -852,7 +852,7 @@ fn view_chain_chooser<'a>(
     results: &'a [(Chain, ScanResult)],
 ) -> Element<'a, Message> {
     let mut col = column![
-        kao_hero(t, "(◔‿◔)", 56.0),
+        kao_hero(t, "(๑ᵔ⤙ᵔ๑)", 56.0),
         vspace(10),
         screen_title(t, "Pick a chain"),
         vspace(6),
@@ -924,7 +924,7 @@ fn view_no_chain<'a>(
     results: &'a [(Chain, ScanResult)],
 ) -> Element<'a, Message> {
     let mut col = column![
-        kao_hero(t, "(×_×)", 56.0),
+        kao_hero(t, "(*ᴗ͈ˬᴗ͈)ꕤ*.ﾟ", 56.0),
         vspace(10),
         screen_title(t, "No Safe found"),
         vspace(6),
@@ -1014,7 +1014,7 @@ fn view_inspect<'a>(
     );
 
     let mut body = column![
-        kao_hero(t, "(•‿•)", 48.0),
+        kao_hero(t, "⸜(｡˃ ᵕ ˂ )⸝♡", 48.0),
         vspace(8),
         screen_title(t, "Safe found"),
         vspace(12),
