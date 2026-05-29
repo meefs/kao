@@ -1,4 +1,4 @@
-//! Multi-step onboarding flow for adding a Gnosis Safe to the wallet.
+//! Multi-step onboarding flow for adding a Safe to the wallet.
 //!
 //! The flow is six sub-steps held in a single `Step` enum so each step
 //! carries exactly the data it needs (invalid states are
@@ -833,7 +833,7 @@ fn view_address_input<'a>(
 
 fn view_scanning<'a>(t: KaoTheme, what: &'a str) -> Element<'a, Message> {
     column![
-        kao_hero(t, "(•_•) ⌛", 56.0),
+        kao_hero(t, "(◔_◔)", 56.0),
         vspace(10),
         screen_title(t, "Scanning…"),
         vspace(6),

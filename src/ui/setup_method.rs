@@ -167,7 +167,7 @@ impl SetupMethodScreen {
                 accent: t.a3,
                 number: "6",
                 label: "Add a Safe",
-                sub: "Onboard a Gnosis Safe multisig as signer or observer",
+                sub: "Onboard a Safe multisig as signer, proposer or observer",
                 on_press: Message::AddSafe,
             },
         );
