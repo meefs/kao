@@ -257,6 +257,107 @@ pub fn ghost_button<'a, M: Clone + 'a>(
         })
 }
 
+/// Tinted card with a numbered chip, label and sub-label, used by the
+/// initial setup-method picker and the Safe-onboarding "add a new
+/// signer" picker. Click anywhere on the card to fire `on_press`.
+///
+/// `bg` is the card's tint (one of `t.ab1` / `t.ab2` / `t.ab3` for the
+/// rotating palette); `accent` matches it (`t.a1` / `t.a2` / `t.a3`).
+pub fn method_card<'a, M: Clone + 'a>(
+    t: KaoTheme,
+    bg: Color,
+    accent: Color,
+    number: &'a str,
+    label: &'a str,
+    sub: &'a str,
+    on_press: M,
+) -> Element<'a, M> {
+    let info = column![
+        row![
+            container(text(number).size(11).color(accent).font(black()))
+                .padding(Padding::from([2, 7]))
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(bg)),
+                    border: Border {
+                        color: with_alpha(accent, 0.3),
+                        width: 1.0,
+                        radius: Radius::from(6),
+                    },
+                    text_color: Some(accent),
+                    ..container::Style::default()
+                }),
+            Space::new().width(8),
+            text(label).size(15).color(t.text).font(black()),
+        ]
+        .align_y(Alignment::Center),
+        Space::new().height(2),
+        text(sub).size(12).color(t.sub),
+    ]
+    .spacing(0);
+
+    let row_content = row![
+        container(info).width(Length::Fill),
+        text("→").size(18).color(accent).font(bold()),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let styled = container(row_content)
+        .padding(Padding::from([14, 16]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: with_alpha(accent, 0.25),
+                width: 1.5,
+                radius: Radius::from(15),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        });
+
+    mouse_area(styled)
+        .on_press(on_press)
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
+}
+
+/// Themed checkbox factory. Builds a `checkbox` with Kao's accent
+/// fill, accent-tinted border on hover, and a white tick. Caller
+/// wires `.label(...)`, `.on_toggle(...)`, and `.size(...)` as
+/// usual; this returns the widget after the style is set so iced's
+/// builder chain remains ergonomic.
+pub fn kao_checkbox<'a, M: 'a>(t: KaoTheme, is_checked: bool) -> iced::widget::Checkbox<'a, M> {
+    use iced::widget::checkbox::{self, Status};
+    iced::widget::checkbox(is_checked).style(move |_theme, status| {
+        let (checked, hovered) = match status {
+            Status::Active { is_checked } => (is_checked, false),
+            Status::Hovered { is_checked } => (is_checked, true),
+            Status::Disabled { is_checked } => (is_checked, false),
+        };
+        let bg = if checked {
+            t.a1
+        } else if hovered {
+            with_alpha(t.a1, 0.10)
+        } else {
+            Color::TRANSPARENT
+        };
+        // Active border on either checked OR hovered, so the tick box
+        // visually previews its selectable state on pointer-over.
+        let border_color = if checked || hovered { t.a1 } else { t.border };
+        checkbox::Style {
+            background: Background::Color(bg),
+            icon_color: Color::WHITE,
+            border: Border {
+                color: border_color,
+                width: 1.5,
+                radius: Radius::from(5),
+            },
+            text_color: Some(t.text),
+        }
+    })
+}
+
 pub fn primary_button<'a, M: Clone + 'a>(
     t: KaoTheme,
     label: &'a str,

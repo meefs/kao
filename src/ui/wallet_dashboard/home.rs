@@ -9,8 +9,8 @@ use crate::chain::Chain;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::{KaoTheme, mix, with_alpha};
 use crate::ui::kao_widgets::{
-    bold, card_style, hover_fill, kao_fit, kao_scrollable_style, kao_text, kaomoji_for_index, mono,
-    mono_black, mono_bold, token_avatar,
+    bold, card_style, hover_fill, hover_tint, kao_fit, kao_scrollable_style, kao_text,
+    kaomoji_for_index, mono, mono_black, mono_bold, token_avatar,
 };
 
 pub fn view<'a>(
@@ -18,10 +18,17 @@ pub fn view<'a>(
     can_send: bool,
     portfolio: &'a [LiveToken],
     portfolio_loading: bool,
+    portfolio_refreshing: bool,
 ) -> Element<'a, Message> {
     let hero = balance_hero(t, portfolio);
     let actions = quick_actions(t, can_send);
-    let assets_label = text("ASSETS").size(11).color(t.sub).font(bold());
+    let assets_label_row = row![
+        text("ASSETS").size(11).color(t.sub).font(bold()),
+        Space::new().width(Length::Fill),
+        refresh_button(t, portfolio_refreshing),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
     let mut assets = column![].spacing(5);
     if portfolio_loading {
         assets = assets.push(
@@ -41,7 +48,7 @@ pub fn view<'a>(
         Space::new().height(18),
         actions,
         Space::new().height(18),
-        assets_label,
+        assets_label_row,
         Space::new().height(10),
         assets,
     ];
@@ -95,6 +102,39 @@ fn balance_hero<'a>(t: KaoTheme, portfolio: &[LiveToken]) -> Element<'a, Message
             ..container::Style::default()
         })
         .into()
+}
+
+/// Refresh-balances chip. Sits at the right end of the ASSETS row.
+/// While a user-initiated refresh is in flight, the glyph swaps to
+/// a "loading" kaomoji and the click is suppressed so a rapid
+/// double-tap can't queue two parallel fetches against the same
+/// indexer.
+fn refresh_button<'a>(t: KaoTheme, refreshing: bool) -> Element<'a, Message> {
+    let (glyph, color) = if refreshing {
+        ("(；・∀・) refreshing", t.sub)
+    } else {
+        ("↻ refresh", t.a1)
+    };
+    let label = text(glyph).size(11).color(color).font(bold());
+    let bg = Color::TRANSPARENT;
+    let mut b = button(container(label).padding(Padding::from([3, 8])))
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
+                _ => bg,
+            })),
+            text_color: color,
+            border: Border {
+                color: with_alpha(color, 0.25),
+                width: 1.0,
+                radius: Radius::from(8),
+            },
+            ..button::Style::default()
+        });
+    if !refreshing {
+        b = b.on_press(Message::RefreshPortfolio);
+    }
+    b.into()
 }
 
 fn quick_actions<'a>(t: KaoTheme, can_send: bool) -> Element<'a, Message> {

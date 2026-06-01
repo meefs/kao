@@ -50,15 +50,62 @@ use crate::chain::Chain;
 use crate::net::BalanceFetcher;
 use crate::wallet::{SafeDescriptor, SafeTrust, short_address};
 
-// ── Safe ABI (subset used at onboarding + refresh) ──────────────────────────
+pub mod tx;
+
+// ── Safe ABI (read + EIP-712/exec surface) ──────────────────────────────────
 
 sol! {
+    // Read-only inspection (onboarding + refresh).
     function VERSION() external view returns (string memory);
     function getOwners() external view returns (address[] memory);
     function getThreshold() external view returns (uint256);
     function nonce() external view returns (uint256);
     function getModulesPaginated(address start, uint256 pageSize)
         external view returns (address[] memory array, address next);
+
+    // EIP-712 / exec surface used by the Safe-TX flow (`safe::tx`).
+    function domainSeparator() external view returns (bytes32);
+    function getTransactionHash(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        uint8 operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address refundReceiver,
+        uint256 _nonce
+    ) external view returns (bytes32);
+    function execTransaction(
+        address to,
+        uint256 value,
+        bytes calldata data,
+        uint8 operation,
+        uint256 safeTxGas,
+        uint256 baseGas,
+        uint256 gasPrice,
+        address gasToken,
+        address payable refundReceiver,
+        bytes calldata signatures
+    ) external payable returns (bool success);
+
+    // Field order must EXACTLY match the Safe 1.3+ canonical typehash
+    // — alloy derives the EIP-712 typehash from declaration order, so
+    // any permutation silently produces a different signing hash.
+    // Pinned by `safe::tx::tests::safe_tx_typehash_matches_spec`.
+    struct SafeTx {
+        address to;
+        uint256 value;
+        bytes data;
+        uint8 operation;
+        uint256 safeTxGas;
+        uint256 baseGas;
+        uint256 gasPrice;
+        address gasToken;
+        address refundReceiver;
+        uint256 nonce;
+    }
 }
 
 // ── Storage slot anchors ────────────────────────────────────────────────────
@@ -421,7 +468,15 @@ pub async fn inspect_on_chain(net: &dyn BalanceFetcher, chain: Chain, addr: Addr
     // 1. Bail early on undeployed addresses. The rest of the reads
     //    would just return empty bytes / revert, and the
     //    NotDeployed/NotASafe distinction matters to the UI.
-    let code = match net.get_code(addr, chain).await {
+    //
+    //    Uses `_raw` reads throughout (here and in the parallel block
+    //    below) so the scan never triggers a helios-opstack build —
+    //    that crate spawns a background consensus task per build that
+    //    polls the L2 beacon proxy every second forever, even after
+    //    its `OpStackClient` is dropped. Probing every chain at
+    //    onboarding would leave a permanent log-spamming task per L2.
+    //    The verified path takes over once the user broadcasts.
+    let code = match net.get_code_raw(addr, chain).await {
         Ok(v) => v.value,
         Err(e) => {
             return ScanResult::NotASafe {
@@ -693,7 +748,9 @@ async fn read_implementation(
     chain: Chain,
     addr: Address,
 ) -> Result<Address, String> {
-    let slot = net.get_storage_at(addr, IMPLEMENTATION_SLOT, chain).await?;
+    let slot = net
+        .get_storage_at_raw(addr, IMPLEMENTATION_SLOT, chain)
+        .await?;
     Ok(b256_to_address(slot.value))
 }
 
@@ -703,7 +760,7 @@ async fn read_version(
     addr: Address,
 ) -> Result<String, String> {
     let calldata = VERSIONCall {}.abi_encode();
-    let ret = net.call(addr, Bytes::from(calldata), chain).await?;
+    let ret = net.call_raw(addr, Bytes::from(calldata), chain).await?;
     // Single-return sol! decode returns the bare value, not a tuple struct.
     decode_ret::<VERSIONCall>(&ret.value)
 }
@@ -714,7 +771,7 @@ async fn read_owners(
     addr: Address,
 ) -> Result<Vec<Address>, String> {
     let calldata = getOwnersCall {}.abi_encode();
-    let ret = net.call(addr, Bytes::from(calldata), chain).await?;
+    let ret = net.call_raw(addr, Bytes::from(calldata), chain).await?;
     decode_ret::<getOwnersCall>(&ret.value)
 }
 
@@ -724,7 +781,7 @@ async fn read_threshold(
     addr: Address,
 ) -> Result<u32, String> {
     let calldata = getThresholdCall {}.abi_encode();
-    let ret = net.call(addr, Bytes::from(calldata), chain).await?;
+    let ret = net.call_raw(addr, Bytes::from(calldata), chain).await?;
     let v = decode_ret::<getThresholdCall>(&ret.value)?;
     // Clamp to u32. Realistic Safes have thresholds ≤ owner count
     // which itself is ≤ a few dozen; the cast can't lose meaningful
@@ -736,7 +793,7 @@ async fn read_threshold(
 
 async fn read_nonce(net: &dyn BalanceFetcher, chain: Chain, addr: Address) -> Result<U256, String> {
     let calldata = nonceCall {}.abi_encode();
-    let ret = net.call(addr, Bytes::from(calldata), chain).await?;
+    let ret = net.call_raw(addr, Bytes::from(calldata), chain).await?;
     decode_ret::<nonceCall>(&ret.value)
 }
 
@@ -746,7 +803,7 @@ async fn read_guard(
     addr: Address,
 ) -> Result<Option<Address>, String> {
     let slot = net
-        .get_storage_at(addr, B256_to_u256(GUARD_STORAGE_SLOT), chain)
+        .get_storage_at_raw(addr, B256_to_u256(GUARD_STORAGE_SLOT), chain)
         .await?;
     Ok(non_zero_address(b256_to_address(slot.value)))
 }
@@ -757,7 +814,7 @@ async fn read_fallback_handler(
     addr: Address,
 ) -> Result<Option<Address>, String> {
     let slot = net
-        .get_storage_at(addr, B256_to_u256(FALLBACK_HANDLER_STORAGE_SLOT), chain)
+        .get_storage_at_raw(addr, B256_to_u256(FALLBACK_HANDLER_STORAGE_SLOT), chain)
         .await?;
     Ok(non_zero_address(b256_to_address(slot.value)))
 }
@@ -778,7 +835,7 @@ async fn read_modules(
             pageSize: U256::from(MODULES_PAGE_SIZE),
         }
         .abi_encode();
-        let ret = net.call(addr, Bytes::from(calldata), chain).await?;
+        let ret = net.call_raw(addr, Bytes::from(calldata), chain).await?;
         let decoded = decode_ret::<getModulesPaginatedCall>(&ret.value)?;
         all.extend(decoded.array.iter().copied());
         if decoded.next == MODULE_SENTINEL || decoded.next == Address::ZERO {

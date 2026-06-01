@@ -478,6 +478,28 @@ impl KaoSigner {
             )),
         }
     }
+
+    /// Sign a precomputed 32-byte hash. Used by the Safe-TX flow,
+    /// which computes the EIP-712 signing hash locally (and
+    /// cross-checks it against the Safe's `getTransactionHash`)
+    /// then signs the bare hash as `r ‖ s ‖ v` with `v ∈ {27, 28}`.
+    ///
+    /// Hardware variants return `UnsupportedOperation` on purpose:
+    /// Ledger's Ethereum app refuses bare-hash signing under its
+    /// blind-signing policy, and Trezor likewise. Device EIP-712
+    /// signing needs the structured-fields APDU path
+    /// (`sign_typed_data_v4`) — a separate slice. `ViewOnly` has no
+    /// key.
+    pub async fn sign_hash(&self, hash: B256) -> Result<Signature, alloy::signers::Error> {
+        match self {
+            KaoSigner::Local(s) => s.sign_hash(&hash).await,
+            KaoSigner::Ledger(_) | KaoSigner::Trezor(_) | KaoSigner::ViewOnly(_) => {
+                Err(alloy::signers::Error::UnsupportedOperation(
+                    alloy::signers::UnsupportedSignerOperation::SignHash,
+                ))
+            }
+        }
+    }
 }
 
 /// Cell used to hand a non-Clone live signer through Clone iced messages.
@@ -971,6 +993,32 @@ mod tests {
         assert!(matches!(
             err,
             alloy::signers::Error::UnsupportedOperation(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn kao_signer_local_sign_hash_recovers_to_address() {
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        let hash = B256::repeat_byte(0xab);
+        let sig = ks.sign_hash(hash).await.unwrap();
+        let recovered = sig.recover_address_from_prehash(&hash).unwrap();
+        assert_eq!(recovered, ks.address());
+    }
+
+    #[tokio::test]
+    async fn kao_signer_view_only_sign_hash_returns_unsupported() {
+        let addr: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        let ks = KaoSigner::ViewOnly(addr);
+        let err = ks.sign_hash(B256::ZERO).await.unwrap_err();
+        assert!(matches!(
+            err,
+            alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignHash
+            )
         ));
     }
 

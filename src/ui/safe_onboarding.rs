@@ -12,10 +12,16 @@
 //! 4. `Inspect` — show owners, threshold, modules, guard, fallback
 //!    handler (each with classification labels via `safe::classify_module`).
 //! 5. `RoleSelection` — intersect on-chain owners with the user's
-//!    existing accounts; offer to link any matches OR proceed as
-//!    watch-only. The "add a new signer" path is deferred to a later
-//!    commit; the button is rendered but disabled in 3a.
-//! 6. `Label` — name the Safe, optionally add sibling chains where the
+//!    existing accounts; offer to link any matches, proceed as
+//!    watch-only, OR enter the add-signer sub-flow to import a new
+//!    account that owns this Safe.
+//! 6. `PickSignerMethod` — only reachable from RoleSelection via "Add
+//!    a new signer". Offer seed phrase, private key, or hardware
+//!    wallet as the import method. Picking one emits
+//!    `Outcome::RequestAddSigner` so the parent app can run the import
+//!    flow with the allowed-owner constraint, then call back into the
+//!    screen via `apply_added_signer` / `apply_signer_import_error`.
+//! 7. `Label` — name the Safe, optionally add sibling chains where the
 //!    same address is also a Safe, confirm.
 //!
 //! On `Label` confirm the screen emits `Outcome::Done { descriptor,
@@ -27,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::Address;
 use iced::keyboard;
-use iced::widget::{Space, checkbox, column, container, row, scrollable, text, text_input};
+use iced::widget::{Space, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
 use crate::chain::Chain;
@@ -37,9 +43,9 @@ use crate::safe::{self, SafeMetadata, ScanResult};
 use crate::settings;
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    auth_background, auth_card, colored_address, error_text, ghost_button, hint_pill, kao_hero,
-    link_button, mono, mono_bold, primary_button, screen_subtitle, screen_title, text_input_style,
-    vspace,
+    auth_background, auth_card, colored_address, error_text, ghost_button, hint_pill, kao_checkbox,
+    kao_hero, link_button, method_card, mono, mono_bold, primary_button, screen_subtitle,
+    screen_title, text_input_style, vspace,
 };
 use crate::wallet::{SafeDescriptor, SafeTrust};
 
@@ -80,6 +86,12 @@ pub enum Message {
     /// User confirmed the signer selection from the matched-existing
     /// list. Advances to Label with the currently-selected signers.
     RoleConfirm,
+    /// User wants to import a new account that owns this Safe. Moves
+    /// to `PickSignerMethod`.
+    AddSignerPressed,
+
+    // PickSignerMethod
+    SignerMethodPicked(SignerMethod),
 
     // Label
     NameInput(String),
@@ -109,6 +121,30 @@ pub enum Outcome {
     /// User backed out. Parent decides what to do (return to setup
     /// picker for fresh wallets, return to dashboard for add-account).
     Back,
+    /// User picked an import method for a new signer. The parent
+    /// runs the corresponding import sub-screen, then must call
+    /// `apply_added_signer` (success) or `apply_signer_import_error`
+    /// (rejected) on this screen to resume. While the parent owns
+    /// the sub-screen, this `SafeOnboardingScreen` instance is parked
+    /// at `PickSignerMethod` and must be kept alive (stashed).
+    RequestAddSigner {
+        method: SignerMethod,
+        /// Owners of the Safe whose key isn't already represented by
+        /// an account in the wallet. The parent enforces this set on
+        /// the imported address — anything outside is rejected.
+        allowed_owners: Vec<Address>,
+    },
+}
+
+/// Import method the user picked for the add-signer sub-flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignerMethod {
+    SeedPhrase,
+    PrivateKey,
+    Hardware,
+    /// The owner of this Safe is itself a Safe — open a nested
+    /// onboarding flow to add it as its own `SafeDescriptor`.
+    NestedSafe,
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -170,6 +206,32 @@ enum Step {
         /// Subset of `matched` (by `account_idx`) the user has
         /// checked. Empty = will be a watch-only Safe.
         selected: BTreeSet<u32>,
+        /// Owners that are themselves Safes the user has onboarded
+        /// during this session via the nested-Safe sub-flow.
+        /// Informational — the parent→child link is derived from the
+        /// owner-set intersection at signing time, not persisted on
+        /// `SafeDescriptor`.
+        linked_nested_safes: Vec<Address>,
+        /// Optional error from a previous add-signer attempt — shown
+        /// once when we return to this step. Cleared on any toggle.
+        signer_error: Option<String>,
+    },
+    /// Sub-step of RoleSelection: user has pressed "Add a new signer"
+    /// and is picking an import method. Carries forward the
+    /// RoleSelection state verbatim so backing out is a clean rewind.
+    PickSignerMethod {
+        chain: Chain,
+        metadata: SafeMetadata,
+        trust: SafeTrust,
+        all_results: Vec<(Chain, ScanResult)>,
+        matched: Vec<ExistingAccount>,
+        selected: BTreeSet<u32>,
+        linked_nested_safes: Vec<Address>,
+        /// Owners not yet represented by an existing wallet account.
+        /// Surfaced on the picker so the user knows which addresses
+        /// the import must derive to, and used by the parent as the
+        /// allowed-list when validating the imported signer.
+        unclaimed_owners: Vec<Address>,
     },
     Label {
         chain: Chain,
@@ -251,6 +313,8 @@ impl SafeOnboardingScreen {
             Message::SignerToggled(idx) => self.handle_signer_toggled(idx),
             Message::WatchOnlySelected => self.handle_watch_only(),
             Message::RoleConfirm => self.handle_role_confirm(),
+            Message::AddSignerPressed => self.handle_add_signer_pressed(),
+            Message::SignerMethodPicked(method) => self.handle_signer_method_picked(method),
             Message::NameInput(s) => self.handle_name_input(s),
             Message::SiblingToggled(chain) => self.handle_sibling_toggled(chain),
             Message::LabelConfirm => self.handle_label_confirm(),
@@ -279,8 +343,24 @@ impl SafeOnboardingScreen {
                 metadata,
                 matched,
                 selected,
+                linked_nested_safes,
+                signer_error,
                 ..
-            } => view_role_selection(t, *chain, metadata, matched, selected),
+            } => view_role_selection(
+                t,
+                *chain,
+                metadata,
+                matched,
+                selected,
+                linked_nested_safes,
+                signer_error.as_deref(),
+            ),
+            Step::PickSignerMethod {
+                chain,
+                metadata,
+                unclaimed_owners,
+                ..
+            } => view_pick_signer_method(t, *chain, metadata, unclaimed_owners),
             Step::Label {
                 chain,
                 metadata,
@@ -307,6 +387,10 @@ impl SafeOnboardingScreen {
         // back propagates Outcome::Back to the parent.
         match &self.step {
             Step::AddressInput { .. } => (Task::none(), Some(Outcome::Back)),
+            Step::PickSignerMethod { .. } => {
+                self.rewind_picker_to_role(None, |_, _, _| {});
+                (Task::none(), None)
+            }
             _ => {
                 self.step = Step::AddressInput {
                     input: String::new(),
@@ -524,17 +608,180 @@ impl SafeOnboardingScreen {
             all_results: all_results.clone(),
             matched,
             selected,
+            linked_nested_safes: Vec::new(),
+            signer_error: None,
         };
         (Task::none(), None)
     }
 
     fn handle_signer_toggled(&mut self, idx: u32) -> (Task<Message>, Option<Outcome>) {
-        if let Step::RoleSelection { selected, .. } = &mut self.step
-            && !selected.remove(&idx)
+        if let Step::RoleSelection {
+            selected,
+            signer_error,
+            ..
+        } = &mut self.step
         {
-            selected.insert(idx);
+            if !selected.remove(&idx) {
+                selected.insert(idx);
+            }
+            *signer_error = None;
         }
         (Task::none(), None)
+    }
+
+    fn handle_add_signer_pressed(&mut self) -> (Task<Message>, Option<Outcome>) {
+        if !matches!(self.step, Step::RoleSelection { .. }) {
+            return (Task::none(), None);
+        }
+        let existing_addrs: BTreeSet<Address> = self.existing.iter().map(|e| e.address).collect();
+        let placeholder = Step::AddressInput {
+            input: String::new(),
+            error: None,
+            ens_resolving: None,
+        };
+        let Step::RoleSelection {
+            chain,
+            metadata,
+            trust,
+            all_results,
+            matched,
+            selected,
+            linked_nested_safes,
+            ..
+        } = std::mem::replace(&mut self.step, placeholder)
+        else {
+            unreachable!("guarded above")
+        };
+        let unclaimed_owners: Vec<Address> = metadata
+            .owners
+            .iter()
+            .copied()
+            .filter(|a| !existing_addrs.contains(a))
+            .collect();
+        self.step = Step::PickSignerMethod {
+            chain,
+            metadata,
+            trust,
+            all_results,
+            matched,
+            selected,
+            linked_nested_safes,
+            unclaimed_owners,
+        };
+        (Task::none(), None)
+    }
+
+    fn handle_signer_method_picked(
+        &mut self,
+        method: SignerMethod,
+    ) -> (Task<Message>, Option<Outcome>) {
+        let Step::PickSignerMethod {
+            unclaimed_owners, ..
+        } = &self.step
+        else {
+            return (Task::none(), None);
+        };
+        if unclaimed_owners.is_empty() {
+            self.rewind_picker_to_role(
+                Some("Every owner of this Safe is already in your wallet.".to_string()),
+                |_, _, _| {},
+            );
+            return (Task::none(), None);
+        }
+        let allowed_owners = unclaimed_owners.clone();
+        (
+            Task::none(),
+            Some(Outcome::RequestAddSigner {
+                method,
+                allowed_owners,
+            }),
+        )
+    }
+
+    /// Called by the parent after a successful import + owner
+    /// validation. Pushes `new_account` into the screen's `existing`
+    /// snapshot (so subsequent picker entries treat it as already
+    /// claimed) and the RoleSelection's matched/selected lists.
+    pub fn apply_added_signer(&mut self, new_account: ExistingAccount) {
+        if !self
+            .existing
+            .iter()
+            .any(|e| e.account_idx == new_account.account_idx)
+        {
+            self.existing.push(new_account.clone());
+        }
+        self.rewind_picker_to_role(None, |matched, selected, _| {
+            if !matched
+                .iter()
+                .any(|m| m.account_idx == new_account.account_idx)
+            {
+                matched.push(new_account.clone());
+            }
+            selected.insert(new_account.account_idx);
+        });
+    }
+
+    /// Called by the parent after a nested-Safe sub-flow finished and
+    /// the inner Safe was saved to the wallet. Records the nested
+    /// Safe's address as a linked owner so the RoleSelection view can
+    /// surface it as a sign-capable owner.
+    pub fn apply_added_nested_safe(&mut self, address: Address) {
+        self.rewind_picker_to_role(None, |_, _, linked| {
+            if !linked.contains(&address) {
+                linked.push(address);
+            }
+        });
+    }
+
+    /// Called by the parent when an import attempt failed validation
+    /// (e.g., the derived address wasn't an owner of this Safe). Bounce
+    /// the user back to RoleSelection with the error displayed.
+    pub fn apply_signer_import_error(&mut self, message: String) {
+        self.rewind_picker_to_role(Some(message), |_, _, _| {});
+    }
+
+    /// Common rewind from `PickSignerMethod` to `RoleSelection`. Moves
+    /// the carried-forward state by value (no metadata/all_results
+    /// clone) and runs `mutate` on the matched/selected/nested-safe
+    /// lists before rebuilding the step. No-op if the current step
+    /// isn't the picker.
+    fn rewind_picker_to_role(
+        &mut self,
+        signer_error: Option<String>,
+        mutate: impl FnOnce(&mut Vec<ExistingAccount>, &mut BTreeSet<u32>, &mut Vec<Address>),
+    ) {
+        if !matches!(self.step, Step::PickSignerMethod { .. }) {
+            return;
+        }
+        let placeholder = Step::AddressInput {
+            input: String::new(),
+            error: None,
+            ens_resolving: None,
+        };
+        let Step::PickSignerMethod {
+            chain,
+            metadata,
+            trust,
+            all_results,
+            mut matched,
+            mut selected,
+            mut linked_nested_safes,
+            ..
+        } = std::mem::replace(&mut self.step, placeholder)
+        else {
+            unreachable!("guarded above")
+        };
+        mutate(&mut matched, &mut selected, &mut linked_nested_safes);
+        self.step = Step::RoleSelection {
+            chain,
+            metadata,
+            trust,
+            all_results,
+            matched,
+            selected,
+            linked_nested_safes,
+            signer_error,
+        };
     }
 
     fn handle_watch_only(&mut self) -> (Task<Message>, Option<Outcome>) {
@@ -1094,6 +1341,8 @@ fn view_role_selection<'a>(
     md: &'a SafeMetadata,
     matched: &'a [ExistingAccount],
     selected: &BTreeSet<u32>,
+    linked_nested_safes: &'a [Address],
+    signer_error: Option<&'a str>,
 ) -> Element<'a, Message> {
     let header = column![
         screen_title(t, "Your role"),
@@ -1132,18 +1381,34 @@ fn view_role_selection<'a>(
         for m in matched {
             let is_selected = selected.contains(&m.account_idx);
             let idx = m.account_idx;
-            let cb = checkbox(is_selected)
+            let cb = kao_checkbox(t, is_selected)
                 .label(format!("{} · {}", m.label, m.address))
                 .on_toggle(move |_| Message::SignerToggled(idx))
-                .size(14);
+                .size(16)
+                .spacing(10)
+                .text_size(13)
+                .text_line_height(1.4)
+                .font(mono());
             body = body.push(vspace(6)).push(cb);
         }
     }
 
-    let confirm_label = if selected.is_empty() {
-        "Continue as watch-only →"
-    } else {
-        "Link signers →"
+    if !linked_nested_safes.is_empty() {
+        body = body.push(vspace(14)).push(
+            text("Linked owner Safes")
+                .size(12)
+                .color(t.text)
+                .font(mono_bold()),
+        );
+        for a in linked_nested_safes {
+            body = body.push(vspace(6)).push(colored_address(t, *a));
+        }
+    }
+
+    let confirm_label = match (selected.is_empty(), linked_nested_safes.is_empty()) {
+        (true, true) => "Continue as watch-only →",
+        (true, false) => "Continue →",
+        (false, _) => "Link signers →",
     };
     body = body
         .push(vspace(20))
@@ -1155,16 +1420,113 @@ fn view_role_selection<'a>(
             }),
         )
         .push(vspace(10))
-        // Add-signer flow is intentionally inert in 3a — wired in a
-        // follow-up commit. The button is rendered as a hint of
-        // where the flow will live, but doesn't dispatch a message.
-        .push(
-            text("(Add a new signer — coming in a follow-up commit)")
+        .push({
+            let label: Element<'_, Message> =
+                text("Add a new signer →").size(12).color(t.text).into();
+            ghost_button(t, label)
+                .padding(Padding::from([10, 14]))
+                .on_press(Message::AddSignerPressed)
+        });
+    if let Some(err) = signer_error {
+        body = body.push(vspace(10)).push(error_text(t, err));
+    }
+    body.into()
+}
+
+/// Pick the import method for a new signer. Surfaces the list of
+/// owners the user still needs to "claim" (i.e., own a key for) so
+/// they can verify the upcoming import is targeting the right one.
+fn view_pick_signer_method<'a>(
+    t: KaoTheme,
+    chain: Chain,
+    md: &'a SafeMetadata,
+    unclaimed_owners: &'a [Address],
+) -> Element<'a, Message> {
+    let header = column![
+        kao_hero(t, "(っ◔◡◔)っ", 48.0),
+        vspace(8),
+        screen_title(t, "Add a new signer"),
+        vspace(6),
+        screen_subtitle(
+            t,
+            "Pick an import method. The address it derives must be one of this Safe's owners.",
+        ),
+        vspace(8),
+        text(format!("Safe on {} — {}", chain.display_name(), md.address))
+            .size(11)
+            .color(t.sub)
+            .font(mono()),
+    ]
+    .width(Length::Fill)
+    .align_x(Alignment::Center);
+
+    let mut owners_col = column![
+        text("Unclaimed owners")
+            .size(12)
+            .color(t.text)
+            .font(mono_bold())
+    ];
+    if unclaimed_owners.is_empty() {
+        owners_col = owners_col.push(vspace(4)).push(
+            text("Every owner is already in your wallet — nothing to import.")
                 .size(11)
                 .color(t.sub)
                 .font(mono()),
         );
-    body.into()
+    } else {
+        for a in unclaimed_owners {
+            owners_col = owners_col.push(vspace(4)).push(colored_address(t, *a));
+        }
+    }
+
+    let mut body = column![header, vspace(16), owners_col]
+        .width(Length::Fill)
+        .align_x(Alignment::Center);
+
+    if !unclaimed_owners.is_empty() {
+        body = body
+            .push(vspace(18))
+            .push(method_card(
+                t,
+                t.ab1,
+                t.a1,
+                "1",
+                "Seed phrase",
+                "Restore an account from a 12 or 24-word phrase, then pick the matching HD index.",
+                Message::SignerMethodPicked(SignerMethod::SeedPhrase),
+            ))
+            .push(vspace(10))
+            .push(method_card(
+                t,
+                t.ab2,
+                t.a2,
+                "2",
+                "Private key",
+                "Paste a raw 32-byte hex key. Rejected if it doesn't derive to an owner.",
+                Message::SignerMethodPicked(SignerMethod::PrivateKey),
+            ))
+            .push(vspace(10))
+            .push(method_card(
+                t,
+                t.ab3,
+                t.a3,
+                "3",
+                "Hardware wallet",
+                "Connect a Ledger or Trezor and pick the matching account.",
+                Message::SignerMethodPicked(SignerMethod::Hardware),
+            ))
+            .push(vspace(10))
+            .push(method_card(
+                t,
+                t.ab1,
+                t.a1,
+                "4",
+                "Nested Safe",
+                "The owner is itself a Safe — onboard it as its own entry and link it as an owner.",
+                Message::SignerMethodPicked(SignerMethod::NestedSafe),
+            ));
+    }
+    scrollable(body).height(Length::Shrink).into()
 }
 
 fn view_label<'a>(
@@ -1213,10 +1575,13 @@ fn view_label<'a>(
         for (sib_chain, _md, _trust, on) in siblings {
             let chain_label = sib_chain.display_name().to_string();
             let captured_chain = *sib_chain;
-            let cb = checkbox(*on)
+            let cb = kao_checkbox(t, *on)
                 .label(format!("Add as separate entry · {chain_label}"))
                 .on_toggle(move |_| Message::SiblingToggled(captured_chain))
-                .size(14);
+                .size(16)
+                .spacing(10)
+                .text_size(13)
+                .font(mono());
             siblings_col = siblings_col.push(cb).push(vspace(4));
         }
     }
@@ -1517,6 +1882,8 @@ mod tests {
             all_results: vec![],
             matched: vec![],
             selected: BTreeSet::new(),
+            linked_nested_safes: Vec::new(),
+            signer_error: None,
         };
         let _ = s.update(Message::WatchOnlySelected);
         match &s.step {
@@ -1640,6 +2007,239 @@ mod tests {
         let (_task, outcome) = s.update(Message::BackPressed);
         assert!(outcome.is_none(), "in-flow back must not propagate");
         assert!(matches!(s.step, Step::AddressInput { .. }));
+    }
+
+    /// Build a RoleSelection step with the given owner set, matched
+    /// accounts, and selection. The screen's `existing` snapshot is
+    /// derived from `matched` so the picker's "unclaimed owners"
+    /// computation has a real intersection to work against.
+    fn role_selection_with(
+        owners: Vec<Address>,
+        matched: Vec<ExistingAccount>,
+        selected: BTreeSet<u32>,
+    ) -> SafeOnboardingScreen {
+        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
+        let mut s = SafeOnboardingScreen::new(net, matched.clone());
+        s.step = Step::RoleSelection {
+            chain: Chain::Mainnet,
+            metadata: fake_metadata_with_owners(owners, 1),
+            trust: SafeTrust::Canonical,
+            all_results: vec![],
+            matched,
+            selected,
+            linked_nested_safes: Vec::new(),
+            signer_error: None,
+        };
+        s
+    }
+
+    #[tokio::test]
+    async fn add_signer_pressed_transitions_to_picker_with_unclaimed_owners() {
+        let owner_c = address!("0x0000000000000000000000000000000000000c0c");
+        let matched = vec![ExistingAccount {
+            account_idx: 0,
+            address: owner_a(),
+            label: "Account 1".into(),
+        }];
+        let mut s = role_selection_with(
+            vec![owner_a(), owner_b(), owner_c],
+            matched,
+            BTreeSet::from([0u32]),
+        );
+        let (_task, outcome) = s.update(Message::AddSignerPressed);
+        assert!(outcome.is_none());
+        match &s.step {
+            Step::PickSignerMethod {
+                unclaimed_owners, ..
+            } => {
+                // owner_a is already in the wallet (via existing), so
+                // only owner_b and owner_c are unclaimed.
+                let mut unclaimed = unclaimed_owners.clone();
+                unclaimed.sort();
+                let mut expected = vec![owner_b(), owner_c];
+                expected.sort();
+                assert_eq!(unclaimed, expected);
+            }
+            other => panic!("expected PickSignerMethod, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn picking_method_emits_request_add_signer_with_allowed_owners() {
+        let owner_c = address!("0x0000000000000000000000000000000000000c0c");
+        let mut s =
+            role_selection_with(vec![owner_a(), owner_b(), owner_c], vec![], BTreeSet::new());
+        let _ = s.update(Message::AddSignerPressed);
+        let (_task, outcome) = s.update(Message::SignerMethodPicked(SignerMethod::PrivateKey));
+        let Some(Outcome::RequestAddSigner {
+            method,
+            allowed_owners,
+        }) = outcome
+        else {
+            panic!("expected RequestAddSigner, got {outcome:?}");
+        };
+        assert_eq!(method, SignerMethod::PrivateKey);
+        let mut got = allowed_owners.clone();
+        got.sort();
+        let mut want = vec![owner_a(), owner_b(), owner_c];
+        want.sort();
+        assert_eq!(got, want);
+        // Screen stays at PickSignerMethod waiting for the parent's
+        // callback (apply_added_signer or apply_signer_import_error).
+        assert!(matches!(s.step, Step::PickSignerMethod { .. }));
+    }
+
+    #[tokio::test]
+    async fn picking_method_with_no_unclaimed_owners_returns_role_with_error() {
+        let matched = vec![ExistingAccount {
+            account_idx: 0,
+            address: owner_a(),
+            label: "Account 1".into(),
+        }];
+        let mut s = role_selection_with(vec![owner_a()], matched, BTreeSet::from([0u32]));
+        let _ = s.update(Message::AddSignerPressed);
+        let (_task, outcome) = s.update(Message::SignerMethodPicked(SignerMethod::SeedPhrase));
+        assert!(outcome.is_none());
+        match &s.step {
+            Step::RoleSelection { signer_error, .. } => assert!(signer_error.is_some()),
+            other => panic!("expected RoleSelection with error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn back_from_picker_returns_to_role_selection() {
+        let mut s = role_selection_with(
+            vec![owner_a(), owner_b()],
+            vec![ExistingAccount {
+                account_idx: 0,
+                address: owner_a(),
+                label: "Account 1".into(),
+            }],
+            BTreeSet::from([0u32]),
+        );
+        let _ = s.update(Message::AddSignerPressed);
+        let (_task, outcome) = s.update(Message::BackPressed);
+        assert!(outcome.is_none());
+        match &s.step {
+            Step::RoleSelection { selected, .. } => assert!(selected.contains(&0)),
+            other => panic!("expected RoleSelection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_added_signer_returns_to_role_selection_with_new_match_checked() {
+        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
+        let _ = s.update(Message::AddSignerPressed);
+        s.apply_added_signer(ExistingAccount {
+            account_idx: 7,
+            address: owner_b(),
+            label: "Account 8".into(),
+        });
+        match &s.step {
+            Step::RoleSelection {
+                matched,
+                selected,
+                signer_error,
+                ..
+            } => {
+                assert_eq!(matched.len(), 1);
+                assert_eq!(matched[0].account_idx, 7);
+                assert_eq!(matched[0].address, owner_b());
+                assert!(selected.contains(&7));
+                assert!(signer_error.is_none());
+            }
+            other => panic!("expected RoleSelection, got {other:?}"),
+        }
+        // Snapshot is also updated so future picker entries see the new
+        // account as already-claimed.
+        assert!(s.existing.iter().any(|e| e.account_idx == 7));
+    }
+
+    #[tokio::test]
+    async fn nested_safe_method_emits_request_with_allowed_owners() {
+        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
+        let _ = s.update(Message::AddSignerPressed);
+        let (_task, outcome) = s.update(Message::SignerMethodPicked(SignerMethod::NestedSafe));
+        let Some(Outcome::RequestAddSigner { method, .. }) = outcome else {
+            panic!("expected RequestAddSigner");
+        };
+        assert_eq!(method, SignerMethod::NestedSafe);
+    }
+
+    #[tokio::test]
+    async fn apply_added_nested_safe_records_owner_and_returns_to_role() {
+        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
+        let _ = s.update(Message::AddSignerPressed);
+        s.apply_added_nested_safe(owner_b());
+        match &s.step {
+            Step::RoleSelection {
+                linked_nested_safes,
+                signer_error,
+                ..
+            } => {
+                assert_eq!(linked_nested_safes, &vec![owner_b()]);
+                assert!(signer_error.is_none());
+            }
+            other => panic!("expected RoleSelection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_safes_persist_across_picker_roundtrip() {
+        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
+        let _ = s.update(Message::AddSignerPressed);
+        s.apply_added_nested_safe(owner_b());
+        // Re-enter the picker; the already-linked nested Safe should
+        // survive the round-trip.
+        let _ = s.update(Message::AddSignerPressed);
+        match &s.step {
+            Step::PickSignerMethod {
+                linked_nested_safes,
+                ..
+            } => assert_eq!(linked_nested_safes, &vec![owner_b()]),
+            other => panic!("expected PickSignerMethod, got {other:?}"),
+        }
+        let _ = s.update(Message::BackPressed);
+        match &s.step {
+            Step::RoleSelection {
+                linked_nested_safes,
+                ..
+            } => assert_eq!(linked_nested_safes, &vec![owner_b()]),
+            other => panic!("expected RoleSelection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_added_nested_safe_is_idempotent() {
+        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
+        let _ = s.update(Message::AddSignerPressed);
+        s.apply_added_nested_safe(owner_b());
+        // Second call with the same address must not duplicate.
+        let _ = s.update(Message::AddSignerPressed);
+        s.apply_added_nested_safe(owner_b());
+        match &s.step {
+            Step::RoleSelection {
+                linked_nested_safes,
+                ..
+            } => assert_eq!(linked_nested_safes, &vec![owner_b()]),
+            other => panic!("expected RoleSelection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_signer_import_error_returns_to_role_selection_with_error() {
+        let mut s = role_selection_with(vec![owner_a(), owner_b()], vec![], BTreeSet::new());
+        let _ = s.update(Message::AddSignerPressed);
+        s.apply_signer_import_error("Imported address is not an owner.".to_string());
+        match &s.step {
+            Step::RoleSelection { signer_error, .. } => {
+                assert_eq!(
+                    signer_error.as_deref(),
+                    Some("Imported address is not an owner.")
+                );
+            }
+            other => panic!("expected RoleSelection, got {other:?}"),
+        }
     }
 
     #[tokio::test]

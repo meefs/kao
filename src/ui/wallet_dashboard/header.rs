@@ -27,6 +27,11 @@ pub fn view<'a>(
     verification: VerificationStatus,
     display_name: String,
     rename_draft: Option<&'a str>,
+    network_label: &'a str,
+    // When `true`, the title slot renders a non-editable Safe name
+    // row (no rename pencil) — Safe rename isn't a feature yet, so
+    // the affordance would be a false promise.
+    is_safe: bool,
 ) -> Element<'a, Message> {
     let addr_short = short_address(address);
     // Address pill: clickable trigger that opens the account dropdown.
@@ -55,15 +60,16 @@ pub fn view<'a>(
         .into();
 
     let net_row = row![
-        text("Ethereum Mainnet").size(11).color(t.sub).font(mono()),
+        text(network_label.to_string()).size(11).color(t.sub).font(mono()),
         Space::new().width(8),
         verification_badge(t, verification),
     ]
     .align_y(Alignment::Center);
 
-    let title_slot: Element<'a, Message> = match rename_draft {
-        Some(draft) => rename_input(t, draft),
-        None => static_name(t, display_name),
+    let title_slot: Element<'a, Message> = match (rename_draft, is_safe) {
+        (Some(draft), _) => rename_input(t, draft),
+        (None, false) => static_name(t, display_name),
+        (None, true) => safe_name_static(t, display_name),
     };
 
     let title_col = column![
@@ -131,6 +137,17 @@ fn static_name<'a>(t: KaoTheme, display_name: String) -> Element<'a, Message> {
 
     row![name, Space::new().width(6), pencil]
         .align_y(Alignment::Center)
+        .into()
+}
+
+/// Safe-mode title row — no pencil, just the name (which already
+/// carries the threshold badge). Sized identically to `static_name`
+/// so swapping between EOA / Safe modes doesn't shift the layout.
+fn safe_name_static<'a>(t: KaoTheme, display_name: String) -> Element<'a, Message> {
+    text(display_name)
+        .size(17)
+        .color(t.text)
+        .font(bold())
         .into()
 }
 

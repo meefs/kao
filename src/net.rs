@@ -175,6 +175,37 @@ pub trait BalanceFetcher: Send + Sync + std::fmt::Debug {
     /// state reads run against, so a reorg mid-simulation can't mix
     /// proofs across two heads.
     async fn latest_block(&self, chain: Chain) -> Result<VerifiedRead<LatestBlock>, String>;
+
+    /// Raw `eth_getCode` that explicitly skips helios. Used by the Safe
+    /// scan: helios-opstack's consensus client spawns a tokio task per
+    /// build that polls the L2 beacon proxy every second forever (its
+    /// `shutdown()` is a no-op upstream), so triggering a helios build
+    /// for an L2 chain the user is just *probing* leaves a permanent
+    /// log-spamming task behind. The scan only needs to ask "is there
+    /// a Safe at this address?" — that result is informational, and
+    /// the verified path takes over once the user actually broadcasts
+    /// through the Safe.
+    async fn get_code_raw(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String>;
+    /// Raw `eth_getStorageAt` that explicitly skips helios. See
+    /// [`get_code_raw`].
+    async fn get_storage_at_raw(
+        &self,
+        addr: Address,
+        slot: U256,
+        chain: Chain,
+    ) -> Result<VerifiedRead<B256>, String>;
+    /// Raw `eth_call` that explicitly skips helios. See
+    /// [`get_code_raw`].
+    async fn call_raw(
+        &self,
+        to: Address,
+        data: Bytes,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -794,6 +825,35 @@ impl BalanceFetcher for NetworkClient {
             }
         }
     }
+
+    async fn get_code_raw(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        self.ensure_raw_provider(chain).await?;
+        self.fallback_get_code(addr, chain).await
+    }
+
+    async fn get_storage_at_raw(
+        &self,
+        addr: Address,
+        slot: U256,
+        chain: Chain,
+    ) -> Result<VerifiedRead<B256>, String> {
+        self.ensure_raw_provider(chain).await?;
+        self.fallback_get_storage_at(addr, slot, chain).await
+    }
+
+    async fn call_raw(
+        &self,
+        to: Address,
+        data: Bytes,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        self.ensure_raw_provider(chain).await?;
+        self.fallback_call(to, data, chain).await
+    }
 }
 
 impl NetworkClient {
@@ -971,6 +1031,17 @@ impl NetworkClient {
             value: header,
             verified: false,
         })
+    }
+
+    /// Make sure a raw provider exists in `s.fallback` for `chain`,
+    /// building one from settings if helios hasn't initialised the slot
+    /// yet. The `*_raw` entry points call this so they can hit
+    /// `fallback_provider` without first needing a helios build to
+    /// populate the slot as a side effect.
+    async fn ensure_raw_provider(&self, chain: Chain) -> Result<RootProvider<Ethereum>, String> {
+        self.provider(chain)
+            .await
+            .ok_or_else(|| format!("no RPC available for {}", chain.label()))
     }
 
     /// Resolve the cached fallback provider for `chain`. Used by every
@@ -1302,6 +1373,32 @@ impl BalanceFetcher for MockFetcher {
             verified: true,
         })
     }
+
+    async fn get_code_raw(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        self.get_code(addr, chain).await
+    }
+
+    async fn get_storage_at_raw(
+        &self,
+        addr: Address,
+        slot: U256,
+        chain: Chain,
+    ) -> Result<VerifiedRead<B256>, String> {
+        self.get_storage_at(addr, slot, chain).await
+    }
+
+    async fn call_raw(
+        &self,
+        to: Address,
+        data: Bytes,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        self.call(to, data, chain).await
+    }
 }
 
 /// Parameterizable test double for `BalanceFetcher`. Modelled on
@@ -1432,6 +1529,29 @@ impl BalanceFetcher for CallMock {
             },
             verified: true,
         })
+    }
+    async fn get_code_raw(
+        &self,
+        addr: Address,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        self.get_code(addr, chain).await
+    }
+    async fn get_storage_at_raw(
+        &self,
+        addr: Address,
+        slot: U256,
+        chain: Chain,
+    ) -> Result<VerifiedRead<B256>, String> {
+        self.get_storage_at(addr, slot, chain).await
+    }
+    async fn call_raw(
+        &self,
+        to: Address,
+        data: Bytes,
+        chain: Chain,
+    ) -> Result<VerifiedRead<Bytes>, String> {
+        self.call(to, data, chain).await
     }
 }
 

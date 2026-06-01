@@ -22,42 +22,169 @@ use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
     avatar, black, bold, colored_address, ghost_button, hover_tint, kao_fit, kao_scrollable_style,
-    kao_text, kaomoji_for_index, modal_wrapper, mono, mono_black, primary_button, review_row,
-    secondary_button, text_input_style,
+    kao_text, kaomoji_for_account, kaomoji_for_index, modal_wrapper, mono, mono_black,
+    primary_button, review_row, secondary_button, text_input_style,
 };
 use crate::ui::wallet_dashboard::function_panel;
 use crate::wallet::sim::{SimOutcome, SimulationResult, TokenTransfer};
 use crate::wallet::tx::{SendPlan, SendToken, TxQuote, parse_amount_units};
-use crate::wallet::{Contact, ContactsBook};
+use crate::wallet::{AccountDescriptor, ContactsBook, SafeDescriptor, account_address};
 
-/// View-time snapshot of the contacts book. Derived once at the top of
-/// the dashboard's `view()` and moved into the SendPane's view by value
-/// so the iced widget tree owns its strings instead of borrowing from a
-/// lock guard that dies when the function returns.
+/// Source of a picker row. Drives the kind chip rendered next to the
+/// row's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PickerKind {
+    /// Saved contact from the contacts book.
+    Contact,
+    /// One of the user's own accounts (Local/Ledger/Trezor/View-only).
+    OwnAccount,
+    /// One of the user's own Safes (signing or watch-only).
+    OwnSafe,
+}
+
+/// One entry in the merged recipient picker. Built once per view at
+/// the dashboard level so the iced widget tree owns its strings.
+#[derive(Debug, Clone)]
+pub struct PickerEntry {
+    pub name: String,
+    pub address: Address,
+    pub kaomoji: String,
+    pub kind: PickerKind,
+    /// Pinned ENS name when this entry came from a contact with an
+    /// ENS record. Own-account / own-Safe entries don't carry ENS
+    /// (no reverse-resolve at view time). Drives the
+    /// `AddressVerifying` resolution state on pick.
+    pub ens: Option<String>,
+    /// Short tag rendered next to the name. `None` for plain
+    /// contacts (the most common type — the chip would be noise);
+    /// otherwise the account/Safe kind ("Local", "Ledger", "Trezor",
+    /// "View only", "Safe", "Safe watch").
+    pub chip: Option<&'static str>,
+}
+
+/// View-time snapshot of the recipient picker. Despite the name,
+/// this carries the **merged** book: saved contacts + the user's own
+/// accounts + the user's own Safes, with the active sender excluded.
+///
+/// Sending to yourself is a real and frequent need — rebalancing
+/// between hot wallet and Safe, withdrawing from a Safe back to the
+/// signing EOA — so the picker has to surface own-addresses without
+/// forcing the user to save them as contacts first.
 #[derive(Debug, Clone, Default)]
 pub struct ContactsView {
-    pub snapshot: Vec<Contact>,
+    pub entries: Vec<PickerEntry>,
 }
 
 impl ContactsView {
-    pub fn from_book(book: &ContactsBook) -> Self {
-        Self {
-            snapshot: book.iter().cloned().collect(),
+    /// Merged picker: contacts (first), then the user's own accounts
+    /// and Safes. Dedupe by address — if an own-account is also a
+    /// saved contact, the contact entry wins (user's chosen name +
+    /// kaomoji + any ENS pin).
+    ///
+    /// `exclude_account` / `exclude_safe` drop the active sender so
+    /// the user doesn't see themselves as a destination. In EOA
+    /// mode pass `Some(active_index), None`; in Safe mode pass
+    /// `None, Some(active_safe_idx)` (own EOAs are valid Safe-send
+    /// destinations — withdrawing back to a signing key is a normal
+    /// flow).
+    pub fn merged(
+        book: &ContactsBook,
+        accounts: &[AccountDescriptor],
+        safes: &[SafeDescriptor],
+        exclude_account: Option<usize>,
+        exclude_safe: Option<usize>,
+    ) -> Self {
+        let mut entries: Vec<PickerEntry> =
+            book.iter().map(picker_entry_from_contact).collect();
+        let mut seen: std::collections::HashSet<Address> =
+            entries.iter().map(|e| e.address).collect();
+
+        for (idx, acc) in accounts.iter().enumerate() {
+            if exclude_account == Some(idx) {
+                continue;
+            }
+            let Some(addr) = account_address(acc) else {
+                continue;
+            };
+            if !seen.insert(addr) {
+                continue;
+            }
+            let chip: &'static str = match acc {
+                AccountDescriptor::Local { .. } => "Local",
+                AccountDescriptor::Ledger { .. } => "Ledger",
+                AccountDescriptor::Trezor { .. } => "Trezor",
+                AccountDescriptor::ViewOnly { .. } => "View only",
+            };
+            entries.push(PickerEntry {
+                name: acc.display_name(idx),
+                address: addr,
+                kaomoji: kaomoji_for_account(idx).to_string(),
+                kind: PickerKind::OwnAccount,
+                ens: None,
+                chip: Some(chip),
+            });
         }
+
+        for (idx, safe) in safes.iter().enumerate() {
+            if exclude_safe == Some(idx) {
+                continue;
+            }
+            let addr = safe.address();
+            if !seen.insert(addr) {
+                continue;
+            }
+            let watch_only = safe.linked_signer_indices.is_empty();
+            let kao = if watch_only { "(◐_◐)" } else { "(◐‿◐)" };
+            let chip = if watch_only { "Safe watch" } else { "Safe" };
+            entries.push(PickerEntry {
+                name: safe.display_name(idx),
+                address: addr,
+                kaomoji: kao.to_string(),
+                kind: PickerKind::OwnSafe,
+                ens: None,
+                chip: Some(chip),
+            });
+        }
+
+        Self { entries }
     }
 
     pub fn name_for(&self, addr: Address) -> Option<&str> {
-        self.snapshot
+        self.entries
             .iter()
-            .find(|c| c.address() == addr)
-            .map(|c| c.name.as_str())
+            .find(|e| e.address == addr)
+            .map(|e| e.name.as_str())
+    }
+}
+
+fn picker_entry_from_contact(c: &crate::wallet::Contact) -> PickerEntry {
+    let kao = if c.kaomoji.is_empty() {
+        "(◕‿◕)".to_string()
+    } else {
+        c.kaomoji.clone()
+    };
+    PickerEntry {
+        name: c.name.clone(),
+        address: c.address(),
+        kaomoji: kao,
+        kind: PickerKind::Contact,
+        ens: c.ens.as_ref().map(|e| e.name.clone()),
+        chip: None,
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum Message {
     SetTo(String),
-    PickContact(usize),
+    /// User picked a recipient from the merged picker (contact /
+    /// own-account / own-Safe). The chosen address is carried
+    /// inline; `ens` is `Some` only for contact entries with a
+    /// pinned ENS record, which triggers the AddressVerifying
+    /// re-resolve flow.
+    PickRecipient {
+        address: Address,
+        ens: Option<String>,
+    },
     SetAmount(String),
     SetToken(usize),
     Max,
@@ -282,45 +409,37 @@ impl SendPane {
         self.amount = amount_str;
     }
 
-    pub fn update(
-        &mut self,
-        msg: Message,
-        contacts: &ContactsBook,
-    ) -> (Task<Message>, Option<Outcome>) {
+    pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             Message::SetTo(s) => {
                 self.set_to(s);
                 (Task::none(), None)
             }
-            Message::PickContact(i) => {
-                if let Some(c) = contacts.get(i) {
-                    let addr = c.address();
-                    // Bump the seq so any in-flight prior resolution result
-                    // is dropped (matches the typed-input contract).
-                    self.resolution_seq = self.resolution_seq.wrapping_add(1);
-                    // Render the canonical hex of the contact in the
-                    // input box so the user sees what they're sending to
-                    // even when picking by name. EIP-55 checksum keeps
-                    // the value copy-paste safe.
-                    self.to = addr.to_checksum(None);
-                    match &c.ens {
-                        Some(ens) => {
-                            // Pinned address is usable now; kick a
-                            // background ENS verify against the same name.
-                            // The dashboard's `take_pending_ens` will
-                            // dispatch the lookup; `EnsResolved` lands
-                            // back here and either silently accepts or
-                            // surfaces a divergence banner.
-                            self.resolution = Resolution::AddressVerifying {
-                                pinned: addr,
-                                name: ens.name.clone(),
-                            };
-                        }
-                        None => {
-                            self.resolution = Resolution::Address(addr);
+            Message::PickRecipient { address, ens } => {
+                // Bump the seq so any in-flight prior resolution
+                // result is dropped (matches the typed-input
+                // contract).
+                self.resolution_seq = self.resolution_seq.wrapping_add(1);
+                // Render the canonical hex of the picked address in
+                // the input box so the user sees what they're
+                // sending to even when picking by name. EIP-55
+                // checksum keeps the value copy-paste safe.
+                self.to = address.to_checksum(None);
+                self.resolution = match ens {
+                    Some(name) => {
+                        // Contact carries a pinned ENS — kick a
+                        // background verify against the same name.
+                        // The dashboard's `take_pending_ens` will
+                        // dispatch the lookup; `EnsResolved` lands
+                        // back here and either silently accepts or
+                        // surfaces a divergence banner.
+                        Resolution::AddressVerifying {
+                            pinned: address,
+                            name,
                         }
                     }
-                }
+                    None => Resolution::Address(address),
+                };
                 (Task::none(), None)
             }
             Message::EnsResolved { seq, name, result } => {
@@ -564,7 +683,7 @@ impl SendPane {
         let inner: Element<'_, Message> = match self.step {
             0 => self.step_recipient(
                 t,
-                contacts.snapshot,
+                contacts.entries,
                 recipient_name.clone(),
                 recipient_in_book,
             ),
@@ -641,7 +760,7 @@ impl SendPane {
     fn step_recipient<'a>(
         &'a self,
         t: KaoTheme,
-        snapshot: Vec<Contact>,
+        snapshot: Vec<PickerEntry>,
         recipient_name: Option<String>,
         recipient_in_book: bool,
     ) -> Element<'a, Message> {
@@ -809,7 +928,10 @@ impl SendPane {
             _ => Space::new().height(0).into(),
         };
 
-        let recent_label = text("RECENT").size(11).color(t.sub).font(bold());
+        // Picker covers contacts + own accounts + own Safes (active
+        // sender excluded). "RECIPIENTS" reads more accurately than
+        // "RECENT" now that the list isn't ordered by recency.
+        let recent_label = text("RECIPIENTS").size(11).color(t.sub).font(bold());
 
         let contacts_block: Element<'_, Message> = if snapshot.is_empty() {
             container(
@@ -821,14 +943,14 @@ impl SendPane {
             .into()
         } else {
             let mut col = column![].spacing(2);
-            for (i, c) in snapshot.into_iter().enumerate() {
-                col = col.push(contact_row(t, i, c, &self.to));
+            for entry in snapshot.into_iter() {
+                col = col.push(picker_row(t, entry, &self.to));
             }
             // Cap the picker's vertical footprint at ~3 rows. Without
-            // this, a wallet with a long contacts list would push the
-            // Continue button off the modal — and the modal sits in a
-            // fixed-width container with no outer scroll, so there's
-            // no recovery.
+            // this, a wallet with a long list would push the
+            // Continue button off the modal — and the modal sits in
+            // a fixed-width container with no outer scroll, so
+            // there's no recovery.
             scrollable(col)
                 .height(Length::Fixed(168.0))
                 .width(Length::Fill)
@@ -1376,43 +1498,60 @@ impl SendPane {
     }
 }
 
-/// Picker row for one saved contact. Free function rather than method
-/// because it owns the `Contact` snapshot (the live book lives behind a
-/// shared `RwLock` and we don't want to hold a read guard across iced's
-/// widget construction).
-fn contact_row<'a>(t: KaoTheme, i: usize, c: Contact, current_input: &str) -> Element<'a, Message> {
-    let addr = c.address();
+/// Picker row for one entry in the merged recipient list (contact,
+/// own-account, or own-Safe). Free function rather than method
+/// because it owns the snapshot data — the live book lives behind a
+/// shared `RwLock` and we don't want to hold a read guard across
+/// iced's widget construction.
+///
+/// Own-account and own-Safe entries render a small chip ("Local",
+/// "Ledger", "Safe", etc.) next to the name so the user can tell at
+/// a glance whether they're sending to a contact or one of their
+/// own addresses. Plain contacts skip the chip (the most common
+/// type — the chip would be noise).
+fn picker_row<'a>(t: KaoTheme, entry: PickerEntry, current_input: &str) -> Element<'a, Message> {
+    let addr = entry.address;
     let checksum = addr.to_checksum(None);
     let selected = current_input.eq_ignore_ascii_case(&checksum);
     let bg = if selected { t.ab2 } else { Color::TRANSPARENT };
 
-    let kao_glyph = if c.kaomoji.is_empty() {
-        "(◕‿◕)".to_string()
-    } else {
-        c.kaomoji.clone()
-    };
-    let name = c.name.clone();
     let short = short_address_str(&format!("{addr:#x}"));
     let check = if selected { "✓" } else { " " };
 
+    let mut name_row = row![text(entry.name.clone()).size(14).color(t.text).font(bold())]
+        .align_y(Alignment::Center);
+    if let Some(chip) = entry.chip {
+        // Tinted chip text to match the dropdown's kind labels — t.a2
+        // for Safe entries, t.sub for accounts. Cheaper than rendering
+        // a true pill since the recipient picker is dense.
+        let chip_color = match entry.kind {
+            PickerKind::OwnSafe => t.a2,
+            _ => t.sub,
+        };
+        name_row = name_row
+            .push(Space::new().width(8))
+            .push(text(chip).size(10).color(chip_color).font(mono()));
+    }
+
     let row_content = row![
-        avatar_owned(t, kao_glyph, 34.0),
+        avatar_owned(t, entry.kaomoji.clone(), 34.0),
         Space::new().width(12),
-        column![
-            text(name).size(14).color(t.text).font(bold()),
-            text(short).size(11).color(t.sub).font(mono()),
-        ]
-        .spacing(0)
-        .width(Length::Fill),
+        column![name_row, text(short).size(11).color(t.sub).font(mono()),]
+            .spacing(0)
+            .width(Length::Fill),
         text(check).size(16).color(t.a2),
     ]
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
+    let pick_msg = Message::PickRecipient {
+        address: addr,
+        ens: entry.ens.clone(),
+    };
     button(row_content)
         .padding(Padding::from([9, 10]))
         .width(Length::Fill)
-        .on_press(Message::PickContact(i))
+        .on_press(pick_msg)
         .style(move |_theme, status| button::Style {
             background: Some(Background::Color(match status {
                 button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
@@ -1639,5 +1778,165 @@ fn trim_trailing_decimal_zeros(s: &str) -> String {
         "0".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wallet::{Contact, ContactEns, SafeTrust};
+
+    fn local_account(seed: u8, name: Option<&str>) -> AccountDescriptor {
+        let mut bytes = [seed; 32];
+        if bytes.iter().all(|b| *b == 0) {
+            bytes[0] = 1;
+        }
+        AccountDescriptor::Local {
+            name: name.map(str::to_string),
+            key_bytes: bytes,
+        }
+    }
+
+    fn view_only_account(byte: u8, name: Option<&str>) -> AccountDescriptor {
+        AccountDescriptor::ViewOnly {
+            name: name.map(str::to_string),
+            address: [byte; 20],
+        }
+    }
+
+    fn safe(addr_byte: u8, name: Option<&str>, linked: Vec<u32>) -> SafeDescriptor {
+        SafeDescriptor {
+            name: name.map(str::to_string),
+            chain_id: 1,
+            address: [addr_byte; 20],
+            version: "1.4.1".into(),
+            trust: SafeTrust::Canonical,
+            threshold: 1,
+            owners: vec![[0u8; 20]; linked.len().max(1)],
+            modules: Vec::new(),
+            guard: None,
+            fallback_handler: None,
+            linked_signer_indices: linked,
+            sibling_chains: Vec::new(),
+            cached_at: 0,
+        }
+    }
+
+    fn contact(addr_byte: u8, name: &str, ens: Option<&str>) -> Contact {
+        Contact {
+            name: name.to_string(),
+            address: [addr_byte; 20],
+            kaomoji: String::new(),
+            notes: String::new(),
+            ens: ens.map(|n| ContactEns {
+                name: n.to_string(),
+                last_resolved_addr: [addr_byte; 20],
+            }),
+        }
+    }
+
+    #[test]
+    fn merged_view_orders_contacts_before_own_addresses() {
+        let mut book = ContactsBook::new();
+        book.upsert(contact(0xaa, "alice", None));
+        let accounts = vec![local_account(1, Some("hot wallet"))];
+        let safes = vec![safe(0xcc, Some("treasury"), vec![0])];
+        let view = ContactsView::merged(&book, &accounts, &safes, None, None);
+        assert_eq!(view.entries.len(), 3);
+        assert_eq!(view.entries[0].name, "alice");
+        assert_eq!(view.entries[0].kind, PickerKind::Contact);
+        assert_eq!(view.entries[1].name, "hot wallet");
+        assert_eq!(view.entries[1].kind, PickerKind::OwnAccount);
+        assert_eq!(view.entries[1].chip, Some("Local"));
+        assert_eq!(view.entries[2].name, "treasury");
+        assert_eq!(view.entries[2].kind, PickerKind::OwnSafe);
+        assert_eq!(view.entries[2].chip, Some("Safe"));
+    }
+
+    #[test]
+    fn merged_view_excludes_active_account_in_eoa_mode() {
+        let book = ContactsBook::new();
+        let accounts = vec![
+            local_account(1, Some("hot")),
+            local_account(2, Some("cold")),
+        ];
+        let view = ContactsView::merged(&book, &accounts, &[], Some(0), None);
+        let names: Vec<_> = view.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["cold"]);
+    }
+
+    #[test]
+    fn merged_view_excludes_active_safe_in_safe_mode() {
+        let book = ContactsBook::new();
+        let safes = vec![
+            safe(0xc0, Some("treasury"), vec![]),
+            safe(0xc1, Some("ops"), vec![]),
+        ];
+        let view = ContactsView::merged(&book, &[], &safes, None, Some(0));
+        let names: Vec<_> = view.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["ops"]);
+    }
+
+    #[test]
+    fn merged_view_dedupes_when_own_account_is_also_a_contact() {
+        // Contact pinned to the same address as the user's view-only
+        // account — only the contact entry should appear (user's
+        // chosen name wins).
+        let mut book = ContactsBook::new();
+        book.upsert(contact(0x42, "alice (pinned)", Some("alice.eth")));
+        let accounts = vec![view_only_account(0x42, Some("watched"))];
+        let view = ContactsView::merged(&book, &accounts, &[], None, None);
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.entries[0].name, "alice (pinned)");
+        assert_eq!(view.entries[0].kind, PickerKind::Contact);
+        assert_eq!(view.entries[0].ens.as_deref(), Some("alice.eth"));
+    }
+
+    #[test]
+    fn merged_view_renders_watch_only_safe_chip() {
+        let book = ContactsBook::new();
+        // Empty `linked_signer_indices` → watch-only Safe.
+        let safes = vec![safe(0xcd, Some("public dao"), vec![])];
+        let view = ContactsView::merged(&book, &[], &safes, None, None);
+        assert_eq!(view.entries.len(), 1);
+        assert_eq!(view.entries[0].kind, PickerKind::OwnSafe);
+        assert_eq!(view.entries[0].chip, Some("Safe watch"));
+    }
+
+    #[test]
+    fn merged_view_carries_contact_ens_through_picker_entry() {
+        let mut book = ContactsBook::new();
+        book.upsert(contact(0xab, "vitalik", Some("vitalik.eth")));
+        let view = ContactsView::merged(&book, &[], &[], None, None);
+        assert_eq!(view.entries[0].ens.as_deref(), Some("vitalik.eth"));
+        // Own-account entries never carry ENS.
+        let accounts = vec![local_account(1, Some("hot"))];
+        let view = ContactsView::merged(&ContactsBook::new(), &accounts, &[], None, None);
+        assert!(view.entries[0].ens.is_none());
+    }
+
+    #[test]
+    fn name_for_resolves_across_all_picker_kinds() {
+        let mut book = ContactsBook::new();
+        book.upsert(contact(0xaa, "alice", None));
+        let accounts = vec![local_account(1, Some("hot"))];
+        let safes = vec![safe(0xcc, Some("treasury"), vec![0])];
+        let view = ContactsView::merged(&book, &accounts, &safes, None, None);
+
+        let alice_addr = Address::from([0xaa; 20]);
+        assert_eq!(view.name_for(alice_addr), Some("alice"));
+        // The "hot" account's address derives from the key bytes;
+        // pull it back from the entries vec by kind.
+        let hot_addr = view
+            .entries
+            .iter()
+            .find(|e| matches!(e.kind, PickerKind::OwnAccount))
+            .unwrap()
+            .address;
+        assert_eq!(view.name_for(hot_addr), Some("hot"));
+        let safe_addr = Address::from([0xcc; 20]);
+        assert_eq!(view.name_for(safe_addr), Some("treasury"));
+        // Unknown address → None.
+        assert!(view.name_for(Address::ZERO).is_none());
     }
 }

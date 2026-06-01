@@ -24,6 +24,7 @@ use crate::wallet::{
 #[derive(Debug, Clone)]
 pub enum Message {
     Select(usize),
+    SelectSafe(usize),
     Add,
     Close,
     BoxClickIgnored,
@@ -33,6 +34,7 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub enum Outcome {
     Switch(usize),
+    SelectSafe(usize),
     Add,
     Closed,
 }
@@ -48,6 +50,7 @@ impl AccountDropdown {
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
             Message::Select(idx) => (Task::none(), Some(Outcome::Switch(idx))),
+            Message::SelectSafe(idx) => (Task::none(), Some(Outcome::SelectSafe(idx))),
             Message::Add => (Task::none(), Some(Outcome::Add)),
             Message::Close => (Task::none(), Some(Outcome::Closed)),
             Message::BoxClickIgnored => (Task::none(), None),
@@ -72,6 +75,7 @@ impl AccountDropdown {
         accounts: &'a [AccountDescriptor],
         safes: &'a [SafeDescriptor],
         active_index: usize,
+        active_safe: Option<usize>,
     ) -> Element<'a, Message> {
         // Backdrop: full-window mouse_area to catch outside clicks.
         let backdrop = mouse_area(
@@ -88,12 +92,20 @@ impl AccountDropdown {
         // info rows — the affordance comes back when the Safe-TX flow
         // lands in a future stage.
         let mut list = column![].spacing(2).width(Length::Fill);
+        // When a Safe is the active context, suppress the EOA active
+        // marker — otherwise both the active Safe and the underlying
+        // executor EOA would show ◉ at the same time.
+        let eoa_active_index = if active_safe.is_some() {
+            usize::MAX
+        } else {
+            active_index
+        };
         for (idx, account) in accounts.iter().enumerate() {
             let is_signer = account_is_safe_signer(idx as u32, safes);
-            list = list.push(account_row(t, idx, account, active_index, is_signer));
+            list = list.push(account_row(t, idx, account, eoa_active_index, is_signer));
         }
         for (idx, safe) in safes.iter().enumerate() {
-            list = list.push(safe_row(t, idx, safe));
+            list = list.push(safe_row(t, idx, safe, active_safe == Some(idx)));
         }
         list = list.push(thin_divider(t));
         list = list.push(add_account_row(t));
@@ -211,23 +223,37 @@ fn account_row<'a>(
         .into()
 }
 
-/// Render one Safe row. Non-clickable in 3b — no Safe-TX flow exists
-/// yet, so clicking would be a false affordance. We surface presence,
-/// the watch-only state, and which chain the deployment is on; the row
-/// becomes interactive when the Safe-TX flow lands.
-fn safe_row<'a>(t: KaoTheme, idx: usize, safe: &'a SafeDescriptor) -> Element<'a, Message> {
+/// Render one Safe row.
+///
+/// Signing Safes (`linked_signer_indices` non-empty) are clickable
+/// and emit `Message::SelectSafe(idx)` — the dashboard then opens
+/// the Safe-send modal. Watch-only Safes (no linked owners in this
+/// wallet) stay non-clickable: there's no signing path, so the click
+/// would be a false affordance.
+///
+/// Layout mirrors `account_row`: avatar + info column + active
+/// indicator on the right (◉ when this Safe is the active context,
+/// ○ otherwise). Background is transparent until hover/active, so
+/// the row sits flush with the surrounding accounts instead of
+/// reading as a permanently-highlighted strip.
+fn safe_row<'a>(
+    t: KaoTheme,
+    idx: usize,
+    safe: &'a SafeDescriptor,
+    active: bool,
+) -> Element<'a, Message> {
     let watch_only = safe.linked_signer_indices.is_empty();
     let label = safe.display_name(idx);
     let chain_label = chain_label_for_id(safe.chain_id);
     let badge_text = if watch_only { "Safe (watch)" } else { "Safe" };
-    // Watch-only Safes get muted text + a paler tinted background to
-    // make it visually clear they're observe-only — same logic as
-    // ViewOnly accounts but stronger since a Safe also doesn't have
-    // the "switch active" affordance an account has.
-    let (text_color, sub_color, bg_color) = if watch_only {
-        (t.sub, with_alpha(t.sub, 0.7), with_alpha(t.ab2, 0.3))
+    // Watch-only Safes mute the text colors but keep the same row
+    // structure. The strong bg tint used to be a substitute for the
+    // missing active marker — now that the row carries ◉/○, that
+    // visual crutch is gone and watch-only just reads as "muted".
+    let (text_color, sub_color) = if watch_only {
+        (t.sub, with_alpha(t.sub, 0.7))
     } else {
-        (t.text, t.sub, with_alpha(t.ab1, 0.5))
+        (t.text, t.sub)
     };
 
     let kind_row = row![
@@ -249,33 +275,65 @@ fn safe_row<'a>(t: KaoTheme, idx: usize, safe: &'a SafeDescriptor) -> Element<'a
 
     // (◐‿◐) for signing Safes (two-eyes hint at multi-sig); (◐_◐) for
     // watch-only (same shape but a flat mouth — no "joy of signing").
-    let kao = if watch_only {
-        "(◐_◐)"
+    let kao = if watch_only { "(◐_◐)" } else { "(◐‿◐)" };
+    // Active indicator: ◉ when this Safe is the open context, ○
+    // otherwise (only when signable — watch-only Safes can't be the
+    // active context, so the slot stays empty for them).
+    let trailing: Element<'_, Message> = if watch_only {
+        Space::new().width(0).into()
+    } else if active {
+        text("◉").size(14).color(t.a1).into()
     } else {
-        "(◐‿◐)"
+        text("○").size(14).color(t.sub).into()
     };
     let inner = row![
-        avatar(t, kao, 32.0, t.ab2),
+        avatar(t, kao, 32.0, t.ab1),
         Space::new().width(10),
         container(info).width(Length::Fill),
+        trailing,
     ]
     .align_y(Alignment::Center)
     .width(Length::Fill);
 
-    container(inner)
-        .padding(Padding::from([6, 8]))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(bg_color)),
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: Radius::from(10),
-            },
-            text_color: Some(text_color),
-            ..container::Style::default()
-        })
-        .into()
+    if watch_only {
+        // Non-clickable but the row body still rounds + tints on
+        // hover-less; muted bg keeps observe-only Safes visually
+        // distinct without the wider chip treatment.
+        container(inner)
+            .padding(Padding::from([6, 8]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(with_alpha(t.ab2, 0.3))),
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: Radius::from(10),
+                },
+                text_color: Some(text_color),
+                ..container::Style::default()
+            })
+            .into()
+    } else {
+        let bg = if active { t.ab1 } else { Color::TRANSPARENT };
+        button(inner)
+            .padding(Padding::from([6, 8]))
+            .width(Length::Fill)
+            .on_press(Message::SelectSafe(idx))
+            .style(move |_theme, status| button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
+                    _ => bg,
+                })),
+                text_color,
+                border: Border {
+                    color: Color::TRANSPARENT,
+                    width: 0.0,
+                    radius: Radius::from(10),
+                },
+                ..button::Style::default()
+            })
+            .into()
+    }
 }
 
 fn chain_label_for_id(chain_id: u64) -> &'static str {
