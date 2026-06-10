@@ -5,12 +5,14 @@
 //! Save invalidates the shared `BalanceFetcher` so the next balance/portfolio
 //! fetch rebuilds Helios against the new endpoints.
 //!
-//! Mainnet is the only chain whose RPCs are persisted today: settings +
-//! `net.rs` are still mainnet-only. The form deliberately renders only the
-//! Mainnet pair so the user doesn't believe an L2 edit will save — L2
-//! rows return once per-chain plumbing lands. The `Draft` still carries
-//! a `PerChain<String>` so reintroducing those rows is a render-only
-//! change.
+//! Every chain gets an editable exec + consensus row. Mainnet is
+//! mandatory; an L2 row left blank clears that chain's explicit
+//! override, returning it to the settings-layer fallback (an exec URL
+//! synthesized from the user's dRPC/Alchemy key, or the chain's default
+//! consensus endpoint). Each row seeds from `settings::rpcs` /
+//! `settings::consensus_rpcs`, so the form shows the URL the chain is
+//! *actually* using — including a synthesized one — not just what was
+//! explicitly saved.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -61,29 +63,24 @@ pub struct NetworksPane {
 
 impl NetworksPane {
     pub fn new(network: Arc<dyn BalanceFetcher>) -> Self {
-        // Settings is mainnet-only today, so seed Mainnet's slots from the
-        // persisted values (falling back to chain defaults if blank) and
-        // pre-fill the L2 slots with their public defaults so the form
-        // looks complete the moment the pane opens.
-        let saved_exec = settings::rpcs(Chain::Mainnet)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
-        let saved_consensus = settings::consensus_rpcs(Chain::Mainnet)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        // Seed every chain from the resolved settings — `settings::rpcs`
+        // already folds in the key-synthesized fallback, so the form
+        // shows what each chain actually queries, not just the explicit
+        // override. Chains with nothing resolvable fall back to their
+        // public defaults so the row is still editable.
         let mut exec = PerChain::<String>::default();
         let mut consensus = PerChain::<String>::default();
         for chain in Chain::ALL {
-            let exec_seed = match chain {
-                Chain::Mainnet if !saved_exec.is_empty() => saved_exec.clone(),
-                _ => chain.default_exec_url().to_string(),
-            };
-            let consensus_seed = match chain {
-                Chain::Mainnet if !saved_consensus.is_empty() => saved_consensus.clone(),
-                _ => chain.default_consensus_url().to_string(),
-            };
+            let exec_seed = settings::rpcs(chain)
+                .into_iter()
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| chain.default_exec_url().to_string());
+            let consensus_seed = settings::consensus_rpcs(chain)
+                .into_iter()
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| chain.default_consensus_url().to_string());
             exec.set(chain, exec_seed);
             consensus.set(chain, consensus_seed);
         }
@@ -117,11 +114,24 @@ impl NetworksPane {
                 (Task::none(), None)
             }
             Message::Save => {
-                let exec = self.draft.exec.get(Chain::Mainnet).trim().to_string();
-                let consensus = self.draft.consensus.get(Chain::Mainnet).trim().to_string();
                 let checkpoint_override = parse_checkpoint(self.draft.checkpoint_override.trim());
-                settings::set_rpcs(Chain::Mainnet, vec![exec]);
-                settings::set_consensus_rpcs(Chain::Mainnet, vec![consensus]);
+                // A blank row clears the chain's explicit override so the
+                // settings-layer fallback (key-synthesized exec URL /
+                // default consensus endpoint) takes over again. Mainnet
+                // can't be blank — `draft_valid` gates Save on it.
+                for chain in Chain::ALL {
+                    let exec = self.draft.exec.get(chain).trim().to_string();
+                    settings::set_rpcs(chain, if exec.is_empty() { vec![] } else { vec![exec] });
+                    let consensus = self.draft.consensus.get(chain).trim().to_string();
+                    settings::set_consensus_rpcs(
+                        chain,
+                        if consensus.is_empty() {
+                            vec![]
+                        } else {
+                            vec![consensus]
+                        },
+                    );
+                }
                 settings::set_checkpoint_override(checkpoint_override);
                 self.saving = true;
                 let network = self.network.clone();
@@ -158,39 +168,35 @@ impl NetworksPane {
         .align_y(Alignment::Center)
         .width(Length::Fill);
 
-        // Mainnet is the only chain we persist today. Render exactly one
-        // row per section so the form can't promise an L2 edit will save.
-        let exec_input = text_input("https://…", self.draft.exec.get(Chain::Mainnet))
-            .on_input(|s| Message::ExecChanged(Chain::Mainnet, s))
-            .padding(Padding::from([6, 10]))
-            .style(move |_theme, status| text_input_style(t, status));
-        let exec_rows = column![labeled_row(t, Chain::Mainnet.label(), exec_input.into())]
-            .spacing(6)
-            .width(Length::Fill);
+        let mut exec_rows = column![].spacing(6).width(Length::Fill);
+        for chain in Chain::ALL {
+            let input = text_input("https://…", self.draft.exec.get(chain))
+                .on_input(move |s| Message::ExecChanged(chain, s))
+                .padding(Padding::from([6, 10]))
+                .style(move |_theme, status| text_input_style(t, status));
+            exec_rows = exec_rows.push(labeled_row(t, chain.label(), input.into()));
+        }
         let exec_section = section(
             t,
             "Execution RPC",
             "(◕‿◕✿)",
-            "Helios verifies every response against the consensus layer. Per-chain endpoints land once L2 support ships.",
+            "Helios verifies every response against the consensus layer. Leave an L2 blank to fall back to your provider key's endpoint.",
             exec_rows.into(),
         );
 
-        let consensus_input = text_input("https://…", self.draft.consensus.get(Chain::Mainnet))
-            .on_input(|s| Message::ConsensusChanged(Chain::Mainnet, s))
-            .padding(Padding::from([6, 10]))
-            .style(move |_theme, status| text_input_style(t, status));
-        let consensus_rows = column![labeled_row(
-            t,
-            Chain::Mainnet.label(),
-            consensus_input.into(),
-        )]
-        .spacing(6)
-        .width(Length::Fill);
+        let mut consensus_rows = column![].spacing(6).width(Length::Fill);
+        for chain in Chain::ALL {
+            let input = text_input("https://…", self.draft.consensus.get(chain))
+                .on_input(move |s| Message::ConsensusChanged(chain, s))
+                .padding(Padding::from([6, 10]))
+                .style(move |_theme, status| text_input_style(t, status));
+            consensus_rows = consensus_rows.push(labeled_row(t, chain.label(), input.into()));
+        }
         let consensus_section = section(
             t,
             "Consensus RPC",
             "( ´ ▽ ` )ﾉ",
-            "Beacon-chain LC API endpoint Helios bootstraps from.",
+            "Light-client endpoint Helios bootstraps from. Leave an L2 blank to use the chain's default.",
             consensus_rows.into(),
         );
 
@@ -269,14 +275,20 @@ fn labeled_row<'a>(
 }
 
 fn draft_valid(draft: &Draft) -> bool {
-    // Mainnet is the only chain whose values get persisted today, so it's
-    // the only one Save needs to enforce. L2 fields are session-only and
-    // we don't block save on them — empty is fine, garbled is fine.
-    if !is_https_url(draft.exec.get(Chain::Mainnet)) {
-        return false;
-    }
-    if !is_https_url(draft.consensus.get(Chain::Mainnet)) {
-        return false;
+    // Mainnet anchors Helios and can't be blank. L2 rows may be blank —
+    // that clears the explicit override and the chain falls back to a
+    // key-synthesized exec URL / default consensus endpoint — but a
+    // non-blank row must be a real HTTPS URL or Save would persist junk.
+    for chain in Chain::ALL {
+        let exec = draft.exec.get(chain).trim();
+        let consensus = draft.consensus.get(chain).trim();
+        let mandatory = matches!(chain, Chain::Mainnet);
+        if (mandatory || !exec.is_empty()) && !is_https_url(exec) {
+            return false;
+        }
+        if (mandatory || !consensus.is_empty()) && !is_https_url(consensus) {
+            return false;
+        }
     }
     let cp = draft.checkpoint_override.trim();
     if !cp.is_empty() && B256::from_str(cp).is_err() {
