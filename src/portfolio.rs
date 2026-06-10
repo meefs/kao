@@ -650,28 +650,57 @@ const PROBE_FEES: [u32; 3] = [500, 3000, 10000];
 /// legitimately thin long-tail pools still price.
 const MIN_POOL_WETH_WEI: U256 = U256::from_limbs([100_000_000_000_000_000u64, 0, 0, 0]); // 1e17 = 0.1 WETH
 
-/// Issue one Multicall3 `aggregate3` round trip. Wraps the call in
-/// `with_rate_limit_retry` so 429s back off instead of zeroing the
-/// portfolio. Returns the per-subcall (success, returnData) rows in the
-/// same order the caller queued them.
+/// Max subcalls per `aggregate3` round trip. dRPC's free tier kills any
+/// request running longer than 2 s, and a single eth_call executing
+/// ~330 `balanceOf`s against Base state exceeds that on its public
+/// upstreams (HTTP 408, code 30). 100 subcalls keeps every chunk well
+/// under the budget while costing the largest list only a few extra
+/// round trips.
+const MULTICALL_CHUNK: usize = 100;
+
+/// Issue one logical Multicall3 `aggregate3` read, split into
+/// `MULTICALL_CHUNK`-sized round trips so no single eth_call outlives a
+/// free-tier provider's per-request timeout. All chunks are pinned to
+/// the same `block`, so the caller still observes one consistent state
+/// snapshot. Each chunk is wrapped in `with_rate_limit_retry` so 429s
+/// back off instead of zeroing the portfolio. Returns the per-subcall
+/// (success, returnData) rows in the same order the caller queued them.
 pub(crate) async fn multicall3(
     provider: &RootProvider<Ethereum>,
     block: BlockId,
     label: &str,
     calls: Vec<Call3>,
 ) -> Result<Vec<MultiResult>, String> {
-    let calldata = Bytes::from(aggregate3Call { calls }.abi_encode());
-    let raw = with_rate_limit_retry(label, || async {
-        let tx = alloy::rpc::types::TransactionRequest::default()
-            .to(MULTICALL3)
-            .input(alloy::rpc::types::TransactionInput::new(calldata.clone()));
-        provider.call(tx).block(block).await
-    })
-    .await
-    .map_err(|e| format!("{label}: {e}"))?;
-    let decoded =
-        aggregate3Call::abi_decode_returns(&raw).map_err(|e| format!("{label} decode: {e}"))?;
-    Ok(decoded)
+    let mut out: Vec<MultiResult> = Vec::with_capacity(calls.len());
+    for chunk in calls.chunks(MULTICALL_CHUNK) {
+        let calldata = Bytes::from(
+            aggregate3Call {
+                calls: chunk.to_vec(),
+            }
+            .abi_encode(),
+        );
+        let raw = with_rate_limit_retry(label, || async {
+            let tx = alloy::rpc::types::TransactionRequest::default()
+                .to(MULTICALL3)
+                .input(alloy::rpc::types::TransactionInput::new(calldata.clone()));
+            provider.call(tx).block(block).await
+        })
+        .await
+        .map_err(|e| format!("{label}: {e}"))?;
+        let decoded =
+            aggregate3Call::abi_decode_returns(&raw).map_err(|e| format!("{label} decode: {e}"))?;
+        // Callers index results positionally; a short chunk would shift
+        // every later row onto the wrong token.
+        if decoded.len() != chunk.len() {
+            return Err(format!(
+                "{label}: chunk returned {} results for {} calls",
+                decoded.len(),
+                chunk.len(),
+            ));
+        }
+        out.extend(decoded);
+    }
+    Ok(out)
 }
 
 /// Crate-internal façade over `multicall3` that hides the sol-generated
