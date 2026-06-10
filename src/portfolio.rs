@@ -16,6 +16,7 @@ use alloy::sol_types::SolCall;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
@@ -47,17 +48,46 @@ where
     Fut: std::future::Future<Output = Result<T, E>>,
     E: std::fmt::Display,
 {
+    with_retry_if(label, is_rate_limited, f).await
+}
+
+/// Like `with_rate_limit_retry`, but also retries provider-side request
+/// timeouts (dRPC free tier kills any request over 2 s — its public
+/// upstreams intermittently blow that budget even on a plain
+/// `eth_getCode`). For single-shot reads the request can't be made
+/// smaller, so a straight backoff-retry is the only remedy; `multicall3`
+/// keeps timeouts out of its retry wrapper because shrinking the chunk
+/// is the better response there.
+pub(crate) async fn with_transient_retry<T, E, F, Fut>(label: &str, f: F) -> Result<T, E>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    with_retry_if(label, |m| is_rate_limited(m) || is_provider_timeout(m), f).await
+}
+
+async fn with_retry_if<T, E, F, Fut>(
+    label: &str,
+    retryable: impl Fn(&str) -> bool,
+    f: F,
+) -> Result<T, E>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
     let mut delay = RETRY_INITIAL_DELAY;
     for attempt in 1..=RETRY_MAX_ATTEMPTS {
         match f().await {
             Ok(v) => return Ok(v),
-            Err(e) if attempt < RETRY_MAX_ATTEMPTS && is_rate_limited(&e.to_string()) => {
+            Err(e) if attempt < RETRY_MAX_ATTEMPTS && retryable(&e.to_string()) => {
                 warn!(
                     label,
                     attempt,
                     delay_ms = delay.as_millis() as u64,
                     error = %e,
-                    "rate-limited; retrying",
+                    "transient rpc error; retrying",
                 );
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(RETRY_MAX_DELAY);
@@ -650,29 +680,64 @@ const PROBE_FEES: [u32; 3] = [500, 3000, 10000];
 /// legitimately thin long-tail pools still price.
 const MIN_POOL_WETH_WEI: U256 = U256::from_limbs([100_000_000_000_000_000u64, 0, 0, 0]); // 1e17 = 0.1 WETH
 
-/// Max subcalls per `aggregate3` round trip. dRPC's free tier kills any
-/// request running longer than 2 s, and a single eth_call executing
-/// ~330 `balanceOf`s against Base state exceeds that on its public
-/// upstreams (HTTP 408, code 30). 100 subcalls keeps every chunk well
-/// under the budget while costing the largest list only a few extra
-/// round trips.
+/// Starting subcall count per `aggregate3` round trip. dRPC's free tier
+/// kills any request running longer than 2 s, and a single eth_call
+/// executing ~330 `balanceOf`s against Base state exceeds that on its
+/// public upstreams (HTTP 408, code 30). How many subcalls fit under
+/// the budget varies with upstream load, so this is only the optimistic
+/// opening bid — `multicall3` halves it on timeout.
 const MULTICALL_CHUNK: usize = 100;
 
-/// Issue one logical Multicall3 `aggregate3` read, split into
-/// `MULTICALL_CHUNK`-sized round trips so no single eth_call outlives a
-/// free-tier provider's per-request timeout. All chunks are pinned to
-/// the same `block`, so the caller still observes one consistent state
-/// snapshot. Each chunk is wrapped in `with_rate_limit_retry` so 429s
-/// back off instead of zeroing the portfolio. Returns the per-subcall
-/// (success, returnData) rows in the same order the caller queued them.
+/// Floor for the timeout-driven halving. Below this the per-request
+/// overhead dominates and shrinking further can't help; keep retrying
+/// at this size until the budget runs out instead.
+const MULTICALL_CHUNK_MIN: usize = 10;
+
+/// Provider-timeout retries one `multicall3` call may burn before
+/// giving up. Paired with the backoff below, the budget spans ~30 s —
+/// free-tier 408s come in congestion windows (observed: every request
+/// on a chain failing for several seconds straight), so retries that
+/// all land inside the same window are wasted.
+const MULTICALL_TIMEOUT_RETRIES: u32 = 6;
+
+/// Process-wide chunk-size ratchet, shared across refreshes. Upstream
+/// speed is a property of the provider, not of one portfolio walk —
+/// once a size times out, later walks start from the size that worked
+/// instead of rediscovering it 2 s at a time. Only ever shrinks;
+/// restart the app to reset after switching providers.
+static MULTICALL_CHUNK_RATCHET: AtomicUsize = AtomicUsize::new(MULTICALL_CHUNK);
+
+/// Match a provider-side per-request timeout (dRPC free tier: HTTP 408
+/// with `{"message":"Request timeout on the free tier…","code":30}`) or
+/// a client-side socket timeout. Distinct from `is_rate_limited` — the
+/// fix is a smaller request, not a longer backoff.
+fn is_provider_timeout(msg: &str) -> bool {
+    msg.contains("HTTP error 408") || msg.contains("Request timeout") || msg.contains("timed out")
+}
+
+/// Issue one logical Multicall3 `aggregate3` read, split into chunked
+/// round trips so no single eth_call outlives a free-tier provider's
+/// per-request timeout. Chunks start at the ratcheted size and halve on
+/// every timeout (down to `MULTICALL_CHUNK_MIN`). All chunks are pinned
+/// to the same `block`, so the caller still observes one consistent
+/// state snapshot. Each chunk is wrapped in `with_rate_limit_retry` so
+/// 429s back off instead of zeroing the portfolio. Returns the
+/// per-subcall (success, returnData) rows in the same order the caller
+/// queued them.
 pub(crate) async fn multicall3(
     provider: &RootProvider<Ethereum>,
     block: BlockId,
     label: &str,
     calls: Vec<Call3>,
 ) -> Result<Vec<MultiResult>, String> {
+    let mut chunk_size = MULTICALL_CHUNK_RATCHET.load(Ordering::Relaxed);
+    let mut timeout_budget = MULTICALL_TIMEOUT_RETRIES;
+    let mut timeout_delay = RETRY_INITIAL_DELAY;
     let mut out: Vec<MultiResult> = Vec::with_capacity(calls.len());
-    for chunk in calls.chunks(MULTICALL_CHUNK) {
+    let mut idx = 0;
+    while idx < calls.len() {
+        let end = (idx + chunk_size).min(calls.len());
+        let chunk = &calls[idx..end];
         let calldata = Bytes::from(
             aggregate3Call {
                 calls: chunk.to_vec(),
@@ -685,8 +750,32 @@ pub(crate) async fn multicall3(
                 .input(alloy::rpc::types::TransactionInput::new(calldata.clone()));
             provider.call(tx).block(block).await
         })
-        .await
-        .map_err(|e| format!("{label}: {e}"))?;
+        .await;
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(e) => {
+                let msg = e.to_string();
+                if timeout_budget == 0 || !is_provider_timeout(&msg) {
+                    return Err(format!("{label}: {msg}"));
+                }
+                timeout_budget -= 1;
+                if chunk_size > MULTICALL_CHUNK_MIN {
+                    chunk_size = (chunk_size / 2).max(MULTICALL_CHUNK_MIN);
+                    MULTICALL_CHUNK_RATCHET.fetch_min(chunk_size, Ordering::Relaxed);
+                }
+                warn!(
+                    label,
+                    chunk_size,
+                    retries_left = timeout_budget,
+                    delay_ms = timeout_delay.as_millis() as u64,
+                    error = %msg,
+                    "provider timeout; backing off, then retrying with smaller multicall chunk",
+                );
+                tokio::time::sleep(timeout_delay).await;
+                timeout_delay = (timeout_delay * 2).min(RETRY_MAX_DELAY);
+                continue;
+            }
+        };
         let decoded =
             aggregate3Call::abi_decode_returns(&raw).map_err(|e| format!("{label} decode: {e}"))?;
         // Callers index results positionally; a short chunk would shift
@@ -699,6 +788,7 @@ pub(crate) async fn multicall3(
             ));
         }
         out.extend(decoded);
+        idx = end;
     }
     Ok(out)
 }

@@ -36,6 +36,7 @@ use helios_opstack::config::Network as OpNetwork;
 use tracing::{debug, error, info, warn};
 
 use crate::chain::{Chain, PerChain};
+use crate::portfolio::with_transient_retry;
 use crate::settings;
 use crate::wallet::short_address;
 
@@ -871,12 +872,19 @@ impl BalanceFetcher for NetworkClient {
         }
     }
 
+    // The `*_raw` entry points are single-shot reads the Safe scan
+    // treats as load-bearing shape signals — a transient provider
+    // timeout surfacing as an Err would demote a healthy Safe to
+    // "no longer looks like a Safe". Wrap them in the transient retry
+    // (429s + per-request timeouts). Reverts don't match the predicate,
+    // so `call_raw` probes against non-Safes still fail fast.
+
     async fn get_code_raw(
         &self,
         addr: Address,
         chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String> {
-        self.fallback_get_code(addr, chain).await
+        with_transient_retry("get_code_raw", || self.fallback_get_code(addr, chain)).await
     }
 
     async fn get_storage_at_raw(
@@ -885,7 +893,10 @@ impl BalanceFetcher for NetworkClient {
         slot: U256,
         chain: Chain,
     ) -> Result<VerifiedRead<B256>, String> {
-        self.fallback_get_storage_at(addr, slot, chain).await
+        with_transient_retry("get_storage_at_raw", || {
+            self.fallback_get_storage_at(addr, slot, chain)
+        })
+        .await
     }
 
     async fn call_raw(
@@ -894,7 +905,7 @@ impl BalanceFetcher for NetworkClient {
         data: Bytes,
         chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String> {
-        self.fallback_call(to, data, chain).await
+        with_transient_retry("call_raw", || self.fallback_call(to, data.clone(), chain)).await
     }
 }
 
