@@ -7,6 +7,7 @@ use alloy::signers::local::{
     MnemonicBuilder, MnemonicKey, PrivateKeySigner, coins_bip39, coins_bip39::English,
 };
 use alloy::signers::trezor::{HDPath as AlloyTrezorHDPath, TrezorSigner};
+use alloy::sol_types::{Eip712Domain, SolStruct};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
@@ -500,6 +501,113 @@ impl KaoSigner {
             }
         }
     }
+
+    /// Sign an EIP-712 typed-data payload (e.g. a `SafeTx`) — the path
+    /// that makes **hardware** Safe signing work where `sign_hash` does
+    /// not. Each inner signer's `sign_typed_data` drives its native
+    /// EIP-712 flow: software hashes locally; Ledger/Trezor send the
+    /// domain separator + struct hash to the device (the hashed-message
+    /// EIP-712 mode their firmware permits even under blind-signing).
+    ///
+    /// For `Local` this is byte-identical to `sign_hash` over
+    /// `payload.eip712_signing_hash(domain)` — verified by
+    /// `local_eip712_matches_sign_hash`. The produced `v` is `{27,28}`,
+    /// exactly what `pack_owner_signatures` expects.
+    ///
+    /// `ViewOnly` has no key → `UnsupportedOperation`.
+    pub async fn sign_eip712<T: SolStruct + Send + Sync>(
+        &self,
+        payload: &T,
+        domain: &Eip712Domain,
+    ) -> Result<Signature, alloy::signers::Error> {
+        match self {
+            KaoSigner::Local(s) => s.sign_typed_data(payload, domain).await,
+            KaoSigner::Ledger(s) => s.sign_typed_data(payload, domain).await,
+            KaoSigner::Trezor(s) => s.sign_typed_data(payload, domain).await,
+            KaoSigner::ViewOnly(_) => Err(alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignTypedData,
+            )),
+        }
+    }
+
+    /// Produce an EIP-191 `personal_sign` signature over `message`. The
+    /// Safe `eth_sign` fallback (`v ∈ {31,32}`) builds on this for
+    /// devices/app-versions that reject EIP-712; the Safe-specific `+4`
+    /// `v` adjustment is applied at packing time in `safe::tx`, since
+    /// the EIP-191 prefix Safe expects (`"\x19Ethereum Signed
+    /// Message:\n32"` over the 32-byte safeTxHash) is exactly what
+    /// `Signer::sign_message` emits.
+    ///
+    /// `ViewOnly` has no key → `UnsupportedOperation`.
+    pub async fn sign_eth_message(
+        &self,
+        message: &[u8],
+    ) -> Result<Signature, alloy::signers::Error> {
+        match self {
+            KaoSigner::Local(s) => s.sign_message(message).await,
+            KaoSigner::Ledger(s) => s.sign_message(message).await,
+            KaoSigner::Trezor(s) => s.sign_message(message).await,
+            KaoSigner::ViewOnly(_) => Err(alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignMessage,
+            )),
+        }
+    }
+}
+
+/// Construct a *live* signer for an arbitrary linked owner — used when a
+/// Safe owner this wallet controls is **not** the currently-active
+/// account (confirm/execute/propose from the queue). Software owners
+/// rebuild from key bytes; hardware owners reconnect by their stored HD
+/// path and the derived address is checked against the descriptor so a
+/// wrong-device / wrong-derivation mismatch fails loudly instead of
+/// signing under the wrong key.
+///
+/// Async because the hardware variants block on the device. `ViewOnly`
+/// has no key and errors.
+pub async fn build_owner_signer(desc: &AccountDescriptor) -> Result<KaoSigner, String> {
+    match desc {
+        AccountDescriptor::Local { key_bytes, .. } => {
+            let s = signer_from_bytes(&B256::from(*key_bytes)).map_err(|e| e.to_string())?;
+            Ok(KaoSigner::Local(s))
+        }
+        AccountDescriptor::Ledger { path, address, .. } => {
+            let s = LedgerSigner::new(path.to_alloy(), None)
+                .await
+                .map_err(|e| format!("ledger: {e}"))?;
+            let got = Signer::address(&s);
+            let want = Address::from(*address);
+            if got != want {
+                // short_address: this string ends up in logs (warn! at
+                // the call sites), and log lines never carry full user
+                // addresses. Eight hex chars per side is plenty to tell
+                // a wrong-device / wrong-path mix-up apart.
+                return Err(format!(
+                    "ledger address mismatch: device {} vs expected {}",
+                    short_address(got),
+                    short_address(want),
+                ));
+            }
+            Ok(KaoSigner::Ledger(s))
+        }
+        AccountDescriptor::Trezor { path, address, .. } => {
+            let s = TrezorSigner::new(path.to_alloy(), None)
+                .await
+                .map_err(|e| format!("trezor: {e}"))?;
+            let got = Signer::address(&s);
+            let want = Address::from(*address);
+            if got != want {
+                return Err(format!(
+                    "trezor address mismatch: device {} vs expected {}",
+                    short_address(got),
+                    short_address(want),
+                ));
+            }
+            Ok(KaoSigner::Trezor(s))
+        }
+        AccountDescriptor::ViewOnly { .. } => {
+            Err("view-only account has no signing key".to_string())
+        }
+    }
 }
 
 /// Cell used to hand a non-Clone live signer through Clone iced messages.
@@ -625,6 +733,7 @@ pub fn account_short_address(account: &AccountDescriptor) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::U256;
 
     #[test]
     fn account_postcard_roundtrip_local() {
@@ -1020,6 +1129,99 @@ mod tests {
                 alloy::signers::UnsupportedSignerOperation::SignHash
             )
         ));
+    }
+
+    alloy::sol! {
+        struct Demo712 {
+            uint256 x;
+            address y;
+        }
+    }
+
+    #[tokio::test]
+    async fn local_eip712_matches_sign_hash() {
+        // The software path through `sign_eip712` must be byte-identical
+        // to hashing locally and `sign_hash`-ing the EIP-712 signing
+        // hash — that equivalence is what lets the Safe flow swap to
+        // `sign_eip712` (so hardware works) without changing the bytes a
+        // software owner produces.
+        use alloy::sol_types::SolStruct;
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        let domain = Eip712Domain {
+            name: None,
+            version: None,
+            chain_id: Some(U256::from(1u64)),
+            verifying_contract: Some(Address::repeat_byte(0x11)),
+            salt: None,
+        };
+        let payload = Demo712 {
+            x: U256::from(42u64),
+            y: Address::repeat_byte(0xab),
+        };
+        let via_712 = ks.sign_eip712(&payload, &domain).await.unwrap();
+        let hash = payload.eip712_signing_hash(&domain);
+        let via_hash = ks.sign_hash(hash).await.unwrap();
+        assert_eq!(via_712.as_bytes(), via_hash.as_bytes());
+        // And it recovers to the owner over the prehash.
+        assert_eq!(
+            via_712.recover_address_from_prehash(&hash).unwrap(),
+            ks.address()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_eth_message_recovers_over_eip191_prefix() {
+        // `sign_eth_message` is EIP-191 personal_sign; recovery uses the
+        // prefixed digest. This underpins the Safe `eth_sign` fallback.
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        let hash = B256::repeat_byte(0xcd);
+        let sig = ks.sign_eth_message(hash.as_slice()).await.unwrap();
+        let recovered = sig
+            .recover_address_from_msg(hash.as_slice())
+            .unwrap();
+        assert_eq!(recovered, ks.address());
+    }
+
+    #[tokio::test]
+    async fn view_only_eip712_and_eth_message_unsupported() {
+        let ks = KaoSigner::ViewOnly(Address::repeat_byte(0x01));
+        let domain = Eip712Domain {
+            name: None,
+            version: None,
+            chain_id: Some(U256::from(1u64)),
+            verifying_contract: Some(Address::ZERO),
+            salt: None,
+        };
+        let payload = Demo712 {
+            x: U256::ZERO,
+            y: Address::ZERO,
+        };
+        assert!(ks.sign_eip712(&payload, &domain).await.is_err());
+        assert!(ks.sign_eth_message(&[0u8; 32]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn build_owner_signer_local_round_trips() {
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = derive_accounts_from(&parent, 0, 1).unwrap()[0].clone();
+        let addr = signer.address();
+        let desc = local_account(&signer);
+        let built = build_owner_signer(&desc).await.unwrap();
+        assert_eq!(built.address(), addr);
+        assert!(built.can_sign());
+    }
+
+    #[tokio::test]
+    async fn build_owner_signer_view_only_errors() {
+        let desc = AccountDescriptor::ViewOnly {
+            name: None,
+            address: [0x22; 20],
+        };
+        assert!(build_owner_signer(&desc).await.is_err());
     }
 
     #[test]

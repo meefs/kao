@@ -377,15 +377,27 @@ pub struct LatestBlock {
     pub excess_blob_gas: Option<u64>,
 }
 
+/// Helios side of a chain. Its mutex is held across the entire
+/// build/sync in `get`, which serializes concurrent *verified* calls on
+/// the same chain (intended — they all want the same client). Raw-RPC
+/// state deliberately lives in [`RawState`] under its own lock so the
+/// Safe scan's `*_raw` reads and the cooldown checks never stall behind
+/// a 45-second helios sync.
 #[derive(Default)]
 struct ChainState {
     client: Option<HeliosBackend>,
     built_with: Option<ConfigSnapshot>,
-    chosen_rpc: Option<String>,
-    /// Cached raw provider against `chosen_rpc`. Used by the fallback
-    /// path so a cooldown-period request doesn't pay TLS/transport setup
-    /// every time.
-    fallback: Option<RootProvider<Ethereum>>,
+}
+
+/// Raw-RPC side of a chain. Guarded by a `std::sync::Mutex` (never held
+/// across an `.await`) so it stays accessible while a helios build holds
+/// the `ChainState` mutex.
+#[derive(Default)]
+struct RawState {
+    /// Cached raw provider. Shared by the fallback path, the `*_raw`
+    /// entry points, and `provider()` so a cooldown-period request
+    /// doesn't pay TLS/transport setup every time.
+    provider: Option<RootProvider<Ethereum>>,
     /// Set to `Some(Instant::now())` whenever a helios call has just
     /// errored or helios couldn't be built. Subsequent requests within
     /// `FALLBACK_COOLDOWN` skip helios entirely.
@@ -394,6 +406,7 @@ struct ChainState {
 
 pub struct NetworkClient {
     states: PerChain<Mutex<ChainState>>,
+    raw: PerChain<std::sync::Mutex<RawState>>,
     /// Most recent `VerificationStatus` per chain. Held outside the
     /// mutex so the UI can poll it without blocking on a long helios
     /// sync. Encoded as `u8` for `AtomicU8`; see
@@ -411,6 +424,7 @@ impl NetworkClient {
     pub fn new() -> Self {
         Self {
             states: PerChain::default(),
+            raw: PerChain::default(),
             statuses: PerChain::default(),
         }
     }
@@ -423,15 +437,50 @@ impl NetworkClient {
         self.states.get(chain)
     }
 
+    fn raw_state(&self, chain: Chain) -> std::sync::MutexGuard<'_, RawState> {
+        self.raw
+            .get(chain)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Resolve the shared raw provider for `chain`, building and caching
+    /// one from settings when none exists yet. Single lock acquisition —
+    /// callers hold the provider they got, so an `invalidate()` landing
+    /// mid-request can't yank it out from under them.
+    fn raw_provider(&self, chain: Chain) -> Result<RootProvider<Ethereum>, String> {
+        let mut r = self.raw_state(chain);
+        if let Some(p) = &r.provider {
+            return Ok(p.clone());
+        }
+        let rpcs = settings::rpcs(chain);
+        let url = rpcs
+            .choose(&mut rand::thread_rng())
+            .ok_or_else(|| format!("no execution RPCs configured for {}", chain.label()))?;
+        let provider = build_fallback(url)
+            .ok_or_else(|| format!("cannot build RPC provider for {}", chain.label()))?;
+        r.provider = Some(provider.clone());
+        Ok(provider)
+    }
+
     /// Get a synced Helios client for `chain`, building (and waiting for
-    /// sync) if needed. Rebuilds when the user's settings have drifted
-    /// from the last build.
+    /// sync) if needed. Rebuilds when the user's RPC endpoints have
+    /// drifted from the last build.
     async fn get(&self, chain: Chain) -> Result<HeliosBackend, String> {
         let snapshot = current_snapshot(chain);
         let mut s = self.state_for(chain).lock().await;
 
+        // Reuse the existing client when the *endpoints* match. The
+        // checkpoint is deliberately excluded from the comparison: it's
+        // only a bootstrap hint, and `refresh_auto_checkpoint` updates it
+        // asynchronously shortly after startup — tearing down an
+        // already-synced client over checkpoint drift would force a
+        // pointless re-sync. A user-entered checkpoint override flows
+        // through `invalidate()` (networks-pane save), which clears
+        // `built_with` and forces the rebuild explicitly.
         if let (Some(client), Some(prev)) = (&s.client, &s.built_with)
-            && prev == &snapshot
+            && prev.rpcs == snapshot.rpcs
+            && prev.consensus_rpcs == snapshot.consensus_rpcs
         {
             return Ok(client.clone());
         }
@@ -449,17 +498,18 @@ impl NetworkClient {
             ));
         }
         let chosen_exec = pick_rpc(&snapshot.rpcs);
-        // Build the raw fallback provider eagerly against the same URL
-        // helios is about to use. If helios's build/sync fails below, the
-        // fallback still exists for the cooldown window.
-        s.fallback = build_fallback(&chosen_exec);
-        s.chosen_rpc = Some(chosen_exec.clone());
+        // Point the raw provider at the same URL helios is about to use
+        // so both paths share one transport. If helios's build/sync fails
+        // below, the raw provider still exists for the cooldown window.
+        self.raw_state(chain).provider = build_fallback(&chosen_exec);
 
         let consensus_order = shuffled(&snapshot.consensus_rpcs);
         info!(
             chain = %chain.label(),
-            execution_rpc = %chosen_exec,
-            consensus_rpcs = ?consensus_order,
+            // URLs are scrubbed to scheme://host — exec/consensus RPC
+            // URLs routinely carry the API key in the path or query.
+            execution_rpc = %redact_urls(&chosen_exec),
+            consensus_rpcs = ?consensus_order.iter().map(|u| redact_urls(u)).collect::<Vec<_>>(),
             checkpoint = ?snapshot.checkpoint,
             "building helios client",
         );
@@ -477,7 +527,7 @@ impl NetworkClient {
                 warn!(
                     chain = %chain.label(),
                     elapsed = ?started.elapsed(),
-                    error = %e,
+                    error = %redact_urls(&e),
                     "helios build/sync failed",
                 );
                 return Err(e);
@@ -496,26 +546,27 @@ impl NetworkClient {
         Ok(backend)
     }
 
-    /// Snapshot whether we should skip helios this request.
-    async fn in_cooldown(&self, chain: Chain) -> bool {
-        let s = self.state_for(chain).lock().await;
-        s.last_fallback_at
+    /// Snapshot whether we should skip helios this request. Sync — reads
+    /// only the raw-side lock, so it can't stall behind an in-flight
+    /// helios build.
+    fn in_cooldown(&self, chain: Chain) -> bool {
+        self.raw_state(chain)
+            .last_fallback_at
             .map(|t| t.elapsed() < FALLBACK_COOLDOWN)
             .unwrap_or(false)
     }
 
     /// Mark "helios just failed; route around it for a bit" and ensure a
     /// fallback provider exists for the cooldown window.
-    async fn start_cooldown(&self, chain: Chain) {
-        let mut s = self.state_for(chain).lock().await;
-        s.last_fallback_at = Some(Instant::now());
-        if s.fallback.is_none() {
+    fn start_cooldown(&self, chain: Chain) {
+        let mut r = self.raw_state(chain);
+        r.last_fallback_at = Some(Instant::now());
+        if r.provider.is_none() {
             // Helios never even chose an exec RPC — pick one ourselves
             // so the fallback path has somewhere to send the request.
             let rpcs = settings::rpcs(chain);
             if let Some(url) = rpcs.choose(&mut rand::thread_rng()) {
-                s.fallback = build_fallback(url);
-                s.chosen_rpc = Some(url.clone());
+                r.provider = build_fallback(url);
             }
         }
     }
@@ -541,27 +592,33 @@ impl BalanceFetcher for NetworkClient {
     /// picking a fresh random RPC from each chain's list.
     async fn invalidate(&self) {
         for chain in Chain::ALL {
-            let mut s = self.state_for(chain).lock().await;
-            let previous = s.client.take();
-            s.built_with = None;
-            s.chosen_rpc = None;
-            s.fallback = None;
-            s.last_fallback_at = None;
-            drop(s);
+            let previous = {
+                let mut s = self.state_for(chain).lock().await;
+                s.built_with = None;
+                s.client.take()
+            };
             spawn_shutdown(previous);
+            {
+                let mut r = self.raw_state(chain);
+                r.provider = None;
+                r.last_fallback_at = None;
+            }
             self.set_status(chain, VerificationStatus::Connecting);
         }
     }
 
     async fn balance(&self, addr: Address, chain: Chain) -> Result<String, String> {
         // Cooldown: route straight to raw RPC, skip the helios attempt.
-        if self.in_cooldown(chain).await {
+        if self.in_cooldown(chain) {
             return self.fallback_balance(addr, chain).await;
         }
 
         // Try helios. On any error, start a cooldown and fall through
-        // to raw.
-        self.set_status(chain, VerificationStatus::Connecting);
+        // to raw. The status is only written once the outcome is known —
+        // setting `Connecting` up front would flicker the dashboard
+        // badge Verified → Connecting → Verified on every healthy
+        // refresh. (`Connecting` is the per-chain default at startup and
+        // is restored by `invalidate()`.)
         match self.get(chain).await {
             Ok(client) => match client.get_balance(addr, BlockId::latest()).await {
                 Ok(raw) => {
@@ -572,20 +629,20 @@ impl BalanceFetcher for NetworkClient {
                     debug!(
                         chain = %chain.label(),
                         addr = %short_address(addr),
-                        error = %e,
+                        error = %redact_urls(&e),
                         "helios balance failed; falling back to raw RPC",
                     );
-                    self.start_cooldown(chain).await;
+                    self.start_cooldown(chain);
                     self.fallback_balance(addr, chain).await
                 }
             },
             Err(e) => {
                 warn!(
                     chain = %chain.label(),
-                    error = %e,
+                    error = %redact_urls(&e),
                     "helios unavailable; falling back to raw RPC",
                 );
-                self.start_cooldown(chain).await;
+                self.start_cooldown(chain);
                 self.fallback_balance(addr, chain).await
             }
         }
@@ -596,23 +653,11 @@ impl BalanceFetcher for NetworkClient {
     }
 
     async fn provider(&self, chain: Chain) -> Option<RootProvider<Ethereum>> {
-        let mut s = self.state_for(chain).lock().await;
-        if let Some(p) = &s.fallback {
-            return Some(p.clone());
-        }
-        // Helios hasn't built yet — pick an RPC ourselves and cache it
-        // so subsequent portfolio fetches and the helios fallback path
-        // share one transport.
-        let rpcs = settings::rpcs(chain);
-        let url = rpcs.choose(&mut rand::thread_rng())?.clone();
-        let provider = build_fallback(&url)?;
-        s.fallback = Some(provider.clone());
-        s.chosen_rpc = Some(url);
-        Some(provider)
+        self.raw_provider(chain).ok()
     }
 
     async fn get_code(&self, addr: Address, chain: Chain) -> Result<VerifiedRead<Bytes>, String> {
-        if self.in_cooldown(chain).await {
+        if self.in_cooldown(chain) {
             return self.fallback_get_code(addr, chain).await;
         }
         match self.get(chain).await {
@@ -625,20 +670,20 @@ impl BalanceFetcher for NetworkClient {
                     debug!(
                         chain = %chain.label(),
                         addr = %short_address(addr),
-                        error = %e,
+                        error = %redact_urls(&e),
                         "helios get_code failed; falling back to raw RPC",
                     );
-                    self.start_cooldown(chain).await;
+                    self.start_cooldown(chain);
                     self.fallback_get_code(addr, chain).await
                 }
             },
             Err(e) => {
                 warn!(
                     chain = %chain.label(),
-                    error = %e,
+                    error = %redact_urls(&e),
                     "helios unavailable for get_code; falling back to raw RPC",
                 );
-                self.start_cooldown(chain).await;
+                self.start_cooldown(chain);
                 self.fallback_get_code(addr, chain).await
             }
         }
@@ -650,7 +695,7 @@ impl BalanceFetcher for NetworkClient {
         slot: U256,
         chain: Chain,
     ) -> Result<VerifiedRead<B256>, String> {
-        if self.in_cooldown(chain).await {
+        if self.in_cooldown(chain) {
             return self.fallback_get_storage_at(addr, slot, chain).await;
         }
         match self.get(chain).await {
@@ -663,20 +708,20 @@ impl BalanceFetcher for NetworkClient {
                     debug!(
                         chain = %chain.label(),
                         addr = %short_address(addr),
-                        error = %e,
+                        error = %redact_urls(&e),
                         "helios get_storage_at failed; falling back to raw RPC",
                     );
-                    self.start_cooldown(chain).await;
+                    self.start_cooldown(chain);
                     self.fallback_get_storage_at(addr, slot, chain).await
                 }
             },
             Err(e) => {
                 warn!(
                     chain = %chain.label(),
-                    error = %e,
+                    error = %redact_urls(&e),
                     "helios unavailable for get_storage_at; falling back to raw RPC",
                 );
-                self.start_cooldown(chain).await;
+                self.start_cooldown(chain);
                 self.fallback_get_storage_at(addr, slot, chain).await
             }
         }
@@ -688,7 +733,7 @@ impl BalanceFetcher for NetworkClient {
         data: Bytes,
         chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String> {
-        if self.in_cooldown(chain).await {
+        if self.in_cooldown(chain) {
             return self.fallback_call(to, data, chain).await;
         }
         match self.get(chain).await {
@@ -701,20 +746,20 @@ impl BalanceFetcher for NetworkClient {
                     debug!(
                         chain = %chain.label(),
                         addr = %short_address(to),
-                        error = %e,
+                        error = %redact_urls(&e),
                         "helios call failed; falling back to raw RPC",
                     );
-                    self.start_cooldown(chain).await;
+                    self.start_cooldown(chain);
                     self.fallback_call(to, data, chain).await
                 }
             },
             Err(e) => {
                 warn!(
                     chain = %chain.label(),
-                    error = %e,
+                    error = %redact_urls(&e),
                     "helios unavailable for call; falling back to raw RPC",
                 );
-                self.start_cooldown(chain).await;
+                self.start_cooldown(chain);
                 self.fallback_call(to, data, chain).await
             }
         }
@@ -725,7 +770,7 @@ impl BalanceFetcher for NetworkClient {
         addr: Address,
         chain: Chain,
     ) -> Result<VerifiedRead<U256>, String> {
-        if self.in_cooldown(chain).await {
+        if self.in_cooldown(chain) {
             return self.fallback_get_balance_raw(addr, chain).await;
         }
         match self.get(chain).await {
@@ -738,20 +783,20 @@ impl BalanceFetcher for NetworkClient {
                     debug!(
                         chain = %chain.label(),
                         addr = %short_address(addr),
-                        error = %e,
+                        error = %redact_urls(&e),
                         "helios get_balance_raw failed; falling back to raw RPC",
                     );
-                    self.start_cooldown(chain).await;
+                    self.start_cooldown(chain);
                     self.fallback_get_balance_raw(addr, chain).await
                 }
             },
             Err(e) => {
                 warn!(
                     chain = %chain.label(),
-                    error = %e,
+                    error = %redact_urls(&e),
                     "helios unavailable for get_balance_raw; falling back to raw RPC",
                 );
-                self.start_cooldown(chain).await;
+                self.start_cooldown(chain);
                 self.fallback_get_balance_raw(addr, chain).await
             }
         }
@@ -762,7 +807,7 @@ impl BalanceFetcher for NetworkClient {
         addr: Address,
         chain: Chain,
     ) -> Result<VerifiedRead<u64>, String> {
-        if self.in_cooldown(chain).await {
+        if self.in_cooldown(chain) {
             return self.fallback_get_transaction_count(addr, chain).await;
         }
         match self.get(chain).await {
@@ -775,27 +820,27 @@ impl BalanceFetcher for NetworkClient {
                     debug!(
                         chain = %chain.label(),
                         addr = %short_address(addr),
-                        error = %e,
+                        error = %redact_urls(&e),
                         "helios get_transaction_count failed; falling back to raw RPC",
                     );
-                    self.start_cooldown(chain).await;
+                    self.start_cooldown(chain);
                     self.fallback_get_transaction_count(addr, chain).await
                 }
             },
             Err(e) => {
                 warn!(
                     chain = %chain.label(),
-                    error = %e,
+                    error = %redact_urls(&e),
                     "helios unavailable for get_transaction_count; falling back to raw RPC",
                 );
-                self.start_cooldown(chain).await;
+                self.start_cooldown(chain);
                 self.fallback_get_transaction_count(addr, chain).await
             }
         }
     }
 
     async fn latest_block(&self, chain: Chain) -> Result<VerifiedRead<LatestBlock>, String> {
-        if self.in_cooldown(chain).await {
+        if self.in_cooldown(chain) {
             return self.fallback_latest_block(chain).await;
         }
         match self.get(chain).await {
@@ -807,20 +852,20 @@ impl BalanceFetcher for NetworkClient {
                 Err(e) => {
                     debug!(
                         chain = %chain.label(),
-                        error = %e,
+                        error = %redact_urls(&e),
                         "helios latest_block failed; falling back to raw RPC",
                     );
-                    self.start_cooldown(chain).await;
+                    self.start_cooldown(chain);
                     self.fallback_latest_block(chain).await
                 }
             },
             Err(e) => {
                 warn!(
                     chain = %chain.label(),
-                    error = %e,
+                    error = %redact_urls(&e),
                     "helios unavailable for latest_block; falling back to raw RPC",
                 );
-                self.start_cooldown(chain).await;
+                self.start_cooldown(chain);
                 self.fallback_latest_block(chain).await
             }
         }
@@ -831,7 +876,6 @@ impl BalanceFetcher for NetworkClient {
         addr: Address,
         chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String> {
-        self.ensure_raw_provider(chain).await?;
         self.fallback_get_code(addr, chain).await
     }
 
@@ -841,7 +885,6 @@ impl BalanceFetcher for NetworkClient {
         slot: U256,
         chain: Chain,
     ) -> Result<VerifiedRead<B256>, String> {
-        self.ensure_raw_provider(chain).await?;
         self.fallback_get_storage_at(addr, slot, chain).await
     }
 
@@ -851,7 +894,6 @@ impl BalanceFetcher for NetworkClient {
         data: Bytes,
         chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String> {
-        self.ensure_raw_provider(chain).await?;
         self.fallback_call(to, data, chain).await
     }
 }
@@ -861,12 +903,17 @@ impl NetworkClient {
     /// `verified=false` flag in the returned `VerifiedRead` lets the
     /// clear-signing UI surface "unverified bytecode" without affecting
     /// the global balance verification badge.
+    ///
+    /// Log/error wording on this and the other `fallback_*` methods says
+    /// "raw-rpc", not "fallback": these are also the *primary* path for
+    /// the `*_raw` entry points (Safe scan / Transaction-Service reads),
+    /// where nothing fell back because helios was never tried.
     async fn fallback_get_code(
         &self,
         addr: Address,
         chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String> {
-        let provider = self.fallback_provider(chain).await?;
+        let provider = self.raw_provider(chain)?;
         provider
             .get_code_at(addr)
             .await
@@ -875,13 +922,14 @@ impl NetworkClient {
                 verified: false,
             })
             .map_err(|e| {
+                let msg = redact_urls(&e.to_string());
                 debug!(
                     chain = %chain.label(),
                     addr = %short_address(addr),
-                    error = %e,
-                    "fallback get_code failed",
+                    error = %msg,
+                    "raw-rpc get_code failed",
                 );
-                e.to_string()
+                msg
             })
     }
 
@@ -891,7 +939,7 @@ impl NetworkClient {
         slot: U256,
         chain: Chain,
     ) -> Result<VerifiedRead<B256>, String> {
-        let provider = self.fallback_provider(chain).await?;
+        let provider = self.raw_provider(chain)?;
         provider
             .get_storage_at(addr, slot)
             .await
@@ -900,13 +948,14 @@ impl NetworkClient {
                 verified: false,
             })
             .map_err(|e| {
+                let msg = redact_urls(&e.to_string());
                 debug!(
                     chain = %chain.label(),
                     addr = %short_address(addr),
-                    error = %e,
-                    "fallback get_storage_at failed",
+                    error = %msg,
+                    "raw-rpc get_storage_at failed",
                 );
-                e.to_string()
+                msg
             })
     }
 
@@ -923,7 +972,7 @@ impl NetworkClient {
         data: Bytes,
         chain: Chain,
     ) -> Result<VerifiedRead<Bytes>, String> {
-        let provider = self.fallback_provider(chain).await?;
+        let provider = self.raw_provider(chain)?;
         let req = alloy::rpc::types::TransactionRequest::default()
             .to(to)
             .input(alloy::rpc::types::TransactionInput::new(data));
@@ -935,13 +984,17 @@ impl NetworkClient {
                 verified: false,
             })
             .map_err(|e| {
+                let msg = redact_urls(&e.to_string());
+                // Reverts land here too — the Safe scan *probes*
+                // addresses with `call_raw`, so a revert on a non-Safe
+                // is expected control flow, hence debug, not warn.
                 debug!(
                     chain = %chain.label(),
                     addr = %short_address(to),
-                    error = %e,
-                    "fallback call failed",
+                    error = %msg,
+                    "raw-rpc call failed",
                 );
-                e.to_string()
+                msg
             })
     }
 
@@ -950,7 +1003,7 @@ impl NetworkClient {
         addr: Address,
         chain: Chain,
     ) -> Result<VerifiedRead<U256>, String> {
-        let provider = self.fallback_provider(chain).await?;
+        let provider = self.raw_provider(chain)?;
         provider
             .get_balance(addr)
             .await
@@ -959,13 +1012,14 @@ impl NetworkClient {
                 verified: false,
             })
             .map_err(|e| {
+                let msg = redact_urls(&e.to_string());
                 debug!(
                     chain = %chain.label(),
                     addr = %short_address(addr),
-                    error = %e,
-                    "fallback get_balance_raw failed",
+                    error = %msg,
+                    "raw-rpc get_balance failed",
                 );
-                e.to_string()
+                msg
             })
     }
 
@@ -974,7 +1028,7 @@ impl NetworkClient {
         addr: Address,
         chain: Chain,
     ) -> Result<VerifiedRead<u64>, String> {
-        let provider = self.fallback_provider(chain).await?;
+        let provider = self.raw_provider(chain)?;
         // Default selector is `latest` — matches the verified path
         // above. `.pending()` would mismatch the simulation block and
         // race the broadcast path's pending lookup.
@@ -986,13 +1040,14 @@ impl NetworkClient {
                 verified: false,
             })
             .map_err(|e| {
+                let msg = redact_urls(&e.to_string());
                 debug!(
                     chain = %chain.label(),
                     addr = %short_address(addr),
-                    error = %e,
-                    "fallback get_transaction_count failed",
+                    error = %msg,
+                    "raw-rpc get_transaction_count failed",
                 );
-                e.to_string()
+                msg
             })
     }
 
@@ -1000,17 +1055,18 @@ impl NetworkClient {
         &self,
         chain: Chain,
     ) -> Result<VerifiedRead<LatestBlock>, String> {
-        let provider = self.fallback_provider(chain).await?;
+        let provider = self.raw_provider(chain)?;
         let block = provider
             .get_block(alloy::eips::BlockId::latest())
             .await
             .map_err(|e| {
+                let msg = redact_urls(&e.to_string());
                 debug!(
                     chain = %chain.label(),
-                    error = %e,
-                    "fallback latest_block failed",
+                    error = %msg,
+                    "raw-rpc latest_block failed",
                 );
-                e.to_string()
+                msg
             })?
             .ok_or_else(|| format!("no latest block on {}", chain.label()))?;
         // alloy 2.x's `Block.header` is the same `Header<H>` shape as
@@ -1033,38 +1089,16 @@ impl NetworkClient {
         })
     }
 
-    /// Make sure a raw provider exists in `s.fallback` for `chain`,
-    /// building one from settings if helios hasn't initialised the slot
-    /// yet. The `*_raw` entry points call this so they can hit
-    /// `fallback_provider` without first needing a helios build to
-    /// populate the slot as a side effect.
-    async fn ensure_raw_provider(&self, chain: Chain) -> Result<RootProvider<Ethereum>, String> {
-        self.provider(chain)
-            .await
-            .ok_or_else(|| format!("no RPC available for {}", chain.label()))
-    }
-
-    /// Resolve the cached fallback provider for `chain`. Used by every
-    /// `fallback_*` method; threads "no RPCs configured" / "URL parse
-    /// failure" through as `Err`.
-    async fn fallback_provider(&self, chain: Chain) -> Result<RootProvider<Ethereum>, String> {
-        let s = self.state_for(chain).lock().await;
-        s.fallback
-            .clone()
-            .ok_or_else(|| format!("no fallback RPC available for {}", chain.label()))
-    }
-
     /// Plain `eth_getBalance` against the chosen exec RPC. No proof, no
     /// verification — used during the cooldown window after a helios
     /// failure.
     async fn fallback_balance(&self, addr: Address, chain: Chain) -> Result<String, String> {
-        let provider = {
-            let s = self.state_for(chain).lock().await;
-            s.fallback.clone()
-        };
-        let Some(provider) = provider else {
-            self.set_status(chain, VerificationStatus::Unavailable);
-            return Err(format!("no fallback RPC available for {}", chain.label()));
+        let provider = match self.raw_provider(chain) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_status(chain, VerificationStatus::Unavailable);
+                return Err(e);
+            }
         };
         match provider.get_balance(addr).await {
             Ok(raw) => {
@@ -1073,13 +1107,17 @@ impl NetworkClient {
             }
             Err(e) => {
                 self.set_status(chain, VerificationStatus::Unavailable);
-                debug!(
+                let msg = redact_urls(&e.to_string());
+                // warn, not debug: both helios AND the raw path are now
+                // down — the user is looking at the `Unavailable` badge,
+                // so this is the log line that explains it.
+                warn!(
                     chain = %chain.label(),
                     addr = %short_address(addr),
-                    error = %e,
-                    "fallback balance failed",
+                    error = %msg,
+                    "raw-rpc balance failed; chain unavailable",
                 );
-                Err(e.to_string())
+                Err(msg)
             }
         }
     }
@@ -1104,11 +1142,55 @@ fn latest_from_rpc_header(header: &alloy_rpc_types_eth::Header) -> LatestBlock {
     }
 }
 
+/// Scrub every absolute URL in `s` down to `scheme://host/…`.
+///
+/// Alloy transport errors `Display` the full request URL (reqwest's
+/// `… for url (https://host/path?query)` form), and RPC providers
+/// routinely put the API key in the path (Alchemy, Infura) or query
+/// string (dRPC). Logging `{e}` verbatim — or threading `e.to_string()`
+/// into a UI-visible error — would leak the key. Keeping the host
+/// preserves the "which upstream failed" signal without the credential.
+/// The same discipline as `indexer::redact_url_in_err`, but applied to
+/// already-formatted strings since alloy's error types don't expose a
+/// `without_url()`.
+fn redact_urls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(pos) = rest.find("://") {
+        // Back up over the scheme (https, wss, …).
+        let scheme_start = rest[..pos]
+            .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '-' && c != '.')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        out.push_str(&rest[..scheme_start]);
+        let after = &rest[pos + 3..];
+        let host_end = after
+            .find(|c: char| {
+                c == '/' || c == '?' || c == '#' || c == ')' || c == '"' || c == '\'' || c.is_whitespace()
+            })
+            .unwrap_or(after.len());
+        out.push_str(&rest[scheme_start..pos + 3 + host_end]);
+        // Drop the path/query/fragment up to a natural terminator.
+        let tail = &after[host_end..];
+        let drop_end = tail
+            .find(|c: char| c == ')' || c == '"' || c == '\'' || c.is_whitespace())
+            .unwrap_or(tail.len());
+        if drop_end > 0 {
+            out.push_str("/…");
+        }
+        rest = &tail[drop_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn build_fallback(url: &str) -> Option<RootProvider<Ethereum>> {
     match url::Url::parse(url) {
         Ok(u) => Some(RootProvider::<Ethereum>::new_http(u)),
         Err(e) => {
-            error!(url = %url, error = %e, "cannot build fallback provider");
+            // The unparsable input may still contain a key fragment —
+            // scrub what we can rather than echoing it verbatim.
+            error!(url = %redact_urls(url), error = %e, "cannot build raw provider");
             None
         }
     }
@@ -1131,7 +1213,6 @@ fn pick_rpc(rpcs: &[String]) -> String {
 }
 
 fn shuffled(rpcs: &[String]) -> Vec<String> {
-    use rand::seq::SliceRandom;
     let mut out: Vec<String> = rpcs.to_vec();
     out.shuffle(&mut rand::thread_rng());
     out
@@ -1158,7 +1239,7 @@ async fn build_backend_with_consensus_fallback(
                 if !errors.is_empty() {
                     info!(
                         chain = %chain.label(),
-                        consensus_rpc = %cl,
+                        consensus_rpc = %redact_urls(cl),
                         prior_failures = errors.len(),
                         "consensus rpc succeeded after prior failures",
                     );
@@ -1166,8 +1247,11 @@ async fn build_backend_with_consensus_fallback(
                 return Ok(backend);
             }
             Err(e) => {
-                warn!(chain = %chain.label(), consensus_rpc = %cl, error = %e, "consensus rpc failed");
-                errors.push(format!("{cl}: {e}"));
+                let msg = redact_urls(&e);
+                warn!(chain = %chain.label(), consensus_rpc = %redact_urls(cl), error = %msg, "consensus rpc failed");
+                // The aggregate bubbles into a UI-visible error string,
+                // so the per-endpoint URL is scrubbed there too.
+                errors.push(format!("{}: {}", redact_urls(cl), msg));
             }
         }
     }
@@ -1720,6 +1804,86 @@ mod pure_tests {
         let a = current_snapshot(Chain::Mainnet);
         let b = current_snapshot(Chain::Mainnet);
         assert_eq!(a, b);
+    }
+
+    // ── cooldown / raw-state machine ─────────────────────────────────
+
+    #[test]
+    fn cooldown_starts_clear_and_flips_per_chain() {
+        let net = NetworkClient::new();
+        for chain in Chain::ALL {
+            assert!(!net.in_cooldown(chain), "{chain}: fresh client must not start cooled down");
+        }
+        net.start_cooldown(Chain::Base);
+        assert!(net.in_cooldown(Chain::Base));
+        // Per-chain isolation: a Base helios failure must not push
+        // Mainnet or Optimism onto the unverified path.
+        assert!(!net.in_cooldown(Chain::Mainnet));
+        assert!(!net.in_cooldown(Chain::Optimism));
+    }
+
+    #[tokio::test]
+    async fn invalidate_clears_cooldown_and_resets_status() {
+        let net = NetworkClient::new();
+        net.start_cooldown(Chain::Mainnet);
+        net.set_status(Chain::Mainnet, VerificationStatus::Fallback);
+        assert!(net.in_cooldown(Chain::Mainnet));
+        net.invalidate().await;
+        assert!(
+            !net.in_cooldown(Chain::Mainnet),
+            "invalidate must clear the cooldown so the next request retries helios",
+        );
+        for chain in Chain::ALL {
+            assert_eq!(net.last_status(chain), VerificationStatus::Connecting);
+        }
+    }
+
+    #[test]
+    fn last_status_defaults_to_connecting_for_all_chains() {
+        let net = NetworkClient::new();
+        for chain in Chain::ALL {
+            assert_eq!(net.last_status(chain), VerificationStatus::Connecting);
+        }
+    }
+
+    #[test]
+    fn raw_provider_resolves_for_mainnet_default_settings() {
+        // Mainnet always has at least the seeded default RPC, so the
+        // raw provider must build without a helios build ever running —
+        // this is the path the Safe scan and Transaction-Service reads
+        // depend on. Construction is lazy (no I/O here).
+        let net = NetworkClient::new();
+        assert!(net.raw_provider(Chain::Mainnet).is_ok());
+        // Second resolve hits the cache and must also succeed.
+        assert!(net.raw_provider(Chain::Mainnet).is_ok());
+    }
+
+    #[test]
+    fn redact_urls_strips_path_and_query_keeps_host() {
+        let s = "error sending request for url (https://eth-mainnet.g.alchemy.com/v2/SECRETKEY)";
+        let r = redact_urls(s);
+        assert!(!r.contains("SECRETKEY"), "key must be scrubbed: {r}");
+        assert!(r.contains("https://eth-mainnet.g.alchemy.com/…"));
+        assert!(r.ends_with(')'), "text after the URL must survive: {r}");
+    }
+
+    #[test]
+    fn redact_urls_strips_query_string_keys() {
+        let r = redact_urls("GET https://lb.drpc.org/ogrpc?network=ethereum&dkey=SECRET failed");
+        assert!(!r.contains("SECRET"));
+        assert_eq!(r, "GET https://lb.drpc.org/… failed");
+    }
+
+    #[test]
+    fn redact_urls_handles_multiple_urls_and_bare_hosts() {
+        let r = redact_urls("https://a.example/k1 then https://b.example then wss://c.example/k3");
+        assert_eq!(r, "https://a.example/… then https://b.example then wss://c.example/…");
+    }
+
+    #[test]
+    fn redact_urls_no_url_is_identity() {
+        assert_eq!(redact_urls("plain error, no urls"), "plain error, no urls");
+        assert_eq!(redact_urls(""), "");
     }
 
     #[test]
