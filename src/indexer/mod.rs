@@ -147,10 +147,31 @@ pub trait Indexer: Send + Sync + std::fmt::Debug {
 /// with `for url (...)` — would leak the key into any log line that
 /// surfaces the error.
 ///
+/// `without_url()` clears that keyed URL, but reqwest's own `Display` is
+/// then terse to the point of uselessness: a transport failure renders as
+/// just `"error sending request"` with no hint of *why* (DNS, connection
+/// refused, TLS, timeout). So we also walk the [`std::error::Error::source`]
+/// chain and append each underlying cause. Those inner hyper/io errors
+/// carry transport-level detail only — a host:port at most — and never the
+/// request URL's path or query, so surfacing them stays key-safe.
+///
 /// Always route reqwest errors through this helper instead of writing
 /// `format!("…: {e}")` directly. See `feedback_reqwest_url_leak.md`.
 pub(crate) fn redact_url_in_err(e: reqwest::Error) -> String {
-    e.without_url().to_string()
+    let e = e.without_url();
+    let mut msg = e.to_string();
+    let mut src = std::error::Error::source(&e);
+    while let Some(cause) = src {
+        let cause_msg = cause.to_string();
+        // Skip a cause that just restates the message already appended
+        // (some wrappers re-`Display` their inner error verbatim).
+        if !msg.ends_with(&cause_msg) {
+            msg.push_str(": ");
+            msg.push_str(&cause_msg);
+        }
+        src = cause.source();
+    }
+    msg
 }
 
 /// Shared `reqwest::Client` for every indexer impl. One TLS pool per process,
@@ -544,6 +565,20 @@ mod tests {
         let a = http_client();
         let b = http_client();
         assert!(std::ptr::eq(a, b));
+    }
+
+    #[test]
+    fn redact_appends_underlying_cause() {
+        // A builder error for a malformed URL wraps the url parse error as
+        // its `source()`. The helper must surface that cause instead of
+        // collapsing to reqwest's terse top-level message — that's the
+        // whole point of the verbose-logging change.
+        let err = http_client().get("not a url").build().unwrap_err();
+        let redacted = redact_url_in_err(err);
+        assert!(
+            redacted.contains(": "),
+            "expected an appended cause after the top-level message, got: {redacted:?}"
+        );
     }
 
     #[test]
