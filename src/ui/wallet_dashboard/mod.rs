@@ -39,10 +39,10 @@ mod tx_details;
 use account_dropdown::AccountDropdown;
 use contacts_settings::ContactsPane;
 use networks::NetworksPane;
-use safes_settings::SafesPane;
 use receive::ReceivePane;
 use safe_send::{SafeSendPane, SafeSendRequest};
 use safe_tx_detail::SafeTxDetailPane;
+use safes_settings::SafesPane;
 use send::SendPane;
 use swap::SwapPane;
 use tx_details::TxDetailsPane;
@@ -1682,8 +1682,7 @@ impl WalletScreen {
                         "safe-send: spawning broadcast task",
                     );
                     p.mark_busy();
-                    let pre_task =
-                        spawn_safe_broadcast_task(self.network.clone(), req, owner_keys);
+                    let pre_task = spawn_safe_broadcast_task(self.network.clone(), req, owner_keys);
                     return (pre_task, None);
                 }
                 if let safe_send::Message::Propose = &child_msg {
@@ -1731,9 +1730,7 @@ impl WalletScreen {
                 // hitting Retry) arms a one-shot request to compute and
                 // on-chain-verify the safeTxHash the user will sign.
                 let prepare_task = match p.take_pending_prepare() {
-                    Some((seq, req)) => {
-                        spawn_safe_prepare_task(self.network.clone(), seq, req)
-                    }
+                    Some((seq, req)) => spawn_safe_prepare_task(self.network.clone(), seq, req),
                     None => Task::none(),
                 };
                 let task = task.map(Message::SafeSend);
@@ -1752,8 +1749,7 @@ impl WalletScreen {
                         // pre-filled. `OpenContactsPaneWith` also runs
                         // the modal close animation, so the SafeSend
                         // modal tears down on the next chrome tick.
-                        let open_task =
-                            Task::done(Message::OpenContactsPaneWith { address, ens });
+                        let open_task = Task::done(Message::OpenContactsPaneWith { address, ens });
                         return (Task::batch([task, ens_task, prepare_task, open_task]), None);
                     }
                     None => return (Task::batch([task, ens_task, prepare_task]), None),
@@ -1766,8 +1762,7 @@ impl WalletScreen {
                         Ok(hash) => info!(hash = %format!("{hash:#x}"), "safe-send broadcast ok"),
                         Err(e) => warn!(error = %e, "safe-send broadcast failed"),
                     }
-                    let (task, _outcome) =
-                        p.update(safe_send::Message::BroadcastDone(result));
+                    let (task, _outcome) = p.update(safe_send::Message::BroadcastDone(result));
                     let refresh = if success {
                         Task::batch([
                             self.refresh_verification_task(),
@@ -1786,8 +1781,7 @@ impl WalletScreen {
                         Ok(()) => info!("safe-send propose ok"),
                         Err(e) => warn!(error = %e, "safe-send propose failed"),
                     }
-                    let (task, _outcome) =
-                        p.update(safe_send::Message::ProposeDone(result));
+                    let (task, _outcome) = p.update(safe_send::Message::ProposeDone(result));
                     // On success refresh the pending queue so the new
                     // proposal shows up the moment the user closes.
                     let refresh = if success {
@@ -1813,8 +1807,7 @@ impl WalletScreen {
                 let threshold = safe.threshold;
                 let version = safe.version.clone();
                 let service_base = safe.tx_service_base().to_string();
-                let owners: Vec<Address> =
-                    safe.owners.iter().map(|o| Address::from(*o)).collect();
+                let owners: Vec<Address> = safe.owners.iter().map(|o| Address::from(*o)).collect();
                 let signable: Vec<Address> = self
                     .safe_signable_owners(safe)
                     .into_iter()
@@ -1937,7 +1930,7 @@ impl WalletScreen {
                         self.mark_safe_detail_busy();
                         let Some(owner_desc) = owner_desc else {
                             self.set_safe_detail_result(Err(
-                                "no linked owner left to sign with".to_string(),
+                                "no linked owner left to sign with".to_string()
                             ));
                             return (task, None);
                         };
@@ -1999,8 +1992,7 @@ impl WalletScreen {
                         } else {
                             None
                         };
-                        let Some((safe, chain, nonce, owner, version, service_base)) = prep
-                        else {
+                        let Some((safe, chain, nonce, owner, version, service_base)) = prep else {
                             return (task, None);
                         };
                         // Same version gate as Confirm — a rejection is
@@ -2014,7 +2006,7 @@ impl WalletScreen {
                         self.mark_safe_detail_busy();
                         let Some(owner_desc) = owner_desc else {
                             self.set_safe_detail_result(Err(
-                                "no linked owner available to reject".to_string(),
+                                "no linked owner available to reject".to_string()
                             ));
                             return (task, None);
                         };
@@ -2263,7 +2255,13 @@ impl WalletScreen {
             Modal::Receive(p) => p.view(t, self.chrome.progress()).map(Message::Receive),
             Modal::Swap(p) => p.view(t, self.chrome.progress()).map(Message::Swap),
             Modal::AccountDropdown(d) => d
-                .view(t, &self.accounts, &self.safes, self.active_index, self.active_safe)
+                .view(
+                    t,
+                    &self.accounts,
+                    &self.safes,
+                    self.active_index,
+                    self.active_safe,
+                )
                 .map(Message::AccountDropdown),
             Modal::TxDetails(p) => {
                 let tx_book = match self.contacts.read() {
@@ -2281,9 +2279,7 @@ impl WalletScreen {
                 p.view(t, picker, self.chrome.progress())
                     .map(Message::SafeSend)
             }
-            Modal::SafeTxDetail(p) => {
-                p.view(t, self.chrome.progress()).map(Message::SafeTxDetail)
-            }
+            Modal::SafeTxDetail(p) => p.view(t, self.chrome.progress()).map(Message::SafeTxDetail),
         };
         let composed: Element<'_, Message> = stack![background, modal_layer].into();
 
@@ -2723,7 +2719,10 @@ fn signable_owners_of(
 }
 
 /// The descriptor whose address matches `addr`, if the wallet holds it.
-fn owner_desc_by_address(addr: Address, accounts: &[AccountDescriptor]) -> Option<AccountDescriptor> {
+fn owner_desc_by_address(
+    addr: Address,
+    accounts: &[AccountDescriptor],
+) -> Option<AccountDescriptor> {
     accounts
         .iter()
         .find(|a| account_address(a) == Some(addr))
@@ -2758,8 +2757,7 @@ fn spawn_safe_prepare_task(
         async move {
             let result: Result<(u64, B256), String> = async {
                 ensure_signable_version(&req.version)?;
-                let nonce =
-                    current_safe_nonce(network.as_ref(), req.safe_address, chain).await?;
+                let nonce = current_safe_nonce(network.as_ref(), req.safe_address, chain).await?;
                 let tx = build_safe_tx_with_nonce(
                     SafeTxInput {
                         to: req.to,
@@ -2829,8 +2827,7 @@ async fn rebuild_reviewed_safe_tx(
         // the invariant "we sign only what was displayed" must hold.
         return Err("safe-tx differs from the reviewed hash — refusing to sign".to_string());
     }
-    verify_safe_tx_before_signing(network, &tx, req.safe_address, req.chain, local_hash)
-        .await?;
+    verify_safe_tx_before_signing(network, &tx, req.safe_address, req.chain, local_hash).await?;
     Ok((tx, domain, local_hash))
 }
 
@@ -2929,8 +2926,7 @@ fn spawn_safe_propose_task(
     let chain = req.chain;
     Task::perform(
         async move {
-            let (tx, domain, local) =
-                rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
+            let (tx, domain, local) = rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
             let (sender, sig) = sign_owner(&signer, &tx, &domain, local).await?;
             crate::safe::service::propose(
@@ -2990,7 +2986,9 @@ fn spawn_safe_confirm_task(
     tx: crate::safe::SafeTx,
     safe_tx_hash: B256,
 ) -> Task<Message> {
-    use crate::safe::tx::{safe_domain, safe_tx_hash as compute_hash, sign_owner, verify_safe_tx_before_signing};
+    use crate::safe::tx::{
+        safe_domain, safe_tx_hash as compute_hash, sign_owner, verify_safe_tx_before_signing,
+    };
     Task::perform(
         async move {
             let domain = safe_domain(safe, chain);
@@ -3306,8 +3304,7 @@ mod tests {
 
     #[test]
     fn display_address_returns_safe_addr_when_active_safe_set() {
-        let mut screen =
-            screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
         assert_eq!(screen.display_address(), addr(1));
         screen.active_safe = Some(0);
         assert_eq!(screen.display_address(), Address::from([0x55u8; 20]));
@@ -3315,8 +3312,7 @@ mod tests {
 
     #[test]
     fn select_safe_outcome_enters_safe_mode_and_resets_history() {
-        let mut screen =
-            screen_with_safes(addr(1), vec![safe_descriptor(0x77, 1)]);
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x77, 1)]);
         screen.history.push(IndexedTx {
             hash: alloy::primitives::B256::ZERO,
             block_number: 1,
@@ -3341,7 +3337,10 @@ mod tests {
             account_dropdown::Message::SelectSafe(0),
         ));
         assert_eq!(screen.active_safe, Some(0));
-        assert!(screen.history.is_empty(), "history should clear on Safe entry");
+        assert!(
+            screen.history.is_empty(),
+            "history should clear on Safe entry"
+        );
         assert!(!screen.history_loaded);
     }
 
@@ -3386,8 +3385,10 @@ mod tests {
     #[test]
     fn allowed_chains_in_safe_mode_returns_only_safe_chain() {
         // Mainnet Safe — only Mainnet shows.
-        let mut screen =
-            screen_with_safes(addr(1), vec![safe_descriptor(0x55, Chain::Mainnet.chain_id())]);
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x55, Chain::Mainnet.chain_id())],
+        );
         screen.active_safe = Some(0);
         assert_eq!(screen.allowed_chains(), vec![Chain::Mainnet]);
 
@@ -3479,8 +3480,7 @@ mod tests {
 
     #[test]
     fn switch_account_outcome_exits_safe_mode_and_resets_history() {
-        let mut screen =
-            screen_with_safes(addr(1), vec![safe_descriptor(0x77, 1)]);
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x77, 1)]);
         screen.active_safe = Some(0);
         screen.history_loaded = true;
         screen.modal = Modal::AccountDropdown(AccountDropdown::new());
@@ -3789,9 +3789,7 @@ mod tests {
     use crate::net::CallMock;
     use alloy::sol_types::{SolCall, SolValue};
 
-    fn reviewed_req(
-        prepared: Option<safe_send::PreparedSafeTx>,
-    ) -> safe_send::SafeSendRequest {
+    fn reviewed_req(prepared: Option<safe_send::PreparedSafeTx>) -> safe_send::SafeSendRequest {
         safe_send::SafeSendRequest {
             safe_address: addr(0x5A),
             chain: Chain::Mainnet,
@@ -3901,9 +3899,7 @@ mod tests {
         // Contract agrees on both pre-sign checks.
         mock.set_call(
             safe,
-            alloy::primitives::Bytes::from(
-                crate::safe::domainSeparatorCall {}.abi_encode(),
-            ),
+            alloy::primitives::Bytes::from(crate::safe::domainSeparatorCall {}.abi_encode()),
             alloy::primitives::Bytes::from(
                 safe_domain(safe, Chain::Mainnet).separator().abi_encode(),
             ),
@@ -3929,8 +3925,7 @@ mod tests {
             alloy::primitives::Bytes::from(local_hash.abi_encode()),
             true,
         );
-        let (got_tx, _domain, got_hash) =
-            rebuild_reviewed_safe_tx(&mock, &req).await.unwrap();
+        let (got_tx, _domain, got_hash) = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap();
         assert_eq!(got_hash, local_hash);
         assert_eq!(got_tx.to, tx.to);
         assert_eq!(got_tx.value, tx.value);
@@ -3953,9 +3948,7 @@ mod tests {
         plant_safe_nonce(&mock, safe, 7);
         mock.set_call(
             safe,
-            alloy::primitives::Bytes::from(
-                crate::safe::domainSeparatorCall {}.abi_encode(),
-            ),
+            alloy::primitives::Bytes::from(crate::safe::domainSeparatorCall {}.abi_encode()),
             alloy::primitives::Bytes::from(
                 crate::safe::tx::safe_domain(safe, Chain::Mainnet)
                     .separator()

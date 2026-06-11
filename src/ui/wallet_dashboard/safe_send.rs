@@ -359,7 +359,9 @@ impl SafeSendPane {
     /// safeTxHash is on screen (`prepared`): nothing gets signed that
     /// the user couldn't verify.
     fn can_execute_now(&self) -> bool {
-        !self.busy && !self.settled() && self.has_enough_local_signers()
+        !self.busy
+            && !self.settled()
+            && self.has_enough_local_signers()
             && self.can_continue_from_compose()
             && self.prepared.is_some()
     }
@@ -367,8 +369,7 @@ impl SafeSendPane {
     /// "Propose to co-signers" is reachable with a single signable owner,
     /// once the reviewed safeTxHash is on screen.
     fn can_propose(&self) -> bool {
-        !self.busy && !self.settled() && self.can_continue_from_compose()
-            && self.prepared.is_some()
+        !self.busy && !self.settled() && self.can_continue_from_compose() && self.prepared.is_some()
     }
 
     /// Reset the pinned hash and bump the seq so any in-flight prep
@@ -414,9 +415,10 @@ impl SafeSendPane {
             threshold: self.threshold,
             linked_local_indices: self.linked_local_indices.clone(),
             signable_indices: self.signable_indices.clone(),
-            prepared: self
-                .prepared
-                .map(|(nonce, safe_tx_hash)| PreparedSafeTx { nonce, safe_tx_hash }),
+            prepared: self.prepared.map(|(nonce, safe_tx_hash)| PreparedSafeTx {
+                nonce,
+                safe_tx_hash,
+            }),
         })
     }
 
@@ -722,7 +724,10 @@ impl SafeSendPane {
                 row![
                     text("✓ valid address").size(11).color(t.up).font(bold()),
                     Space::new().width(8),
-                    text(short_address(*addr)).size(11).color(t.sub).font(mono()),
+                    text(short_address(*addr))
+                        .size(11)
+                        .color(t.sub)
+                        .font(mono()),
                 ]
                 .align_y(Alignment::Center),
             )
@@ -731,8 +736,14 @@ impl SafeSendPane {
             Resolution::AddressVerifying { pinned, name } => container(
                 column![
                     row![
-                        text(format!("✓ {name}  ·  ")).size(11).color(t.up).font(bold()),
-                        text(short_address(*pinned)).size(11).color(t.sub).font(mono()),
+                        text(format!("✓ {name}  ·  "))
+                            .size(11)
+                            .color(t.up)
+                            .font(bold()),
+                        text(short_address(*pinned))
+                            .size(11)
+                            .color(t.sub)
+                            .font(mono()),
                     ]
                     .align_y(Alignment::Center),
                     text("(verifying ENS…)").size(10).color(t.sub),
@@ -743,8 +754,14 @@ impl SafeSendPane {
             .into(),
             Resolution::Resolved { name, addr } => container(
                 row![
-                    text(format!("✓ {name} →  ")).size(11).color(t.up).font(bold()),
-                    text(short_address(*addr)).size(11).color(t.sub).font(mono()),
+                    text(format!("✓ {name} →  "))
+                        .size(11)
+                        .color(t.up)
+                        .font(bold()),
+                    text(short_address(*addr))
+                        .size(11)
+                        .color(t.sub)
+                        .font(mono()),
                 ]
                 .align_y(Alignment::Center),
             )
@@ -789,11 +806,17 @@ impl SafeSendPane {
                     vspace(4),
                     row![
                         text("pinned: ").size(11).color(t.sub),
-                        text(short_address(*pinned)).size(11).color(t.sub).font(mono()),
+                        text(short_address(*pinned))
+                            .size(11)
+                            .color(t.sub)
+                            .font(mono()),
                     ],
                     row![
                         text("now:    ").size(11).color(t.sub),
-                        text(short_address(*fresh)).size(11).color(t.text).font(mono()),
+                        text(short_address(*fresh))
+                            .size(11)
+                            .color(t.text)
+                            .font(mono()),
                     ],
                     vspace(6),
                     secondary_button(t, "Use new address").on_press(Message::AcceptEnsDivergence),
@@ -925,7 +948,11 @@ impl SafeSendPane {
         content.into()
     }
 
-    fn view_review<'a>(&'a self, t: KaoTheme, recipient_name: Option<String>) -> Element<'a, Message> {
+    fn view_review<'a>(
+        &'a self,
+        t: KaoTheme,
+        recipient_name: Option<String>,
+    ) -> Element<'a, Message> {
         let recipient = self.resolution.recipient().unwrap_or(Address::ZERO);
         let amount_wei = self.parsed_amount().unwrap_or(U256::ZERO);
         let amount_str = format_units(amount_wei, 18).unwrap_or_else(|_| "?".into());
@@ -956,7 +983,10 @@ impl SafeSendPane {
                 None
             }
         });
-        let mut to_col = column![text("To").size(11).color(t.sub).font(mono_bold()), vspace(4)];
+        let mut to_col = column![
+            text("To").size(11).color(t.sub).font(mono_bold()),
+            vspace(4)
+        ];
         if let Some(name) = header_label {
             to_col = to_col.push(text(name).size(13).color(t.text).font(bold()));
             to_col = to_col.push(vspace(4));
@@ -982,7 +1012,10 @@ impl SafeSendPane {
                 row![
                     avatar(t, kao, 26.0, t.ab1),
                     Space::new().width(8),
-                    text(short_address(*addr)).size(12).color(t.text).font(mono()),
+                    text(short_address(*addr))
+                        .size(12)
+                        .color(t.text)
+                        .font(mono()),
                 ]
                 .align_y(Alignment::Center),
             );
@@ -1100,7 +1133,11 @@ impl SafeSendPane {
             let can_exec = self.can_execute_now();
             let mut exec_btn = primary_button(
                 t,
-                if self.busy { "Signing & sending…" } else { "Sign & execute now" },
+                if self.busy {
+                    "Signing & sending…"
+                } else {
+                    "Sign & execute now"
+                },
                 can_exec,
             );
             if can_exec {
@@ -1133,7 +1170,11 @@ impl SafeSendPane {
         content.into()
     }
 
-    fn view_success<'a>(&'a self, t: KaoTheme, recipient_name: Option<String>) -> Element<'a, Message> {
+    fn view_success<'a>(
+        &'a self,
+        t: KaoTheme,
+        recipient_name: Option<String>,
+    ) -> Element<'a, Message> {
         let amount_wei = self.parsed_amount().unwrap_or(U256::ZERO);
         let amount_str = format_units(amount_wei, 18).unwrap_or_else(|_| "?".into());
         let recipient = self.resolution.recipient().unwrap_or(Address::ZERO);
@@ -1335,7 +1376,10 @@ fn safe_summary<'a>(t: KaoTheme, safe: Address, chain: Chain) -> Element<'a, Mes
         Space::new().width(10),
         column![
             text("From Safe").size(11).color(t.sub).font(mono_bold()),
-            text(chain.display_name()).size(12).color(t.text).font(bold()),
+            text(chain.display_name())
+                .size(12)
+                .color(t.text)
+                .font(bold()),
         ]
         .spacing(2)
         .width(Length::Fill),
@@ -1478,11 +1522,16 @@ fn unsupported_chain_banner<'a>(t: KaoTheme, chain_id: u64) -> Element<'a, Messa
 }
 
 fn error_banner<'a>(t: KaoTheme, msg: &str) -> Element<'a, Message> {
-    container(text(format!("(╥﹏╥) {msg}")).size(12).color(t.down).font(bold()))
-        .padding(Padding::from([10, 4]))
-        .width(Length::Fill)
-        .center_x(Length::Fill)
-        .into()
+    container(
+        text(format!("(╥﹏╥) {msg}"))
+            .size(12)
+            .color(t.down)
+            .font(bold()),
+    )
+    .padding(Padding::from([10, 4]))
+    .width(Length::Fill)
+    .center_x(Length::Fill)
+    .into()
 }
 
 fn banner<'a>(
@@ -1713,7 +1762,10 @@ mod tests {
         // Default Safe → public gateway.
         let pane = ready_pane();
         let req = pane.outgoing_request().unwrap();
-        assert_eq!(req.service_base, crate::safe::service::DEFAULT_TX_SERVICE_BASE);
+        assert_eq!(
+            req.service_base,
+            crate::safe::service::DEFAULT_TX_SERVICE_BASE
+        );
 
         // Custom mirror on the descriptor → the propose path POSTs there.
         let accounts = vec![local_account(1)];
@@ -1909,7 +1961,10 @@ mod tests {
             Some(Outcome::CopyText(s)) => s,
             other => panic!("expected CopyText, got {other:?}"),
         };
-        assert!(url.starts_with("https://eth.blockscout.com/tx/0x"), "got {url}");
+        assert!(
+            url.starts_with("https://eth.blockscout.com/tx/0x"),
+            "got {url}"
+        );
     }
 
     // ── ENS / contacts integration ────────────────────────────────────
@@ -2040,7 +2095,12 @@ mod tests {
             Some(Outcome::SaveAsContact { address, ens }) => (address, ens),
             other => panic!("expected SaveAsContact, got {other:?}"),
         };
-        assert_eq!(addr, "0x000000000000000000000000000000000000dEaD".parse::<Address>().unwrap());
+        assert_eq!(
+            addr,
+            "0x000000000000000000000000000000000000dEaD"
+                .parse::<Address>()
+                .unwrap()
+        );
         assert!(ens.is_none());
     }
 
@@ -2072,14 +2132,18 @@ mod tests {
         let req = pane.outgoing_request().unwrap();
         assert_eq!(
             req.to,
-            "0x000000000000000000000000000000000000dEaD".parse::<Address>().unwrap()
+            "0x000000000000000000000000000000000000dEaD"
+                .parse::<Address>()
+                .unwrap()
         );
         // Bumping the seq via a fresh hex input keeps things in sync.
         pane.set_to("0x000000000000000000000000000000000000beef".into());
         let req = pane.outgoing_request().unwrap();
         assert_eq!(
             req.to,
-            "0x000000000000000000000000000000000000bEEf".parse::<Address>().unwrap()
+            "0x000000000000000000000000000000000000bEEf"
+                .parse::<Address>()
+                .unwrap()
         );
     }
 }

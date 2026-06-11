@@ -338,10 +338,7 @@ fn map_raw(raw: RawMultisigTx, threshold: u32, current_nonce: u64) -> Option<Pen
 /// leave an opaque `HTTP 422`. The body is service-authored text about
 /// our own request — no URL, no key — so it's safe to surface, truncated
 /// so a misbehaving upstream can't flood the log.
-async fn check_status(
-    context: &str,
-    resp: reqwest::Response,
-) -> Result<reqwest::Response, String> {
+async fn check_status(context: &str, resp: reqwest::Response) -> Result<reqwest::Response, String> {
     let status = resp.status();
     if status.is_success() {
         return Ok(resp);
@@ -353,7 +350,11 @@ async fn check_status(
     } else {
         const MAX_BODY: usize = 300;
         let detail: String = body.chars().take(MAX_BODY).collect();
-        let ellipsis = if body.chars().count() > MAX_BODY { "…" } else { "" };
+        let ellipsis = if body.chars().count() > MAX_BODY {
+            "…"
+        } else {
+            ""
+        };
         Err(format!("{context}: HTTP {status} — {detail}{ellipsis}"))
     }
 }
@@ -397,7 +398,12 @@ pub async fn fetch_pending(
         .await?
         .json()
         .await
-        .map_err(|e| format!("safe-service decode: {}", crate::indexer::redact_url_in_err(e)))?;
+        .map_err(|e| {
+            format!(
+                "safe-service decode: {}",
+                crate::indexer::redact_url_in_err(e)
+            )
+        })?;
     let mut out: Vec<PendingSafeTx> = page
         .results
         .into_iter()
@@ -479,7 +485,12 @@ pub async fn fetch_detail(
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("safe-service GET detail: {}", crate::indexer::redact_url_in_err(e)))?;
+        .map_err(|e| {
+            format!(
+                "safe-service GET detail: {}",
+                crate::indexer::redact_url_in_err(e)
+            )
+        })?;
     let raw: RawMultisigTx = check_status("safe-service detail", resp)
         .await?
         .json()
@@ -493,7 +504,10 @@ pub async fn fetch_detail(
 
     let tx = raw_to_safe_tx(&raw).ok_or("safe-service: unparsable tx detail")?;
     let nonce = u64::try_from(tx.nonce).unwrap_or(u64::MAX);
-    let required = raw.confirmations_required.unwrap_or(threshold as u64).max(1);
+    let required = raw
+        .confirmations_required
+        .unwrap_or(threshold as u64)
+        .max(1);
     let confirmations: Vec<ServiceConfirmation> = raw
         .confirmations
         .iter()
@@ -588,7 +602,12 @@ pub async fn propose(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("safe-service propose: {}", crate::indexer::redact_url_in_err(e)))?;
+        .map_err(|e| {
+            format!(
+                "safe-service propose: {}",
+                crate::indexer::redact_url_in_err(e)
+            )
+        })?;
     check_status("safe-service propose", resp).await?;
     Ok(())
 }
@@ -609,7 +628,12 @@ pub async fn confirm(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("safe-service confirm: {}", crate::indexer::redact_url_in_err(e)))?;
+        .map_err(|e| {
+            format!(
+                "safe-service confirm: {}",
+                crate::indexer::redact_url_in_err(e)
+            )
+        })?;
     check_status("safe-service confirm", resp).await?;
     Ok(())
 }
@@ -622,21 +646,39 @@ mod tests {
     fn fsm_awaiting_confirmations_below_threshold() {
         // 1 of 2 sigs, nonce is the live one → still needs signatures.
         let s = derive_state(1, 2, 5, false, None, 5);
-        assert_eq!(s, SafeTxState::AwaitingConfirmations { have: 1, required: 2 });
+        assert_eq!(
+            s,
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2
+            }
+        );
     }
 
     #[test]
     fn fsm_awaiting_execution_is_next_when_nonce_current() {
         // Threshold met and nonce == current → executable now.
         let s = derive_state(2, 2, 5, false, None, 5);
-        assert_eq!(s, SafeTxState::AwaitingExecution { required: 2, is_next: true });
+        assert_eq!(
+            s,
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: true
+            }
+        );
     }
 
     #[test]
     fn fsm_awaiting_execution_blocked_behind_earlier_nonce() {
         // Threshold met but an earlier nonce hasn't gone yet.
         let s = derive_state(3, 2, 7, false, None, 5);
-        assert_eq!(s, SafeTxState::AwaitingExecution { required: 2, is_next: false });
+        assert_eq!(
+            s,
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: false
+            }
+        );
     }
 
     #[test]
@@ -693,7 +735,10 @@ mod tests {
         // 1 parsable confirmation against the fallback threshold of 3.
         assert_eq!(
             tx.state,
-            SafeTxState::AwaitingConfirmations { have: 1, required: 3 }
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 3
+            }
         );
     }
 
@@ -730,10 +775,16 @@ mod tests {
         assert_eq!(tx.nonce, 9);
         assert_eq!(tx.value, U256::from(1_000_000_000_000_000_000u128));
         assert!(tx.data.is_empty());
-        assert_eq!(tx.submission_ts, crate::indexer::parse_iso8601("2026-01-15T10:30:00Z"));
+        assert_eq!(
+            tx.submission_ts,
+            crate::indexer::parse_iso8601("2026-01-15T10:30:00Z")
+        );
         assert_eq!(
             tx.state,
-            SafeTxState::AwaitingConfirmations { have: 1, required: 2 }
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2
+            }
         );
     }
 
@@ -778,7 +829,9 @@ mod tests {
         let err = check_status("ctx", response(503, "")).await.unwrap_err();
         assert_eq!(err, "ctx: HTTP 503 Service Unavailable");
         // Whitespace-only bodies collapse to the same shape.
-        let err = check_status("ctx", response(503, "  \n")).await.unwrap_err();
+        let err = check_status("ctx", response(503, "  \n"))
+            .await
+            .unwrap_err();
         assert_eq!(err, "ctx: HTTP 503 Service Unavailable");
     }
 
@@ -845,7 +898,10 @@ mod tests {
         let tx = map_raw(raw, 3, 5).unwrap();
         assert_eq!(
             tx.state,
-            SafeTxState::AwaitingExecution { required: 1, is_next: true }
+            SafeTxState::AwaitingExecution {
+                required: 1,
+                is_next: true
+            }
         );
     }
 
@@ -889,7 +945,10 @@ mod tests {
             confirmations_url(base, hash, Chain::Base),
             propose_url(base, safe, Chain::Base),
         ] {
-            assert!(url.starts_with("https://txs.example-dao.org/tx-service/base/"), "{url}");
+            assert!(
+                url.starts_with("https://txs.example-dao.org/tx-service/base/"),
+                "{url}"
+            );
             assert!(!url.contains("api.safe.global"), "{url}");
         }
     }
@@ -917,7 +976,10 @@ mod tests {
         assert_eq!(normalize_service_base("   ").unwrap(), None);
         // Typing the default collapses to "no override" so the store
         // never pins the public gateway as if it were a custom mirror.
-        assert_eq!(normalize_service_base(DEFAULT_TX_SERVICE_BASE).unwrap(), None);
+        assert_eq!(
+            normalize_service_base(DEFAULT_TX_SERVICE_BASE).unwrap(),
+            None
+        );
         assert_eq!(
             normalize_service_base("https://api.safe.global/").unwrap(),
             None,
@@ -1085,10 +1147,9 @@ mod tests {
             refundReceiver: Address::ZERO,
             nonce: U256::from(7u64),
         };
-        let safe_tx_hash =
-            "0xbb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8"
-                .parse::<B256>()
-                .unwrap();
+        let safe_tx_hash = "0xbb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8"
+            .parse::<B256>()
+            .unwrap();
         let sender = Address::repeat_byte(0x22);
         let sig = Bytes::from(vec![0xAAu8; 65]);
         let body = ProposeBody {
@@ -1157,14 +1218,20 @@ mod tests {
     fn parse_u256_field_handles_null_empty_garbage() {
         assert_eq!(parse_u256_field(&None), U256::ZERO);
         assert_eq!(parse_u256_field(&Some(String::new())), U256::ZERO);
-        assert_eq!(parse_u256_field(&Some("not-a-number".to_string())), U256::ZERO);
+        assert_eq!(
+            parse_u256_field(&Some("not-a-number".to_string())),
+            U256::ZERO
+        );
         assert_eq!(parse_u256_field(&Some("42".to_string())), U256::from(42u64));
     }
 
     #[test]
     fn parse_addr_field_handles_null_and_valid() {
         assert_eq!(parse_addr_field(&None), Address::ZERO);
-        assert_eq!(parse_addr_field(&Some("garbage".to_string())), Address::ZERO);
+        assert_eq!(
+            parse_addr_field(&Some("garbage".to_string())),
+            Address::ZERO
+        );
         let a = parse_addr_field(&Some(
             "0x000000000000000000000000000000000000dEaD".to_string(),
         ));
@@ -1248,7 +1315,10 @@ mod tests {
                 refundReceiver: Address::ZERO,
                 nonce: U256::ZERO,
             },
-            state: SafeTxState::AwaitingConfirmations { have: 2, required: 3 },
+            state: SafeTxState::AwaitingConfirmations {
+                have: 2,
+                required: 3,
+            },
             confirmations: vec![
                 ServiceConfirmation {
                     owner: Address::repeat_byte(0x11),

@@ -62,7 +62,8 @@ pub fn view<'a>(
     // leaves the slice empty / flags false in EOA mode). Sits between the
     // quick actions and the asset list so a queued multisig tx is the
     // first thing an owner sees.
-    if let Some(section) = pending_section(t, safe_pending, safe_pending_loading, safe_pending_error)
+    if let Some(section) =
+        pending_section(t, safe_pending, safe_pending_loading, safe_pending_error)
     {
         content = content.push(Space::new().height(18)).push(section);
     }
@@ -137,19 +138,21 @@ fn refresh_button<'a>(t: KaoTheme, refreshing: bool) -> Element<'a, Message> {
     };
     let label = text(glyph).size(11).color(color).font(bold());
     let bg = Color::TRANSPARENT;
-    let mut b = button(container(label).padding(Padding::from([3, 8])))
-        .style(move |_theme, status| button::Style {
-            background: Some(Background::Color(match status {
-                button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
-                _ => bg,
-            })),
-            text_color: color,
-            border: Border {
-                color: with_alpha(color, 0.25),
-                width: 1.0,
-                radius: Radius::from(8),
-            },
-            ..button::Style::default()
+    let mut b =
+        button(container(label).padding(Padding::from([3, 8]))).style(move |_theme, status| {
+            button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
+                    _ => bg,
+                })),
+                text_color: color,
+                border: Border {
+                    color: with_alpha(color, 0.25),
+                    width: 1.0,
+                    radius: Radius::from(8),
+                },
+                ..button::Style::default()
+            }
         });
     if !refreshing {
         b = b.on_press(Message::RefreshPortfolio);
@@ -215,7 +218,11 @@ fn pending_row<'a>(t: KaoTheme, tx: &PendingSafeTx, now: u64, idx: usize) -> Ele
     };
 
     let meta = if tx.submission_ts > 0 {
-        format!("nonce {} · {}", tx.nonce, format_relative(now, tx.submission_ts))
+        format!(
+            "nonce {} · {}",
+            tx.nonce,
+            format_relative(now, tx.submission_ts)
+        )
     } else {
         format!("nonce {}", tx.nonce)
     };

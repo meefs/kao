@@ -60,7 +60,10 @@ pub fn view<'a>(
         .into();
 
     let net_row = row![
-        text(network_label.to_string()).size(11).color(t.sub).font(mono()),
+        text(network_label.to_string())
+            .size(11)
+            .color(t.sub)
+            .font(mono()),
         Space::new().width(8),
         verification_badge(t, verification),
     ]

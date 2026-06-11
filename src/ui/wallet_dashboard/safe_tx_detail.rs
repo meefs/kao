@@ -21,7 +21,7 @@ use crate::safe::service::{PendingSafeTx, SafeTxDetail, SafeTxState};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     bold, colored_address, colored_hash, kao_fit, kao_scrollable_style, modal_wrapper, mono,
-    mono_bold, mono_black, primary_button, secondary_button,
+    mono_black, mono_bold, primary_button, secondary_button,
 };
 use crate::wallet::short_address;
 
@@ -226,8 +226,7 @@ impl SafeTxDetailPane {
     }
 
     pub fn view<'a>(&'a self, t: KaoTheme, progress: f32) -> Element<'a, Message> {
-        let is_rejection =
-            self.pending.to == self.safe && self.pending.value.is_zero();
+        let is_rejection = self.pending.to == self.safe && self.pending.value.is_zero();
 
         let header_kao = container(kao_fit(t, "(￣ー￣)ゞ", 220.0, 48.0))
             .width(Length::Fill)
@@ -274,13 +273,13 @@ impl SafeTxDetailPane {
             fields = fields.push(operation_warning(t, operation));
         }
         if !is_rejection {
-            fields = fields.push(field(
-                t,
-                "To",
-                colored_address(t, self.pending.to),
-            ));
+            fields = fields.push(field(t, "To", colored_address(t, self.pending.to)));
         }
-        fields = fields.push(simple_field(t, "Network", self.chain.display_name().to_string()));
+        fields = fields.push(simple_field(
+            t,
+            "Network",
+            self.chain.display_name().to_string(),
+        ));
         fields = fields.push(simple_field(t, "Nonce", self.pending.nonce.to_string()));
 
         // The full safeTxHash, chunked and coloured like addresses.
@@ -351,7 +350,10 @@ impl SafeTxDetailPane {
     fn owners_block<'a>(&'a self, t: KaoTheme) -> Element<'a, Message> {
         let label = text(format!(
             "OWNERS ({} of {})",
-            self.detail.as_ref().map(|d| d.owners_signed().len()).unwrap_or(0),
+            self.detail
+                .as_ref()
+                .map(|d| d.owners_signed().len())
+                .unwrap_or(0),
             self.detail
                 .as_ref()
                 .map(|d| d.confirmations_required)
@@ -364,7 +366,12 @@ impl SafeTxDetailPane {
         let mut col = column![label, Space::new().height(8)].width(Length::Fill);
 
         if self.loading {
-            col = col.push(text("Loading signatures…").size(12).color(t.sub).font(mono()));
+            col = col.push(
+                text("Loading signatures…")
+                    .size(12)
+                    .color(t.sub)
+                    .font(mono()),
+            );
             return col.into();
         }
         let signed = self
@@ -641,7 +648,11 @@ mod tests {
 
     /// Pane with two Safe owners; `signable` are the ones this wallet
     /// controls. `has_exec` toggles the local gas payer.
-    fn pane(signable: Vec<Address>, has_exec: bool, pending_state: SafeTxState) -> SafeTxDetailPane {
+    fn pane(
+        signable: Vec<Address>,
+        has_exec: bool,
+        pending_state: SafeTxState,
+    ) -> SafeTxDetailPane {
         SafeTxDetailPane::new(
             Address::ZERO,
             Chain::Mainnet,
@@ -659,10 +670,16 @@ mod tests {
         let mut p = pane(
             vec![owner(0x11), owner(0x22)],
             true,
-            SafeTxState::AwaitingConfirmations { have: 1, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
         );
         p.set_detail(Ok(detail(
-            SafeTxState::AwaitingConfirmations { have: 1, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
             vec![owner(0x11)],
         )));
         assert_eq!(p.unsigned_signable(), vec![owner(0x22)]);
@@ -673,7 +690,10 @@ mod tests {
         let p = pane(
             vec![owner(0x11)],
             true,
-            SafeTxState::AwaitingConfirmations { have: 0, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 0,
+                required: 2,
+            },
         );
         assert!(p.unsigned_signable().is_empty());
     }
@@ -685,15 +705,24 @@ mod tests {
         let mut p = pane(
             vec![owner(0x11)],
             true,
-            SafeTxState::AwaitingConfirmations { have: 1, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
         );
         p.set_detail(Ok(detail(
-            SafeTxState::AwaitingExecution { required: 2, is_next: true },
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: true,
+            },
             vec![owner(0x11), owner(0x22)],
         )));
         assert_eq!(
             p.effective_state(),
-            SafeTxState::AwaitingExecution { required: 2, is_next: true }
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: true
+            }
         );
     }
 
@@ -702,10 +731,16 @@ mod tests {
         let mut p = pane(
             vec![owner(0x22)],
             true,
-            SafeTxState::AwaitingConfirmations { have: 1, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
         );
         p.set_detail(Ok(detail(
-            SafeTxState::AwaitingConfirmations { have: 1, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
             vec![owner(0x11)],
         )));
         // (confirm, execute, reject): signable owner 0x22 hasn't signed →
@@ -718,10 +753,16 @@ mod tests {
         let mut p = pane(
             vec![owner(0x11)],
             true,
-            SafeTxState::AwaitingExecution { required: 2, is_next: true },
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: true,
+            },
         );
         p.set_detail(Ok(detail(
-            SafeTxState::AwaitingExecution { required: 2, is_next: true },
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: true,
+            },
             vec![owner(0x11), owner(0x22)],
         )));
         // threshold met & next → execute + reject; nothing to confirm.
@@ -733,10 +774,16 @@ mod tests {
         let mut p = pane(
             vec![owner(0x11)],
             false, // no local gas payer
-            SafeTxState::AwaitingExecution { required: 2, is_next: true },
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: true,
+            },
         );
         p.set_detail(Ok(detail(
-            SafeTxState::AwaitingExecution { required: 2, is_next: true },
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: true,
+            },
             vec![owner(0x11), owner(0x22)],
         )));
         assert!(!p.action_availability().1);
@@ -747,10 +794,16 @@ mod tests {
         let mut p = pane(
             vec![owner(0x11)],
             true,
-            SafeTxState::AwaitingExecution { required: 2, is_next: false },
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: false,
+            },
         );
         p.set_detail(Ok(detail(
-            SafeTxState::AwaitingExecution { required: 2, is_next: false },
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: false,
+            },
             vec![owner(0x11), owner(0x22)],
         )));
         // Can't execute (earlier nonce blocks it) but can still reject.
@@ -777,10 +830,16 @@ mod tests {
         let mut p = pane(
             vec![],
             false,
-            SafeTxState::AwaitingConfirmations { have: 1, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
         );
         p.set_detail(Ok(detail(
-            SafeTxState::AwaitingConfirmations { have: 1, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
             vec![owner(0x11)],
         )));
         assert_eq!(p.action_availability(), (false, false, false));
@@ -791,7 +850,10 @@ mod tests {
         // List-time snapshot said plain call; the loaded detail
         // reconstructs a delegatecall (it's what execute would encode)
         // — the warning must key off the authoritative one.
-        let state = SafeTxState::AwaitingConfirmations { have: 0, required: 2 };
+        let state = SafeTxState::AwaitingConfirmations {
+            have: 0,
+            required: 2,
+        };
         let mut p = pane(vec![], false, state);
         assert_eq!(p.effective_operation(), 0);
         let mut d = detail(state, vec![]);
@@ -805,7 +867,10 @@ mod tests {
         let mut p = pane(
             vec![owner(0x11)],
             true,
-            SafeTxState::AwaitingConfirmations { have: 0, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 0,
+                required: 2,
+            },
         );
         p.mark_busy();
         assert!(p.busy());
@@ -819,7 +884,10 @@ mod tests {
         let mut p = pane(
             vec![owner(0x11)],
             true,
-            SafeTxState::AwaitingConfirmations { have: 0, required: 2 },
+            SafeTxState::AwaitingConfirmations {
+                have: 0,
+                required: 2,
+            },
         );
         assert!(p.loading);
         p.set_detail(Err("offline".to_string()));

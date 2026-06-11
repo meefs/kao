@@ -36,8 +36,7 @@ use crate::net::BalanceFetcher;
 use crate::wallet::KaoSigner;
 
 use super::{
-    SafeTx, decode_ret, domainSeparatorCall, execTransactionCall, getTransactionHashCall,
-    nonceCall,
+    SafeTx, decode_ret, domainSeparatorCall, execTransactionCall, getTransactionHashCall, nonceCall,
 };
 
 /// Safe-spec operation byte. Only `Call` is exposed in v1 —
@@ -378,9 +377,11 @@ pub async fn sign_owner(
 ) -> Result<(Address, Bytes), String> {
     match eip712_owner_sig(signer, tx, domain).await {
         Ok(v) => Ok(v),
-        Err(eip712_err) => eth_sign_owner_sig(signer, safe_tx_hash).await.map_err(|eth_err| {
-            format!("eip712 ({eip712_err}) and eth_sign ({eth_err}) both failed")
-        }),
+        Err(eip712_err) => eth_sign_owner_sig(signer, safe_tx_hash)
+            .await
+            .map_err(|eth_err| {
+                format!("eip712 ({eip712_err}) and eth_sign ({eth_err}) both failed")
+            }),
     }
 }
 
@@ -560,13 +561,9 @@ mod tests {
         //     verifyingContract))
         let safe = safe_addr();
         let chain = Chain::Mainnet;
-        let domain_typehash = keccak256(
-            b"EIP712Domain(uint256 chainId,address verifyingContract)",
-        );
+        let domain_typehash = keccak256(b"EIP712Domain(uint256 chainId,address verifyingContract)");
         let chain_id = U256::from(chain.chain_id());
-        let manual = keccak256(
-            (domain_typehash, chain_id, safe).abi_encode(),
-        );
+        let manual = keccak256((domain_typehash, chain_id, safe).abi_encode());
         let derived = safe_domain(safe, chain).separator();
         assert_eq!(derived, manual);
         // Pin the domain typehash too.
@@ -699,7 +696,9 @@ mod tests {
             Bytes::from(U256::from(99u64).abi_encode()),
             true,
         );
-        let n = current_safe_nonce(&mock, safe, Chain::Mainnet).await.unwrap();
+        let n = current_safe_nonce(&mock, safe, Chain::Mainnet)
+            .await
+            .unwrap();
         assert_eq!(n, 99);
     }
 
@@ -780,7 +779,8 @@ mod tests {
         let hash = B256::repeat_byte(0x12);
         let sig1 = s1.sign_hash(&hash).await.unwrap();
         let sig2 = s2.sign_hash(&hash).await.unwrap();
-        let packed = pack_owner_signatures(vec![(s1.address(), sig1), (s2.address(), sig2)]).unwrap();
+        let packed =
+            pack_owner_signatures(vec![(s1.address(), sig1), (s2.address(), sig2)]).unwrap();
         let assembled = assemble_signatures(vec![
             (s1.address(), Bytes::from(sig1.as_bytes().to_vec())),
             (s2.address(), Bytes::from(sig2.as_bytes().to_vec())),
@@ -797,11 +797,8 @@ mod tests {
         let hi = Address::repeat_byte(0x22);
         let blob_lo = Bytes::from(vec![0xAAu8; 65]);
         let blob_hi = Bytes::from(vec![0xBBu8; 65]);
-        let packed = assemble_signatures(vec![
-            (hi, blob_hi.clone()),
-            (lo, blob_lo.clone()),
-        ])
-        .unwrap();
+        let packed =
+            assemble_signatures(vec![(hi, blob_hi.clone()), (lo, blob_lo.clone())]).unwrap();
         assert_eq!(packed.len(), 130);
         assert_eq!(&packed[..65], &blob_lo[..]);
         assert_eq!(&packed[65..], &blob_hi[..]);
@@ -931,7 +928,12 @@ mod tests {
             _nonce: tx.nonce,
         }
         .abi_encode();
-        mock.set_call(safe, Bytes::from(calldata), Bytes::from(hash.abi_encode()), true);
+        mock.set_call(
+            safe,
+            Bytes::from(calldata),
+            Bytes::from(hash.abi_encode()),
+            true,
+        );
     }
 
     #[tokio::test]
@@ -1034,9 +1036,16 @@ mod tests {
             assert!(ensure_signable_version(ok).is_ok(), "{ok}");
         }
         for bad in [
-            "1.0.0", "1.1.1", "1.2.0", // pre-chainId domain
-            "1.6.0", "2.0.0", // newer than the reviewed range
-            "1.4", "1.4.1-beta", "1.4.x", "", "hi there",
+            "1.0.0",
+            "1.1.1",
+            "1.2.0", // pre-chainId domain
+            "1.6.0",
+            "2.0.0", // newer than the reviewed range
+            "1.4",
+            "1.4.1-beta",
+            "1.4.x",
+            "",
+            "hi there",
         ] {
             assert!(ensure_signable_version(bad).is_err(), "{bad}");
         }

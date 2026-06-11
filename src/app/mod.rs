@@ -632,11 +632,7 @@ impl App {
     /// dispatch the disk write off-thread, and push the updated list
     /// into the dashboard so its copy (and the open Settings → Safes
     /// pane) reseeds from what actually persisted.
-    fn set_safe_service_url(
-        &mut self,
-        index: usize,
-        url: Option<String>,
-    ) -> iced::Task<Message> {
+    fn set_safe_service_url(&mut self, index: usize, url: Option<String>) -> iced::Task<Message> {
         let Some(wallet) = self.wallet.as_mut() else {
             warn!("set_safe_service_url: no wallet loaded");
             return iced::Task::none();

@@ -1177,7 +1177,13 @@ fn redact_urls(s: &str) -> String {
         let after = &rest[pos + 3..];
         let host_end = after
             .find(|c: char| {
-                c == '/' || c == '?' || c == '#' || c == ')' || c == '"' || c == '\'' || c.is_whitespace()
+                c == '/'
+                    || c == '?'
+                    || c == '#'
+                    || c == ')'
+                    || c == '"'
+                    || c == '\''
+                    || c.is_whitespace()
             })
             .unwrap_or(after.len());
         out.push_str(&rest[scheme_start..pos + 3 + host_end]);
@@ -1823,7 +1829,10 @@ mod pure_tests {
     fn cooldown_starts_clear_and_flips_per_chain() {
         let net = NetworkClient::new();
         for chain in Chain::ALL {
-            assert!(!net.in_cooldown(chain), "{chain}: fresh client must not start cooled down");
+            assert!(
+                !net.in_cooldown(chain),
+                "{chain}: fresh client must not start cooled down"
+            );
         }
         net.start_cooldown(Chain::Base);
         assert!(net.in_cooldown(Chain::Base));
@@ -1888,7 +1897,10 @@ mod pure_tests {
     #[test]
     fn redact_urls_handles_multiple_urls_and_bare_hosts() {
         let r = redact_urls("https://a.example/k1 then https://b.example then wss://c.example/k3");
-        assert_eq!(r, "https://a.example/… then https://b.example then wss://c.example/…");
+        assert_eq!(
+            r,
+            "https://a.example/… then https://b.example then wss://c.example/…"
+        );
     }
 
     #[test]

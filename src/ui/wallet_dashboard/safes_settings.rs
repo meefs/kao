@@ -38,10 +38,7 @@ pub enum Outcome {
     /// Persist a new transaction-service base for `wallet.safes[index]`.
     /// `None` clears the override back to the public default. Already
     /// normalized/validated by the pane.
-    SetServiceUrl {
-        index: usize,
-        url: Option<String>,
-    },
+    SetServiceUrl { index: usize, url: Option<String> },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,10 +83,7 @@ impl SafesPane {
                     return (Task::none(), None);
                 };
                 match normalize_service_base(&r.draft) {
-                    Ok(url) => (
-                        Task::none(),
-                        Some(Outcome::SetServiceUrl { index: i, url }),
-                    ),
+                    Ok(url) => (Task::none(), Some(Outcome::SetServiceUrl { index: i, url })),
                     Err(e) => {
                         r.error = Some(e);
                         (Task::none(), None)
@@ -145,7 +139,12 @@ impl SafesPane {
         .into()
     }
 
-    fn safe_card<'a>(&'a self, t: KaoTheme, i: usize, safe: &'a SafeDescriptor) -> Element<'a, Message> {
+    fn safe_card<'a>(
+        &'a self,
+        t: KaoTheme,
+        i: usize,
+        safe: &'a SafeDescriptor,
+    ) -> Element<'a, Message> {
         let row_state = &self.rows[i];
         let stored = safe.tx_service_url.clone().unwrap_or_default();
         let dirty = row_state.draft.trim().trim_end_matches('/') != stored;
@@ -205,7 +204,10 @@ impl SafesPane {
             Space::new().height(10),
             colored_address(t, safe.address()),
             Space::new().height(10),
-            text("Transaction service").size(12).color(t.text).font(mono_bold()),
+            text("Transaction service")
+                .size(12)
+                .color(t.text)
+                .font(mono_bold()),
             Space::new().height(4),
             row![
                 container(input).width(Length::Fill),
@@ -219,7 +221,10 @@ impl SafesPane {
         .width(Length::Fill);
         if let Some(err) = &row_state.error {
             content = content.push(Space::new().height(6)).push(
-                text(format!("(╥﹏╥) {err}")).size(11).color(t.down).font(bold()),
+                text(format!("(╥﹏╥) {err}"))
+                    .size(11)
+                    .color(t.down)
+                    .font(bold()),
             );
         }
 
@@ -268,7 +273,10 @@ mod tests {
     #[test]
     fn save_emits_normalized_url() {
         let mut p = SafesPane::new(vec![safe(None)]);
-        let _ = p.update(Message::UrlChanged(0, "https://txs.example-dao.org/".into()));
+        let _ = p.update(Message::UrlChanged(
+            0,
+            "https://txs.example-dao.org/".into(),
+        ));
         let (_, outcome) = p.update(Message::Save(0));
         match outcome {
             Some(Outcome::SetServiceUrl { index: 0, url }) => {

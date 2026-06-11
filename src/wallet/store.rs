@@ -1950,8 +1950,7 @@ mod tests {
                     expected.cached_at,
                 ))
                 .unwrap();
-                let blob =
-                    encrypt_blob(key.as_slice(), &safe_aad(0), &legacy_plaintext).unwrap();
+                let blob = encrypt_blob(key.as_slice(), &safe_aad(0), &legacy_plaintext).unwrap();
                 let mut safes = txn.open_table(SAFES_TABLE).unwrap();
                 safes.insert(0u32, blob.as_slice()).unwrap();
             }

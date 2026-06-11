@@ -275,7 +275,11 @@ fn safe_row<'a>(
 
     // (◐‿◐) for signing Safes (two-eyes hint at multi-sig); (◐_◐) for
     // watch-only (same shape but a flat mouth — no "joy of signing").
-    let kao = if watch_only { "(◐_◐)" } else { "(◐‿◐)" };
+    let kao = if watch_only {
+        "(◐_◐)"
+    } else {
+        "(◐‿◐)"
+    };
     // Active indicator: ◉ when this Safe is the open context, ○
     // otherwise (only when signable — watch-only Safes can't be the
     // active context, so the slot stays empty for them).

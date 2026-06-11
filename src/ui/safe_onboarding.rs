@@ -1677,21 +1677,22 @@ fn view_label<'a>(
     // Transaction Service mirror. Per-Safe, validated on confirm.
     let advanced_header = link_button(
         t,
-        if advanced { "Advanced ▾" } else { "Advanced ▸" },
+        if advanced {
+            "Advanced ▾"
+        } else {
+            "Advanced ▸"
+        },
     )
     .on_press(Message::AdvancedToggled);
     let mut advanced_col = column![advanced_header].width(Length::Fill);
     if advanced {
-        let service_input = text_input(
-            crate::safe::service::DEFAULT_TX_SERVICE_BASE,
-            service_url,
-        )
-        .on_input(Message::ServiceUrlInput)
-        .on_submit(Message::LabelConfirm)
-        .padding(Padding::from([10, 12]))
-        .size(13)
-        .font(mono())
-        .style(move |_theme, status| text_input_style(t, status));
+        let service_input = text_input(crate::safe::service::DEFAULT_TX_SERVICE_BASE, service_url)
+            .on_input(Message::ServiceUrlInput)
+            .on_submit(Message::LabelConfirm)
+            .padding(Padding::from([10, 12]))
+            .size(13)
+            .font(mono())
+            .style(move |_theme, status| text_input_style(t, status));
         advanced_col = advanced_col
             .push(vspace(8))
             .push(
@@ -1712,9 +1713,7 @@ fn view_label<'a>(
                 .color(t.sub),
             );
         if let Some(err) = service_url_error {
-            advanced_col = advanced_col
-                .push(vspace(6))
-                .push(error_text(t, err));
+            advanced_col = advanced_col.push(vspace(6)).push(error_text(t, err));
         }
     }
 

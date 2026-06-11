@@ -1199,9 +1199,7 @@ mod tests {
         let ks = KaoSigner::Local(signer.clone());
         let hash = B256::repeat_byte(0xcd);
         let sig = ks.sign_eth_message(hash.as_slice()).await.unwrap();
-        let recovered = sig
-            .recover_address_from_msg(hash.as_slice())
-            .unwrap();
+        let recovered = sig.recover_address_from_msg(hash.as_slice()).unwrap();
         assert_eq!(recovered, ks.address());
     }
 

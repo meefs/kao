@@ -94,8 +94,7 @@ impl ContactsView {
         exclude_account: Option<usize>,
         exclude_safe: Option<usize>,
     ) -> Self {
-        let mut entries: Vec<PickerEntry> =
-            book.iter().map(picker_entry_from_contact).collect();
+        let mut entries: Vec<PickerEntry> = book.iter().map(picker_entry_from_contact).collect();
         let mut seen: std::collections::HashSet<Address> =
             entries.iter().map(|e| e.address).collect();
 
@@ -134,7 +133,11 @@ impl ContactsView {
                 continue;
             }
             let watch_only = safe.linked_signer_indices.is_empty();
-            let kao = if watch_only { "(◐_◐)" } else { "(◐‿◐)" };
+            let kao = if watch_only {
+                "(◐_◐)"
+            } else {
+                "(◐‿◐)"
+            };
             let chip = if watch_only { "Safe watch" } else { "Safe" };
             entries.push(PickerEntry {
                 name: safe.display_name(idx),
