@@ -303,6 +303,17 @@ pub struct SafeDescriptor {
     /// Unix seconds at which the cached on-chain fields above were last
     /// refreshed. UI uses this to show a staleness indicator.
     pub cached_at: u64,
+    /// Custom Safe Transaction Service base URL for THIS Safe — `None`
+    /// means the public `api.safe.global`. Per-Safe rather than global
+    /// so a DAO treasury can point at its self-hosted mirror while a
+    /// personal Safe stays on the default. Set via the onboarding
+    /// Advanced section or Settings → Safes; always normalized through
+    /// `safe::service::normalize_service_base` before it lands here.
+    ///
+    /// NOTE: appended last for postcard compatibility — the store's
+    /// loader falls back to the pre-field layout for older wallets
+    /// (`store::decode_safe`). New fields must keep appending.
+    pub tx_service_url: Option<String>,
 }
 
 // Tests exercise these directly; the UI consumers (account list rendering,
@@ -345,6 +356,14 @@ impl SafeDescriptor {
 
     pub fn address(&self) -> Address {
         Address::from(self.address)
+    }
+
+    /// Transaction-service base URL this Safe actually talks to — the
+    /// custom mirror when set, the public default otherwise.
+    pub fn tx_service_base(&self) -> &str {
+        self.tx_service_url
+            .as_deref()
+            .unwrap_or(crate::safe::service::DEFAULT_TX_SERVICE_BASE)
     }
 }
 
@@ -1326,6 +1345,7 @@ mod tests {
             linked_signer_indices: linked,
             sibling_chains: Vec::new(),
             cached_at: 0,
+            tx_service_url: None,
         }
     }
 

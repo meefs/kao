@@ -20,8 +20,8 @@ use crate::chain::Chain;
 use crate::safe::service::{PendingSafeTx, SafeTxDetail, SafeTxState};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    bold, colored_address, kao_fit, kao_scrollable_style, modal_wrapper, mono, mono_bold,
-    mono_black, primary_button, secondary_button,
+    bold, colored_address, colored_hash, kao_fit, kao_scrollable_style, modal_wrapper, mono,
+    mono_bold, mono_black, primary_button, secondary_button,
 };
 use crate::wallet::short_address;
 
@@ -51,6 +51,15 @@ pub enum Outcome {
 pub struct SafeTxDetailPane {
     safe: Address,
     chain: Chain,
+    /// `VERSION()` snapshot from the SafeDescriptor at open. The
+    /// dashboard gates Confirm/Reject on
+    /// `safe::tx::ensure_signable_version` with this — signing for a
+    /// pre-1.3 domain shape is refused before any signer is built.
+    version: String,
+    /// Transaction-service base for THIS Safe (custom mirror or the
+    /// public default), snapshotted at open so every action in the
+    /// modal talks to the same service the queue row came from.
+    service_base: String,
     /// Lean record the row was opened from — renders immediately while
     /// the full detail loads.
     pending: PendingSafeTx,
@@ -77,6 +86,8 @@ impl SafeTxDetailPane {
     pub fn new(
         safe: Address,
         chain: Chain,
+        version: String,
+        service_base: String,
         pending: PendingSafeTx,
         owners: Vec<Address>,
         signable: Vec<Address>,
@@ -85,6 +96,8 @@ impl SafeTxDetailPane {
         Self {
             safe,
             chain,
+            version,
+            service_base,
             pending,
             owners,
             signable,
@@ -102,6 +115,12 @@ impl SafeTxDetailPane {
     }
     pub fn chain(&self) -> Chain {
         self.chain
+    }
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+    pub fn service_base(&self) -> &str {
+        &self.service_base
     }
     pub fn nonce(&self) -> u64 {
         self.pending.nonce
@@ -130,6 +149,17 @@ impl SafeTxDetailPane {
             .as_ref()
             .map(|d| d.state)
             .unwrap_or(self.pending.state)
+    }
+
+    /// Safe operation byte for the badge/warning: `0` call,
+    /// `1` delegatecall. Prefers the loaded detail's reconstructed tx
+    /// (authoritative — it's what the execute path encodes) over the
+    /// list-time snapshot.
+    fn effective_operation(&self) -> u8 {
+        self.detail
+            .as_ref()
+            .map(|d| d.tx.operation)
+            .unwrap_or(self.pending.operation)
     }
 
     /// Owner addresses that this wallet controls and that have **not** yet
@@ -233,6 +263,16 @@ impl SafeTxDetailPane {
 
         // Field stack.
         let mut fields = column![].spacing(14).width(Length::Fill);
+        // Operation warning FIRST — a delegatecall runs arbitrary code
+        // under the Safe's identity (it can swap owners, drain funds,
+        // or replace the implementation), so it must never read like a
+        // plain transfer. Unknown bytes (>1) are flagged too: the Safe
+        // contract would reject them, so a record carrying one is
+        // service garbage at best.
+        let operation = self.effective_operation();
+        if operation != 0 {
+            fields = fields.push(operation_warning(t, operation));
+        }
         if !is_rejection {
             fields = fields.push(field(
                 t,
@@ -242,6 +282,25 @@ impl SafeTxDetailPane {
         }
         fields = fields.push(simple_field(t, "Network", self.chain.display_name().to_string()));
         fields = fields.push(simple_field(t, "Nonce", self.pending.nonce.to_string()));
+
+        // The full safeTxHash, chunked and coloured like addresses.
+        // This is THE cross-device verification anchor: it's what every
+        // owner signs, what the Transaction Service keys this record
+        // by, and what a hardware wallet / the Safe web app shows a
+        // co-signer. Compare chunk-by-chunk before confirming.
+        fields = fields.push(field(
+            t,
+            "Safe tx hash",
+            column![
+                colored_hash(t, self.pending.safe_tx_hash),
+                Space::new().height(4),
+                text("Verify this exact hash on your signing device and with co-signers.")
+                    .size(11)
+                    .color(t.sub),
+            ]
+            .width(Length::Fill)
+            .into(),
+        ));
 
         // Owners checklist.
         fields = fields.push(self.owners_block(t));
@@ -437,6 +496,45 @@ fn simple_field<'a>(t: KaoTheme, label: &'a str, value: String) -> Element<'a, M
     .into()
 }
 
+/// Loud red banner for non-call operations. Delegatecall gets the full
+/// explanation; any other non-zero byte is flagged as malformed.
+fn operation_warning<'a>(t: KaoTheme, operation: u8) -> Element<'a, Message> {
+    let (title, msg) = if operation == 1 {
+        (
+            "⚠ DELEGATECALL",
+            "This transaction runs arbitrary code AS the Safe. It can change owners, \
+             drain all funds, or replace the Safe's implementation. Only sign if you \
+             built it yourself or fully trust the proposer.",
+        )
+    } else {
+        (
+            "⚠ Unknown operation",
+            "This record carries an operation byte the Safe contract doesn't define. \
+             It cannot execute as-is — treat it as malformed and reject it.",
+        )
+    };
+    container(
+        column![
+            text(title).size(12).color(t.down).font(bold()),
+            Space::new().height(2),
+            text(msg).size(11).color(t.text),
+        ]
+        .spacing(0),
+    )
+    .padding(Padding::from([10, 12]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(with_alpha(t.down, 0.10))),
+        border: Border {
+            color: with_alpha(t.down, 0.45),
+            width: 1.0,
+            radius: Radius::from(10),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
 fn notice_line<'a>(t: KaoTheme, msg: &str, is_err: bool) -> Element<'a, Message> {
     let color = if is_err { t.down } else { t.up };
     container(text(msg.to_string()).size(12).color(color).font(mono()))
@@ -518,6 +616,7 @@ mod tests {
             to: owner(0xaa),
             value: U256::ZERO,
             data: Bytes::new(),
+            operation: 0,
             nonce: 5,
             state,
             submission_ts: 0,
@@ -546,6 +645,8 @@ mod tests {
         SafeTxDetailPane::new(
             Address::ZERO,
             Chain::Mainnet,
+            "1.4.1".to_string(),
+            crate::safe::service::DEFAULT_TX_SERVICE_BASE.to_string(),
             pending(pending_state),
             vec![owner(0x11), owner(0x22)],
             signable,
@@ -683,6 +784,20 @@ mod tests {
             vec![owner(0x11)],
         )));
         assert_eq!(p.action_availability(), (false, false, false));
+    }
+
+    #[test]
+    fn effective_operation_prefers_loaded_detail() {
+        // List-time snapshot said plain call; the loaded detail
+        // reconstructs a delegatecall (it's what execute would encode)
+        // — the warning must key off the authoritative one.
+        let state = SafeTxState::AwaitingConfirmations { have: 0, required: 2 };
+        let mut p = pane(vec![], false, state);
+        assert_eq!(p.effective_operation(), 0);
+        let mut d = detail(state, vec![]);
+        d.tx.operation = 1;
+        p.set_detail(Ok(d));
+        assert_eq!(p.effective_operation(), 1);
     }
 
     #[test]

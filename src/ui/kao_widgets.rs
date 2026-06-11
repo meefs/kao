@@ -2,7 +2,7 @@
 //! wallet dashboard. Generic over the message type so each screen can use them
 //! with its own local `Message` enum.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use iced::border::Radius;
 use iced::widget::text::Wrapping;
 use iced::widget::{
@@ -758,13 +758,32 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
     debug_assert_eq!(checksum.len(), 42);
     let body = &checksum[2..]; // drop the "0x"
 
-    // Ten distinct accent colours for the ten 2-byte chunks. Each
-    // adjacent pair flips on *both* axes — hue (rotating through the
-    // three accents with stride 2) and lightness (alternating bright /
-    // deep). That dual flip makes neighbours pop apart far more than a
-    // smooth gradient does, and keeps homoglyph swaps from blending into
-    // a same-coloured neighbour.
-    let chunk_colors: [Color; 10] = [
+    let chunk_colors = chunk_palette(t);
+    let mut spans = row![text("0x").size(14).color(t.sub).font(mono_bold())].spacing(0);
+
+    for (i, color) in chunk_colors.iter().enumerate() {
+        let start = i * 4;
+        let chunk = body[start..start + 4].to_string();
+        spans = spans.push(text(chunk).size(14).color(*color).font(mono_bold()));
+    }
+
+    container(spans)
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .padding(Padding::from([2, 0]))
+        .into()
+}
+
+/// Ten distinct accent colours for 4-hex-char chunks. Each adjacent
+/// pair flips on *both* axes — hue (rotating through the three accents
+/// with stride 2) and lightness (alternating bright / deep). That dual
+/// flip makes neighbours pop apart far more than a smooth gradient
+/// does, and keeps homoglyph swaps from blending into a same-coloured
+/// neighbour. Shared by [`colored_address`] (10 chunks, exactly one
+/// cycle) and [`colored_hash`] (16 chunks, wraps — the 9→0 seam still
+/// flips lightness within the a1 hue, so no two neighbours merge).
+fn chunk_palette(t: KaoTheme) -> [Color; 10] {
+    [
         t.a1,                    // 0: bright a1
         mix(t.a3, t.text, 0.55), // 1: deep a3
         t.a2,                    // 2: bright a2
@@ -775,17 +794,48 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
         mix(t.a2, t.text, 0.75), // 7: very deep a2
         mix(t.a2, t.a3, 0.5),    // 8: bright a2+a3
         mix(t.a1, t.text, 0.75), // 9: very deep a1
-    ];
+    ]
+}
 
-    let mut spans = row![text("0x").size(14).color(t.sub).font(mono_bold())].spacing(0);
+/// Render a 32-byte hash (safeTxHash, message hash) in full, chunked
+/// like [`colored_address`]: 64 hex chars split into sixteen 4-char
+/// chunks over two rows of eight, each chunk coloured from the shared
+/// palette.
+///
+/// This is the verification surface for multisig signing — the same
+/// grouping Ledger/Trezor and the Safe web app use when they display a
+/// safeTxHash, so a user can compare chunk-by-chunk across devices and
+/// co-signers. Never truncated: a prefix/suffix display is exactly what
+/// a hash-collision phisher relies on.
+pub fn colored_hash<'a, M: 'a>(t: KaoTheme, hash: B256) -> Element<'a, M> {
+    let hex = format!("{hash:x}"); // 64 lowercase hex chars, no 0x
+    debug_assert_eq!(hex.len(), 64);
+    let chunk_colors = chunk_palette(t);
 
-    for (i, color) in chunk_colors.iter().enumerate() {
-        let start = i * 4;
-        let chunk = body[start..start + 4].to_string();
-        spans = spans.push(text(chunk).size(14).color(*color).font(mono_bold()));
+    let mut lines = column![].spacing(2);
+    for line_idx in 0..2 {
+        let mut spans = row![].spacing(0);
+        if line_idx == 0 {
+            spans = spans.push(text("0x").size(13).color(t.sub).font(mono_bold()));
+        } else {
+            // Two invisible chars keep the second row's chunks aligned
+            // with the first row's (which carries the "0x" prefix).
+            spans = spans.push(text("  ").size(13).font(mono_bold()));
+        }
+        for i in (line_idx * 8)..(line_idx * 8 + 8) {
+            let start = i * 4;
+            let chunk = hex[start..start + 4].to_string();
+            spans = spans.push(
+                text(chunk)
+                    .size(13)
+                    .color(chunk_colors[i % 10])
+                    .font(mono_bold()),
+            );
+        }
+        lines = lines.push(spans);
     }
 
-    container(spans)
+    container(lines)
         .width(Length::Fill)
         .center_x(Length::Fill)
         .padding(Padding::from([2, 0]))

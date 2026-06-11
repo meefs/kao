@@ -627,6 +627,38 @@ impl App {
         iced::Task::batch(tasks)
     }
 
+    /// Persist a per-Safe transaction-service override. Mirrors the
+    /// contacts-save shape: mutate the in-memory wallet synchronously,
+    /// dispatch the disk write off-thread, and push the updated list
+    /// into the dashboard so its copy (and the open Settings → Safes
+    /// pane) reseeds from what actually persisted.
+    fn set_safe_service_url(
+        &mut self,
+        index: usize,
+        url: Option<String>,
+    ) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_mut() else {
+            warn!("set_safe_service_url: no wallet loaded");
+            return iced::Task::none();
+        };
+        let Some(slot) = wallet.safes.get_mut(index) else {
+            warn!(index, "set_safe_service_url: no Safe at index");
+            return iced::Task::none();
+        };
+        slot.tx_service_url = url;
+        let push = iced::Task::done(Message::WalletDashboard(
+            WalletDashboardMessage::SafesUpdated(wallet.safes.clone()),
+        ));
+        let save = match self.passphrase.as_ref() {
+            Some(pw) => save_descriptor_task(wallet.clone(), pw.clone()),
+            None => {
+                warn!("set_safe_service_url: no passphrase held; skipping disk write");
+                iced::Task::none()
+            }
+        };
+        iced::Task::batch(vec![push, save])
+    }
+
     fn cancel_add_account(&mut self) -> iced::Task<Message> {
         self.setup_context = None;
         if let Some(signer) = self.pending_signer.take() {
@@ -1540,6 +1572,10 @@ impl App {
                                 iced::Task::none()
                             }
                         };
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
+                    }
+                    Some(WalletDashboardOutcome::SetSafeServiceUrl { index, url }) => {
+                        let save = self.set_safe_service_url(index, url);
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
                     }
                     None => cmd.map(Message::WalletDashboard),

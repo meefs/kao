@@ -1,14 +1,14 @@
-//! Read-only integration with the **Safe Transaction Service**
-//! (`api.safe.global`) — the off-chain aggregator that holds a Safe's
-//! proposed multisig transactions and the owner signatures collected so
-//! far.
+//! Integration with the **Safe Transaction Service** (`api.safe.global`)
+//! — the off-chain aggregator that holds a Safe's proposed multisig
+//! transactions and the owner signatures collected so far.
 //!
-//! This is the **read** half: list the Safe's pending queue and derive a
-//! lifecycle [`SafeTxState`] for each entry. The service is hit
-//! **keyless** — the public endpoint allows ~2 RPS without an
-//! `Authorization` header, which is plenty for a single user's wallet.
-//! Proposing and confirming (the write endpoints) are deliberately out of
-//! scope; Kao still executes Safe txs directly on-chain via
+//! Reads: the Safe's pending queue (with a derived lifecycle
+//! [`SafeTxState`] per entry) and per-tx detail. Writes: [`propose`] and
+//! [`confirm`], which only ever carry a signature the caller produced
+//! after on-chain hash verification. The service is hit **keyless** —
+//! the public endpoint allows ~2 RPS without an `Authorization` header,
+//! which is plenty for a single user's wallet. Execution never goes
+//! through the service; Kao broadcasts `execTransaction` directly via
 //! [`super::tx::execute_safe_tx`].
 //!
 //! ### Trust posture
@@ -36,6 +36,48 @@ use crate::net::BalanceFetcher;
 
 use super::SafeTx;
 use super::tx::current_safe_nonce;
+
+/// The public Safe Transaction Service gateway. Every service call
+/// takes an explicit `base` so a Safe can point at a self-hosted
+/// mirror instead (per-Safe `SafeDescriptor::tx_service_url`); this is
+/// the default when none is configured. A custom base must serve the
+/// same multi-chain layout: `{base}/tx-service/{chain}/api/v1/…`.
+pub const DEFAULT_TX_SERVICE_BASE: &str = "https://api.safe.global";
+
+/// Validate and normalize a user-supplied service base URL.
+///
+/// Returns `Ok(None)` for blank input or the default gateway (both
+/// mean "store nothing, use the default"), `Ok(Some(base))` with
+/// trailing slashes stripped otherwise. Rejects anything that isn't
+/// `https` — the Safe address rides in every request path, so a
+/// plaintext mirror would broadcast the user's holdings to the network
+/// — except plain-http loopback, the common self-hosted dev setup.
+pub fn normalize_service_base(input: &str) -> Result<Option<String>, String> {
+    let trimmed = input.trim().trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == DEFAULT_TX_SERVICE_BASE {
+        return Ok(None);
+    }
+    let url = reqwest::Url::parse(trimmed).map_err(|e| format!("invalid URL: {e}"))?;
+    match url.scheme() {
+        "https" => {}
+        "http" if matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")) => {}
+        "http" => {
+            return Err(
+                "plain http would leak your Safe address to the network — use https \
+                 (http is allowed only for localhost)"
+                    .to_string(),
+            );
+        }
+        other => return Err(format!("unsupported scheme \"{other}\" — use https")),
+    }
+    if url.host_str().is_none() {
+        return Err("URL needs a host".to_string());
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("base URL must not carry a ?query or #fragment".to_string());
+    }
+    Ok(Some(trimmed.to_string()))
+}
 
 // ── Lifecycle FSM ────────────────────────────────────────────────────────────
 
@@ -107,6 +149,11 @@ pub struct PendingSafeTx {
     /// row shows only the native value today.
     #[allow(dead_code)]
     pub data: Bytes,
+    /// Safe operation byte: `0` = call, `1` = delegatecall. Surfaced so
+    /// the queue row and detail modal can flag delegatecalls loudly — a
+    /// queued delegatecall proposed by another owner runs arbitrary code
+    /// under the Safe's identity and must never look like a plain send.
+    pub operation: u8,
     pub nonce: u64,
     pub state: SafeTxState,
     /// Unix seconds the proposal was submitted (0 if unparsable).
@@ -276,6 +323,7 @@ fn map_raw(raw: RawMultisigTx, threshold: u32, current_nonce: u64) -> Option<Pen
         to,
         value,
         data,
+        operation: raw.operation,
         nonce,
         state,
         submission_ts,
@@ -314,9 +362,9 @@ async fn check_status(
 /// `executed=false` returns only the live queue (proposed + replaced);
 /// `ordering=nonce` so rows arrive lowest-nonce-first. The Safe address
 /// is checksummed in the path — the API 422s on a lowercase address.
-fn queue_url(safe: Address, chain: Chain) -> String {
+fn queue_url(base: &str, safe: Address, chain: Chain) -> String {
     format!(
-        "https://api.safe.global/tx-service/{}/api/v1/safes/{}/multisig-transactions/?executed=false&ordering=nonce",
+        "{base}/tx-service/{}/api/v1/safes/{}/multisig-transactions/?executed=false&ordering=nonce",
         chain.safe_tx_service_shortname(),
         safe.to_checksum(None),
     )
@@ -333,12 +381,13 @@ fn queue_url(safe: Address, chain: Chain) -> String {
 /// an empty queue yields `Ok(vec![])`.
 pub async fn fetch_pending(
     net: &dyn BalanceFetcher,
+    base: &str,
     safe: Address,
     chain: Chain,
     threshold: u32,
 ) -> Result<Vec<PendingSafeTx>, String> {
     let current_nonce = current_safe_nonce(net, safe, chain).await?;
-    let url = queue_url(safe, chain);
+    let url = queue_url(base, safe, chain);
     let resp = crate::indexer::http_client()
         .get(&url)
         .send()
@@ -388,25 +437,25 @@ impl SafeTxDetail {
     }
 }
 
-fn detail_url(safe_tx_hash: B256, chain: Chain) -> String {
+fn detail_url(base: &str, safe_tx_hash: B256, chain: Chain) -> String {
     format!(
-        "https://api.safe.global/tx-service/{}/api/v1/multisig-transactions/{:#x}/",
+        "{base}/tx-service/{}/api/v1/multisig-transactions/{:#x}/",
         chain.safe_tx_service_shortname(),
         safe_tx_hash,
     )
 }
 
-fn confirmations_url(safe_tx_hash: B256, chain: Chain) -> String {
+fn confirmations_url(base: &str, safe_tx_hash: B256, chain: Chain) -> String {
     format!(
-        "https://api.safe.global/tx-service/{}/api/v1/multisig-transactions/{:#x}/confirmations/",
+        "{base}/tx-service/{}/api/v1/multisig-transactions/{:#x}/confirmations/",
         chain.safe_tx_service_shortname(),
         safe_tx_hash,
     )
 }
 
-fn propose_url(safe: Address, chain: Chain) -> String {
+fn propose_url(base: &str, safe: Address, chain: Chain) -> String {
     format!(
-        "https://api.safe.global/tx-service/{}/api/v1/safes/{}/multisig-transactions/",
+        "{base}/tx-service/{}/api/v1/safes/{}/multisig-transactions/",
         chain.safe_tx_service_shortname(),
         safe.to_checksum(None),
     )
@@ -418,13 +467,14 @@ fn propose_url(safe: Address, chain: Chain) -> String {
 /// `confirmationsRequired`.
 pub async fn fetch_detail(
     net: &dyn BalanceFetcher,
+    base: &str,
     safe: Address,
     chain: Chain,
     safe_tx_hash: B256,
     threshold: u32,
 ) -> Result<SafeTxDetail, String> {
     let current_nonce = current_safe_nonce(net, safe, chain).await?;
-    let url = detail_url(safe_tx_hash, chain);
+    let url = detail_url(base, safe_tx_hash, chain);
     let resp = crate::indexer::http_client()
         .get(&url)
         .send()
@@ -508,6 +558,7 @@ struct ConfirmBody {
 /// Pure HTTP: the caller is responsible for having verified the hash
 /// on-chain before signing.
 pub async fn propose(
+    base: &str,
     safe: Address,
     chain: Chain,
     tx: &SafeTx,
@@ -533,7 +584,7 @@ pub async fn propose(
         origin: origin.map(str::to_string),
     };
     let resp = crate::indexer::http_client()
-        .post(propose_url(safe, chain))
+        .post(propose_url(base, safe, chain))
         .json(&body)
         .send()
         .await
@@ -545,6 +596,7 @@ pub async fn propose(
 /// Add a confirming owner's `signature` (over `safe_tx_hash`) to an
 /// existing queued tx. Pure HTTP.
 pub async fn confirm(
+    base: &str,
     safe_tx_hash: B256,
     chain: Chain,
     signature: &Bytes,
@@ -553,7 +605,7 @@ pub async fn confirm(
         signature: signature.to_string(),
     };
     let resp = crate::indexer::http_client()
-        .post(confirmations_url(safe_tx_hash, chain))
+        .post(confirmations_url(base, safe_tx_hash, chain))
         .json(&body)
         .send()
         .await
@@ -819,10 +871,79 @@ mod tests {
         let safe = "0x000000000000000000000000000000000000dead"
             .parse::<Address>()
             .unwrap();
-        let url = propose_url(safe, Chain::Mainnet);
+        let url = propose_url(DEFAULT_TX_SERVICE_BASE, safe, Chain::Mainnet);
+        assert!(url.starts_with("https://api.safe.global/"));
         assert!(url.contains("/tx-service/eth/"));
         assert!(url.contains(&safe.to_checksum(None)));
         assert!(url.ends_with("/multisig-transactions/"));
+    }
+
+    #[test]
+    fn url_builders_respect_custom_base() {
+        let safe = Address::repeat_byte(0x11);
+        let hash = B256::repeat_byte(0x22);
+        let base = "https://txs.example-dao.org";
+        for url in [
+            queue_url(base, safe, Chain::Base),
+            detail_url(base, hash, Chain::Base),
+            confirmations_url(base, hash, Chain::Base),
+            propose_url(base, safe, Chain::Base),
+        ] {
+            assert!(url.starts_with("https://txs.example-dao.org/tx-service/base/"), "{url}");
+            assert!(!url.contains("api.safe.global"), "{url}");
+        }
+    }
+
+    #[test]
+    fn normalize_service_base_accepts_https_and_strips_slashes() {
+        assert_eq!(
+            normalize_service_base("https://txs.example-dao.org//").unwrap(),
+            Some("https://txs.example-dao.org".to_string()),
+        );
+        // Loopback http is the self-hosted dev setup — allowed.
+        assert_eq!(
+            normalize_service_base("http://localhost:8000/").unwrap(),
+            Some("http://localhost:8000".to_string()),
+        );
+        assert_eq!(
+            normalize_service_base("http://127.0.0.1:8000").unwrap(),
+            Some("http://127.0.0.1:8000".to_string()),
+        );
+    }
+
+    #[test]
+    fn normalize_service_base_blank_or_default_means_none() {
+        assert_eq!(normalize_service_base("").unwrap(), None);
+        assert_eq!(normalize_service_base("   ").unwrap(), None);
+        // Typing the default collapses to "no override" so the store
+        // never pins the public gateway as if it were a custom mirror.
+        assert_eq!(normalize_service_base(DEFAULT_TX_SERVICE_BASE).unwrap(), None);
+        assert_eq!(
+            normalize_service_base("https://api.safe.global/").unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn normalize_service_base_handles_ipv6_loopback() {
+        // The loopback allowance must cover IPv6 too — `Url::host_str`
+        // keeps the brackets, which is what the allowlist matches on.
+        assert_eq!(
+            normalize_service_base("http://[::1]:8000").unwrap(),
+            Some("http://[::1]:8000".to_string()),
+        );
+        // A NON-loopback IPv6 host over plain http stays rejected.
+        assert!(normalize_service_base("http://[2001:db8::1]:8000").is_err());
+    }
+
+    #[test]
+    fn normalize_service_base_rejects_leaky_or_malformed() {
+        // Non-loopback plain http leaks the Safe address en route.
+        assert!(normalize_service_base("http://txs.example-dao.org").is_err());
+        assert!(normalize_service_base("ftp://example.org").is_err());
+        assert!(normalize_service_base("not a url").is_err());
+        assert!(normalize_service_base("https://example.org?key=1").is_err());
+        assert!(normalize_service_base("https://example.org#frag").is_err());
     }
 
     #[test]
@@ -840,7 +961,7 @@ mod tests {
         let safe = "0x000000000000000000000000000000000000dead"
             .parse::<Address>()
             .unwrap();
-        let url = queue_url(safe, Chain::Optimism);
+        let url = queue_url(DEFAULT_TX_SERVICE_BASE, safe, Chain::Optimism);
         assert!(url.contains("/tx-service/oeth/"));
         assert!(url.contains("executed=false"));
         // Checksummed address in the path (mixed case), not the lowercase input.
@@ -868,6 +989,32 @@ mod tests {
             submission_date: None,
         };
         assert!(map_raw(raw, 1, 0).is_none());
+    }
+
+    #[test]
+    fn map_raw_carries_operation_byte() {
+        // A delegatecall proposed by another client must reach the UI
+        // model — the queue row / detail modal flag it as dangerous.
+        let raw = RawMultisigTx {
+            safe_tx_hash: "0x".to_string() + &"ef".repeat(32),
+            to: "0x000000000000000000000000000000000000dEaD".to_string(),
+            value: "0".to_string(),
+            data: None,
+            nonce: "5".to_string(),
+            operation: 1,
+            safe_tx_gas: None,
+            base_gas: None,
+            gas_price: None,
+            gas_token: None,
+            refund_receiver: None,
+            is_executed: false,
+            is_successful: None,
+            confirmations_required: Some(2),
+            confirmations: vec![],
+            submission_date: None,
+        };
+        let tx = map_raw(raw, 2, 5).unwrap();
+        assert_eq!(tx.operation, 1);
     }
 
     #[test]
@@ -1125,10 +1272,10 @@ mod tests {
         let hash = "0xbb8310d486368db6bd6f849402fdd73ad53d316b5a4b2644ad6efe0f941286d8"
             .parse::<B256>()
             .unwrap();
-        let d = detail_url(hash, Chain::Base);
+        let d = detail_url(DEFAULT_TX_SERVICE_BASE, hash, Chain::Base);
         assert!(d.contains("/tx-service/base/"));
         assert!(d.contains(&format!("{hash:#x}")));
-        let c = confirmations_url(hash, Chain::Mainnet);
+        let c = confirmations_url(DEFAULT_TX_SERVICE_BASE, hash, Chain::Mainnet);
         assert!(c.contains("/tx-service/eth/"));
         assert!(c.ends_with("/confirmations/"));
     }

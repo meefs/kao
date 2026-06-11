@@ -1819,6 +1819,7 @@ mod tests {
             linked_signer_indices: linked,
             sibling_chains: Vec::new(),
             cached_at: 0,
+            tx_service_url: None,
         }
     }
 

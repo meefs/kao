@@ -14,6 +14,7 @@ use super::Message;
 const SETTINGS_ROWS: &[(&str, &str, &str)] = &[
     ("Security", "(⌐■_■)", "Seed phrase · lock screen"),
     ("Networks", "( ・∀・)ﾉ", "Mainnet · testnets · L2s"),
+    ("Safes", "(◐‿◐)", "Multisigs · transaction service"),
     ("Contacts", "(✿◠‿◠)", "Named addresses · saved recipients"),
     ("Notifications", "ヾ(＾∇＾)", "Price alerts · tx updates"),
     ("Appearance", "(｡◕‿◕｡)", "Theme · palette"),
@@ -25,6 +26,7 @@ pub fn view<'a>(t: KaoTheme) -> Element<'a, Message> {
     for (label, kao, sub) in SETTINGS_ROWS {
         let on_click = match *label {
             "Networks" => Some(Message::OpenNetworksSettings),
+            "Safes" => Some(Message::OpenSafesSettings),
             "Appearance" => Some(Message::OpenAppearanceSettings),
             "Contacts" => Some(Message::OpenContactsSettings),
             _ => None,

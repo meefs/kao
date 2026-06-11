@@ -577,8 +577,7 @@ fn load_from_with_policy(
                 let idx = k.value();
                 let aad = safe_aad(idx);
                 let plaintext = decrypt_blob(master_key.as_slice(), &aad, v.value())?;
-                let safe: SafeDescriptor = postcard::from_bytes(&plaintext)
-                    .map_err(|e| WalletError::Encryption(format!("deserialize safe {idx}: {e}")))?;
+                let safe = decode_safe(&plaintext, idx)?;
                 entries.push((idx, safe));
             }
             entries.sort_by_key(|(i, _)| *i);
@@ -593,6 +592,58 @@ fn load_from_with_policy(
         accounts,
         safes,
         active_index,
+    })
+}
+
+/// Decode one decrypted Safe row, tolerating the pre-`tx_service_url`
+/// layout.
+///
+/// Postcard isn't self-describing: appending a field to
+/// `SafeDescriptor` makes blobs written before the field one byte
+/// short, and a plain `from_bytes` would hard-fail the whole wallet
+/// load. Try the current shape first; on failure re-read as the legacy
+/// shape and default the new field. New fields MUST keep appending to
+/// the end of `SafeDescriptor` and extend the legacy fallback here.
+fn decode_safe(plaintext: &[u8], idx: u32) -> Result<SafeDescriptor, WalletError> {
+    /// `SafeDescriptor` exactly as persisted before `tx_service_url`
+    /// shipped. Field order/types must never change.
+    #[derive(serde::Deserialize)]
+    struct LegacySafeV1 {
+        name: Option<String>,
+        chain_id: u64,
+        address: [u8; 20],
+        version: String,
+        trust: crate::wallet::SafeTrust,
+        threshold: u32,
+        owners: Vec<[u8; 20]>,
+        modules: Vec<[u8; 20]>,
+        guard: Option<[u8; 20]>,
+        fallback_handler: Option<[u8; 20]>,
+        linked_signer_indices: Vec<u32>,
+        sibling_chains: Vec<u64>,
+        cached_at: u64,
+    }
+
+    if let Ok(safe) = postcard::from_bytes::<SafeDescriptor>(plaintext) {
+        return Ok(safe);
+    }
+    let legacy: LegacySafeV1 = postcard::from_bytes(plaintext)
+        .map_err(|e| WalletError::Encryption(format!("deserialize safe {idx}: {e}")))?;
+    Ok(SafeDescriptor {
+        name: legacy.name,
+        chain_id: legacy.chain_id,
+        address: legacy.address,
+        version: legacy.version,
+        trust: legacy.trust,
+        threshold: legacy.threshold,
+        owners: legacy.owners,
+        modules: legacy.modules,
+        guard: legacy.guard,
+        fallback_handler: legacy.fallback_handler,
+        linked_signer_indices: legacy.linked_signer_indices,
+        sibling_chains: legacy.sibling_chains,
+        cached_at: legacy.cached_at,
+        tx_service_url: None,
     })
 }
 
@@ -1554,6 +1605,7 @@ mod tests {
             linked_signer_indices: vec![0],
             sibling_chains: Vec::new(),
             cached_at: 1_700_000_000,
+            tx_service_url: None,
         }
     }
 
@@ -1577,7 +1629,40 @@ mod tests {
             linked_signer_indices: vec![0, 2],
             sibling_chains: vec![1, 8453], // mainnet, base
             cached_at: 1_700_000_042,
+            tx_service_url: Some("https://txs.example-dao.org".into()),
         }
+    }
+
+    #[test]
+    fn decode_safe_falls_back_to_pre_service_url_layout() {
+        // Serialize the legacy 13-field shape verbatim (everything up to
+        // `cached_at`) and decode through the loader's fallback — older
+        // wallets must load with `tx_service_url: None`, not error.
+        let current = minimal_safe(0x07, 1);
+        let legacy_bytes = postcard::to_stdvec(&(
+            &current.name,
+            current.chain_id,
+            current.address,
+            &current.version,
+            &current.trust,
+            current.threshold,
+            &current.owners,
+            &current.modules,
+            current.guard,
+            current.fallback_handler,
+            &current.linked_signer_indices,
+            &current.sibling_chains,
+            current.cached_at,
+        ))
+        .unwrap();
+        let decoded = decode_safe(&legacy_bytes, 0).unwrap();
+        assert_eq!(decoded, current);
+        assert!(decoded.tx_service_url.is_none());
+
+        // And the current shape still round-trips, custom URL intact.
+        let rich = rich_safe(0x42);
+        let bytes = postcard::to_stdvec(&rich).unwrap();
+        assert_eq!(decode_safe(&bytes, 1).unwrap(), rich);
     }
 
     fn wallet_with_safes(safes: Vec<SafeDescriptor>) -> WalletDescriptor {
@@ -1815,6 +1900,67 @@ mod tests {
             }
             other => panic!("expected Encryption error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_accepts_legacy_safe_row_written_before_tx_service_url() {
+        // End-to-end guarantee for wallets saved before `tx_service_url`
+        // shipped: a safes row whose plaintext uses the OLD 13-field
+        // postcard layout — encrypted under the real per-row AAD — must
+        // load as `tx_service_url: None`, not fail the whole wallet
+        // open. Exercises the full path (decrypt → `decode_safe`
+        // fallback), unlike the codec-only unit test.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let expected = minimal_safe(0x07, 1);
+        let desc = wallet_with_safes(vec![expected.clone()]);
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        // Overwrite row 0 with a legacy-encoded, properly-encrypted blob.
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let header = {
+                    let meta = txn.open_table(META_TABLE).unwrap();
+                    let raw = meta.get(HEADER_KEY).unwrap().unwrap().value().to_vec();
+                    deserialize_header(&raw).unwrap()
+                };
+                let key = derive_master_key(
+                    &pw("pw"),
+                    &header.salt,
+                    header.argon2_m_cost_kib,
+                    header.argon2_t_cost,
+                    header.argon2_p_cost,
+                )
+                .unwrap();
+                let legacy_plaintext = postcard::to_stdvec(&(
+                    &expected.name,
+                    expected.chain_id,
+                    expected.address,
+                    &expected.version,
+                    &expected.trust,
+                    expected.threshold,
+                    &expected.owners,
+                    &expected.modules,
+                    expected.guard,
+                    expected.fallback_handler,
+                    &expected.linked_signer_indices,
+                    &expected.sibling_chains,
+                    expected.cached_at,
+                ))
+                .unwrap();
+                let blob =
+                    encrypt_blob(key.as_slice(), &safe_aad(0), &legacy_plaintext).unwrap();
+                let mut safes = txn.open_table(SAFES_TABLE).unwrap();
+                safes.insert(0u32, blob.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.safes, vec![expected]);
+        assert!(loaded.safes[0].tx_service_url.is_none());
     }
 
     #[test]

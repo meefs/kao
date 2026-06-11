@@ -29,6 +29,7 @@ mod networks;
 mod receive;
 mod safe_send;
 mod safe_tx_detail;
+mod safes_settings;
 mod send;
 mod settings_root;
 mod sidebar;
@@ -38,6 +39,7 @@ mod tx_details;
 use account_dropdown::AccountDropdown;
 use contacts_settings::ContactsPane;
 use networks::NetworksPane;
+use safes_settings::SafesPane;
 use receive::ReceivePane;
 use safe_send::{SafeSendPane, SafeSendRequest};
 use safe_tx_detail::SafeTxDetailPane;
@@ -144,6 +146,8 @@ pub enum Message {
     Tick,
     OpenNetworksSettings,
     Networks(networks::Message),
+    OpenSafesSettings,
+    SafesSettings(safes_settings::Message),
     OpenAppearanceSettings,
     CloseAppearanceSettings,
     OpenContactsSettings,
@@ -237,6 +241,13 @@ pub enum Outcome {
     /// re-enters the dashboard with the live signer and the Send modal
     /// pre-opened.
     NeedsHardwareReconnect,
+    /// User changed a Safe's transaction-service mirror in Settings →
+    /// Safes. The App writes it into `wallet.safes[index]`, persists,
+    /// and pushes the updated list back via `Message::SafesUpdated`.
+    SetSafeServiceUrl {
+        index: usize,
+        url: Option<String>,
+    },
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -259,6 +270,7 @@ enum Modal {
 enum SettingsPane {
     Root,
     Networks(NetworksPane),
+    Safes(SafesPane),
     Appearance,
     Contacts(ContactsPane),
 }
@@ -907,6 +919,7 @@ impl WalletScreen {
         }
         let address = safe.address();
         let threshold = safe.threshold;
+        let service_base = safe.tx_service_base().to_string();
         let network = self.network.clone();
         Some(Task::perform(
             async move {
@@ -916,8 +929,14 @@ impl WalletScreen {
                     "fetching safe pending queue",
                 );
                 let started = std::time::Instant::now();
-                let result =
-                    crate::safe::service::fetch_pending(&*network, address, chain, threshold).await;
+                let result = crate::safe::service::fetch_pending(
+                    &*network,
+                    &service_base,
+                    address,
+                    chain,
+                    threshold,
+                )
+                .await;
                 debug!(
                     elapsed = ?started.elapsed(),
                     ok = result.is_ok(),
@@ -1006,6 +1025,11 @@ impl WalletScreen {
                 // and returns the complete updated list, so there's
                 // nothing to merge.
                 self.safes = safes;
+                // Keep the Settings → Safes pane (if open) in sync so
+                // its drafts reseed from what actually persisted.
+                if let SettingsPane::Safes(p) = &mut self.settings_pane {
+                    p.set_safes(self.safes.clone());
+                }
             }
             Message::PortfolioFetched {
                 address,
@@ -1703,15 +1727,24 @@ impl WalletScreen {
                     }
                     None => Task::none(),
                 };
+                // Likewise for the review-prep: entering review (or
+                // hitting Retry) arms a one-shot request to compute and
+                // on-chain-verify the safeTxHash the user will sign.
+                let prepare_task = match p.take_pending_prepare() {
+                    Some((seq, req)) => {
+                        spawn_safe_prepare_task(self.network.clone(), seq, req)
+                    }
+                    None => Task::none(),
+                };
                 let task = task.map(Message::SafeSend);
                 match outcome {
                     Some(safe_send::Outcome::Closed) => {
                         self.modal = Modal::None;
-                        return (Task::batch([task, ens_task]), None);
+                        return (Task::batch([task, ens_task, prepare_task]), None);
                     }
                     Some(safe_send::Outcome::CopyText(s)) => {
                         let arm = self.arm_clipboard_clear(s);
-                        return (Task::batch([task, arm, ens_task]), None);
+                        return (Task::batch([task, arm, ens_task, prepare_task]), None);
                     }
                     Some(safe_send::Outcome::SaveAsContact { address, ens }) => {
                         // Same path as the EOA Send pane's CTA: switch
@@ -1721,9 +1754,9 @@ impl WalletScreen {
                         // modal tears down on the next chrome tick.
                         let open_task =
                             Task::done(Message::OpenContactsPaneWith { address, ens });
-                        return (Task::batch([task, ens_task, open_task]), None);
+                        return (Task::batch([task, ens_task, prepare_task, open_task]), None);
                     }
-                    None => return (Task::batch([task, ens_task]), None),
+                    None => return (Task::batch([task, ens_task, prepare_task]), None),
                 }
             }
             Message::SafeSendBroadcastReturn(result) => {
@@ -1778,6 +1811,8 @@ impl WalletScreen {
                 };
                 let safe_addr = safe.address();
                 let threshold = safe.threshold;
+                let version = safe.version.clone();
+                let service_base = safe.tx_service_base().to_string();
                 let owners: Vec<Address> =
                     safe.owners.iter().map(|o| Address::from(*o)).collect();
                 let signable: Vec<Address> = self
@@ -1790,6 +1825,8 @@ impl WalletScreen {
                 self.modal = Modal::SafeTxDetail(SafeTxDetailPane::new(
                     safe_addr,
                     chain,
+                    version,
+                    service_base.clone(),
                     pending,
                     owners,
                     signable,
@@ -1799,6 +1836,7 @@ impl WalletScreen {
                 return (
                     spawn_safe_detail_load_task(
                         self.network.clone(),
+                        service_base,
                         safe_addr,
                         chain,
                         hash,
@@ -1821,7 +1859,12 @@ impl WalletScreen {
                     Ok(msg) => info!(msg, "safe-tx action ok"),
                     Err(e) => warn!(error = %e, "safe-tx action failed"),
                 }
-                let (safe, chain, hash) = (p.safe(), p.chain(), p.safe_tx_hash());
+                let (safe, chain, hash, service_base) = (
+                    p.safe(),
+                    p.chain(),
+                    p.safe_tx_hash(),
+                    p.service_base().to_string(),
+                );
                 p.set_action_result(result);
                 if !ok {
                     return (Task::none(), None);
@@ -1834,6 +1877,7 @@ impl WalletScreen {
                     .unwrap_or(0);
                 let reload = spawn_safe_detail_load_task(
                     self.network.clone(),
+                    service_base,
                     safe,
                     chain,
                     hash,
@@ -1869,14 +1913,26 @@ impl WalletScreen {
                                     p.unsigned_signable().first().copied(),
                                     p.safe(),
                                     p.chain(),
+                                    p.version().to_string(),
+                                    p.service_base().to_string(),
                                 )
                             })
                         } else {
                             None
                         };
-                        let Some((tx, hash, owner, safe, chain)) = prep else {
+                        let Some((tx, hash, owner, safe, chain, version, service_base)) = prep
+                        else {
                             return (task, None);
                         };
+                        // Version gate before any signer is built: a
+                        // pre-1.3 (or unknown-shape) domain must refuse
+                        // with the explainable error, not a late
+                        // on-chain mismatch.
+                        if let Err(e) = crate::safe::tx::ensure_signable_version(&version) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
                         let owner_desc = owner.and_then(|a| self.owner_desc_for(a));
                         self.mark_safe_detail_busy();
                         let Some(owner_desc) = owner_desc else {
@@ -1887,6 +1943,7 @@ impl WalletScreen {
                         };
                         let confirm = spawn_safe_confirm_task(
                             self.network.clone(),
+                            service_base,
                             owner_desc,
                             safe,
                             chain,
@@ -1931,13 +1988,28 @@ impl WalletScreen {
                     }
                     Some(safe_tx_detail::Outcome::Reject) => {
                         let prep = if let Modal::SafeTxDetail(p) = &self.modal {
-                            Some((p.safe(), p.chain(), p.nonce(), p.signable_owner()))
+                            Some((
+                                p.safe(),
+                                p.chain(),
+                                p.nonce(),
+                                p.signable_owner(),
+                                p.version().to_string(),
+                                p.service_base().to_string(),
+                            ))
                         } else {
                             None
                         };
-                        let Some((safe, chain, nonce, owner)) = prep else {
+                        let Some((safe, chain, nonce, owner, version, service_base)) = prep
+                        else {
                             return (task, None);
                         };
+                        // Same version gate as Confirm — a rejection is
+                        // a SafeTx signature too.
+                        if let Err(e) = crate::safe::tx::ensure_signable_version(&version) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
                         let owner_desc = owner.and_then(|a| self.owner_desc_for(a));
                         self.mark_safe_detail_busy();
                         let Some(owner_desc) = owner_desc else {
@@ -1948,6 +2020,7 @@ impl WalletScreen {
                         };
                         let reject = spawn_safe_reject_task(
                             self.network.clone(),
+                            service_base,
                             owner_desc,
                             safe,
                             chain,
@@ -1966,6 +2039,29 @@ impl WalletScreen {
             Message::OpenNetworksSettings => {
                 self.settings_pane =
                     SettingsPane::Networks(NetworksPane::new(self.network.clone()));
+            }
+            Message::OpenSafesSettings => {
+                self.settings_pane = SettingsPane::Safes(SafesPane::new(self.safes.clone()));
+            }
+            Message::SafesSettings(child_msg) => {
+                let SettingsPane::Safes(p) = &mut self.settings_pane else {
+                    return (Task::none(), None);
+                };
+                let (task, outcome) = p.update(child_msg);
+                let task = task.map(Message::SafesSettings);
+                match outcome {
+                    Some(safes_settings::Outcome::Closed) => {
+                        self.settings_pane = SettingsPane::Root;
+                        return (task, None);
+                    }
+                    Some(safes_settings::Outcome::SetServiceUrl { index, url }) => {
+                        // Bubble to the App, which owns the wallet and
+                        // the disk write; it pushes the updated list
+                        // back via `SafesUpdated` (reseeding the pane).
+                        return (task, Some(Outcome::SetSafeServiceUrl { index, url }));
+                    }
+                    None => return (task, None),
+                }
             }
             Message::OpenAppearanceSettings => {
                 self.settings_pane = SettingsPane::Appearance;
@@ -2283,6 +2379,7 @@ impl WalletScreen {
             Nav::Settings => match &self.settings_pane {
                 SettingsPane::Root => settings_root::view(t),
                 SettingsPane::Networks(p) => p.view(t).map(Message::Networks),
+                SettingsPane::Safes(p) => p.view(t).map(Message::SafesSettings),
                 SettingsPane::Appearance => appearance::view(t, self.theme_kind),
                 SettingsPane::Contacts(p) => p.view(t).map(Message::Contacts),
             },
@@ -2642,16 +2739,109 @@ fn first_local_key_of(accounts: &[AccountDescriptor]) -> Option<B256> {
     })
 }
 
+/// Review-prep for the SafeSend modal: build the SafeTx at the live
+/// nonce, run both on-chain cross-checks (domain separator +
+/// `getTransactionHash`), and hand the pinned `(nonce, safeTxHash)`
+/// back to the pane so the review screen shows the exact hash the
+/// signer(s) will commit to. Touches no signer.
+fn spawn_safe_prepare_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    req: SafeSendRequest,
+) -> Task<Message> {
+    use crate::safe::tx::{
+        Operation, SafeTxInput, build_safe_tx_with_nonce, current_safe_nonce,
+        ensure_signable_version, safe_domain, safe_tx_hash, verify_safe_tx_before_signing,
+    };
+    let chain = req.chain;
+    Task::perform(
+        async move {
+            let result: Result<(u64, B256), String> = async {
+                ensure_signable_version(&req.version)?;
+                let nonce =
+                    current_safe_nonce(network.as_ref(), req.safe_address, chain).await?;
+                let tx = build_safe_tx_with_nonce(
+                    SafeTxInput {
+                        to: req.to,
+                        value: req.value,
+                        data: alloy::primitives::Bytes::new(),
+                        operation: Operation::Call,
+                    },
+                    nonce,
+                );
+                let domain = safe_domain(req.safe_address, chain);
+                let local = safe_tx_hash(&tx, &domain);
+                verify_safe_tx_before_signing(
+                    network.as_ref(),
+                    &tx,
+                    req.safe_address,
+                    chain,
+                    local,
+                )
+                .await?;
+                Ok((nonce, local))
+            }
+            .await;
+            (seq, result)
+        },
+        |(seq, result)| Message::SafeSend(safe_send::Message::HashReady { seq, result }),
+    )
+}
+
+/// Rebuild the SafeTx at the `(nonce, hash)` pin the user reviewed,
+/// re-running every pre-sign check. Shared front-half of the broadcast
+/// and propose tasks. Fails if the review pin is missing, the live
+/// nonce moved since review (another co-signer executed something), or
+/// any local/on-chain hash check diverges — in every case before a
+/// signature exists.
+async fn rebuild_reviewed_safe_tx(
+    network: &dyn BalanceFetcher,
+    req: &SafeSendRequest,
+) -> Result<(crate::safe::SafeTx, alloy::sol_types::Eip712Domain, B256), String> {
+    use crate::safe::tx::{
+        Operation, SafeTxInput, build_safe_tx_with_nonce, current_safe_nonce,
+        ensure_signable_version, safe_domain, safe_tx_hash, verify_safe_tx_before_signing,
+    };
+    ensure_signable_version(&req.version)?;
+    let pinned = req
+        .prepared
+        .ok_or("internal: sign requested before the reviewed hash was ready")?;
+    let live_nonce = current_safe_nonce(network, req.safe_address, req.chain).await?;
+    if live_nonce != pinned.nonce {
+        return Err(format!(
+            "Safe nonce advanced since review ({} → {live_nonce}) — go back and review again",
+            pinned.nonce,
+        ));
+    }
+    let tx = build_safe_tx_with_nonce(
+        SafeTxInput {
+            to: req.to,
+            value: req.value,
+            data: alloy::primitives::Bytes::new(),
+            operation: Operation::Call,
+        },
+        pinned.nonce,
+    );
+    let domain = safe_domain(req.safe_address, req.chain);
+    let local_hash = safe_tx_hash(&tx, &domain);
+    if local_hash != pinned.safe_tx_hash {
+        // Can only happen if the form and the pin desynced — a bug, but
+        // the invariant "we sign only what was displayed" must hold.
+        return Err("safe-tx differs from the reviewed hash — refusing to sign".to_string());
+    }
+    verify_safe_tx_before_signing(network, &tx, req.safe_address, req.chain, local_hash)
+        .await?;
+    Ok((tx, domain, local_hash))
+}
+
 /// Spawn the Safe-TX sign-and-broadcast task.
 ///
-/// 1. Build the SafeTx (reads on-chain nonce).
-/// 2. Cross-check the local EIP-712 hash against the Safe's own
-///    `getTransactionHash` — abort on divergence rather than sign
-///    something the contract won't recover the same way.
-/// 3. For the first `threshold` owner keys (in `owner_keys` order),
+/// 1. Rebuild the SafeTx at the reviewed `(nonce, hash)` pin and re-run
+///    the on-chain cross-checks (`rebuild_reviewed_safe_tx`).
+/// 2. For the first `threshold` owner keys (in `owner_keys` order),
 ///    derive a Local signer and sign the hash.
-/// 4. Pack signatures Safe-style (ascending by address, 65 B each).
-/// 5. Call `execute_safe_tx` using the first owner as gas payer.
+/// 3. Pack signatures Safe-style (ascending by address, 65 B each).
+/// 4. Call `execute_safe_tx` using the first owner as gas payer.
 ///
 /// The first entry in `owner_keys` doubles as the gas-paying
 /// executor — that way the dashboard's active EOA can be anything
@@ -2663,10 +2853,7 @@ fn spawn_safe_broadcast_task(
     req: SafeSendRequest,
     owner_keys: Vec<alloy::primitives::B256>,
 ) -> Task<Message> {
-    use crate::safe::tx::{
-        Operation, SafeTxInput, build_safe_tx, execute_safe_tx, pack_owner_signatures,
-        safe_domain, safe_tx_hash, verify_safe_tx_hash_on_chain,
-    };
+    use crate::safe::tx::{execute_safe_tx, pack_owner_signatures};
     let chain = req.chain;
     Task::perform(
         async move {
@@ -2697,39 +2884,8 @@ fn spawn_safe_broadcast_task(
             };
             let executor = KaoSigner::Local(executor_signer);
 
-            let input = SafeTxInput {
-                safe: req.safe_address,
-                chain,
-                to: req.to,
-                value: req.value,
-                data: alloy::primitives::Bytes::new(),
-                operation: Operation::Call,
-            };
-            let safe_tx = match build_safe_tx(network.as_ref(), input).await {
-                Ok(t) => t,
-                Err(e) => return Err(e),
-            };
-            let domain = safe_domain(req.safe_address, chain);
-            let local_hash = safe_tx_hash(&safe_tx, &domain);
-            // Defense-in-depth — abort if the contract computes a
-            // different hash than we did. Almost always means the
-            // address isn't actually a Safe 1.3+ at this chain.
-            let chain_hash = match verify_safe_tx_hash_on_chain(
-                network.as_ref(),
-                &safe_tx,
-                req.safe_address,
-                chain,
-            )
-            .await
-            {
-                Ok(h) => h,
-                Err(e) => return Err(e),
-            };
-            if local_hash != chain_hash {
-                return Err(format!(
-                    "safe hash mismatch: local {local_hash:#x} vs on-chain {chain_hash:#x}",
-                ));
-            }
+            let (safe_tx, _domain, local_hash) =
+                rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
             let mut sigs = Vec::with_capacity(req.threshold as usize);
             for key in owner_keys.into_iter().take(req.threshold as usize) {
                 let local = match crate::wallet::signer_from_bytes(&key) {
@@ -2743,7 +2899,7 @@ fn spawn_safe_broadcast_task(
                 };
                 sigs.push((kao.address(), sig));
             }
-            let packed = pack_owner_signatures(sigs);
+            let packed = pack_owner_signatures(sigs)?;
             execute_safe_tx(
                 &provider,
                 &executor,
@@ -2758,46 +2914,36 @@ fn spawn_safe_broadcast_task(
     )
 }
 
-/// Propose a Safe-send tx to the Transaction Service: build the SafeTx at
-/// the live nonce, verify its hash on-chain, sign once as `owner_desc`
-/// (software or hardware), and POST. Co-signers finish it from their own
-/// wallets. Mirrors `spawn_safe_broadcast_task`'s build→verify→sign
-/// front-half, but stops at the service instead of broadcasting.
+/// Propose a Safe-send tx to the Transaction Service: rebuild the SafeTx
+/// at the reviewed `(nonce, hash)` pin, re-run the on-chain checks, sign
+/// once as `owner_desc` (software or hardware), and POST. Co-signers
+/// finish it from their own wallets. Mirrors `spawn_safe_broadcast_task`'s
+/// rebuild→verify→sign front-half, but stops at the service instead of
+/// broadcasting.
 fn spawn_safe_propose_task(
     network: Arc<dyn BalanceFetcher>,
     owner_desc: AccountDescriptor,
     req: SafeSendRequest,
 ) -> Task<Message> {
-    use crate::safe::tx::{
-        Operation, SafeTxInput, build_safe_tx, safe_domain, safe_tx_hash,
-        sign_owner, verify_safe_tx_hash_on_chain,
-    };
+    use crate::safe::tx::sign_owner;
     let chain = req.chain;
     Task::perform(
         async move {
-            let domain = safe_domain(req.safe_address, chain);
-            let input = SafeTxInput {
-                safe: req.safe_address,
-                chain,
-                to: req.to,
-                value: req.value,
-                data: alloy::primitives::Bytes::new(),
-                operation: Operation::Call,
-            };
-            let tx = build_safe_tx(network.as_ref(), input).await?;
-            let local = safe_tx_hash(&tx, &domain);
-            let chain_hash =
-                verify_safe_tx_hash_on_chain(network.as_ref(), &tx, req.safe_address, chain)
-                    .await?;
-            if local != chain_hash {
-                return Err(format!(
-                    "safe hash mismatch: local {local:#x} vs on-chain {chain_hash:#x}"
-                ));
-            }
+            let (tx, domain, local) =
+                rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
             let (sender, sig) = sign_owner(&signer, &tx, &domain, local).await?;
-            crate::safe::service::propose(req.safe_address, chain, &tx, local, sender, &sig, Some("Kao"))
-                .await?;
+            crate::safe::service::propose(
+                &req.service_base,
+                req.safe_address,
+                chain,
+                &tx,
+                local,
+                sender,
+                &sig,
+                Some("Kao"),
+            )
+            .await?;
             Ok(())
         },
         Message::SafeSendProposeReturn,
@@ -2809,6 +2955,7 @@ fn spawn_safe_propose_task(
 /// execute-from-queue path.
 fn spawn_safe_detail_load_task(
     network: Arc<dyn BalanceFetcher>,
+    service_base: String,
     safe: Address,
     chain: crate::chain::Chain,
     safe_tx_hash: B256,
@@ -2816,8 +2963,15 @@ fn spawn_safe_detail_load_task(
 ) -> Task<Message> {
     Task::perform(
         async move {
-            crate::safe::service::fetch_detail(network.as_ref(), safe, chain, safe_tx_hash, threshold)
-                .await
+            crate::safe::service::fetch_detail(
+                network.as_ref(),
+                &service_base,
+                safe,
+                chain,
+                safe_tx_hash,
+                threshold,
+            )
+            .await
         },
         Message::SafeTxDetailLoaded,
     )
@@ -2829,15 +2983,14 @@ fn spawn_safe_detail_load_task(
 /// loaded disagrees with what the Safe computes.
 fn spawn_safe_confirm_task(
     network: Arc<dyn BalanceFetcher>,
+    service_base: String,
     owner_desc: AccountDescriptor,
     safe: Address,
     chain: crate::chain::Chain,
     tx: crate::safe::SafeTx,
     safe_tx_hash: B256,
 ) -> Task<Message> {
-    use crate::safe::tx::{
-        safe_domain, safe_tx_hash as compute_hash, sign_owner, verify_safe_tx_hash_on_chain,
-    };
+    use crate::safe::tx::{safe_domain, safe_tx_hash as compute_hash, sign_owner, verify_safe_tx_before_signing};
     Task::perform(
         async move {
             let domain = safe_domain(safe, chain);
@@ -2845,16 +2998,10 @@ fn spawn_safe_confirm_task(
             if local != safe_tx_hash {
                 return Err("safe-tx: detail hash drifted; refusing to sign".to_string());
             }
-            let chain_hash =
-                verify_safe_tx_hash_on_chain(network.as_ref(), &tx, safe, chain).await?;
-            if local != chain_hash {
-                return Err(format!(
-                    "safe hash mismatch: local {local:#x} vs on-chain {chain_hash:#x}"
-                ));
-            }
+            verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local).await?;
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
             let (_, sig) = sign_owner(&signer, &tx, &domain, safe_tx_hash).await?;
-            crate::safe::service::confirm(safe_tx_hash, chain, &sig).await?;
+            crate::safe::service::confirm(&service_base, safe_tx_hash, chain, &sig).await?;
             Ok("Signature added".to_string())
         },
         Message::SafeTxActionDone,
@@ -2883,7 +3030,7 @@ fn spawn_safe_execute_task(
             let executor = KaoSigner::Local(
                 crate::wallet::signer_from_bytes(&executor_key).map_err(|e| e.to_string())?,
             );
-            let packed = assemble_signatures(confirmations);
+            let packed = assemble_signatures(confirmations)?;
             let hash = execute_safe_tx(&provider, &executor, safe, chain, tx, packed).await?;
             Ok(format!("Executed · {hash:#x}"))
         },
@@ -2897,6 +3044,7 @@ fn spawn_safe_execute_task(
 /// the original.
 fn spawn_safe_reject_task(
     network: Arc<dyn BalanceFetcher>,
+    service_base: String,
     owner_desc: AccountDescriptor,
     safe: Address,
     chain: crate::chain::Chain,
@@ -2904,24 +3052,27 @@ fn spawn_safe_reject_task(
 ) -> Task<Message> {
     use crate::safe::tx::{
         build_rejection_tx, safe_domain, safe_tx_hash as compute_hash, sign_owner,
-        verify_safe_tx_hash_on_chain,
+        verify_safe_tx_before_signing,
     };
     Task::perform(
         async move {
             let domain = safe_domain(safe, chain);
-            let tx = build_rejection_tx(safe, chain, nonce);
+            let tx = build_rejection_tx(safe, nonce);
             let local = compute_hash(&tx, &domain);
-            let chain_hash =
-                verify_safe_tx_hash_on_chain(network.as_ref(), &tx, safe, chain).await?;
-            if local != chain_hash {
-                return Err(format!(
-                    "safe hash mismatch: local {local:#x} vs on-chain {chain_hash:#x}"
-                ));
-            }
+            verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local).await?;
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
             let (sender, sig) = sign_owner(&signer, &tx, &domain, local).await?;
-            crate::safe::service::propose(safe, chain, &tx, local, sender, &sig, Some("Kao:reject"))
-                .await?;
+            crate::safe::service::propose(
+                &service_base,
+                safe,
+                chain,
+                &tx,
+                local,
+                sender,
+                &sig,
+                Some("Kao:reject"),
+            )
+            .await?;
             Ok("Rejection proposed".to_string())
         },
         Message::SafeTxActionDone,
@@ -3136,6 +3287,7 @@ mod tests {
             linked_signer_indices: vec![0],
             sibling_chains: Vec::new(),
             cached_at: 0,
+            tx_service_url: None,
         }
     }
 
@@ -3481,6 +3633,7 @@ mod tests {
             linked_signer_indices: Vec::new(),
             sibling_chains: Vec::new(),
             cached_at: 0,
+            tx_service_url: None,
         }
     }
 
@@ -3505,6 +3658,7 @@ mod tests {
             to: addr(0xdd),
             value: U256::ZERO,
             data: alloy::primitives::Bytes::new(),
+            operation: 0,
             nonce,
             state: crate::safe::service::SafeTxState::AwaitingConfirmations {
                 have: 1,
@@ -3622,5 +3776,214 @@ mod tests {
             result: Ok(Vec::new()),
         });
         assert!(s.safe_pending_error.is_none());
+    }
+
+    // ── rebuild_reviewed_safe_tx (the review-pin enforcement core) ────
+    //
+    // Every signature in the SafeSend flow goes through this fn. The
+    // invariant under test: a signature can only ever cover the exact
+    // `(nonce, safeTxHash)` the user verified on the review screen —
+    // any drift (missing pin, advanced nonce, hash divergence, wrong
+    // version) must abort BEFORE a signer is touched.
+
+    use crate::net::CallMock;
+    use alloy::sol_types::{SolCall, SolValue};
+
+    fn reviewed_req(
+        prepared: Option<safe_send::PreparedSafeTx>,
+    ) -> safe_send::SafeSendRequest {
+        safe_send::SafeSendRequest {
+            safe_address: addr(0x5A),
+            chain: Chain::Mainnet,
+            version: "1.4.1".into(),
+            service_base: crate::safe::service::DEFAULT_TX_SERVICE_BASE.into(),
+            to: addr(0xDD),
+            value: U256::from(1_000u64),
+            threshold: 1,
+            linked_local_indices: vec![0],
+            signable_indices: vec![0],
+            prepared,
+        }
+    }
+
+    /// The SafeTx `rebuild_reviewed_safe_tx` derives from `reviewed_req`
+    /// at `nonce`, plus its local EIP-712 hash.
+    fn expected_tx_and_hash(nonce: u64) -> (crate::safe::SafeTx, B256) {
+        use crate::safe::tx::{
+            Operation, SafeTxInput, build_safe_tx_with_nonce, safe_domain, safe_tx_hash,
+        };
+        let req = reviewed_req(None);
+        let tx = build_safe_tx_with_nonce(
+            SafeTxInput {
+                to: req.to,
+                value: req.value,
+                data: alloy::primitives::Bytes::new(),
+                operation: Operation::Call,
+            },
+            nonce,
+        );
+        let hash = safe_tx_hash(&tx, &safe_domain(req.safe_address, req.chain));
+        (tx, hash)
+    }
+
+    fn plant_safe_nonce(mock: &CallMock, safe: Address, nonce: u64) {
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(crate::safe::nonceCall {}.abi_encode()),
+            alloy::primitives::Bytes::from(U256::from(nonce).abi_encode()),
+            true,
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_without_a_review_pin() {
+        let mock = CallMock::new();
+        let err = rebuild_reviewed_safe_tx(&mock, &reviewed_req(None))
+            .await
+            .unwrap_err();
+        assert!(err.contains("reviewed hash"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_unsignable_version_before_any_chain_read() {
+        // Nothing planted on the mock: if the version guard didn't fire
+        // first, the nonce read would fail with a different error.
+        let mock = CallMock::new();
+        let mut req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: B256::repeat_byte(0xaa),
+        }));
+        req.version = "1.1.1".into();
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("outside the signable range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_when_nonce_advanced_since_review() {
+        // A co-signer executed something between review and click — the
+        // live nonce is past the pin. Clear error, no signature.
+        let mock = CallMock::new();
+        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: B256::repeat_byte(0xaa),
+        }));
+        plant_safe_nonce(&mock, req.safe_address, 8);
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("advanced since review"), "{err}");
+        assert!(err.contains("7 → 8"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_when_pin_hash_diverges_from_rebuilt_tx() {
+        // Pin carries the right nonce but a hash that doesn't match the
+        // rebuilt tx (form/pin desync — a bug, but the invariant holds).
+        let mock = CallMock::new();
+        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: B256::repeat_byte(0xaa), // not the real hash
+        }));
+        plant_safe_nonce(&mock, req.safe_address, 7);
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("differs from the reviewed hash"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_passes_when_pin_matches_and_contract_agrees() {
+        use crate::safe::tx::safe_domain;
+        let mock = CallMock::new();
+        let (tx, local_hash) = expected_tx_and_hash(7);
+        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: local_hash,
+        }));
+        let safe = req.safe_address;
+        plant_safe_nonce(&mock, safe, 7);
+        // Contract agrees on both pre-sign checks.
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(
+                crate::safe::domainSeparatorCall {}.abi_encode(),
+            ),
+            alloy::primitives::Bytes::from(
+                safe_domain(safe, Chain::Mainnet).separator().abi_encode(),
+            ),
+            true,
+        );
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(
+                crate::safe::getTransactionHashCall {
+                    to: tx.to,
+                    value: tx.value,
+                    data: tx.data.clone(),
+                    operation: tx.operation,
+                    safeTxGas: tx.safeTxGas,
+                    baseGas: tx.baseGas,
+                    gasPrice: tx.gasPrice,
+                    gasToken: tx.gasToken,
+                    refundReceiver: tx.refundReceiver,
+                    _nonce: tx.nonce,
+                }
+                .abi_encode(),
+            ),
+            alloy::primitives::Bytes::from(local_hash.abi_encode()),
+            true,
+        );
+        let (got_tx, _domain, got_hash) =
+            rebuild_reviewed_safe_tx(&mock, &req).await.unwrap();
+        assert_eq!(got_hash, local_hash);
+        assert_eq!(got_tx.to, tx.to);
+        assert_eq!(got_tx.value, tx.value);
+        assert_eq!(got_tx.nonce, tx.nonce);
+        assert_eq!(got_tx.operation, tx.operation);
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_when_contract_disputes_the_hash() {
+        // Pin and local rebuild agree, but the contract's
+        // getTransactionHash differs (wrong contract / encoding drift).
+        // The on-chain cross-check must still veto.
+        let mock = CallMock::new();
+        let (tx, local_hash) = expected_tx_and_hash(7);
+        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: local_hash,
+        }));
+        let safe = req.safe_address;
+        plant_safe_nonce(&mock, safe, 7);
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(
+                crate::safe::domainSeparatorCall {}.abi_encode(),
+            ),
+            alloy::primitives::Bytes::from(
+                crate::safe::tx::safe_domain(safe, Chain::Mainnet)
+                    .separator()
+                    .abi_encode(),
+            ),
+            true,
+        );
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(
+                crate::safe::getTransactionHashCall {
+                    to: tx.to,
+                    value: tx.value,
+                    data: tx.data.clone(),
+                    operation: tx.operation,
+                    safeTxGas: tx.safeTxGas,
+                    baseGas: tx.baseGas,
+                    gasPrice: tx.gasPrice,
+                    gasToken: tx.gasToken,
+                    refundReceiver: tx.refundReceiver,
+                    _nonce: tx.nonce,
+                }
+                .abi_encode(),
+            ),
+            alloy::primitives::Bytes::from(B256::repeat_byte(0x66).abi_encode()),
+            true,
+        );
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("safe hash mismatch"), "{err}");
     }
 }

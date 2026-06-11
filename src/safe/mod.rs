@@ -50,6 +50,7 @@ use crate::chain::Chain;
 use crate::net::BalanceFetcher;
 use crate::wallet::{SafeDescriptor, SafeTrust, short_address};
 
+pub mod service;
 pub mod tx;
 
 // ── Safe ABI (read + EIP-712/exec surface) ──────────────────────────────────
@@ -94,6 +95,7 @@ sol! {
     // — alloy derives the EIP-712 typehash from declaration order, so
     // any permutation silently produces a different signing hash.
     // Pinned by `safe::tx::tests::safe_tx_typehash_matches_spec`.
+    #[derive(Debug)]
     struct SafeTx {
         address to;
         uint256 value;
@@ -652,6 +654,8 @@ pub async fn refresh_one(
         linked_signer_indices: existing.linked_signer_indices.clone(),
         sibling_chains: existing.sibling_chains.clone(),
         cached_at: now,
+        // User configuration, not on-chain state — survives refresh.
+        tx_service_url: existing.tx_service_url.clone(),
     };
     Ok((new_desc, diff))
 }
@@ -1473,6 +1477,7 @@ mod tests {
             linked_signer_indices: Vec::new(),
             sibling_chains: Vec::new(),
             cached_at: 0,
+            tx_service_url: None,
         }
     }
 
@@ -1748,6 +1753,7 @@ mod tests {
             linked_signer_indices: vec![3],
             sibling_chains: vec![10],
             cached_at: 100,
+            tx_service_url: None,
         };
 
         let (new_desc, diff) = refresh_one(&mock, &prev).await.unwrap();
@@ -1762,6 +1768,37 @@ mod tests {
         assert_eq!(new_desc.sibling_chains, prev.sibling_chains);
         // cached_at advances (clamp to ≥ prev).
         assert!(new_desc.cached_at >= prev.cached_at);
+    }
+
+    #[tokio::test]
+    async fn refresh_one_preserves_custom_tx_service_url() {
+        // The service mirror is user configuration, not on-chain state —
+        // a background refresh must carry it through verbatim, exactly
+        // like name / linked signers / siblings.
+        let mock = CallMock::new();
+        let owners = vec![address!("0x000000000000000000000000000000000000beef")];
+        let _ = plant_canonical_safe(&mock, &owners, 1, &[], None, None);
+        let prev = SafeDescriptor {
+            name: Some("treasury".into()),
+            chain_id: Chain::Mainnet.chain_id(),
+            address: safe_addr().into(),
+            version: "1.4.1".into(),
+            trust: SafeTrust::Canonical,
+            threshold: 1,
+            owners: vec![owners[0].into()],
+            modules: Vec::new(),
+            guard: None,
+            fallback_handler: None,
+            linked_signer_indices: Vec::new(),
+            sibling_chains: Vec::new(),
+            cached_at: 100,
+            tx_service_url: Some("https://txs.example-dao.org".into()),
+        };
+        let (new_desc, _diff) = refresh_one(&mock, &prev).await.unwrap();
+        assert_eq!(
+            new_desc.tx_service_url.as_deref(),
+            Some("https://txs.example-dao.org"),
+        );
     }
 
     #[tokio::test]
@@ -1782,6 +1819,7 @@ mod tests {
             linked_signer_indices: Vec::new(),
             sibling_chains: Vec::new(),
             cached_at: 0,
+            tx_service_url: None,
         };
         let err = refresh_one(&mock, &prev).await.unwrap_err();
         assert!(
@@ -1813,6 +1851,7 @@ mod tests {
             linked_signer_indices: Vec::new(),
             sibling_chains: Vec::new(),
             cached_at: 0,
+            tx_service_url: None,
         };
 
         let (_new, diff) = refresh_one(&mock, &prev).await.unwrap();

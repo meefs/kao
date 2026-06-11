@@ -4,8 +4,11 @@
 //! This module is the layer below the UI. It exposes:
 //!
 //! - `SafeTxInput` — ergonomic builder input (recipient + value + calldata).
-//! - `build_safe_tx` — reads the Safe's authoritative on-chain nonce and
-//!   returns a fully-populated `SafeTx` with relay fields zeroed.
+//! - `current_safe_nonce` / `build_safe_tx_with_nonce` — read the Safe's
+//!   authoritative on-chain nonce, then assemble a fully-populated
+//!   `SafeTx` (relay fields zeroed) at that *pinned* nonce. Split on
+//!   purpose: the nonce is read once at review time and carried through
+//!   to signing, so the user only ever signs the hash they verified.
 //! - `safe_tx_hash` — local EIP-712 signing hash.
 //! - `verify_safe_tx_hash_on_chain` / `verify_domain_separator_on_chain` —
 //!   cross-checks against the Safe's own `getTransactionHash` /
@@ -33,7 +36,8 @@ use crate::net::BalanceFetcher;
 use crate::wallet::KaoSigner;
 
 use super::{
-    SafeTx, decode_ret, execTransactionCall, getTransactionHashCall, nonceCall,
+    SafeTx, decode_ret, domainSeparatorCall, execTransactionCall, getTransactionHashCall,
+    nonceCall,
 };
 
 /// Safe-spec operation byte. Only `Call` is exposed in v1 —
@@ -46,14 +50,13 @@ pub enum Operation {
     // DelegateCall = 1,  // intentionally not constructible in v1
 }
 
-/// Ergonomic input for `build_safe_tx`. Carries everything the
-/// caller needs to express (target, value, calldata, op) plus the
-/// `(safe, chain)` pair that locates the Safe on-chain so we can read
-/// its authoritative nonce.
+/// Ergonomic input for [`build_safe_tx_with_nonce`] — the
+/// caller-expressible half of a SafeTx (target, value, calldata, op).
+/// The nonce is always supplied explicitly: callers read it via
+/// [`current_safe_nonce`] at review time and pin it through to signing,
+/// so the hash the user verified is the only hash that can be signed.
 #[derive(Debug, Clone)]
 pub struct SafeTxInput {
-    pub safe: Address,
-    pub chain: Chain,
     pub to: Address,
     pub value: U256,
     pub data: Bytes,
@@ -110,16 +113,41 @@ pub fn safe_tx_hash(tx: &SafeTx, domain: &Eip712Domain) -> B256 {
 /// We emit the {27, 28} variant exclusively. alloy's
 /// `Signature::as_bytes` writes `r ‖ s ‖ (27 + y_parity)` directly,
 /// so we copy its 65 bytes verbatim.
-pub fn pack_owner_signatures(mut sigs: Vec<(Address, Signature)>) -> Bytes {
+///
+/// Errors on a duplicate signer address. Two signatures from the same
+/// owner only count once inside `checkSignatures`, so the blob would
+/// carry fewer distinct approvals than the threshold requires and
+/// revert on-chain (`GS026`) after gas was paid — and silently
+/// dropping one here would mask the real problem (the caller selected
+/// the same owner twice, e.g. one key imported into two account
+/// slots). Fail loudly before anything leaves the wallet.
+pub fn pack_owner_signatures(mut sigs: Vec<(Address, Signature)>) -> Result<Bytes, String> {
     // `Address` is a `FixedBytes<20>`; its `Ord` impl is lexicographic
     // byte order, which is also numeric big-endian order — matching
     // what Safe sorts on.
     sigs.sort_by_key(|(addr, _)| *addr);
+    ensure_distinct_signers(sigs.iter().map(|(a, _)| *a))?;
     let mut out = Vec::with_capacity(sigs.len() * 65);
     for (_, sig) in sigs {
         out.extend_from_slice(&sig.as_bytes());
     }
-    Bytes::from(out)
+    Ok(Bytes::from(out))
+}
+
+/// Reject adjacent duplicates in an already-sorted signer sequence.
+/// Shared guard for [`pack_owner_signatures`] / [`assemble_signatures`].
+fn ensure_distinct_signers(sorted: impl Iterator<Item = Address>) -> Result<(), String> {
+    let mut prev: Option<Address> = None;
+    for addr in sorted {
+        if prev == Some(addr) {
+            return Err(format!(
+                "duplicate signature from owner {} — each owner counts once toward the threshold",
+                crate::wallet::short_address(addr),
+            ));
+        }
+        prev = Some(addr);
+    }
+    Ok(())
 }
 
 /// Read the AUTHORITATIVE Safe nonce on chain. The cached
@@ -176,18 +204,97 @@ pub async fn verify_safe_tx_hash_on_chain(
     decode_ret::<getTransactionHashCall>(&ret.value)
 }
 
-/// Assemble a `SafeTx` from `input`, reading the Safe's
-/// authoritative nonce on chain. All relay-flow fields (`safeTxGas`,
-/// `baseGas`, `gasPrice`, `gasToken`, `refundReceiver`) are zero —
-/// this slice doesn't support the Safe Transaction Service / Gelato
-/// refund flow. The contract's `execTransaction` accepts these as
-/// no-ops when `gasPrice == 0`.
-pub async fn build_safe_tx(
+/// Cross-check the locally-built EIP-712 domain separator against the
+/// Safe's own `domainSeparator()` view. Companion to
+/// [`verify_safe_tx_hash_on_chain`], same trust posture.
+///
+/// A mismatch means the contract derives its domain differently than we
+/// do — most commonly a pre-1.3 Safe (whose domain omits `chainId`), a
+/// proxy pointing at something that isn't the Safe we classified, or a
+/// chain-id confusion. All of those are "do not sign" conditions: a
+/// signature over our domain would either be rejected by the contract
+/// or, worse, be valid somewhere we didn't intend.
+pub async fn verify_domain_separator_on_chain(
     net: &dyn BalanceFetcher,
-    input: SafeTxInput,
-) -> Result<SafeTx, String> {
-    let nonce_u64 = current_safe_nonce(net, input.safe, input.chain).await?;
-    Ok(SafeTx {
+    safe: Address,
+    chain: Chain,
+) -> Result<(), String> {
+    let local = safe_domain(safe, chain).separator();
+    let calldata = domainSeparatorCall {}.abi_encode();
+    let ret = net.call_raw(safe, Bytes::from(calldata), chain).await?;
+    let on_chain = decode_ret::<domainSeparatorCall>(&ret.value)?;
+    if local == on_chain {
+        Ok(())
+    } else {
+        Err(format!(
+            "safe domain separator mismatch: local {local:#x} vs on-chain {on_chain:#x} — refusing to sign",
+        ))
+    }
+}
+
+/// Run BOTH pre-sign cross-checks against the live contract: the domain
+/// separator and the full `getTransactionHash` for `tx`. `local_hash`
+/// is the hash the caller is about to put in front of a signer; any
+/// divergence aborts before a signature exists.
+///
+/// The two checks overlap (the tx hash commits to the domain) but fail
+/// differently: a domain mismatch pinpoints "wrong domain shape /
+/// wrong chain / pre-1.3 Safe", while a tx-hash mismatch with a clean
+/// domain points at field encoding. Two reads per signing action is
+/// cheap next to a multisig signature that can't be unsigned.
+pub async fn verify_safe_tx_before_signing(
+    net: &dyn BalanceFetcher,
+    tx: &SafeTx,
+    safe: Address,
+    chain: Chain,
+    local_hash: B256,
+) -> Result<(), String> {
+    verify_domain_separator_on_chain(net, safe, chain).await?;
+    let chain_hash = verify_safe_tx_hash_on_chain(net, tx, safe, chain).await?;
+    if local_hash != chain_hash {
+        return Err(format!(
+            "safe hash mismatch: local {local_hash:#x} vs on-chain {chain_hash:#x}",
+        ));
+    }
+    Ok(())
+}
+
+/// Gate signing on Safe versions whose EIP-712 domain shape we
+/// actually implement. [`safe_domain`] hardcodes the 1.3+ form
+/// `EIP712Domain(uint256 chainId, address verifyingContract)`; signing
+/// for anything older would silently produce a hash over the wrong
+/// domain (pre-1.3 omits `chainId`), and anything newer than the
+/// allowlist cap might change the shape again. The on-chain checks in
+/// [`verify_safe_tx_before_signing`] would catch both live — this guard
+/// turns that late opaque mismatch into an early, explainable refusal.
+///
+/// Accepts exactly `1.{3,4,5}.N` (digits-only patch), mirroring the
+/// `KNOWN_SINGLETONS` range in `safe::mod`. Bump together with that
+/// registry and the allowlist cap when Safe ships a new minor.
+pub fn ensure_signable_version(version: &str) -> Result<(), String> {
+    let mut parts = version.split('.');
+    let ok = parts.next() == Some("1")
+        && matches!(parts.next(), Some("3" | "4" | "5"))
+        && parts
+            .next()
+            .is_some_and(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        && parts.next().is_none();
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "Safe version \"{version}\" is outside the signable range (1.3.0 – 1.5.x): \
+             its EIP-712 domain may differ from the one Kao signs, so signing is disabled",
+        ))
+    }
+}
+
+/// Assemble a `SafeTx` from `input` at an explicit `nonce`. Pure — no
+/// network. All relay-flow fields (`safeTxGas`, `baseGas`, `gasPrice`,
+/// `gasToken`, `refundReceiver`) are zero; the contract's
+/// `execTransaction` treats them as no-ops when `gasPrice == 0`.
+pub fn build_safe_tx_with_nonce(input: SafeTxInput, nonce: u64) -> SafeTx {
+    SafeTx {
         to: input.to,
         value: input.value,
         data: input.data,
@@ -197,8 +304,104 @@ pub async fn build_safe_tx(
         gasPrice: U256::ZERO,
         gasToken: Address::ZERO,
         refundReceiver: Address::ZERO,
-        nonce: U256::from(nonce_u64),
-    })
+        nonce: U256::from(nonce),
+    }
+}
+
+/// Build the canonical Safe *rejection* transaction for `nonce`: a
+/// zero-value, empty-calldata call to the Safe itself. Executing it
+/// consumes `nonce`, voiding whatever else was queued at that nonce.
+/// The Transaction Service recognizes a same-nonce self-call as an
+/// on-chain rejection and labels it as such.
+pub fn build_rejection_tx(safe: Address, nonce: u64) -> SafeTx {
+    build_safe_tx_with_nonce(
+        SafeTxInput {
+            to: safe,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            operation: Operation::Call,
+        },
+        nonce,
+    )
+}
+
+/// Concatenate already-encoded per-owner signature blobs into the
+/// `bytes signatures` argument `execTransaction` expects, sorted ascending
+/// by signer address (Safe's `checkSignatures` requirement; see
+/// [`pack_owner_signatures`]).
+///
+/// Unlike `pack_owner_signatures`, the inputs are *raw bytes*, not
+/// `Signature`s — so this can mix EIP-712 (`v∈{27,28}`), `eth_sign`
+/// (`v∈{31,32}`), and signatures pulled verbatim from the Transaction
+/// Service (the execute-from-queue path). Each blob is whatever the
+/// signer produced; for ECDSA owners that's 65 bytes.
+///
+/// Same duplicate-owner guard as [`pack_owner_signatures`]: a service
+/// record (or caller bug) carrying two confirmations from one owner
+/// would revert `GS026` on-chain — refuse before broadcasting.
+pub fn assemble_signatures(mut sigs: Vec<(Address, Bytes)>) -> Result<Bytes, String> {
+    sigs.sort_by_key(|(addr, _)| *addr);
+    ensure_distinct_signers(sigs.iter().map(|(a, _)| *a))?;
+    let mut out = Vec::with_capacity(sigs.iter().map(|(_, b)| b.len()).sum());
+    for (_, b) in sigs {
+        out.extend_from_slice(&b);
+    }
+    Ok(Bytes::from(out))
+}
+
+/// Sign a `SafeTx` as an owner via EIP-712 and return the
+/// `(signer_address, 65-byte blob)` ready for [`assemble_signatures`].
+/// Routes through [`KaoSigner::sign_eip712`], so software **and**
+/// hardware owners work. `v` is `{27,28}`.
+pub async fn eip712_owner_sig(
+    signer: &KaoSigner,
+    tx: &SafeTx,
+    domain: &Eip712Domain,
+) -> Result<(Address, Bytes), String> {
+    let sig = signer
+        .sign_eip712(tx, domain)
+        .await
+        .map_err(|e| format!("eip712 sign: {e}"))?;
+    Ok((signer.address(), Bytes::from(sig.as_bytes().to_vec())))
+}
+
+/// Sign a `SafeTx` as an owner, preferring EIP-712 and falling back to
+/// `eth_sign` when the device/app rejects typed-data signing (older
+/// Ledger app versions). Returns the `(owner, wire-blob)` pair for
+/// [`assemble_signatures`]. The single entry point the propose / confirm
+/// / reject flows use.
+pub async fn sign_owner(
+    signer: &KaoSigner,
+    tx: &SafeTx,
+    domain: &Eip712Domain,
+    safe_tx_hash: B256,
+) -> Result<(Address, Bytes), String> {
+    match eip712_owner_sig(signer, tx, domain).await {
+        Ok(v) => Ok(v),
+        Err(eip712_err) => eth_sign_owner_sig(signer, safe_tx_hash).await.map_err(|eth_err| {
+            format!("eip712 ({eip712_err}) and eth_sign ({eth_err}) both failed")
+        }),
+    }
+}
+
+/// `eth_sign` fallback: sign the safeTxHash as an EIP-191 personal
+/// message and bump `v` by 4 (`{27,28}` → `{31,32}`) so Safe's
+/// `checkSignatures` recovers it against the `"\x19Ethereum Signed
+/// Message:\n32"`-prefixed digest. For devices/app-versions that reject
+/// EIP-712; prefer [`eip712_owner_sig`] when it succeeds.
+pub async fn eth_sign_owner_sig(
+    signer: &KaoSigner,
+    safe_tx_hash: B256,
+) -> Result<(Address, Bytes), String> {
+    let sig = signer
+        .sign_eth_message(safe_tx_hash.as_slice())
+        .await
+        .map_err(|e| format!("eth_sign: {e}"))?;
+    let mut bytes = sig.as_bytes().to_vec();
+    // 65-byte r‖s‖v; `as_bytes` writes v = 27 + parity. Safe reads
+    // v∈{31,32} as "eth_sign over the hash", so +4.
+    bytes[64] += 4;
+    Ok((signer.address(), Bytes::from(bytes)))
 }
 
 /// ABI-encode the `execTransaction(...)` calldata for `tx` with the
@@ -400,7 +603,7 @@ mod tests {
         let s = PrivateKeySigner::random();
         let hash = B256::repeat_byte(0xab);
         let pair = sig_for(hash, &s).await;
-        let bytes = pack_owner_signatures(vec![pair]);
+        let bytes = pack_owner_signatures(vec![pair]).unwrap();
         assert_eq!(bytes.len(), 65);
         assert!(matches!(bytes[64], 27 | 28));
     }
@@ -425,7 +628,7 @@ mod tests {
         let pair_hi = sig_for(hash, &hi).await;
 
         // Feed in HIGH-then-LOW order; expect packing to swap them.
-        let bytes = pack_owner_signatures(vec![pair_hi, pair_lo]);
+        let bytes = pack_owner_signatures(vec![pair_hi, pair_lo]).unwrap();
         assert_eq!(bytes.len(), 130);
         // First 65 bytes should be the low-address signer's signature.
         assert_eq!(&bytes[..65], &pair_lo.1.as_bytes()[..]);
@@ -442,15 +645,46 @@ mod tests {
         let hash = B256::repeat_byte(0xef);
         let pa = sig_for(hash, &s_a).await;
         let pb = sig_for(hash, &s_b).await;
-        let ab = pack_owner_signatures(vec![pa, pb]);
-        let ba = pack_owner_signatures(vec![pb, pa]);
+        let ab = pack_owner_signatures(vec![pa, pb]).unwrap();
+        let ba = pack_owner_signatures(vec![pb, pa]).unwrap();
         assert_eq!(ab, ba);
     }
 
     #[test]
     fn pack_owner_signatures_empty_returns_empty_bytes() {
-        let out = pack_owner_signatures(Vec::new());
+        let out = pack_owner_signatures(Vec::new()).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pack_owner_signatures_rejects_duplicate_owner() {
+        // One key imported into two account slots, both linked and both
+        // selected to sign: the same owner appears twice. checkSignatures
+        // counts it once, so the blob would be under-threshold and
+        // revert GS026 after gas — refuse locally instead.
+        let s = PrivateKeySigner::random();
+        let hash = B256::repeat_byte(0xab);
+        let pair_a = sig_for(hash, &s).await;
+        // Different signature bytes (other hash), same recovered owner —
+        // dedup keys on the address, not the signature payload.
+        let pair_b = sig_for(B256::repeat_byte(0xcd), &s).await;
+        let err = pack_owner_signatures(vec![pair_a, pair_b]).unwrap_err();
+        assert!(err.contains("duplicate signature from owner"), "{err}");
+    }
+
+    #[test]
+    fn assemble_signatures_rejects_duplicate_owner() {
+        // Execute-from-queue path: a service record carrying two
+        // confirmations from one owner must refuse before broadcast.
+        let owner = Address::repeat_byte(0x11);
+        let other = Address::repeat_byte(0x22);
+        let err = assemble_signatures(vec![
+            (owner, Bytes::from(vec![0xAAu8; 65])),
+            (other, Bytes::from(vec![0xBBu8; 65])),
+            (owner, Bytes::from(vec![0xCCu8; 65])),
+        ])
+        .unwrap_err();
+        assert!(err.contains("duplicate signature from owner"), "{err}");
     }
 
     // ── On-chain reader tests against CallMock ────────────────────
@@ -467,34 +701,6 @@ mod tests {
         );
         let n = current_safe_nonce(&mock, safe, Chain::Mainnet).await.unwrap();
         assert_eq!(n, 99);
-    }
-
-    #[tokio::test]
-    async fn build_safe_tx_uses_on_chain_nonce_and_zeros_relay_fields() {
-        let mock = CallMock::new();
-        let safe = safe_addr();
-        mock.set_call(
-            safe,
-            Bytes::from(nonceCall {}.abi_encode()),
-            Bytes::from(U256::from(7u64).abi_encode()),
-            true,
-        );
-        let input = SafeTxInput {
-            safe,
-            chain: Chain::Mainnet,
-            to: address!("0x000000000000000000000000000000000000dEaD"),
-            value: U256::from(1_000_000_000_000_000_000u128),
-            data: Bytes::new(),
-            operation: Operation::Call,
-        };
-        let tx = build_safe_tx(&mock, input).await.unwrap();
-        assert_eq!(tx.nonce, U256::from(7u64));
-        assert_eq!(tx.operation, 0);
-        assert_eq!(tx.safeTxGas, U256::ZERO);
-        assert_eq!(tx.baseGas, U256::ZERO);
-        assert_eq!(tx.gasPrice, U256::ZERO);
-        assert_eq!(tx.gasToken, Address::ZERO);
-        assert_eq!(tx.refundReceiver, Address::ZERO);
     }
 
     #[tokio::test]
@@ -526,6 +732,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, planted);
+    }
+
+    #[test]
+    fn build_safe_tx_with_nonce_zeros_relay_and_sets_nonce() {
+        let input = SafeTxInput {
+            to: address!("0x000000000000000000000000000000000000dEaD"),
+            value: U256::from(5u64),
+            data: Bytes::from_static(&[0x01, 0x02]),
+            operation: Operation::Call,
+        };
+        let tx = build_safe_tx_with_nonce(input, 42);
+        assert_eq!(tx.nonce, U256::from(42u64));
+        assert_eq!(tx.operation, 0);
+        assert_eq!(tx.safeTxGas, U256::ZERO);
+        assert_eq!(tx.baseGas, U256::ZERO);
+        assert_eq!(tx.gasPrice, U256::ZERO);
+        assert_eq!(tx.gasToken, Address::ZERO);
+        assert_eq!(tx.refundReceiver, Address::ZERO);
+        assert_eq!(tx.value, U256::from(5u64));
+    }
+
+    #[test]
+    fn build_rejection_tx_is_zero_value_self_call() {
+        let safe = safe_addr();
+        let tx = build_rejection_tx(safe, 7);
+        assert_eq!(tx.to, safe);
+        assert_eq!(tx.value, U256::ZERO);
+        assert!(tx.data.is_empty());
+        assert_eq!(tx.operation, 0);
+        assert_eq!(tx.nonce, U256::from(7u64));
+    }
+
+    #[test]
+    fn assemble_signatures_empty_is_empty() {
+        assert!(assemble_signatures(Vec::new()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn assemble_signatures_matches_pack_for_eip712_sigs() {
+        // The raw-bytes assembler must produce the exact same blob as the
+        // typed `pack_owner_signatures` when fed equivalent EIP-712
+        // signatures — they're two entry points to the same wire format
+        // (the execute-from-queue path uses the raw one).
+        let s1 = PrivateKeySigner::random();
+        let s2 = PrivateKeySigner::random();
+        let hash = B256::repeat_byte(0x12);
+        let sig1 = s1.sign_hash(&hash).await.unwrap();
+        let sig2 = s2.sign_hash(&hash).await.unwrap();
+        let packed = pack_owner_signatures(vec![(s1.address(), sig1), (s2.address(), sig2)]).unwrap();
+        let assembled = assemble_signatures(vec![
+            (s1.address(), Bytes::from(sig1.as_bytes().to_vec())),
+            (s2.address(), Bytes::from(sig2.as_bytes().to_vec())),
+        ])
+        .unwrap();
+        assert_eq!(packed, assembled);
+    }
+
+    #[tokio::test]
+    async fn assemble_signatures_sorts_and_concats_raw_bytes() {
+        // Two distinct 65-byte blobs tagged by address; lower address
+        // must come first regardless of input order.
+        let lo = Address::repeat_byte(0x11);
+        let hi = Address::repeat_byte(0x22);
+        let blob_lo = Bytes::from(vec![0xAAu8; 65]);
+        let blob_hi = Bytes::from(vec![0xBBu8; 65]);
+        let packed = assemble_signatures(vec![
+            (hi, blob_hi.clone()),
+            (lo, blob_lo.clone()),
+        ])
+        .unwrap();
+        assert_eq!(packed.len(), 130);
+        assert_eq!(&packed[..65], &blob_lo[..]);
+        assert_eq!(&packed[65..], &blob_hi[..]);
+    }
+
+    #[tokio::test]
+    async fn eip712_owner_sig_recovers_with_v_27_or_28() {
+        let signer = PrivateKeySigner::random();
+        let ks = crate::wallet::KaoSigner::Local(signer.clone());
+        let safe = safe_addr();
+        let domain = safe_domain(safe, Chain::Mainnet);
+        let tx = empty_safe_tx();
+        let (owner, bytes) = eip712_owner_sig(&ks, &tx, &domain).await.unwrap();
+        assert_eq!(owner, signer.address());
+        assert_eq!(bytes.len(), 65);
+        assert!(matches!(bytes[64], 27 | 28));
+        // Recovers to the owner over the EIP-712 signing hash.
+        let local_hash = safe_tx_hash(&tx, &domain);
+        let sig = Signature::from_raw(&bytes).unwrap();
+        assert_eq!(
+            sig.recover_address_from_prehash(&local_hash).unwrap(),
+            owner
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_owner_takes_eip712_path_for_software() {
+        // A software signer always succeeds at EIP-712, so `sign_owner`
+        // must return exactly what `eip712_owner_sig` would (the fallback
+        // never fires) — v∈{27,28}.
+        let signer = PrivateKeySigner::random();
+        let ks = crate::wallet::KaoSigner::Local(signer);
+        let safe = safe_addr();
+        let domain = safe_domain(safe, Chain::Mainnet);
+        let tx = empty_safe_tx();
+        let hash = safe_tx_hash(&tx, &domain);
+        let via_combinator = sign_owner(&ks, &tx, &domain, hash).await.unwrap();
+        let via_direct = eip712_owner_sig(&ks, &tx, &domain).await.unwrap();
+        assert_eq!(via_combinator, via_direct);
+        assert!(matches!(via_combinator.1[64], 27 | 28));
+    }
+
+    #[tokio::test]
+    async fn eth_sign_owner_sig_has_v_31_or_32_and_recovers() {
+        let signer = PrivateKeySigner::random();
+        let ks = crate::wallet::KaoSigner::Local(signer.clone());
+        let safe = safe_addr();
+        let domain = safe_domain(safe, Chain::Mainnet);
+        let tx = empty_safe_tx();
+        let hash = safe_tx_hash(&tx, &domain);
+        let (owner, bytes) = eth_sign_owner_sig(&ks, hash).await.unwrap();
+        assert_eq!(bytes.len(), 65);
+        assert!(matches!(bytes[64], 31 | 32));
+        // Undo the +4 and recover over the EIP-191-prefixed digest.
+        let mut raw = bytes.to_vec();
+        raw[64] -= 4;
+        let sig = Signature::from_raw(&raw).unwrap();
+        assert_eq!(
+            sig.recover_address_from_msg(hash.as_slice()).unwrap(),
+            owner
+        );
     }
 
     #[test]
@@ -567,4 +904,141 @@ mod tests {
         assert_eq!(decoded.signatures, sigs);
     }
 
+    // ── Pre-sign verification ─────────────────────────────────────────
+
+    /// Plant `sep` as the Safe's `domainSeparator()` reply on the mock.
+    fn plant_domain_separator(mock: &CallMock, safe: Address, sep: B256) {
+        mock.set_call(
+            safe,
+            Bytes::from(domainSeparatorCall {}.abi_encode()),
+            Bytes::from(sep.abi_encode()),
+            true,
+        );
+    }
+
+    /// Plant the Safe's `getTransactionHash(...)` reply for `tx`.
+    fn plant_tx_hash(mock: &CallMock, safe: Address, tx: &SafeTx, hash: B256) {
+        let calldata = getTransactionHashCall {
+            to: tx.to,
+            value: tx.value,
+            data: tx.data.clone(),
+            operation: tx.operation,
+            safeTxGas: tx.safeTxGas,
+            baseGas: tx.baseGas,
+            gasPrice: tx.gasPrice,
+            gasToken: tx.gasToken,
+            refundReceiver: tx.refundReceiver,
+            _nonce: tx.nonce,
+        }
+        .abi_encode();
+        mock.set_call(safe, Bytes::from(calldata), Bytes::from(hash.abi_encode()), true);
+    }
+
+    #[tokio::test]
+    async fn verify_domain_separator_accepts_matching_contract() {
+        let mock = CallMock::new();
+        let safe = safe_addr();
+        let chain = Chain::Mainnet;
+        plant_domain_separator(&mock, safe, safe_domain(safe, chain).separator());
+        verify_domain_separator_on_chain(&mock, safe, chain)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_domain_separator_rejects_mismatch() {
+        // A pre-1.3 Safe (verifyingContract-only domain) or a wrong-chain
+        // read both surface as a separator that isn't ours.
+        let mock = CallMock::new();
+        let safe = safe_addr();
+        plant_domain_separator(&mock, safe, B256::repeat_byte(0x66));
+        let err = verify_domain_separator_on_chain(&mock, safe, Chain::Mainnet)
+            .await
+            .unwrap_err();
+        assert!(err.contains("domain separator mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn verify_before_signing_passes_when_both_checks_agree() {
+        let mock = CallMock::new();
+        let safe = safe_addr();
+        let chain = Chain::Mainnet;
+        let tx = empty_safe_tx();
+        let domain = safe_domain(safe, chain);
+        let local = safe_tx_hash(&tx, &domain);
+        plant_domain_separator(&mock, safe, domain.separator());
+        plant_tx_hash(&mock, safe, &tx, local);
+        verify_safe_tx_before_signing(&mock, &tx, safe, chain, local)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_before_signing_reports_domain_mismatch_first() {
+        // Both checks would fail here, but the domain check must run
+        // (and report) first — it pinpoints "wrong domain shape / wrong
+        // chain / pre-1.3 Safe", which is more actionable than a bare
+        // tx-hash mismatch.
+        let mock = CallMock::new();
+        let safe = safe_addr();
+        let chain = Chain::Mainnet;
+        let tx = empty_safe_tx();
+        let local = safe_tx_hash(&tx, &safe_domain(safe, chain));
+        plant_domain_separator(&mock, safe, B256::repeat_byte(0x66));
+        plant_tx_hash(&mock, safe, &tx, B256::repeat_byte(0x99));
+        let err = verify_safe_tx_before_signing(&mock, &tx, safe, chain, local)
+            .await
+            .unwrap_err();
+        assert!(err.contains("domain separator mismatch"), "{err}");
+        assert!(!err.contains("safe hash mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn verify_before_signing_propagates_rpc_failure() {
+        // Nothing planted: the domain-separator read itself errors. The
+        // failure must surface as Err — "couldn't verify" must never
+        // collapse into "verified".
+        let mock = CallMock::new();
+        let safe = safe_addr();
+        let chain = Chain::Mainnet;
+        let tx = empty_safe_tx();
+        let local = safe_tx_hash(&tx, &safe_domain(safe, chain));
+        assert!(
+            verify_safe_tx_before_signing(&mock, &tx, safe, chain, local)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_before_signing_rejects_tx_hash_drift() {
+        // Domain agrees but the contract computes a different SafeTx
+        // hash — field-encoding drift must abort before signing.
+        let mock = CallMock::new();
+        let safe = safe_addr();
+        let chain = Chain::Mainnet;
+        let tx = empty_safe_tx();
+        let domain = safe_domain(safe, chain);
+        let local = safe_tx_hash(&tx, &domain);
+        plant_domain_separator(&mock, safe, domain.separator());
+        plant_tx_hash(&mock, safe, &tx, B256::repeat_byte(0x99));
+        let err = verify_safe_tx_before_signing(&mock, &tx, safe, chain, local)
+            .await
+            .unwrap_err();
+        assert!(err.contains("safe hash mismatch"), "{err}");
+    }
+
+    #[test]
+    fn ensure_signable_version_accepts_only_chainid_domain_range() {
+        for ok in ["1.3.0", "1.4.1", "1.5.0", "1.3.12"] {
+            assert!(ensure_signable_version(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "1.0.0", "1.1.1", "1.2.0", // pre-chainId domain
+            "1.6.0", "2.0.0", // newer than the reviewed range
+            "1.4", "1.4.1-beta", "1.4.x", "", "hi there",
+        ] {
+            assert!(ensure_signable_version(bad).is_err(), "{bad}");
+        }
+    }
 }

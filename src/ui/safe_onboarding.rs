@@ -96,6 +96,11 @@ pub enum Message {
     // Label
     NameInput(String),
     SiblingToggled(Chain),
+    /// Expand/collapse the Advanced section (custom transaction
+    /// service).
+    AdvancedToggled,
+    /// Custom Safe Transaction Service base URL input.
+    ServiceUrlInput(String),
     LabelConfirm,
 
     // Cross-step
@@ -242,6 +247,15 @@ enum Step {
         /// Other chains where this address is also a Safe. The bool
         /// is "user wants to add this sibling too". Defaults to true.
         siblings: Vec<(Chain, SafeMetadata, SafeTrust, bool)>,
+        /// Advanced section expanded. Collapsed by default — almost
+        /// everyone wants the public service.
+        advanced: bool,
+        /// Custom Transaction Service base URL, raw as typed.
+        /// Validated through `service::normalize_service_base` on
+        /// confirm; blank means the public default.
+        service_url: String,
+        /// Validation error from the last confirm attempt.
+        service_url_error: Option<String>,
     },
 }
 
@@ -317,6 +331,8 @@ impl SafeOnboardingScreen {
             Message::SignerMethodPicked(method) => self.handle_signer_method_picked(method),
             Message::NameInput(s) => self.handle_name_input(s),
             Message::SiblingToggled(chain) => self.handle_sibling_toggled(chain),
+            Message::AdvancedToggled => self.handle_advanced_toggled(),
+            Message::ServiceUrlInput(s) => self.handle_service_url_input(s),
             Message::LabelConfirm => self.handle_label_confirm(),
         }
     }
@@ -368,7 +384,21 @@ impl SafeOnboardingScreen {
                 linked,
                 name,
                 siblings,
-            } => view_label(t, *chain, metadata, trust, linked, name, siblings),
+                advanced,
+                service_url,
+                service_url_error,
+            } => view_label(
+                t,
+                *chain,
+                metadata,
+                trust,
+                linked,
+                name,
+                siblings,
+                *advanced,
+                service_url,
+                service_url_error.as_deref(),
+            ),
         };
         let card = auth_card(t, 560.0, card_body);
         let back_bar = container(link_button(t, "← Back").on_press(Message::BackPressed))
@@ -861,6 +891,9 @@ impl SafeOnboardingScreen {
             linked,
             name: String::new(),
             siblings,
+            advanced: false,
+            service_url: String::new(),
+            service_url_error: None,
         };
     }
 
@@ -880,6 +913,26 @@ impl SafeOnboardingScreen {
         (Task::none(), None)
     }
 
+    fn handle_advanced_toggled(&mut self) -> (Task<Message>, Option<Outcome>) {
+        if let Step::Label { advanced, .. } = &mut self.step {
+            *advanced = !*advanced;
+        }
+        (Task::none(), None)
+    }
+
+    fn handle_service_url_input(&mut self, s: String) -> (Task<Message>, Option<Outcome>) {
+        if let Step::Label {
+            service_url,
+            service_url_error,
+            ..
+        } = &mut self.step
+        {
+            *service_url = s;
+            *service_url_error = None;
+        }
+        (Task::none(), None)
+    }
+
     fn handle_label_confirm(&mut self) -> (Task<Message>, Option<Outcome>) {
         let Step::Label {
             chain,
@@ -888,9 +941,31 @@ impl SafeOnboardingScreen {
             linked,
             name,
             siblings,
+            service_url,
+            ..
         } = &self.step
         else {
             return (Task::none(), None);
+        };
+        // Validate the Advanced service URL before anything is built —
+        // a typo'd mirror must not get persisted and then silently
+        // 404/timeout every queue fetch.
+        let tx_service_url = match crate::safe::service::normalize_service_base(service_url) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Step::Label {
+                    advanced,
+                    service_url_error,
+                    ..
+                } = &mut self.step
+                {
+                    // Re-open the section so the error is visible even
+                    // if the user collapsed it after typing.
+                    *advanced = true;
+                    *service_url_error = Some(e);
+                }
+                return (Task::none(), None);
+            }
         };
         let now = unix_seconds();
         let clean_name = clean_label(name);
@@ -906,6 +981,7 @@ impl SafeOnboardingScreen {
                 .map(|(c, _, _, _)| c.chain_id())
                 .collect(),
             now,
+            tx_service_url.clone(),
         );
         // Sibling descriptors: each is its own (address, chain_id)
         // record (separate owner cache; the storage layer treats
@@ -942,6 +1018,10 @@ impl SafeOnboardingScreen {
                     Vec::new(),
                     others,
                     now,
+                    // A custom mirror serves the multi-chain
+                    // /tx-service/{chain} layout, so siblings share it.
+                    // Adjustable per Safe later in Settings → Safes.
+                    tx_service_url.clone(),
                 )
             })
             .collect();
@@ -985,6 +1065,7 @@ fn clean_label(raw: &str) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn descriptor_from(
     md: &SafeMetadata,
     chain: Chain,
@@ -993,6 +1074,7 @@ fn descriptor_from(
     linked_signer_indices: Vec<u32>,
     sibling_chains: Vec<u64>,
     cached_at: u64,
+    tx_service_url: Option<String>,
 ) -> SafeDescriptor {
     SafeDescriptor {
         name,
@@ -1008,6 +1090,7 @@ fn descriptor_from(
         linked_signer_indices,
         sibling_chains,
         cached_at,
+        tx_service_url,
     }
 }
 
@@ -1529,6 +1612,7 @@ fn view_pick_signer_method<'a>(
     scrollable(body).height(Length::Shrink).into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn view_label<'a>(
     t: KaoTheme,
     chain: Chain,
@@ -1537,6 +1621,9 @@ fn view_label<'a>(
     linked: &[u32],
     name: &str,
     siblings: &'a [(Chain, SafeMetadata, SafeTrust, bool)],
+    advanced: bool,
+    service_url: &str,
+    service_url_error: Option<&'a str>,
 ) -> Element<'a, Message> {
     let trust_badge = match trust {
         SafeTrust::Canonical => text("Canonical").size(11).color(t.a1).font(mono()),
@@ -1586,6 +1673,51 @@ fn view_label<'a>(
         }
     }
 
+    // Advanced section — collapsed by default; holds the custom
+    // Transaction Service mirror. Per-Safe, validated on confirm.
+    let advanced_header = link_button(
+        t,
+        if advanced { "Advanced ▾" } else { "Advanced ▸" },
+    )
+    .on_press(Message::AdvancedToggled);
+    let mut advanced_col = column![advanced_header].width(Length::Fill);
+    if advanced {
+        let service_input = text_input(
+            crate::safe::service::DEFAULT_TX_SERVICE_BASE,
+            service_url,
+        )
+        .on_input(Message::ServiceUrlInput)
+        .on_submit(Message::LabelConfirm)
+        .padding(Padding::from([10, 12]))
+        .size(13)
+        .font(mono())
+        .style(move |_theme, status| text_input_style(t, status));
+        advanced_col = advanced_col
+            .push(vspace(8))
+            .push(
+                text("Transaction service")
+                    .size(12)
+                    .color(t.text)
+                    .font(mono_bold()),
+            )
+            .push(vspace(4))
+            .push(service_input)
+            .push(vspace(4))
+            .push(
+                text(
+                    "Self-hosted Safe Transaction Service for this Safe. Leave blank \
+                     for the public one. Must serve the /tx-service/{chain} API layout.",
+                )
+                .size(11)
+                .color(t.sub),
+            );
+        if let Some(err) = service_url_error {
+            advanced_col = advanced_col
+                .push(vspace(6))
+                .push(error_text(t, err));
+        }
+    }
+
     let body = column![
         screen_title(t, "Label this Safe"),
         vspace(8),
@@ -1604,6 +1736,8 @@ fn view_label<'a>(
         name_input,
         vspace(16),
         siblings_col,
+        vspace(12),
+        advanced_col,
         vspace(20),
         primary_button(t, "Add to wallet →", true).on_press(Message::LabelConfirm),
     ]
@@ -1914,6 +2048,9 @@ mod tests {
             linked: vec![0],
             name: "  Treasury  ".into(),
             siblings: vec![],
+            advanced: false,
+            service_url: String::new(),
+            service_url_error: None,
         };
         let (_task, outcome) = s.update(Message::LabelConfirm);
         let Some(Outcome::Done { primary, siblings }) = outcome else {
@@ -1925,6 +2062,8 @@ mod tests {
         assert_eq!(primary.threshold, 2);
         assert_eq!(primary.linked_signer_indices, vec![0]);
         assert_eq!(primary.trust, SafeTrust::Canonical);
+        // No Advanced input → public service (stored as None).
+        assert!(primary.tx_service_url.is_none());
         assert!(siblings.is_empty());
     }
 
@@ -1954,6 +2093,9 @@ mod tests {
                 (Chain::Optimism, md.clone(), SafeTrust::Canonical, true),
                 (Chain::Base, md.clone(), SafeTrust::Canonical, true),
             ],
+            advanced: true,
+            service_url: "https://txs.example-dao.org/".into(),
+            service_url_error: None,
         };
         let (_task, outcome) = s.update(Message::LabelConfirm);
         let Some(Outcome::Done { primary, siblings }) = outcome else {
@@ -1972,6 +2114,47 @@ mod tests {
             assert!(sib.linked_signer_indices.is_empty());
             // Each sibling lists the OTHER two chains as siblings.
             assert_eq!(sib.sibling_chains.len(), 2);
+            // The custom mirror serves the multi-chain layout, so
+            // siblings inherit it (normalized: trailing slash gone).
+            assert_eq!(
+                sib.tx_service_url.as_deref(),
+                Some("https://txs.example-dao.org"),
+            );
+        }
+        assert_eq!(
+            primary.tx_service_url.as_deref(),
+            Some("https://txs.example-dao.org"),
+        );
+    }
+
+    #[tokio::test]
+    async fn label_confirm_rejects_bad_service_url_and_stays() {
+        let net: Arc<dyn BalanceFetcher> = Arc::new(CallMock::new());
+        let mut s = screen(net, Vec::new());
+        s.step = Step::Label {
+            chain: Chain::Mainnet,
+            metadata: fake_metadata_with_owners(vec![owner_a()], 1),
+            trust: SafeTrust::Canonical,
+            linked: vec![],
+            name: "Treasury".into(),
+            siblings: vec![],
+            // Collapsed on purpose: the error must force it back open.
+            advanced: false,
+            service_url: "http://txs.example-dao.org".into(), // non-loopback http
+            service_url_error: None,
+        };
+        let (_task, outcome) = s.update(Message::LabelConfirm);
+        assert!(outcome.is_none(), "must not emit Done with a bad URL");
+        match &s.step {
+            Step::Label {
+                advanced,
+                service_url_error,
+                ..
+            } => {
+                assert!(*advanced, "section reopens to show the error");
+                assert!(service_url_error.is_some());
+            }
+            other => panic!("expected to stay on Label, got {other:?}"),
         }
     }
 
