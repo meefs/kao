@@ -2928,15 +2928,14 @@ fn spawn_safe_propose_task(
         async move {
             let (tx, domain, local) = rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
-            let (sender, sig) = sign_owner(&signer, &tx, &domain, local).await?;
+            let owner_sig = sign_owner(&signer, &tx, &domain, local).await?;
             crate::safe::service::propose(
                 &req.service_base,
                 req.safe_address,
                 chain,
                 &tx,
                 local,
-                sender,
-                &sig,
+                &owner_sig,
                 Some("Kao"),
             )
             .await?;
@@ -3059,15 +3058,14 @@ fn spawn_safe_reject_task(
             let local = compute_hash(&tx, &domain);
             verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local).await?;
             let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
-            let (sender, sig) = sign_owner(&signer, &tx, &domain, local).await?;
+            let owner_sig = sign_owner(&signer, &tx, &domain, local).await?;
             crate::safe::service::propose(
                 &service_base,
                 safe,
                 chain,
                 &tx,
                 local,
-                sender,
-                &sig,
+                &owner_sig,
                 Some("Kao:reject"),
             )
             .await?;

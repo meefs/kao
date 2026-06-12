@@ -566,21 +566,21 @@ struct ConfirmBody {
 }
 
 /// Propose a new (or rejection) multisig tx to the service so co-owners
-/// can see and sign it. `sender` must be an owner and `signature` their
-/// EIP-712 (or eth_sign) signature over `safe_tx_hash` — produced by the
-/// caller via `tx::eip712_owner_sig` so the hardware path is covered.
-/// Pure HTTP: the caller is responsible for having verified the hash
-/// on-chain before signing.
+/// can see and sign it. `owner_sig` is the `(owner, signature)` pair from
+/// `tx::sign_owner` — the owner must be one of the Safe's, and the blob
+/// their EIP-712 (or eth_sign) signature over `safe_tx_hash`, so the
+/// hardware path is covered. Pure HTTP: the caller is responsible for
+/// having verified the hash on-chain before signing.
 pub async fn propose(
     base: &str,
     safe: Address,
     chain: Chain,
     tx: &SafeTx,
     safe_tx_hash: B256,
-    sender: Address,
-    signature: &Bytes,
+    owner_sig: &(Address, Bytes),
     origin: Option<&str>,
 ) -> Result<(), String> {
+    let (sender, signature) = owner_sig;
     let body = ProposeBody {
         to: tx.to.to_checksum(None),
         value: tx.value.to_string(),
