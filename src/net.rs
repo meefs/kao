@@ -46,7 +46,10 @@ use crate::wallet::short_address;
 /// unverified results for long, long enough that we don't pay the helios
 /// sync cost repeatedly when the chosen exec RPC is permanently
 /// incompatible (e.g. proof-window limits).
-const FALLBACK_COOLDOWN: Duration = Duration::from_secs(10);
+///
+/// Public so the simulation auto-retry can wait out exactly this window
+/// (plus a margin) before re-running on the verified path.
+pub const FALLBACK_COOLDOWN: Duration = Duration::from_secs(10);
 
 /// Verification state of the most recent balance fetch on a single chain.
 /// Sampled by the dashboard to render a "Verified by Helios" / "Unverified
@@ -561,6 +564,24 @@ impl NetworkClient {
     /// fallback provider exists for the cooldown window.
     fn start_cooldown(&self, chain: Chain) {
         let mut r = self.raw_state(chain);
+        // The per-read failure that lands here is logged at debug; this
+        // single info line makes the cooldown entry visible at default
+        // log level — it explains every "unverified" read (and sim
+        // badge) for the next window. Logged only on the transition
+        // into cooldown: parallel reads (the sim's basic() fetches
+        // balance/nonce/code concurrently) all land here at once, and
+        // re-arms during an active window are extensions, not news.
+        let already_cooling = r
+            .last_fallback_at
+            .map(|t| t.elapsed() < FALLBACK_COOLDOWN)
+            .unwrap_or(false);
+        if !already_cooling {
+            info!(
+                chain = %chain.label(),
+                cooldown_secs = FALLBACK_COOLDOWN.as_secs(),
+                "helios read failed — routing reads to raw RPC for the cooldown window",
+            );
+        }
         r.last_fallback_at = Some(Instant::now());
         if r.provider.is_none() {
             // Helios never even chose an exec RPC — pick one ourselves
@@ -569,6 +590,49 @@ impl NetworkClient {
             if let Some(url) = rpcs.choose(&mut rand::thread_rng()) {
                 r.provider = build_fallback(url);
             }
+        }
+    }
+}
+
+/// Pause before the single in-place retry of a failed helios read.
+/// Long enough to ride out the two transients we've actually observed —
+/// the first reads right after a build/sync settle, and the gap after a
+/// `helios_core` "inconsistent block history" cache clear (next unsafe
+/// head lands within a block time) — short enough that a genuinely
+/// down helios only delays the fallback by half a second.
+const HELIOS_READ_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Run a helios read, retrying ONCE in place after a short pause.
+///
+/// Rationale: a single failed read starts the 10-second fallback
+/// cooldown, which forces *every* read in that window — most visibly an
+/// entire simulation — onto the unverified raw-RPC path. The observed
+/// failures are overwhelmingly transient (post-sync settling, unsafe-
+/// head reorg cache clears), so one immediate retry usually keeps the
+/// whole operation on the verified path instead of poisoning it.
+/// Deliberately unconditional (no error-shape predicate, unlike
+/// `with_transient_retry`): helios error strings aren't stable enough
+/// to classify, and the cost of a wasted retry is half a second.
+async fn helios_read_with_retry<T, F>(
+    what: &'static str,
+    chain: Chain,
+    op: impl Fn() -> F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    match op().await {
+        Ok(v) => Ok(v),
+        Err(first) => {
+            debug!(
+                chain = %chain.label(),
+                read = what,
+                error = %redact_urls(&first),
+                "helios read failed; retrying once in place",
+            );
+            tokio::time::sleep(HELIOS_READ_RETRY_DELAY).await;
+            op().await
+                .map_err(|second| format!("{first}; retry: {second}"))
         }
     }
 }
@@ -621,7 +685,11 @@ impl BalanceFetcher for NetworkClient {
         // refresh. (`Connecting` is the per-chain default at startup and
         // is restored by `invalidate()`.)
         match self.get(chain).await {
-            Ok(client) => match client.get_balance(addr, BlockId::latest()).await {
+            Ok(client) => match helios_read_with_retry("balance", chain, || {
+                client.get_balance(addr, BlockId::latest())
+            })
+            .await
+            {
                 Ok(raw) => {
                     self.set_status(chain, VerificationStatus::Verified);
                     Ok(alloy::primitives::utils::format_ether(raw))
@@ -662,7 +730,11 @@ impl BalanceFetcher for NetworkClient {
             return self.fallback_get_code(addr, chain).await;
         }
         match self.get(chain).await {
-            Ok(client) => match client.get_code(addr, BlockId::latest()).await {
+            Ok(client) => match helios_read_with_retry("get_code", chain, || {
+                client.get_code(addr, BlockId::latest())
+            })
+            .await
+            {
                 Ok(value) => Ok(VerifiedRead {
                     value,
                     verified: true,
@@ -700,7 +772,11 @@ impl BalanceFetcher for NetworkClient {
             return self.fallback_get_storage_at(addr, slot, chain).await;
         }
         match self.get(chain).await {
-            Ok(client) => match client.get_storage_at(addr, slot, BlockId::latest()).await {
+            Ok(client) => match helios_read_with_retry("get_storage_at", chain, || {
+                client.get_storage_at(addr, slot, BlockId::latest())
+            })
+            .await
+            {
                 Ok(value) => Ok(VerifiedRead {
                     value,
                     verified: true,
@@ -738,7 +814,11 @@ impl BalanceFetcher for NetworkClient {
             return self.fallback_call(to, data, chain).await;
         }
         match self.get(chain).await {
-            Ok(client) => match client.call(to, data.clone(), BlockId::latest()).await {
+            Ok(client) => match helios_read_with_retry("call", chain, || {
+                client.call(to, data.clone(), BlockId::latest())
+            })
+            .await
+            {
                 Ok(value) => Ok(VerifiedRead {
                     value,
                     verified: true,
@@ -775,7 +855,11 @@ impl BalanceFetcher for NetworkClient {
             return self.fallback_get_balance_raw(addr, chain).await;
         }
         match self.get(chain).await {
-            Ok(client) => match client.get_balance(addr, BlockId::latest()).await {
+            Ok(client) => match helios_read_with_retry("get_balance_raw", chain, || {
+                client.get_balance(addr, BlockId::latest())
+            })
+            .await
+            {
                 Ok(value) => Ok(VerifiedRead {
                     value,
                     verified: true,
@@ -812,7 +896,11 @@ impl BalanceFetcher for NetworkClient {
             return self.fallback_get_transaction_count(addr, chain).await;
         }
         match self.get(chain).await {
-            Ok(client) => match client.get_nonce(addr, BlockId::latest()).await {
+            Ok(client) => match helios_read_with_retry("get_transaction_count", chain, || {
+                client.get_nonce(addr, BlockId::latest())
+            })
+            .await
+            {
                 Ok(value) => Ok(VerifiedRead {
                     value,
                     verified: true,
@@ -845,21 +933,24 @@ impl BalanceFetcher for NetworkClient {
             return self.fallback_latest_block(chain).await;
         }
         match self.get(chain).await {
-            Ok(client) => match client.latest_block().await {
-                Ok(value) => Ok(VerifiedRead {
-                    value,
-                    verified: true,
-                }),
-                Err(e) => {
-                    debug!(
-                        chain = %chain.label(),
-                        error = %redact_urls(&e),
-                        "helios latest_block failed; falling back to raw RPC",
-                    );
-                    self.start_cooldown(chain);
-                    self.fallback_latest_block(chain).await
+            Ok(client) => {
+                match helios_read_with_retry("latest_block", chain, || client.latest_block()).await
+                {
+                    Ok(value) => Ok(VerifiedRead {
+                        value,
+                        verified: true,
+                    }),
+                    Err(e) => {
+                        debug!(
+                            chain = %chain.label(),
+                            error = %redact_urls(&e),
+                            "helios latest_block failed; falling back to raw RPC",
+                        );
+                        self.start_cooldown(chain);
+                        self.fallback_latest_block(chain).await
+                    }
                 }
-            },
+            }
             Err(e) => {
                 warn!(
                     chain = %chain.label(),
@@ -1922,5 +2013,45 @@ mod pure_tests {
             verified: false,
         };
         assert!(!vr2.verified);
+    }
+
+    /// A transient helios failure (post-sync settling, cache clear)
+    /// must be absorbed by the single in-place retry instead of
+    /// starting a cooldown that forces a whole simulation onto the
+    /// unverified path.
+    #[tokio::test]
+    async fn helios_read_with_retry_recovers_after_one_transient_failure() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let out = helios_read_with_retry("test", Chain::Mainnet, || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n == 0 {
+                    Err("block not found".to_string())
+                } else {
+                    Ok(42u32)
+                }
+            }
+        })
+        .await;
+        assert_eq!(out.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one retry");
+    }
+
+    /// Two consecutive failures surrender to the caller (which then
+    /// starts the cooldown) — the combined error keeps both messages so
+    /// the debug log shows whether the retry saw a different failure.
+    #[tokio::test]
+    async fn helios_read_with_retry_gives_up_after_second_failure() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let calls = AtomicU32::new(0);
+        let out: Result<u32, String> = helios_read_with_retry("test", Chain::Mainnet, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err("boom".to_string()) }
+        })
+        .await;
+        let err = out.unwrap_err();
+        assert_eq!(err, "boom; retry: boom");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no third attempt");
     }
 }
