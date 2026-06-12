@@ -842,6 +842,38 @@ pub fn colored_hash<'a, M: 'a>(t: KaoTheme, hash: B256) -> Element<'a, M> {
         .into()
 }
 
+/// Bordered section card: an uppercase caption over the body. Groups
+/// modal content into scannable units — the Safe review and Safe-tx
+/// detail modals build their TRANSACTION / VERIFY / SIMULATION / …
+/// stacks out of these. (Distinct from [`section`], the settings-page
+/// header block.)
+pub fn section_card<'a, M: 'a>(t: KaoTheme, title: &str, body: Element<'a, M>) -> Element<'a, M> {
+    container(
+        column![
+            text(title.to_string())
+                .size(11)
+                .color(t.sub)
+                .font(mono_bold()),
+            Space::new().height(8),
+            body,
+        ]
+        .width(Length::Fill),
+    )
+    .padding(Padding::from([12, 14]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(t.card_alt)),
+        border: Border {
+            color: t.border,
+            width: 1.0,
+            radius: Radius::from(12),
+        },
+        text_color: Some(t.text),
+        ..container::Style::default()
+    })
+    .into()
+}
+
 /// "Label …….. value" row used in the Send review step. `big` bumps the value
 /// font; `muted` greys it.
 pub fn review_row<'a, M: 'a>(

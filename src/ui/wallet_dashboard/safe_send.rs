@@ -39,13 +39,16 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subsc
 
 use crate::chain::Chain;
 use crate::ens;
+use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     avatar, black, bold, colored_address, colored_hash, hover_tint, kao_fit, kao_fit_size,
     kao_scrollable_style, kao_text, modal_wrapper, mono, mono_bold, primary_button, review_row,
-    secondary_button, text_input_style, vspace,
+    secondary_button, section_card, small_secondary_button, text_input_style, vspace,
 };
 use crate::ui::wallet_dashboard::send::{ContactsView, PickerEntry, PickerKind};
+use crate::ui::wallet_dashboard::sim_view;
+use crate::wallet::sim::SimulationResult;
 use crate::wallet::{AccountDescriptor, SafeDescriptor, account_address, short_address};
 
 /// Number of steps in the wizard. Hard-coded so the progress bar and
@@ -88,6 +91,18 @@ pub enum Message {
         seq: u64,
         result: Result<(u64, B256), String>,
     },
+    /// Result of the dashboard's inner-call preflight: the transfer the
+    /// Safe would make, simulated as if the Safe itself were the caller.
+    /// Advisory only — a revert softens the action buttons, never blocks.
+    /// Same `seq` staleness guard as [`Message::HashReady`].
+    SimReady {
+        seq: u64,
+        result: SimulationResult,
+    },
+    /// User pressed the Re-simulate button — re-dispatch the inner-call
+    /// preflight immediately. The pinned hash is untouched; only the
+    /// sim re-runs.
+    RetrySim,
     /// Re-run the review-prep after a failure (RPC hiccup etc.).
     RetryPrepare,
     /// "Sign & execute now" — sign locally and broadcast in one shot.
@@ -209,6 +224,11 @@ pub struct SafeSendPane {
     /// Kinds of linked owners that can't sign locally (hardware /
     /// view-only). Displayed for context in the pre-flight banner.
     unsupported_owner_kinds: Vec<&'static str>,
+    /// Total owner count of the Safe contract (from the descriptor's
+    /// owner set) — the denominator of the "2 of 3" threshold label.
+    /// NOT the count of owners linked in this wallet, which can be
+    /// smaller and would render nonsense like "2 of 1".
+    owner_count: usize,
     /// 0 = compose, 1 = review, 2 = success.
     step: u8,
     to: String,
@@ -242,6 +262,21 @@ pub struct SafeSendPane {
     /// Highest `prepare_seq` the dashboard has already spawned a prep
     /// task for. Same once-per-change pattern as ENS dispatch.
     prepare_dispatched: Option<u64>,
+    /// Inner-call preflight result for the reviewed transfer. `None`
+    /// while the sim task is in flight (the review card shows a
+    /// "simulating…" line). Reuses `prepare_seq` as the staleness
+    /// guard — both tasks are spawned by the same review entry.
+    sim: Option<SimulationResult>,
+    /// Armed when the sim should be re-dispatched. `Some(true)` = wait
+    /// out the helios fallback cooldown first (the automatic
+    /// verified-retry after an unverified success); `Some(false)` =
+    /// immediately (user pressed Re-simulate). Consumed by
+    /// [`Self::take_pending_sim_retry`].
+    pending_sim_retry: Option<bool>,
+    /// One automatic verified-retry per review entry — a second
+    /// unverified result stays on screen (with the Re-simulate button)
+    /// instead of looping.
+    sim_auto_retried: bool,
 }
 
 impl SafeSendPane {
@@ -292,6 +327,7 @@ impl SafeSendPane {
             signable_indices,
             linked_local_addresses,
             unsupported_owner_kinds,
+            owner_count: safe.owners.len(),
             step: 0,
             to: String::new(),
             resolution: Resolution::Empty,
@@ -306,6 +342,9 @@ impl SafeSendPane {
             prepare_error: None,
             prepare_seq: 0,
             prepare_dispatched: None,
+            sim: None,
+            pending_sim_retry: None,
+            sim_auto_retried: false,
         }
     }
 
@@ -348,6 +387,13 @@ impl SafeSendPane {
             && self.parsed_amount().is_some()
     }
 
+    /// "2 of 3" — threshold over the Safe's TOTAL owner count, the
+    /// conventional multisig notation. The wallet's linked-owner count
+    /// is deliberately not the denominator.
+    fn threshold_label(&self) -> String {
+        format!("{} of {}", self.threshold, self.owner_count)
+    }
+
     /// Settled = an action already completed (executed or proposed); no
     /// further action should fire from the review step.
     fn settled(&self) -> bool {
@@ -378,7 +424,25 @@ impl SafeSendPane {
     fn begin_prepare(&mut self) {
         self.prepared = None;
         self.prepare_error = None;
+        self.sim = None;
+        self.pending_sim_retry = None;
+        self.sim_auto_retried = false;
         self.prepare_seq = self.prepare_seq.wrapping_add(1);
+    }
+
+    /// Coordinator hook: returns `Some((seq, request, delayed))` exactly
+    /// once per armed sim re-run (automatic verified-retry or manual
+    /// Re-simulate). `delayed` asks the dashboard's task to wait out the
+    /// helios fallback cooldown before running. Mirrors
+    /// [`Self::take_pending_prepare`].
+    pub fn take_pending_sim_retry(&mut self) -> Option<(u64, SafeSendRequest, bool)> {
+        if self.step != 1 {
+            self.pending_sim_retry = None;
+            return None;
+        }
+        let delayed = self.pending_sim_retry.take()?;
+        let req = self.outgoing_request()?;
+        Some((self.prepare_seq, req, delayed))
     }
 
     /// Coordinator hook: returns `Some((seq, request))` exactly once per
@@ -564,6 +628,33 @@ impl SafeSendPane {
                 }
                 (Task::none(), None)
             }
+            Message::SimReady { seq, result } => {
+                // Same staleness contract as HashReady: only the review
+                // entry that spawned this sim may consume it.
+                if seq == self.prepare_seq && self.step == 1 {
+                    // Success on fallback state → arm one automatic
+                    // re-run after the helios cooldown expires, so the
+                    // badge self-heals to "Verified" without the user
+                    // doing anything.
+                    if result.is_success() && !result.verified && !self.sim_auto_retried {
+                        self.sim_auto_retried = true;
+                        self.pending_sim_retry = Some(true);
+                    }
+                    self.sim = Some(result);
+                }
+                (Task::none(), None)
+            }
+            Message::RetrySim => {
+                if self.step == 1 && self.sim.is_some() {
+                    self.sim = None;
+                    // A manual retry re-opens the auto-retry budget: if
+                    // this run comes back unverified-success again, it
+                    // still gets its one delayed follow-up.
+                    self.sim_auto_retried = false;
+                    self.pending_sim_retry = Some(false);
+                }
+                (Task::none(), None)
+            }
             Message::RetryPrepare => {
                 if self.step == 1 {
                     self.begin_prepare();
@@ -631,6 +722,7 @@ impl SafeSendPane {
         &'a self,
         t: KaoTheme,
         contacts: ContactsView,
+        portfolio: &'a [LiveToken],
         progress: f32,
     ) -> Element<'a, Message> {
         if self.safe_chain.is_none() {
@@ -693,7 +785,7 @@ impl SafeSendPane {
 
         let body: Element<'_, Message> = match self.step {
             0 => self.view_compose(t, contacts.entries, recipient_in_book),
-            1 => self.view_review(t, recipient_name),
+            1 => self.view_review(t, recipient_name, portfolio),
             _ => self.view_success(t, recipient_name),
         };
         wrap_modal(t, progress, body)
@@ -952,10 +1044,15 @@ impl SafeSendPane {
         &'a self,
         t: KaoTheme,
         recipient_name: Option<String>,
+        portfolio: &'a [LiveToken],
     ) -> Element<'a, Message> {
         let recipient = self.resolution.recipient().unwrap_or(Address::ZERO);
         let amount_wei = self.parsed_amount().unwrap_or(U256::ZERO);
-        let amount_str = format_units(amount_wei, 18).unwrap_or_else(|_| "?".into());
+        // `format_units` pads to 18 fractional digits — "0.000001 ETH"
+        // reads, "0.000001000000000000 ETH" doesn't.
+        let amount_str = format_units(amount_wei, 18)
+            .map(|s| sim_view::trim_trailing_decimal_zeros(&s))
+            .unwrap_or_else(|_| "?".into());
 
         let sending_value = format!("{amount_str} ETH");
         // Safe by construction: `view` short-circuits to the
@@ -994,11 +1091,7 @@ impl SafeSendPane {
         to_col = to_col.push(colored_address(t, recipient));
         let to_block = to_col.width(Length::Fill);
 
-        let threshold_label = format!(
-            "{} of {}",
-            self.threshold,
-            self.linked_local_addresses.len() + self.unsupported_owner_kinds.len()
-        );
+        let threshold_label = self.threshold_label();
 
         // Owner list — one row per linked Local owner that will sign.
         let mut owners_col = column![].spacing(4);
@@ -1021,17 +1114,33 @@ impl SafeSendPane {
             );
         }
 
-        // The safeTxHash the signer(s) are about to commit to — the
-        // verification anchor a hardware wallet shows on-device and
-        // co-signers see in their own clients. Computed by the prep
-        // task at the live nonce and double-checked against the Safe's
-        // own `getTransactionHash` before it's displayed; the sign
-        // buttons stay disabled until it's on screen.
-        let hash_label = text("Safe tx hash").size(11).color(t.sub).font(mono_bold());
+        // ── TRANSACTION ── what moves, from where, to whom.
+        let tx_card = section_card(
+            t,
+            "TRANSACTION",
+            column![
+                review_row(t, "Sending", &sending_value, true, false),
+                container(text(chain_sub).size(10).color(t.sub).font(mono()))
+                    .width(Length::Fill)
+                    .align_x(Alignment::End),
+                vspace(12),
+                from_block,
+                vspace(12),
+                to_block,
+            ]
+            .spacing(0)
+            .width(Length::Fill)
+            .into(),
+        );
+
+        // ── VERIFY BEFORE SIGNING ── the safeTxHash the signer(s) are
+        // about to commit to: the verification anchor a hardware wallet
+        // shows on-device and co-signers see in their own clients.
+        // Computed by the prep task at the live nonce and double-checked
+        // against the Safe's own `getTransactionHash` before display;
+        // the sign buttons stay disabled until it's on screen.
         let hash_block: Element<'_, Message> = match (&self.prepared, &self.prepare_error) {
             (Some((_, hash)), _) => column![
-                hash_label,
-                vspace(4),
                 colored_hash(t, *hash),
                 vspace(4),
                 text("Verify this exact hash on your signing device and with co-signers.")
@@ -1041,8 +1150,6 @@ impl SafeSendPane {
             .width(Length::Fill)
             .into(),
             (None, Some(e)) => column![
-                hash_label,
-                vspace(4),
                 error_banner(t, e),
                 vspace(6),
                 secondary_button(t, "Retry").on_press(Message::RetryPrepare),
@@ -1050,8 +1157,6 @@ impl SafeSendPane {
             .width(Length::Fill)
             .into(),
             (None, None) => column![
-                hash_label,
-                vspace(4),
                 text("Computing — verifying against the Safe on-chain…")
                     .size(11)
                     .color(t.sub)
@@ -1060,48 +1165,77 @@ impl SafeSendPane {
             .width(Length::Fill)
             .into(),
         };
+        let verify_card = section_card(t, "VERIFY BEFORE SIGNING", hash_block);
 
-        let review_card = container(
+        // ── SIMULATION ── inner-call preflight: the transfer simulated
+        // as the Safe itself. Advisory — a revert relabels the action
+        // buttons to "… anyway ⚠" below, but never blocks.
+        let sim_body: Element<'_, Message> = match &self.sim {
+            Some(sim) => {
+                let mut col = column![sim_view::simulation_block(t, sim, chain, portfolio)]
+                    .spacing(6)
+                    .width(Length::Fill);
+                // A verified success is the one result not worth
+                // re-running; everything else (unverified, unavailable,
+                // revert against possibly-stale state) gets a compact
+                // re-run affordance — right-aligned so it never competes
+                // with the primary actions.
+                if !(sim.is_success() && sim.verified) {
+                    col = col.push(
+                        container(
+                            small_secondary_button(t, "↻ Re-simulate").on_press(Message::RetrySim),
+                        )
+                        .width(Length::Fill)
+                        .align_x(Alignment::End),
+                    );
+                }
+                col.into()
+            }
+            None => text("(；・∀・) simulating…")
+                .size(11)
+                .color(t.sub)
+                .font(mono())
+                .into(),
+        };
+        let sim_card = section_card(t, "SIMULATION", sim_body);
+
+        // ── SIGNING ── threshold, this wallet's signers, and the gas
+        // estimate (sim-derived when available, otherwise deferred to
+        // broadcast time).
+        let gas_value = self
+            .sim
+            .as_ref()
+            .and_then(|s| sim_view::format_gas_fee_eth(s.gas_used, s.base_fee_per_gas))
+            .map(|fee| format!("≈ {fee} ETH"))
+            .unwrap_or_else(|| "estimated at broadcast (｡•́︿•̀｡)".to_string());
+        let signing_card = section_card(
+            t,
+            "SIGNING",
             column![
-                review_row(t, "Sending", &sending_value, true, false),
-                container(text(chain_sub).size(10).color(t.sub).font(mono()))
-                    .width(Length::Fill)
-                    .align_x(Alignment::End),
-                vspace(14),
-                from_block,
-                vspace(14),
-                to_block,
-                vspace(14),
-                hash_block,
-                vspace(14),
                 review_row(t, "Threshold", &threshold_label, false, false),
-                vspace(8),
+                vspace(10),
                 text("Signing with").size(11).color(t.sub).font(mono_bold()),
                 vspace(4),
                 owners_col,
-                vspace(14),
-                review_row(t, "Gas fee", "estimated at broadcast (｡•́︿•̀｡)", false, true),
+                vspace(10),
+                review_row(t, "Gas fee", &gas_value, false, true),
             ]
-            .spacing(0),
-        )
-        .padding(Padding::from([18, 20]))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(t.card_alt)),
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: Radius::from(16),
-            },
-            text_color: Some(t.text),
-            ..container::Style::default()
-        });
+            .spacing(0)
+            .width(Length::Fill)
+            .into(),
+        );
 
         let mut content = column![
             step_header(t, 1),
             progress_bar(t, 1),
-            vspace(20),
-            review_card,
+            vspace(16),
+            tx_card,
+            vspace(10),
+            verify_card,
+            vspace(10),
+            sim_card,
+            vspace(10),
+            signing_card,
         ]
         .width(Length::Fill);
 
@@ -1115,11 +1249,17 @@ impl SafeSendPane {
         // with a signable owner. When the wallet can meet the threshold
         // with Local keys alone, an additional "Sign & execute now"
         // shortcut broadcasts in one step.
+        // A predicted revert softens the labels — the sim is advisory
+        // (stale-state false negatives must not strand a legitimate
+        // send), so the actions stay enabled.
+        let sim_revert = self.sim.as_ref().is_some_and(|s| s.is_revert());
         let can_propose = self.can_propose();
         let mut propose_btn = primary_button(
             t,
             if self.busy && !self.has_enough_local_signers() {
                 "Proposing…"
+            } else if sim_revert {
+                "Propose anyway ⚠"
             } else {
                 "Propose to co-signers"
             },
@@ -1135,6 +1275,8 @@ impl SafeSendPane {
                 t,
                 if self.busy {
                     "Signing & sending…"
+                } else if sim_revert {
+                    "Execute anyway ⚠"
                 } else {
                     "Sign & execute now"
                 },
@@ -1176,7 +1318,9 @@ impl SafeSendPane {
         recipient_name: Option<String>,
     ) -> Element<'a, Message> {
         let amount_wei = self.parsed_amount().unwrap_or(U256::ZERO);
-        let amount_str = format_units(amount_wei, 18).unwrap_or_else(|_| "?".into());
+        let amount_str = format_units(amount_wei, 18)
+            .map(|s| sim_view::trim_trailing_decimal_zeros(&s))
+            .unwrap_or_else(|_| "?".into());
         let recipient = self.resolution.recipient().unwrap_or(Address::ZERO);
         // Prefer contact name → resolved ENS → short address.
         let recipient_label = recipient_name.unwrap_or_else(|| match &self.resolution {
@@ -1313,7 +1457,7 @@ fn wrap_modal<'a>(
 ) -> Element<'a, Message> {
     modal_wrapper(
         t,
-        440.0,
+        560.0,
         progress,
         Message::Close,
         Message::BoxClickIgnored,
@@ -1640,6 +1784,18 @@ mod tests {
         assert!(!pane.can_continue_from_compose());
     }
 
+    /// Regression: the review card used to render "2 of 1" for a
+    /// 2-of-3 Safe with one linked owner — the denominator was the
+    /// wallet's linked-owner count instead of the Safe's owner set.
+    #[test]
+    fn threshold_label_uses_safe_owner_count_not_linked_count() {
+        let accounts = vec![local_account(1)];
+        let mut s = safe(2, vec![0]);
+        s.owners = vec![[0x01; 20], [0x02; 20], [0x03; 20]];
+        let pane = SafeSendPane::new(&s, &accounts);
+        assert_eq!(pane.threshold_label(), "2 of 3");
+    }
+
     #[test]
     fn pre_flight_passes_when_threshold_met_by_local_signers() {
         let accounts = vec![local_account(1), local_account(2), local_account(3)];
@@ -1804,6 +1960,143 @@ mod tests {
         let _ = pane.update(Message::Step(1));
         let _ = pane.update(Message::Step(0));
         assert!(pane.take_pending_prepare().is_none());
+    }
+
+    #[test]
+    fn sim_ready_with_stale_seq_is_dropped() {
+        let mut pane = ready_pane();
+        let _ = pane.update(Message::Step(1));
+        let (old_seq, _) = pane.take_pending_prepare().unwrap();
+        // Back out and re-enter review — bumps prepare_seq.
+        let _ = pane.update(Message::Step(0));
+        let _ = pane.update(Message::Step(1));
+        // The stale sim result must not attach to the new review.
+        let _ = pane.update(Message::SimReady {
+            seq: old_seq,
+            result: SimulationResult::unavailable(),
+        });
+        assert!(pane.sim.is_none());
+        // A current-seq result does attach.
+        let (new_seq, _) = pane.take_pending_prepare().unwrap();
+        let _ = pane.update(Message::SimReady {
+            seq: new_seq,
+            result: SimulationResult::unavailable(),
+        });
+        assert!(pane.sim.is_some());
+    }
+
+    fn sim_result(success: bool, verified: bool) -> SimulationResult {
+        use crate::wallet::sim::SimOutcome;
+        use alloy::primitives::Bytes;
+        SimulationResult {
+            outcome: if success {
+                SimOutcome::Success {
+                    output: Bytes::new(),
+                }
+            } else {
+                SimOutcome::Revert {
+                    reason: "nope".to_string(),
+                    raw: Bytes::new(),
+                }
+            },
+            gas_used: 21000,
+            transfers: Vec::new(),
+            verified,
+            base_fee_per_gas: 0,
+        }
+    }
+
+    #[test]
+    fn unverified_success_arms_one_delayed_auto_retry() {
+        let mut pane = ready_pane();
+        let _ = pane.update(Message::Step(1));
+        let (seq, _) = pane.take_pending_prepare().unwrap();
+        let _ = pane.update(Message::SimReady {
+            seq,
+            result: sim_result(true, /* verified */ false),
+        });
+        // One delayed re-run armed…
+        let (retry_seq, _, delayed) = pane.take_pending_sim_retry().unwrap();
+        assert_eq!(retry_seq, seq);
+        assert!(delayed, "auto retry must wait out the helios cooldown");
+        // …and only one: a second unverified success doesn't loop.
+        assert!(pane.take_pending_sim_retry().is_none());
+        let _ = pane.update(Message::SimReady {
+            seq,
+            result: sim_result(true, false),
+        });
+        assert!(pane.take_pending_sim_retry().is_none());
+    }
+
+    #[test]
+    fn verified_success_and_revert_do_not_auto_retry() {
+        let mut pane = ready_pane();
+        let _ = pane.update(Message::Step(1));
+        let (seq, _) = pane.take_pending_prepare().unwrap();
+        let _ = pane.update(Message::SimReady {
+            seq,
+            result: sim_result(true, true),
+        });
+        assert!(pane.take_pending_sim_retry().is_none());
+        // A revert is a real verdict — surfaced via the softened
+        // buttons and the manual Re-simulate button, not auto-rerun.
+        let _ = pane.update(Message::SimReady {
+            seq,
+            result: sim_result(false, true),
+        });
+        assert!(pane.take_pending_sim_retry().is_none());
+    }
+
+    #[test]
+    fn manual_retry_clears_sim_and_dispatches_immediately() {
+        let mut pane = ready_pane();
+        let _ = pane.update(Message::Step(1));
+        let (seq, _) = pane.take_pending_prepare().unwrap();
+        let _ = pane.update(Message::SimReady {
+            seq,
+            result: sim_result(false, true),
+        });
+        assert!(pane.sim.is_some());
+        let _ = pane.update(Message::RetrySim);
+        assert!(pane.sim.is_none(), "back to the simulating… line");
+        let (retry_seq, _, delayed) = pane.take_pending_sim_retry().unwrap();
+        assert_eq!(retry_seq, seq);
+        assert!(!delayed, "manual retry runs immediately");
+        // Manual retry re-opens the auto budget for the new run.
+        let _ = pane.update(Message::SimReady {
+            seq,
+            result: sim_result(true, false),
+        });
+        assert!(pane.take_pending_sim_retry().is_some());
+    }
+
+    #[test]
+    fn pending_sim_retry_dropped_outside_review() {
+        let mut pane = ready_pane();
+        let _ = pane.update(Message::Step(1));
+        let (seq, _) = pane.take_pending_prepare().unwrap();
+        let _ = pane.update(Message::SimReady {
+            seq,
+            result: sim_result(true, false),
+        });
+        // Backing out clears the armed retry along with the sim.
+        let _ = pane.update(Message::Step(0));
+        assert!(pane.take_pending_sim_retry().is_none());
+    }
+
+    #[test]
+    fn back_out_clears_sim() {
+        let mut pane = ready_pane();
+        let _ = pane.update(Message::Step(1));
+        let (seq, _) = pane.take_pending_prepare().unwrap();
+        let _ = pane.update(Message::SimReady {
+            seq,
+            result: SimulationResult::unavailable(),
+        });
+        assert!(pane.sim.is_some());
+        // Form is editable again — the stale preview must go.
+        let _ = pane.update(Message::Step(0));
+        assert!(pane.sim.is_none());
     }
 
     #[test]

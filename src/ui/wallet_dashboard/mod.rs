@@ -33,6 +33,7 @@ mod safes_settings;
 mod send;
 mod settings_root;
 mod sidebar;
+mod sim_view;
 mod swap;
 mod tx_details;
 
@@ -72,6 +73,7 @@ use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::{fill_style, mono};
+use crate::wallet::sim::SimulationResult;
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
     AccountDescriptor, Contact, ContactsBook, KaoSigner, SafeDescriptor, SignerHandoff,
@@ -177,6 +179,20 @@ pub enum Message {
     SafeTxDetail(safe_tx_detail::Message),
     /// Full detail (owners + signatures) for the open queued tx landed.
     SafeTxDetailLoaded(Result<crate::safe::service::SafeTxDetail, String>),
+    /// Inner-call preflight for the open queued tx landed. Tagged with
+    /// the safeTxHash it was simulated for — the staleness guard (the
+    /// analogue of safe_send's seq): dropped unless the detail modal is
+    /// still showing that exact tx.
+    SafeTxInnerSimLoaded {
+        safe_tx_hash: B256,
+        result: SimulationResult,
+    },
+    /// Execute-time (`execTransaction`) preflight for the open queued
+    /// tx landed. Same safeTxHash staleness guard as the inner sim.
+    SafeTxExecSimLoaded {
+        safe_tx_hash: B256,
+        result: SimulationResult,
+    },
     /// A confirm / execute / reject action finished. `Ok` carries a short
     /// success label for the modal's notice line.
     SafeTxActionDone(Result<String, String>),
@@ -261,7 +277,10 @@ enum Modal {
     AccountDropdown(AccountDropdown),
     TxDetails(TxDetailsPane),
     SafeSend(SafeSendPane),
-    SafeTxDetail(SafeTxDetailPane),
+    // Boxed: the pane carries two inline `Option<SimulationResult>`s,
+    // which would otherwise dominate the enum's size
+    // (clippy::large_enum_variant).
+    SafeTxDetail(Box<SafeTxDetailPane>),
 }
 
 /// Which settings pane is currently rendered. The Settings nav slot can show
@@ -675,6 +694,68 @@ impl WalletScreen {
         if let Modal::SafeTxDetail(p) = &mut self.modal {
             p.set_action_result(result);
         }
+    }
+
+    /// Spawn the preflight tasks for the Safe-tx detail modal's loaded
+    /// detail. `inner`/`exec` select the subset (the targeted automatic
+    /// retries re-run only the sim that came back unverified);
+    /// `delayed` waits out the helios fallback cooldown first. No-op
+    /// when the modal is gone or the detail never loaded.
+    ///
+    /// Inner sim only fires for plain calls (the view renders the
+    /// delegatecall skip note without a task); exec sim only when the
+    /// tx is next-up and this wallet holds a local gas payer — and only
+    /// the executor *address* crosses into the task, derived
+    /// synchronously here.
+    fn safe_detail_sim_tasks(&self, inner: bool, exec: bool, delayed: bool) -> Task<Message> {
+        let Modal::SafeTxDetail(p) = &self.modal else {
+            return Task::none();
+        };
+        let Some(d) = p.loaded_detail() else {
+            return Task::none();
+        };
+        let (safe, chain, hash) = (p.safe(), p.chain(), p.safe_tx_hash());
+        let tx = d.tx.clone();
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        if inner && tx.operation == 0 {
+            tasks.push(spawn_safe_inner_sim_task(
+                self.network.clone(),
+                safe,
+                chain,
+                hash,
+                tx.clone(),
+                delayed,
+            ));
+        }
+        let next_up = matches!(
+            d.state,
+            crate::safe::service::SafeTxState::AwaitingExecution { is_next: true, .. }
+        );
+        if exec
+            && next_up
+            && !p.exec_submitted()
+            && let Some(key) = self.first_local_key()
+            && let Ok(signer) = crate::wallet::signer_from_bytes(&key)
+        {
+            let confirmations: Vec<(Address, Bytes)> = d
+                .confirmations
+                .iter()
+                .map(|c| (c.owner, c.signature.clone()))
+                .collect();
+            tasks.push(spawn_safe_exec_sim_task(
+                self.network.clone(),
+                ExecSimSpec {
+                    executor: signer.address(),
+                    safe,
+                    chain,
+                    safe_tx_hash: hash,
+                    tx,
+                    confirmations,
+                },
+                delayed,
+            ));
+        }
+        Task::batch(tasks)
     }
 
     /// Issue a Mainnet `network.balance` call purely to refresh the
@@ -1729,19 +1810,40 @@ impl WalletScreen {
                 // Likewise for the review-prep: entering review (or
                 // hitting Retry) arms a one-shot request to compute and
                 // on-chain-verify the safeTxHash the user will sign.
+                // The inner-call preflight rides the same trigger but
+                // doesn't depend on the pinned nonce, so it runs in
+                // parallel instead of blocking the hash pin.
                 let prepare_task = match p.take_pending_prepare() {
-                    Some((seq, req)) => spawn_safe_prepare_task(self.network.clone(), seq, req),
+                    Some((seq, req)) => Task::batch([
+                        spawn_safe_prepare_task(self.network.clone(), seq, req.clone()),
+                        spawn_safe_send_sim_task(self.network.clone(), seq, req, false),
+                    ]),
+                    None => Task::none(),
+                };
+                // Sim re-runs: the automatic verified-retry (delayed
+                // past the helios cooldown) and the manual Re-simulate
+                // button both arm this hook.
+                let sim_retry_task = match p.take_pending_sim_retry() {
+                    Some((seq, req, delayed)) => {
+                        spawn_safe_send_sim_task(self.network.clone(), seq, req, delayed)
+                    }
                     None => Task::none(),
                 };
                 let task = task.map(Message::SafeSend);
                 match outcome {
                     Some(safe_send::Outcome::Closed) => {
                         self.modal = Modal::None;
-                        return (Task::batch([task, ens_task, prepare_task]), None);
+                        return (
+                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
+                            None,
+                        );
                     }
                     Some(safe_send::Outcome::CopyText(s)) => {
                         let arm = self.arm_clipboard_clear(s);
-                        return (Task::batch([task, arm, ens_task, prepare_task]), None);
+                        return (
+                            Task::batch([task, arm, ens_task, prepare_task, sim_retry_task]),
+                            None,
+                        );
                     }
                     Some(safe_send::Outcome::SaveAsContact { address, ens }) => {
                         // Same path as the EOA Send pane's CTA: switch
@@ -1750,9 +1852,17 @@ impl WalletScreen {
                         // the modal close animation, so the SafeSend
                         // modal tears down on the next chrome tick.
                         let open_task = Task::done(Message::OpenContactsPaneWith { address, ens });
-                        return (Task::batch([task, ens_task, prepare_task, open_task]), None);
+                        return (
+                            Task::batch([task, ens_task, prepare_task, sim_retry_task, open_task]),
+                            None,
+                        );
                     }
-                    None => return (Task::batch([task, ens_task, prepare_task]), None),
+                    None => {
+                        return (
+                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
+                            None,
+                        );
+                    }
                 }
             }
             Message::SafeSendBroadcastReturn(result) => {
@@ -1815,7 +1925,7 @@ impl WalletScreen {
                     .collect();
                 let has_local_executor = self.first_local_key().is_some();
                 let hash = pending.safe_tx_hash;
-                self.modal = Modal::SafeTxDetail(SafeTxDetailPane::new(
+                self.modal = Modal::SafeTxDetail(Box::new(SafeTxDetailPane::new(
                     safe_addr,
                     chain,
                     version,
@@ -1824,7 +1934,7 @@ impl WalletScreen {
                     owners,
                     signable,
                     has_local_executor,
-                ));
+                )));
                 self.chrome.open();
                 return (
                     spawn_safe_detail_load_task(
@@ -1834,13 +1944,73 @@ impl WalletScreen {
                         chain,
                         hash,
                         threshold,
+                        /* delayed */ false,
                     ),
                     None,
                 );
             }
             Message::SafeTxDetailLoaded(result) => {
-                if let Modal::SafeTxDetail(p) = &mut self.modal {
+                // Scope the modal borrow before calling the spawn
+                // helper (which re-borrows immutably). Only the loaded
+                // `detail.tx` is the authoritative SafeTx, so sims are
+                // spawned here — post-action reloads re-run them for
+                // free.
+                {
+                    let Modal::SafeTxDetail(p) = &mut self.modal else {
+                        return (Task::none(), None);
+                    };
+                    // Staleness guard: the delayed post-action reload
+                    // can land after the user opened a *different*
+                    // queued tx — only apply a payload describing the
+                    // tx this modal is showing.
+                    if let Ok(d) = &result
+                        && d.safe_tx_hash != p.safe_tx_hash()
+                    {
+                        return (Task::none(), None);
+                    }
                     p.set_detail(result);
+                }
+                return (
+                    self.safe_detail_sim_tasks(true, true, /* delayed */ false),
+                    None,
+                );
+            }
+            Message::SafeTxInnerSimLoaded {
+                safe_tx_hash,
+                result,
+            } => {
+                let auto = if let Modal::SafeTxDetail(p) = &mut self.modal
+                    && p.safe_tx_hash() == safe_tx_hash
+                {
+                    p.set_inner_sim(result)
+                } else {
+                    false
+                };
+                // Succeeded on fallback state → one automatic re-run
+                // once the helios cooldown has passed.
+                if auto {
+                    return (
+                        self.safe_detail_sim_tasks(true, false, /* delayed */ true),
+                        None,
+                    );
+                }
+            }
+            Message::SafeTxExecSimLoaded {
+                safe_tx_hash,
+                result,
+            } => {
+                let auto = if let Modal::SafeTxDetail(p) = &mut self.modal
+                    && p.safe_tx_hash() == safe_tx_hash
+                {
+                    p.set_exec_sim(result)
+                } else {
+                    false
+                };
+                if auto {
+                    return (
+                        self.safe_detail_sim_tasks(false, true, /* delayed */ true),
+                        None,
+                    );
                 }
             }
             Message::SafeTxActionDone(result) => {
@@ -1863,21 +2033,37 @@ impl WalletScreen {
                     return (Task::none(), None);
                 }
                 // Reload the queue and this tx's detail so the FSM badge
-                // and owner checklist reflect the new state.
+                // and owner checklist reflect the new state. Twice: once
+                // immediately (confirm/reject land in the service
+                // synchronously) and once after a delay — an *execution*
+                // only shows up after the service indexes the mined tx,
+                // so the immediate reload returns the stale state and
+                // the pane bridges the gap with its optimistic
+                // "Execution submitted" presentation.
                 let threshold = self
                     .active_safe_descriptor()
                     .map(|s| s.threshold)
                     .unwrap_or(0);
                 let reload = spawn_safe_detail_load_task(
                     self.network.clone(),
+                    service_base.clone(),
+                    safe,
+                    chain,
+                    hash,
+                    threshold,
+                    /* delayed */ false,
+                );
+                let delayed_reload = spawn_safe_detail_load_task(
+                    self.network.clone(),
                     service_base,
                     safe,
                     chain,
                     hash,
                     threshold,
+                    /* delayed */ true,
                 );
                 let refresh = self.fetch_safe_pending_task().unwrap_or_else(Task::none);
-                return (Task::batch([reload, refresh]), None);
+                return (Task::batch([reload, delayed_reload, refresh]), None);
             }
             Message::SafeTxDetail(child) => {
                 // Pump the child with a scoped &mut borrow so the rest of
@@ -2019,6 +2205,17 @@ impl WalletScreen {
                             nonce,
                         );
                         return (Task::batch([task, reject]), None);
+                    }
+                    Some(safe_tx_detail::Outcome::RetrySims) => {
+                        // The pane already cleared its sim state; just
+                        // re-spawn both tasks immediately.
+                        return (
+                            Task::batch([
+                                task,
+                                self.safe_detail_sim_tasks(true, true, /* delayed */ false),
+                            ]),
+                            None,
+                        );
                     }
                     None => return (task, None),
                 }
@@ -2276,10 +2473,12 @@ impl WalletScreen {
                 // Own EOAs stay visible — withdrawing from a Safe back
                 // to a signing key is a normal flow.
                 let picker = self.recipient_picker(None, self.active_safe);
-                p.view(t, picker, self.chrome.progress())
+                p.view(t, picker, &self.portfolio, self.chrome.progress())
                     .map(Message::SafeSend)
             }
-            Modal::SafeTxDetail(p) => p.view(t, self.chrome.progress()).map(Message::SafeTxDetail),
+            Modal::SafeTxDetail(p) => p
+                .view(t, &self.portfolio, self.chrome.progress())
+                .map(Message::SafeTxDetail),
         };
         let composed: Element<'_, Message> = stack![background, modal_layer].into();
 
@@ -2786,6 +2985,65 @@ fn spawn_safe_prepare_task(
     )
 }
 
+/// How long the automatic verified-retry waits before re-running a sim
+/// that succeeded on fallback state: the helios cooldown window plus a
+/// margin, so the re-run lands back on the verified path instead of
+/// being short-circuited by `in_cooldown` again.
+fn sim_retry_delay() -> std::time::Duration {
+    crate::net::FALLBACK_COOLDOWN + std::time::Duration::from_secs(1)
+}
+
+/// Inner-call preflight for the SafeSend review: simulate the transfer
+/// the Safe would make (`from = Safe`, to/value from the form) against
+/// Helios-verified state. Runs in parallel with the prepare task — the
+/// inner call doesn't depend on the pinned nonce. Advisory: any failure
+/// degrades to `unavailable()` (same convention as the EOA quote path).
+///
+/// `delayed` waits out the helios fallback cooldown (plus a margin)
+/// before running — the automatic verified-retry path. The pane's seq
+/// guard drops the result if the user navigated away meanwhile.
+fn spawn_safe_send_sim_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    req: SafeSendRequest,
+    delayed: bool,
+) -> Task<Message> {
+    use crate::safe::tx::{Operation, SafeTxInput, build_safe_tx_with_nonce};
+    let chain = req.chain;
+    Task::perform(
+        async move {
+            if delayed {
+                tokio::time::sleep(sim_retry_delay()).await;
+            }
+            // Safe-send v1 composes native ETH transfers only —
+            // operation 0, empty calldata, the same SafeTx shape the
+            // prepare task pins. Nonce 0 is fine: the inner sim only
+            // reads to/value/data.
+            let tx = build_safe_tx_with_nonce(
+                SafeTxInput {
+                    to: req.to,
+                    value: req.value,
+                    data: alloy::primitives::Bytes::new(),
+                    operation: Operation::Call,
+                },
+                0,
+            );
+            let result =
+                match crate::safe::sim::simulate_safe_inner(network, req.safe_address, &tx, chain)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, "safe-send: inner sim failed, marking unavailable");
+                        SimulationResult::unavailable()
+                    }
+                };
+            (seq, result)
+        },
+        |(seq, result)| Message::SafeSend(safe_send::Message::SimReady { seq, result }),
+    )
+}
+
 /// Rebuild the SafeTx at the `(nonce, hash)` pin the user reviewed,
 /// re-running every pre-sign check. Shared front-half of the broadcast
 /// and propose tasks. Fails if the review pin is missing, the live
@@ -2948,6 +3206,11 @@ fn spawn_safe_propose_task(
 /// Load full detail (reconstructed `SafeTx` + per-owner signatures) for
 /// one queued tx, for the detail modal's owner checklist and the
 /// execute-from-queue path.
+/// How long the post-action *second* detail reload waits for the
+/// Transaction Service to index a freshly-mined execution. The first
+/// (immediate) reload covers confirm/reject, which land synchronously.
+const SERVICE_REINDEX_DELAY: std::time::Duration = std::time::Duration::from_secs(8);
+
 fn spawn_safe_detail_load_task(
     network: Arc<dyn BalanceFetcher>,
     service_base: String,
@@ -2955,9 +3218,13 @@ fn spawn_safe_detail_load_task(
     chain: crate::chain::Chain,
     safe_tx_hash: B256,
     threshold: u32,
+    delayed: bool,
 ) -> Task<Message> {
     Task::perform(
         async move {
+            if delayed {
+                tokio::time::sleep(SERVICE_REINDEX_DELAY).await;
+            }
             crate::safe::service::fetch_detail(
                 network.as_ref(),
                 &service_base,
@@ -2969,6 +3236,105 @@ fn spawn_safe_detail_load_task(
             .await
         },
         Message::SafeTxDetailLoaded,
+    )
+}
+
+/// Inner-call preflight for the detail modal: the loaded SafeTx body
+/// simulated as the Safe itself. Only spawned for `operation == 0`.
+/// Advisory — failure degrades to `unavailable()`. Tagged with the
+/// safeTxHash so a result for a closed/switched modal is dropped.
+fn spawn_safe_inner_sim_task(
+    network: Arc<dyn BalanceFetcher>,
+    safe: Address,
+    chain: crate::chain::Chain,
+    safe_tx_hash: B256,
+    tx: crate::safe::SafeTx,
+    delayed: bool,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            if delayed {
+                tokio::time::sleep(sim_retry_delay()).await;
+            }
+            let result =
+                match crate::safe::sim::simulate_safe_inner(network, safe, &tx, chain).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, "safe-detail: inner sim failed, marking unavailable");
+                        SimulationResult::unavailable()
+                    }
+                };
+            (safe_tx_hash, result)
+        },
+        |(safe_tx_hash, result)| Message::SafeTxInnerSimLoaded {
+            safe_tx_hash,
+            result,
+        },
+    )
+}
+
+/// Everything the execute-time preflight needs about the queued tx:
+/// who pays gas, which Safe, the reconstructed SafeTx, and the
+/// service-held confirmations to assemble. Bundled so the task takes
+/// `(network, spec, delayed)` instead of eight loose arguments.
+struct ExecSimSpec {
+    executor: Address,
+    safe: Address,
+    chain: crate::chain::Chain,
+    safe_tx_hash: B256,
+    tx: crate::safe::SafeTx,
+    confirmations: Vec<(Address, Bytes)>,
+}
+
+/// Execute-time preflight: assemble the service-held signatures exactly
+/// like the Execute action does and simulate the full `execTransaction`
+/// calldata from the local executor. Catches GS-code failures (bad
+/// sigs, stale nonce) before any gas is spent. Faithful even for
+/// delegatecall — revm runs the real Safe code.
+///
+/// Note the MockFetcher-backed tests can't truly exercise
+/// `checkSignatures` (the Safe has no code in the mock, so the call is
+/// a silent success) — real coverage needs a future anvil harness.
+fn spawn_safe_exec_sim_task(
+    network: Arc<dyn BalanceFetcher>,
+    spec: ExecSimSpec,
+    delayed: bool,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            if delayed {
+                tokio::time::sleep(sim_retry_delay()).await;
+            }
+            let result = match crate::safe::tx::assemble_signatures(spec.confirmations) {
+                Ok(sigs) => {
+                    match crate::safe::sim::simulate_safe_execution(
+                        network,
+                        spec.executor,
+                        spec.safe,
+                        &spec.tx,
+                        sigs,
+                        spec.chain,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(error = %e, "safe-detail: exec sim failed, marking unavailable");
+                            SimulationResult::unavailable()
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "safe-detail: signature assembly failed, exec sim unavailable");
+                    SimulationResult::unavailable()
+                }
+            };
+            (spec.safe_tx_hash, result)
+        },
+        |(safe_tx_hash, result)| Message::SafeTxExecSimLoaded {
+            safe_tx_hash,
+            result,
+        },
     )
 }
 

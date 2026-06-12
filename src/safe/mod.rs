@@ -51,6 +51,7 @@ use crate::net::BalanceFetcher;
 use crate::wallet::{SafeDescriptor, SafeTrust, short_address};
 
 pub mod service;
+pub mod sim;
 pub mod tx;
 
 // ── Safe ABI (read + EIP-712/exec surface) ──────────────────────────────────

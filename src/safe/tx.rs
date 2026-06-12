@@ -787,6 +787,29 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(packed, assembled);
+
+        // Confirmations path: the exec-from-queue flow (and the exec
+        // preflight sim) maps `SafeTxDetail.confirmations` to the same
+        // `(owner, bytes)` pairs — the blob must be identical to the
+        // direct packing above.
+        let confirmations = [
+            crate::safe::service::ServiceConfirmation {
+                owner: s2.address(),
+                signature: Bytes::from(sig2.as_bytes().to_vec()),
+            },
+            crate::safe::service::ServiceConfirmation {
+                owner: s1.address(),
+                signature: Bytes::from(sig1.as_bytes().to_vec()),
+            },
+        ];
+        let via_confirmations = assemble_signatures(
+            confirmations
+                .iter()
+                .map(|c| (c.owner, c.signature.clone()))
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(packed, via_confirmations);
     }
 
     #[tokio::test]
