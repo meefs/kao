@@ -162,36 +162,69 @@ pub struct PendingSafeTx {
 
 // ── Wire models (Safe Transaction Service v1) ────────────────────────────────
 
+/// A field the service may serialize as a JSON string *or* a bare
+/// number, normalized to its string form (the downstream `parse::<U256>`
+/// handles both decimal renderings identically).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StrOrNum {
+    Str(String),
+    Num(serde_json::Number),
+}
+
+impl StrOrNum {
+    fn into_string(self) -> String {
+        match self {
+            StrOrNum::Str(s) => s,
+            StrOrNum::Num(n) => n.to_string(),
+        }
+    }
+}
+
+fn de_num_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    StrOrNum::deserialize(d).map(StrOrNum::into_string)
+}
+
+fn de_opt_num_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<StrOrNum>::deserialize(d)?.map(StrOrNum::into_string))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct MultisigPage {
     #[serde(default)]
     results: Vec<RawMultisigTx>,
 }
 
-/// Numeric fields (`value`, `nonce`) arrive as JSON **strings** in the
-/// Safe API; `to`/`safeTxHash` as hex strings; `data` as nullable hex.
-/// Parse defensively in [`map_raw`] rather than leaning on a derived
-/// deserializer so a single malformed row drops out instead of failing
-/// the whole page.
+/// The live service (v6.x) returns `nonce`/`safeTxGas`/`baseGas` as JSON
+/// **numbers** but `value`/`gasPrice` as strings; older self-hosted
+/// mirrors stringify everything. Every numeric-ish field therefore goes
+/// through [`de_num_string`] so either wire shape decodes — a strict
+/// `String` here made the derived `Vec` decoder reject the whole page on
+/// the first integer (`invalid type: integer `0`, expected a string`).
+/// `to`/`safeTxHash` are hex strings; `data` nullable hex. Values are
+/// then parsed defensively in [`map_raw`] so a single malformed row
+/// drops out instead of failing the whole page.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawMultisigTx {
     safe_tx_hash: String,
     to: String,
+    #[serde(deserialize_with = "de_num_string")]
     value: String,
     #[serde(default)]
     data: Option<String>,
+    #[serde(deserialize_with = "de_num_string")]
     nonce: String,
     // Relay/gas fields — zero for Kao-proposed txs but a tx authored by
     // another client may set them, so they must be read back verbatim to
     // reconstruct an executable `SafeTx` (the safeTxHash depends on them).
     #[serde(default)]
     operation: u8,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_num_string")]
     safe_tx_gas: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_num_string")]
     base_gas: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_opt_num_string")]
     gas_price: Option<String>,
     #[serde(default)]
     gas_token: Option<String>,
@@ -743,8 +776,55 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_and_map_live_integer_shape() {
+        // Captured from api.safe.global (service v6.4.0, 2026-06):
+        // `nonce`/`safeTxGas`/`baseGas` arrive as bare JSON numbers while
+        // `value`/`gasPrice` stay strings. A strict String wire model
+        // rejected this whole page with "invalid type: integer `0`,
+        // expected a string".
+        let json = r#"{
+            "count": 1,
+            "results": [
+                {
+                    "safe": "0x1111111111111111111111111111111111111111",
+                    "to": "0x000000000000000000000000000000000000dEaD",
+                    "value": "0",
+                    "data": null,
+                    "operation": 1,
+                    "gasToken": "0x0000000000000000000000000000000000000000",
+                    "safeTxGas": 0,
+                    "baseGas": 0,
+                    "gasPrice": "0",
+                    "refundReceiver": "0x0000000000000000000000000000000000000000",
+                    "nonce": 2820,
+                    "safeTxHash": "0xe0a663a4fcc44de5a28b1db4d858b82b2f79221d47fb6b48392a66343eb04924",
+                    "isExecuted": false,
+                    "isSuccessful": null,
+                    "confirmationsRequired": 2,
+                    "confirmations": []
+                }
+            ]
+        }"#;
+        let page: MultisigPage = serde_json::from_str(json).unwrap();
+        let raw = page.results.into_iter().next().unwrap();
+        let tx = raw_to_safe_tx(&raw).unwrap();
+        assert_eq!(tx.nonce, U256::from(2820u64));
+        assert_eq!(tx.safeTxGas, U256::ZERO);
+        let pending = map_raw(raw, 2, 2820).unwrap();
+        assert_eq!(pending.nonce, 2820);
+        assert_eq!(
+            pending.state,
+            SafeTxState::AwaitingConfirmations {
+                have: 0,
+                required: 2
+            }
+        );
+    }
+
+    #[test]
     fn deserialize_and_map_sample_page() {
-        // Captured-shape Safe v1 payload: string `value`/`nonce`, null
+        // String-shaped Safe v1 payload (older self-hosted mirrors
+        // stringify the numeric fields): string `value`/`nonce`, null
         // `isSuccessful`, nested confirmations, extra fields we ignore.
         let json = r#"{
             "count": 1,
