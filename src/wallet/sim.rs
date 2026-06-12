@@ -138,6 +138,12 @@ pub struct SimulationResult {
     /// verified path. False if any read fell through to the raw-RPC
     /// fallback during the simulation's cooldown window.
     pub verified: bool,
+    /// Base fee of the block the sim was pinned to, in wei. Lets the UI
+    /// denominate `gas_used` in ETH (`gas_used × base_fee ≈ fee`)
+    /// without a second fee fetch. An approximation by design: it
+    /// excludes the priority tip and, for Safe inner calls, the
+    /// `execTransaction` overhead. `0` when unavailable.
+    pub base_fee_per_gas: u64,
 }
 
 impl SimulationResult {
@@ -152,6 +158,7 @@ impl SimulationResult {
             gas_used: 0,
             transfers: Vec::new(),
             verified: false,
+            base_fee_per_gas: 0,
         }
     }
 
@@ -160,6 +167,14 @@ impl SimulationResult {
             self.outcome,
             SimOutcome::Revert { .. } | SimOutcome::Halt { .. }
         )
+    }
+
+    /// The EVM executed to completion. Combined with `verified`, drives
+    /// the auto-retry ("success but on fallback state — try once more on
+    /// the verified path") and the Re-simulate button visibility (a
+    /// verified success is the one result not worth re-running).
+    pub fn is_success(&self) -> bool {
+        matches!(self.outcome, SimOutcome::Success { .. })
     }
 
     /// Symmetry with `is_revert`. Intentional public API for future
@@ -282,7 +297,7 @@ impl Database for HeliosDb {
 }
 
 // ============================================================================
-// simulate_tx
+// simulate_call / simulate_tx
 // ============================================================================
 
 /// Generous tx-level gas cap. With `disable_block_gas_limit = true` set on
@@ -292,16 +307,50 @@ impl Database for HeliosDb {
 /// faithful to what the tx actually consumes.
 const SIM_GAS_LIMIT: u64 = 30_000_000;
 
+/// A fully-resolved call to preflight. Caller-agnostic: `from` may be an
+/// EOA (the send flow) or a contract such as a Safe (`disable_eip3607`
+/// on the CfgEnv permits a caller with code).
+///
+/// `nonce`: pass the real account nonce for EOA sends; pass `0` for
+/// contract callers. `build_cfg` sets `disable_nonce_check = true`, so
+/// the value is never compared against state — it only feeds CREATE
+/// address derivation, and every sim here is a CALL.
+#[derive(Debug, Clone)]
+pub struct CallSpec {
+    pub chain: Chain,
+    pub from: Address,
+    pub to: Address,
+    pub value: U256,
+    pub input: Bytes,
+    pub nonce: u64,
+}
+
 pub async fn simulate_tx(
     network: Arc<dyn BalanceFetcher>,
     plan: &SendPlan,
     nonce: u64,
 ) -> Result<SimulationResult, SimError> {
-    let chain = plan.chain;
+    let (to, value, input) = plan.tx_target();
+    let spec = CallSpec {
+        chain: plan.chain,
+        from: plan.from,
+        to,
+        value,
+        input,
+        nonce,
+    };
+    simulate_call(network, &spec).await
+}
+
+pub async fn simulate_call(
+    network: Arc<dyn BalanceFetcher>,
+    spec: &CallSpec,
+) -> Result<SimulationResult, SimError> {
+    let chain = spec.chain;
     info!(
         chain = %chain.label(),
         chain_id = chain.chain_id(),
-        from = %plan.from,
+        from = %spec.from,
         "sim: starting",
     );
 
@@ -316,9 +365,11 @@ pub async fn simulate_tx(
         "sim: pinned latest block",
     );
 
-    let (to, value, input) = plan.tx_target();
-    let from = plan.from;
+    let (to, value, input) = (spec.to, spec.value, spec.input.clone());
+    let from = spec.from;
+    let nonce = spec.nonce;
     let chain_id = chain.chain_id();
+    let base_fee_per_gas = block.base_fee_per_gas;
     let handle = Handle::current();
 
     let result = tokio::task::spawn_blocking(move || -> Result<SimulationResult, SimError> {
@@ -337,7 +388,7 @@ pub async fn simulate_tx(
         let mut evm = ctx.with_db(&mut db).build_mainnet();
         let res = evm.replay().map_err(|e| SimError::Evm(format!("{e:?}")))?;
         let verified = db.all_verified;
-        Ok(materialize(res.result, verified))
+        Ok(materialize(res.result, verified, base_fee_per_gas))
     })
     .await
     .map_err(|e| SimError::Join(e.to_string()))??;
@@ -438,7 +489,7 @@ fn build_cfg(chain_id: u64) -> CfgEnv {
     cfg
 }
 
-fn materialize(result: ExecutionResult, verified: bool) -> SimulationResult {
+fn materialize(result: ExecutionResult, verified: bool, base_fee_per_gas: u64) -> SimulationResult {
     let gas_used = result.gas_used();
     let (outcome, logs) = match result {
         ExecutionResult::Success { output, logs, .. } => {
@@ -480,6 +531,7 @@ fn materialize(result: ExecutionResult, verified: bool) -> SimulationResult {
         gas_used,
         transfers,
         verified,
+        base_fee_per_gas,
     }
 }
 
@@ -824,6 +876,35 @@ mod tests {
         assert!(result.transfers.is_empty());
     }
 
+    /// Pins the "contract callers pass nonce 0" decision: `disable_nonce_check`
+    /// means TxEnv.nonce is never compared against state, so a hard-coded 0
+    /// is safe for any CALL — the field only feeds CREATE address derivation.
+    /// If a future revm bump starts enforcing the nonce again, this fails.
+    #[tokio::test]
+    async fn simulate_call_contract_caller_with_nonce_zero_succeeds() {
+        use crate::net::MockFetcher;
+        use alloy::primitives::address;
+
+        let network: Arc<dyn BalanceFetcher> = Arc::new(MockFetcher::new());
+        let spec = CallSpec {
+            chain: Chain::Mainnet,
+            from: address!("0000000000000000000000000000000000005AFE"),
+            to: address!("000000000000000000000000000000000000dEaD"),
+            value: U256::ZERO,
+            input: Bytes::new(),
+            nonce: 0,
+        };
+        let result = simulate_call(network, &spec)
+            .await
+            .expect("sim should not fail");
+        assert!(
+            matches!(result.outcome, SimOutcome::Success { .. }),
+            "expected Success, got {:?}",
+            result.outcome,
+        );
+        assert_eq!(result.gas_used, 21000);
+    }
+
     #[test]
     fn decode_error_string_empty_message() {
         // `revert("")` — selector + offset(0x20) + length(0). No string
@@ -1059,6 +1140,7 @@ mod tests {
             gas_used: 30_000_000,
             transfers: Vec::new(),
             verified: true,
+            base_fee_per_gas: 0,
         };
         assert!(halted.is_revert());
         assert!(!halted.is_unavailable());
@@ -1073,6 +1155,7 @@ mod tests {
             gas_used: 21000,
             transfers: Vec::new(),
             verified: true,
+            base_fee_per_gas: 0,
         };
         assert!(!ok.is_revert());
         assert!(!ok.is_unavailable());
@@ -1130,6 +1213,7 @@ mod tests {
             gas_used: 21000,
             transfers: Vec::new(),
             verified: false,
+            base_fee_per_gas: 0,
         };
         assert!(!r.is_revert());
         assert!(!r.is_unavailable());

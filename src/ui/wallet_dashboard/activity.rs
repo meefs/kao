@@ -284,8 +284,8 @@ fn chain_chip<'a>(t: KaoTheme, chain: Chain) -> Element<'a, Message> {
 
 /// "2 min ago" / "3 hrs ago" / "Yesterday" / "5 days ago". Stays roughly
 /// in sync with the demo strings; precision past a day isn't worth the
-/// extra strings.
-fn format_relative(now: u64, then: u64) -> String {
+/// extra strings. Shared with the Home pane's pending-Safe-tx rows.
+pub(super) fn format_relative(now: u64, then: u64) -> String {
     if then == 0 || then > now {
         return "just now".into();
     }

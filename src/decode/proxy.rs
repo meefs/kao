@@ -329,6 +329,29 @@ mod tests {
                 verified: true,
             })
         }
+        async fn get_code_raw(
+            &self,
+            addr: Address,
+            chain: Chain,
+        ) -> Result<VerifiedRead<Bytes>, String> {
+            self.get_code(addr, chain).await
+        }
+        async fn get_storage_at_raw(
+            &self,
+            addr: Address,
+            slot: U256,
+            chain: Chain,
+        ) -> Result<VerifiedRead<B256>, String> {
+            self.get_storage_at(addr, slot, chain).await
+        }
+        async fn call_raw(
+            &self,
+            to: Address,
+            data: Bytes,
+            chain: Chain,
+        ) -> Result<VerifiedRead<Bytes>, String> {
+            self.call(to, data, chain).await
+        }
     }
 
     fn slot_with_address(addr: Address) -> B256 {

@@ -7,6 +7,7 @@ use alloy::signers::local::{
     MnemonicBuilder, MnemonicKey, PrivateKeySigner, coins_bip39, coins_bip39::English,
 };
 use alloy::signers::trezor::{HDPath as AlloyTrezorHDPath, TrezorSigner};
+use alloy::sol_types::{Eip712Domain, SolStruct};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
@@ -179,10 +180,15 @@ impl AccountDescriptor {
 
 /// Top-level wallet payload. Encrypted at rest inside `wallet.enc`. Holds the
 /// list of accounts the user has set up plus the index of the one currently
-/// in focus on the dashboard.
+/// in focus on the dashboard, plus any Safes the user has onboarded.
+///
+/// `active_index` only refers to `accounts` — Safes are surfaced in the
+/// account list UI but do not claim the active-selection slot in v1. The
+/// future Safe-dashboard plan will introduce a unified `WalletSelection`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletDescriptor {
     pub accounts: Vec<AccountDescriptor>,
+    pub safes: Vec<SafeDescriptor>,
     pub active_index: usize,
 }
 
@@ -190,6 +196,7 @@ impl WalletDescriptor {
     pub fn single(account: AccountDescriptor) -> Self {
         Self {
             accounts: vec![account],
+            safes: Vec::new(),
             active_index: 0,
         }
     }
@@ -207,6 +214,171 @@ impl WalletDescriptor {
     pub fn contains_address(&self, target: Address) -> bool {
         self.addresses().contains(&target)
     }
+
+    /// True if any `(address, chain_id)` Safe descriptor matches. Used to
+    /// keep onboarding from creating a second descriptor for a Safe the
+    /// user already added on the same chain.
+    ///
+    /// Tests exercise it directly; the onboarding flow consumer lands in
+    /// stage 2 of the Safe onboarding work.
+    #[allow(dead_code)]
+    pub fn contains_safe(&self, target: Address, chain_id: u64) -> bool {
+        let target_bytes: [u8; 20] = target.into();
+        self.safes
+            .iter()
+            .any(|s| s.chain_id == chain_id && s.address == target_bytes)
+    }
+}
+
+// ── SafeDescriptor ─────────────────────────────────────────────────────────
+
+/// Whether Kao recognizes the on-chain implementation behind this Safe
+/// proxy. Determined at onboarding by reading proxy storage slot 0 and
+/// looking the address up in the per-chain canonical-singleton registry.
+///
+/// `Canonical` is the only state that will enable signing in the future
+/// Safe-TX flow; `UnrecognizedImpl` is a deliberate "show but don't
+/// trust" mode so a user pasting an exotic Safe deployment isn't locked
+/// out, but also isn't silently led into signing against a contract Kao
+/// has never seen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SafeTrust {
+    Canonical,
+    UnrecognizedImpl,
+}
+
+/// Persisted record of a Safe the user has onboarded. Lives in its own
+/// `safes` redb table — Safes have no private key material of their own
+/// (signing happens via linked owner accounts), so commingling with
+/// `AccountDescriptor` would conflate "thing that holds a secret" with
+/// "thing that delegates signing to other accounts".
+///
+/// The cached on-chain fields (`owners`, `threshold`, `modules`, `guard`,
+/// `fallback_handler`) are snapshots from `cached_at`. The dashboard
+/// refreshes them on app open and the Safe-TX flow refreshes synchronously
+/// before quoting transaction parameters, so stale data should never reach
+/// a signing decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SafeDescriptor {
+    /// User-assigned label. `None` means "no custom name" — call
+    /// `display_name(idx)` for the rendered fallback.
+    pub name: Option<String>,
+    /// EVM chain ID this deployment lives on. Stored explicitly so the
+    /// `(address, chain_id)` pair uniquely identifies a Safe — the same
+    /// address on a different chain is a different Safe with potentially
+    /// different owners.
+    pub chain_id: u64,
+    /// The Safe proxy's address.
+    pub address: [u8; 20],
+    /// `VERSION()` string returned by the proxy, e.g. "1.4.1". Kept as
+    /// the raw string rather than a parsed semver so a future Safe release
+    /// that adds e.g. "1.5.0-beta" doesn't trip deserialization.
+    pub version: String,
+    pub trust: SafeTrust,
+    /// Signature threshold. Safe returns `uint256`; in practice this is
+    /// ≤ owner count which is ≤ a few dozen, but we store as `u32`
+    /// defensively so a pathological value doesn't truncate.
+    pub threshold: u32,
+    pub owners: Vec<[u8; 20]>,
+    /// Enabled modules. Each one can move funds without any owner
+    /// signature — surfaced loudly in the onboarding UI and treated as
+    /// a standing security surface.
+    pub modules: Vec<[u8; 20]>,
+    /// Transaction guard, if set. A guard can block any transaction
+    /// the owners try to execute, so a malicious guard is a brick of
+    /// the entire Safe.
+    pub guard: Option<[u8; 20]>,
+    /// Fallback handler, if set. Safe delegates unknown function
+    /// selectors to this contract — a malicious one can implement
+    /// arbitrary behavior under the Safe's identity.
+    pub fallback_handler: Option<[u8; 20]>,
+    /// Indices into `WalletDescriptor.accounts` for keys the user has
+    /// chosen to link as signers. Empty = observer/watch-only.
+    pub linked_signer_indices: Vec<u32>,
+    /// Other chain IDs where this same address is also a deployed Safe,
+    /// detected during onboarding's parallel scan. Informational only —
+    /// each sibling, if added, gets its own `SafeDescriptor` because
+    /// owner sets can diverge across chains.
+    pub sibling_chains: Vec<u64>,
+    /// Unix seconds at which the cached on-chain fields above were last
+    /// refreshed. UI uses this to show a staleness indicator.
+    pub cached_at: u64,
+    /// Custom Safe Transaction Service base URL for THIS Safe — `None`
+    /// means the public `api.safe.global`. Per-Safe rather than global
+    /// so a DAO treasury can point at its self-hosted mirror while a
+    /// personal Safe stays on the default. Set via the onboarding
+    /// Advanced section or Settings → Safes; always normalized through
+    /// `safe::service::normalize_service_base` before it lands here.
+    ///
+    /// NOTE: appended last for postcard compatibility — the store's
+    /// loader falls back to the pre-field layout for older wallets
+    /// (`store::decode_safe`). New fields must keep appending.
+    pub tx_service_url: Option<String>,
+}
+
+// Tests exercise these directly; the UI consumers (account list rendering,
+// the onboarding label step) land in stage 3 of the Safe onboarding work.
+#[allow(dead_code)]
+impl SafeDescriptor {
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Replace the user-assigned name. Mirrors `AccountDescriptor::set_name`:
+    /// trims whitespace and collapses an empty result to `None` so blank
+    /// inputs revert to the "Safe N" default.
+    pub fn set_name(&mut self, name: Option<String>) {
+        let cleaned = name.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
+        self.name = cleaned;
+    }
+
+    /// Rendered name. Falls back to `Safe {idx + 1}` when unnamed.
+    pub fn display_name(&self, idx: usize) -> String {
+        match self.name() {
+            Some(n) => n.to_string(),
+            None => format!("Safe {}", idx + 1),
+        }
+    }
+
+    /// True when the user has linked at least one of their own accounts
+    /// as a signer of this Safe. Watch-only Safes return false and are
+    /// rendered in a visibly non-signing state.
+    pub fn is_signer(&self) -> bool {
+        !self.linked_signer_indices.is_empty()
+    }
+
+    pub fn address(&self) -> Address {
+        Address::from(self.address)
+    }
+
+    /// Transaction-service base URL this Safe actually talks to — the
+    /// custom mirror when set, the public default otherwise.
+    pub fn tx_service_base(&self) -> &str {
+        self.tx_service_url
+            .as_deref()
+            .unwrap_or(crate::safe::service::DEFAULT_TX_SERVICE_BASE)
+    }
+}
+
+/// True if `account_idx` is listed as a linked signer of any Safe in
+/// `safes`. Drives the dashboard's "Safe signer" cross-badge on
+/// account rows so users can see at a glance which keys are
+/// load-bearing for a multisig.
+///
+/// Free function (not a `WalletDescriptor` method) so the dashboard's
+/// account-list view can call it with just the `&[SafeDescriptor]`
+/// slice it already has — the view doesn't see the whole wallet.
+pub fn account_is_safe_signer(account_idx: u32, safes: &[SafeDescriptor]) -> bool {
+    safes
+        .iter()
+        .any(|s| s.linked_signer_indices.contains(&account_idx))
 }
 
 /// Compute the Ethereum address for an account descriptor. Returns None if a
@@ -324,6 +496,135 @@ impl KaoSigner {
             KaoSigner::ViewOnly(_) => Err(alloy::signers::Error::UnsupportedOperation(
                 alloy::signers::UnsupportedSignerOperation::SignTransaction,
             )),
+        }
+    }
+
+    /// Sign a precomputed 32-byte hash. Used by the Safe-TX flow,
+    /// which computes the EIP-712 signing hash locally (and
+    /// cross-checks it against the Safe's `getTransactionHash`)
+    /// then signs the bare hash as `r ‖ s ‖ v` with `v ∈ {27, 28}`.
+    ///
+    /// Hardware variants return `UnsupportedOperation` on purpose:
+    /// Ledger's Ethereum app refuses bare-hash signing under its
+    /// blind-signing policy, and Trezor likewise. Device EIP-712
+    /// signing needs the structured-fields APDU path
+    /// (`sign_typed_data_v4`) — a separate slice. `ViewOnly` has no
+    /// key.
+    pub async fn sign_hash(&self, hash: B256) -> Result<Signature, alloy::signers::Error> {
+        match self {
+            KaoSigner::Local(s) => s.sign_hash(&hash).await,
+            KaoSigner::Ledger(_) | KaoSigner::Trezor(_) | KaoSigner::ViewOnly(_) => {
+                Err(alloy::signers::Error::UnsupportedOperation(
+                    alloy::signers::UnsupportedSignerOperation::SignHash,
+                ))
+            }
+        }
+    }
+
+    /// Sign an EIP-712 typed-data payload (e.g. a `SafeTx`) — the path
+    /// that makes **hardware** Safe signing work where `sign_hash` does
+    /// not. Each inner signer's `sign_typed_data` drives its native
+    /// EIP-712 flow: software hashes locally; Ledger/Trezor send the
+    /// domain separator + struct hash to the device (the hashed-message
+    /// EIP-712 mode their firmware permits even under blind-signing).
+    ///
+    /// For `Local` this is byte-identical to `sign_hash` over
+    /// `payload.eip712_signing_hash(domain)` — verified by
+    /// `local_eip712_matches_sign_hash`. The produced `v` is `{27,28}`,
+    /// exactly what `pack_owner_signatures` expects.
+    ///
+    /// `ViewOnly` has no key → `UnsupportedOperation`.
+    pub async fn sign_eip712<T: SolStruct + Send + Sync>(
+        &self,
+        payload: &T,
+        domain: &Eip712Domain,
+    ) -> Result<Signature, alloy::signers::Error> {
+        match self {
+            KaoSigner::Local(s) => s.sign_typed_data(payload, domain).await,
+            KaoSigner::Ledger(s) => s.sign_typed_data(payload, domain).await,
+            KaoSigner::Trezor(s) => s.sign_typed_data(payload, domain).await,
+            KaoSigner::ViewOnly(_) => Err(alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignTypedData,
+            )),
+        }
+    }
+
+    /// Produce an EIP-191 `personal_sign` signature over `message`. The
+    /// Safe `eth_sign` fallback (`v ∈ {31,32}`) builds on this for
+    /// devices/app-versions that reject EIP-712; the Safe-specific `+4`
+    /// `v` adjustment is applied at packing time in `safe::tx`, since
+    /// the EIP-191 prefix Safe expects (`"\x19Ethereum Signed
+    /// Message:\n32"` over the 32-byte safeTxHash) is exactly what
+    /// `Signer::sign_message` emits.
+    ///
+    /// `ViewOnly` has no key → `UnsupportedOperation`.
+    pub async fn sign_eth_message(
+        &self,
+        message: &[u8],
+    ) -> Result<Signature, alloy::signers::Error> {
+        match self {
+            KaoSigner::Local(s) => s.sign_message(message).await,
+            KaoSigner::Ledger(s) => s.sign_message(message).await,
+            KaoSigner::Trezor(s) => s.sign_message(message).await,
+            KaoSigner::ViewOnly(_) => Err(alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignMessage,
+            )),
+        }
+    }
+}
+
+/// Construct a *live* signer for an arbitrary linked owner — used when a
+/// Safe owner this wallet controls is **not** the currently-active
+/// account (confirm/execute/propose from the queue). Software owners
+/// rebuild from key bytes; hardware owners reconnect by their stored HD
+/// path and the derived address is checked against the descriptor so a
+/// wrong-device / wrong-derivation mismatch fails loudly instead of
+/// signing under the wrong key.
+///
+/// Async because the hardware variants block on the device. `ViewOnly`
+/// has no key and errors.
+pub async fn build_owner_signer(desc: &AccountDescriptor) -> Result<KaoSigner, String> {
+    match desc {
+        AccountDescriptor::Local { key_bytes, .. } => {
+            let s = signer_from_bytes(&B256::from(*key_bytes)).map_err(|e| e.to_string())?;
+            Ok(KaoSigner::Local(s))
+        }
+        AccountDescriptor::Ledger { path, address, .. } => {
+            let s = LedgerSigner::new(path.to_alloy(), None)
+                .await
+                .map_err(|e| format!("ledger: {e}"))?;
+            let got = Signer::address(&s);
+            let want = Address::from(*address);
+            if got != want {
+                // short_address: this string ends up in logs (warn! at
+                // the call sites), and log lines never carry full user
+                // addresses. Eight hex chars per side is plenty to tell
+                // a wrong-device / wrong-path mix-up apart.
+                return Err(format!(
+                    "ledger address mismatch: device {} vs expected {}",
+                    short_address(got),
+                    short_address(want),
+                ));
+            }
+            Ok(KaoSigner::Ledger(s))
+        }
+        AccountDescriptor::Trezor { path, address, .. } => {
+            let s = TrezorSigner::new(path.to_alloy(), None)
+                .await
+                .map_err(|e| format!("trezor: {e}"))?;
+            let got = Signer::address(&s);
+            let want = Address::from(*address);
+            if got != want {
+                return Err(format!(
+                    "trezor address mismatch: device {} vs expected {}",
+                    short_address(got),
+                    short_address(want),
+                ));
+            }
+            Ok(KaoSigner::Trezor(s))
+        }
+        AccountDescriptor::ViewOnly { .. } => {
+            Err("view-only account has no signing key".to_string())
         }
     }
 }
@@ -451,6 +752,7 @@ pub fn account_short_address(account: &AccountDescriptor) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::U256;
 
     #[test]
     fn account_postcard_roundtrip_local() {
@@ -529,6 +831,7 @@ mod tests {
                     address: [0x22; 20],
                 },
             ],
+            safes: Vec::new(),
             active_index: 1,
         };
         let encoded = postcard::to_stdvec(&desc).unwrap();
@@ -653,6 +956,7 @@ mod tests {
                 name: None,
                 key_bytes: [0xab; 32],
             }],
+            safes: Vec::new(),
             // Bogus index larger than accounts.len(); active() must clamp.
             active_index: 99,
         };
@@ -820,6 +1124,123 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn kao_signer_local_sign_hash_recovers_to_address() {
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        let hash = B256::repeat_byte(0xab);
+        let sig = ks.sign_hash(hash).await.unwrap();
+        let recovered = sig.recover_address_from_prehash(&hash).unwrap();
+        assert_eq!(recovered, ks.address());
+    }
+
+    #[tokio::test]
+    async fn kao_signer_view_only_sign_hash_returns_unsupported() {
+        let addr: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        let ks = KaoSigner::ViewOnly(addr);
+        let err = ks.sign_hash(B256::ZERO).await.unwrap_err();
+        assert!(matches!(
+            err,
+            alloy::signers::Error::UnsupportedOperation(
+                alloy::signers::UnsupportedSignerOperation::SignHash
+            )
+        ));
+    }
+
+    alloy::sol! {
+        struct Demo712 {
+            uint256 x;
+            address y;
+        }
+    }
+
+    #[tokio::test]
+    async fn local_eip712_matches_sign_hash() {
+        // The software path through `sign_eip712` must be byte-identical
+        // to hashing locally and `sign_hash`-ing the EIP-712 signing
+        // hash — that equivalence is what lets the Safe flow swap to
+        // `sign_eip712` (so hardware works) without changing the bytes a
+        // software owner produces.
+        use alloy::sol_types::SolStruct;
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        let domain = Eip712Domain {
+            name: None,
+            version: None,
+            chain_id: Some(U256::from(1u64)),
+            verifying_contract: Some(Address::repeat_byte(0x11)),
+            salt: None,
+        };
+        let payload = Demo712 {
+            x: U256::from(42u64),
+            y: Address::repeat_byte(0xab),
+        };
+        let via_712 = ks.sign_eip712(&payload, &domain).await.unwrap();
+        let hash = payload.eip712_signing_hash(&domain);
+        let via_hash = ks.sign_hash(hash).await.unwrap();
+        assert_eq!(via_712.as_bytes(), via_hash.as_bytes());
+        // And it recovers to the owner over the prehash.
+        assert_eq!(
+            via_712.recover_address_from_prehash(&hash).unwrap(),
+            ks.address()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_eth_message_recovers_over_eip191_prefix() {
+        // `sign_eth_message` is EIP-191 personal_sign; recovery uses the
+        // prefixed digest. This underpins the Safe `eth_sign` fallback.
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let ks = KaoSigner::Local(signer.clone());
+        let hash = B256::repeat_byte(0xcd);
+        let sig = ks.sign_eth_message(hash.as_slice()).await.unwrap();
+        let recovered = sig.recover_address_from_msg(hash.as_slice()).unwrap();
+        assert_eq!(recovered, ks.address());
+    }
+
+    #[tokio::test]
+    async fn view_only_eip712_and_eth_message_unsupported() {
+        let ks = KaoSigner::ViewOnly(Address::repeat_byte(0x01));
+        let domain = Eip712Domain {
+            name: None,
+            version: None,
+            chain_id: Some(U256::from(1u64)),
+            verifying_contract: Some(Address::ZERO),
+            salt: None,
+        };
+        let payload = Demo712 {
+            x: U256::ZERO,
+            y: Address::ZERO,
+        };
+        assert!(ks.sign_eip712(&payload, &domain).await.is_err());
+        assert!(ks.sign_eth_message(&[0u8; 32]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn build_owner_signer_local_round_trips() {
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = derive_accounts_from(&parent, 0, 1).unwrap()[0].clone();
+        let addr = signer.address();
+        let desc = local_account(&signer);
+        let built = build_owner_signer(&desc).await.unwrap();
+        assert_eq!(built.address(), addr);
+        assert!(built.can_sign());
+    }
+
+    #[tokio::test]
+    async fn build_owner_signer_view_only_errors() {
+        let desc = AccountDescriptor::ViewOnly {
+            name: None,
+            address: [0x22; 20],
+        };
+        assert!(build_owner_signer(&desc).await.is_err());
+    }
+
     #[test]
     fn handoff_with_take_returns_signer_once() {
         let addr: Address = "0x000000000000000000000000000000000000dEaD"
@@ -895,9 +1316,74 @@ mod tests {
             .unwrap();
         let desc = WalletDescriptor {
             accounts: vec![view_only_account(addr_a), view_only_account(addr_b)],
+            safes: Vec::new(),
             active_index: 0,
         };
         let addrs = desc.addresses();
         assert_eq!(addrs, vec![addr_a, addr_b]);
+    }
+
+    // ── account_is_safe_signer (badge-classification helper) ────────────
+
+    /// Build a `SafeDescriptor` carrying just the link list — the
+    /// other fields are irrelevant to `account_is_safe_signer`, so we
+    /// keep the test data minimal.
+    fn safe_linking(linked: Vec<u32>) -> SafeDescriptor {
+        SafeDescriptor {
+            name: None,
+            chain_id: 1,
+            address: [0; 20],
+            version: "1.4.1".into(),
+            trust: SafeTrust::Canonical,
+            threshold: 1,
+            owners: Vec::new(),
+            modules: Vec::new(),
+            guard: None,
+            fallback_handler: None,
+            linked_signer_indices: linked,
+            sibling_chains: Vec::new(),
+            cached_at: 0,
+            tx_service_url: None,
+        }
+    }
+
+    #[test]
+    fn account_is_safe_signer_false_when_safes_list_is_empty() {
+        // No safes registered → no account can be a signer. Ensures the
+        // dashboard's badge logic doesn't false-positive on a wallet
+        // that has never onboarded a Safe.
+        assert!(!account_is_safe_signer(0, &[]));
+        assert!(!account_is_safe_signer(99, &[]));
+    }
+
+    #[test]
+    fn account_is_safe_signer_true_when_any_safe_links_the_index() {
+        // Multiple safes; only the second one links account 2.
+        // The lookup must find it without caring about the first
+        // safe's empty link list.
+        let safes = [safe_linking(vec![]), safe_linking(vec![0, 2])];
+        assert!(account_is_safe_signer(0, &safes));
+        assert!(account_is_safe_signer(2, &safes));
+    }
+
+    #[test]
+    fn account_is_safe_signer_false_for_unlinked_indices() {
+        // Account 3 is not linked by any safe — the cross-badge must
+        // NOT render for it. This is the negative case for the same
+        // setup as above.
+        let safes = [safe_linking(vec![0, 2]), safe_linking(vec![5])];
+        assert!(!account_is_safe_signer(1, &safes));
+        assert!(!account_is_safe_signer(3, &safes));
+        assert!(!account_is_safe_signer(4, &safes));
+    }
+
+    #[test]
+    fn account_is_safe_signer_false_for_watch_only_safes() {
+        // A watch-only Safe has an empty `linked_signer_indices` — no
+        // account it might list is "linked". Pins the convention that
+        // watch-only = empty list (not a `None` somewhere).
+        let safes = [safe_linking(vec![]), safe_linking(vec![])];
+        assert!(!account_is_safe_signer(0, &safes));
+        assert!(!account_is_safe_signer(7, &safes));
     }
 }

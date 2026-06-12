@@ -1,27 +1,47 @@
 //! Home pane — balance hero, quick actions (Send/Receive/Swap), live assets list.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use iced::border::Radius;
 use iced::widget::{Space, button, column, container, row, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
+use super::activity::format_relative;
 use super::{MOOD, Message};
 use crate::chain::Chain;
 use crate::portfolio::LiveToken;
+use crate::safe::service::{PendingSafeTx, SafeTxState};
 use crate::ui::kao_theme::{KaoTheme, mix, with_alpha};
 use crate::ui::kao_widgets::{
-    bold, card_style, hover_fill, kao_fit, kao_scrollable_style, kao_text, kaomoji_for_index, mono,
-    mono_black, mono_bold, token_avatar,
+    avatar, bold, card_style, hover_fill, hover_tint, kao_fit, kao_scrollable_style, kao_text,
+    kaomoji_for_index, mono, mono_black, mono_bold, token_avatar,
 };
+use crate::wallet::short_address;
 
+/// Kaomoji on a pending-Safe-tx row — a little "waiting" face, distinct
+/// from the send/receive faces in the activity feed.
+const PENDING_KAO: &str = "(・–・)";
+
+#[allow(clippy::too_many_arguments)]
 pub fn view<'a>(
     t: KaoTheme,
     can_send: bool,
     portfolio: &'a [LiveToken],
     portfolio_loading: bool,
+    portfolio_refreshing: bool,
+    safe_pending: &'a [PendingSafeTx],
+    safe_pending_loading: bool,
+    safe_pending_error: Option<&'a str>,
 ) -> Element<'a, Message> {
     let hero = balance_hero(t, portfolio);
     let actions = quick_actions(t, can_send);
-    let assets_label = text("ASSETS").size(11).color(t.sub).font(bold());
+    let assets_label_row = row![
+        text("ASSETS").size(11).color(t.sub).font(bold()),
+        Space::new().width(Length::Fill),
+        refresh_button(t, portfolio_refreshing),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
     let mut assets = column![].spacing(5);
     if portfolio_loading {
         assets = assets.push(
@@ -36,15 +56,23 @@ pub fn view<'a>(
         }
     }
 
-    let content = column![
-        hero,
-        Space::new().height(18),
-        actions,
-        Space::new().height(18),
-        assets_label,
-        Space::new().height(10),
-        assets,
-    ];
+    let mut content = column![hero, Space::new().height(18), actions];
+
+    // Pending Safe queue — only present in Safe mode (the dashboard
+    // leaves the slice empty / flags false in EOA mode). Sits between the
+    // quick actions and the asset list so a queued multisig tx is the
+    // first thing an owner sees.
+    if let Some(section) =
+        pending_section(t, safe_pending, safe_pending_loading, safe_pending_error)
+    {
+        content = content.push(Space::new().height(18)).push(section);
+    }
+
+    let content = content
+        .push(Space::new().height(18))
+        .push(assets_label_row)
+        .push(Space::new().height(10))
+        .push(assets);
 
     iced::widget::scrollable(
         container(content)
@@ -92,6 +120,204 @@ fn balance_hero<'a>(t: KaoTheme, portfolio: &[LiveToken]) -> Element<'a, Message
                 radius: Radius::from(20),
             },
             text_color: Some(t.text),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Refresh-balances chip. Sits at the right end of the ASSETS row.
+/// While a user-initiated refresh is in flight, the glyph swaps to
+/// a "loading" kaomoji and the click is suppressed so a rapid
+/// double-tap can't queue two parallel fetches against the same
+/// indexer.
+fn refresh_button<'a>(t: KaoTheme, refreshing: bool) -> Element<'a, Message> {
+    let (glyph, color) = if refreshing {
+        ("(；・∀・) refreshing", t.sub)
+    } else {
+        ("↻ refresh", t.a1)
+    };
+    let label = text(glyph).size(11).color(color).font(bold());
+    let bg = Color::TRANSPARENT;
+    let mut b =
+        button(container(label).padding(Padding::from([3, 8]))).style(move |_theme, status| {
+            button::Style {
+                background: Some(Background::Color(match status {
+                    button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
+                    _ => bg,
+                })),
+                text_color: color,
+                border: Border {
+                    color: with_alpha(color, 0.25),
+                    width: 1.0,
+                    radius: Radius::from(8),
+                },
+                ..button::Style::default()
+            }
+        });
+    if !refreshing {
+        b = b.on_press(Message::RefreshPortfolio);
+    }
+    b.into()
+}
+
+/// The "PENDING TRANSACTIONS" block for a Safe's multisig queue. Returns
+/// `None` when there's nothing to surface (not loading, no error, empty
+/// queue) so the section vanishes entirely rather than leaving a bare
+/// header. A non-empty queue renders one [`pending_row`] each; an empty
+/// loading/errored state renders a single muted line that never blocks
+/// the asset list below.
+fn pending_section<'a>(
+    t: KaoTheme,
+    pending: &'a [PendingSafeTx],
+    loading: bool,
+    error: Option<&'a str>,
+) -> Option<Element<'a, Message>> {
+    if pending.is_empty() && !loading && error.is_none() {
+        return None;
+    }
+
+    let label = text("PENDING TRANSACTIONS")
+        .size(11)
+        .color(t.sub)
+        .font(bold());
+
+    let mut col = column![label, Space::new().height(10)].width(Length::Fill);
+
+    if pending.is_empty() {
+        let msg = if loading {
+            "Loading pending transactions…".to_string()
+        } else {
+            // error.is_some() here (empty + not loading is handled above).
+            "Couldn't load pending transactions.".to_string()
+        };
+        col = col.push(text(msg).size(12).color(t.sub).font(mono()));
+    } else {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut rows = column![].spacing(5);
+        for (idx, tx) in pending.iter().enumerate() {
+            rows = rows.push(pending_row(t, tx, now, idx));
+        }
+        col = col.push(rows);
+    }
+
+    Some(col.into())
+}
+
+/// One row in the pending-Safe-tx list. Non-interactive in this slice
+/// (tapping into a detail/verify modal is a follow-up) — styled with the
+/// same card shape as `token_row`, mirroring the activity feed's layout:
+/// avatar · recipient + nonce/time · value + status badge.
+fn pending_row<'a>(t: KaoTheme, tx: &PendingSafeTx, now: u64, idx: usize) -> Element<'a, Message> {
+    let ab = match idx % 3 {
+        0 => t.ab1,
+        1 => t.ab2,
+        _ => t.ab3,
+    };
+
+    let meta = if tx.submission_ts > 0 {
+        format!(
+            "nonce {} · {}",
+            tx.nonce,
+            format_relative(now, tx.submission_ts)
+        )
+    } else {
+        format!("nonce {}", tx.nonce)
+    };
+    let mut left = column![
+        text(format!("To {}", short_address(tx.to)))
+            .size(14)
+            .color(t.text)
+            .font(bold()),
+        Space::new().height(2),
+        text(meta).size(11).color(t.sub).font(mono()),
+    ]
+    .spacing(0);
+    // A delegatecall must never scan as a plain send, even at row level
+    // — the detail modal carries the full warning, this is the tap bait.
+    if tx.operation != 0 {
+        left = left
+            .push(Space::new().height(2))
+            .push(text("⚠ delegatecall").size(11).color(t.down).font(bold()));
+    }
+
+    let value_eth = alloy::primitives::utils::format_ether(tx.value);
+    let value_f = value_eth.parse::<f64>().unwrap_or(0.0);
+    let value_str = if value_f == 0.0 {
+        "0 ETH".to_string()
+    } else if value_f >= 1.0 {
+        format!("{value_f:.4} ETH")
+    } else {
+        let s = format!("{value_f:.6}");
+        format!("{} ETH", s.trim_end_matches('0').trim_end_matches('.'))
+    };
+
+    let right = column![
+        text(value_str).size(14).color(t.text).font(mono_black()),
+        Space::new().height(3),
+        status_badge(t, tx.state),
+    ]
+    .align_x(Alignment::End)
+    .spacing(0);
+
+    let row = row![
+        avatar(t, PENDING_KAO, 40.0, ab),
+        Space::new().width(13),
+        column![left].width(Length::Fill),
+        right,
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    // Whole row is a button → opens the detail/confirm/execute modal,
+    // mirroring the activity feed's tappable rows.
+    button(row)
+        .padding(Padding::from([13, 15]))
+        .width(Length::Fill)
+        .on_press(Message::OpenSafeTxDetails(idx))
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => hover_tint(t.card, t.text),
+                _ => t.card,
+            })),
+            text_color: t.text,
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: Radius::from(14),
+            },
+            ..button::Style::default()
+        })
+        .into()
+}
+
+/// Small filled chip describing the FSM state. Color carries the urgency:
+/// green = ready/executed, accent = collecting signatures, muted =
+/// queued behind an earlier nonce, red = replaced/failed.
+fn status_badge<'a>(t: KaoTheme, state: SafeTxState) -> Element<'a, Message> {
+    let (label, accent): (String, Color) = match state {
+        SafeTxState::AwaitingConfirmations { have, required } => {
+            (format!("{have}/{required} signatures"), t.a1)
+        }
+        SafeTxState::AwaitingExecution { is_next: true, .. } => {
+            ("Ready to execute".to_string(), t.up)
+        }
+        SafeTxState::AwaitingExecution { is_next: false, .. } => ("Queued".to_string(), t.sub),
+        SafeTxState::Replaced => ("Replaced".to_string(), t.down),
+        SafeTxState::Executed { success: true } => ("Executed".to_string(), t.up),
+        SafeTxState::Executed { success: false } => ("Failed".to_string(), t.down),
+    };
+    container(text(label).size(10).color(accent).font(bold()))
+        .padding(Padding::from([2, 6]))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(accent, 0.12))),
+            border: Border {
+                color: with_alpha(accent, 0.3),
+                width: 1.0,
+                radius: Radius::from(6),
+            },
             ..container::Style::default()
         })
         .into()

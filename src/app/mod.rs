@@ -30,6 +30,9 @@ use crate::ui::import_seed_phrase::{
 };
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::bold;
+use crate::ui::safe_onboarding::{
+    Message as SafeOnboardingMessage, Outcome as SafeOnboardingOutcome, SafeOnboardingScreen,
+};
 use crate::ui::select_hardware_wallet::{
     Message as SelectHardwareWalletMessage, Outcome as SelectHardwareWalletOutcome,
     SelectHardwareWalletScreen,
@@ -57,6 +60,7 @@ use crate::ui::wallet_dashboard::{
     Message as WalletDashboardMessage, Outcome as WalletDashboardOutcome, WalletScreen,
 };
 use crate::wallet::{self, AccountDescriptor, Contact, ContactsBook, KaoSigner, WalletDescriptor};
+use alloy::signers::local::PrivateKeySigner;
 
 // ── Messages ─────────────────────────────────────────────────────────────────
 
@@ -69,6 +73,7 @@ pub enum Message {
     ImportAddress(ImportAddressMessage),
     ImportPrivateKey(ImportPrivateKeyMessage),
     ImportSeedPhrase(ImportSeedPhraseMessage),
+    SafeOnboarding(SafeOnboardingMessage),
     SelectHardwareWallet(SelectHardwareWalletMessage),
     SelectHdAccount(SelectHdAccountMessage),
     SelectIndexer(SelectIndexerMessage),
@@ -81,6 +86,12 @@ pub enum Message {
     /// Result of an off-thread `wallet::save_descriptor`. Emitted only to
     /// surface errors — successful saves are silent.
     WalletSaved(Result<(), String>),
+    /// Result of the post-unlock Safe refresh batch. Carries one entry
+    /// per Safe in the order they live in `wallet.safes`. Each entry
+    /// is `Ok((new_descriptor, diff))` on a successful refresh, or
+    /// `Err(reason)` for that Safe alone (other Safes may have
+    /// succeeded). Fires at most once per unlock.
+    SafesRefreshed(crate::safe::RefreshBatch),
     /// Result of an off-thread `wallet::load_contacts`. Carries the
     /// loaded vec on success; errors are logged and the in-memory book
     /// stays empty.
@@ -123,6 +134,7 @@ pub enum Screen {
     ImportAddress(ImportAddressScreen),
     ImportPrivateKey(ImportPrivateKeyScreen),
     ImportSeedPhrase(ImportSeedPhraseScreen),
+    SafeOnboarding(SafeOnboardingScreen),
     SelectHdAccount(SelectHdAccountScreen),
     ConnectLedger(ConnectLedgerScreen),
     ConnectTrezor(ConnectTrezorScreen),
@@ -143,6 +155,18 @@ pub enum Screen {
 enum SetupContext {
     FreshWallet,
     AddAccount,
+}
+
+/// Parked SafeOnboarding state while the user is inside an add-signer
+/// sub-flow (seed phrase / private key / hardware). When this is `Some`,
+/// the on-screen import sub-screen is a sub-flow of SafeOnboarding rather
+/// than a top-level setup step — its success outcome routes through
+/// `finish_add_signer` (validates the derived address against
+/// `allowed_owners` and resumes the parked SafeOnboardingScreen), and
+/// its Back outcome restores the parked screen at the picker.
+struct PendingAddSigner {
+    allowed_owners: Vec<alloy::primitives::Address>,
+    stash: Box<crate::ui::safe_onboarding::SafeOnboardingScreen>,
 }
 
 pub struct App {
@@ -190,6 +214,12 @@ pub struct App {
     /// back to the read-only dashboard with the same tab). `None` means
     /// the current connect-screen session is not a send-reconnect.
     send_reconnect: Option<crate::ui::wallet_dashboard::Nav>,
+    /// Stack of parked SafeOnboardingScreens, innermost-last. Set by
+    /// the add-signer flow: each `begin_add_signer_flow` pushes; each
+    /// resume (back / finish) pops. A stack (rather than `Option`)
+    /// is required because the nested-Safe sub-flow opens another
+    /// SafeOnboardingScreen on top of the parent.
+    pending_add_signer: Vec<PendingAddSigner>,
 }
 
 /// Single-toast state. We don't queue — a fresher error replaces the
@@ -227,6 +257,7 @@ impl App {
                 toast: None,
                 toast_gen: 0,
                 send_reconnect: None,
+                pending_add_signer: Vec::new(),
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
             (app, task)
@@ -243,6 +274,7 @@ impl App {
                 toast: None,
                 toast_gen: 0,
                 send_reconnect: None,
+                pending_add_signer: Vec::new(),
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                 .map(Message::CreatePassword);
@@ -320,14 +352,15 @@ impl App {
         signer: KaoSigner,
         initial_nav: Option<crate::ui::wallet_dashboard::Nav>,
     ) -> iced::Task<Message> {
-        let (accounts, active_index) = match &self.wallet {
-            Some(w) => (w.accounts.clone(), w.active_index),
-            None => (Vec::new(), 0),
+        let (accounts, safes, active_index) = match &self.wallet {
+            Some(w) => (w.accounts.clone(), w.safes.clone(), w.active_index),
+            None => (Vec::new(), Vec::new(), 0),
         };
         let started = std::time::Instant::now();
         let screen = WalletScreen::new(
             signer,
             accounts.clone(),
+            safes,
             active_index,
             self.network.clone(),
             self.portfolio_cache.clone(),
@@ -471,6 +504,157 @@ impl App {
     /// Drop back to the dashboard without going through setup again, using
     /// the signer the user had before they entered the add-account flow.
     /// Used when the user backs out of the SetupMethod / its sub-screens.
+    /// Append `primary` plus any `siblings` to `wallet.safes`, persist
+    /// the wallet, and route back to the dashboard.
+    ///
+    /// v1 (stage 3a) requires an existing wallet — Safes must be added
+    /// in `AddAccount` context. Calling this with no loaded wallet
+    /// surfaces a toast and bails (the storage layer would refuse
+    /// anyway since a wallet with safes but no accounts can't be
+    /// loaded back). Dedup is (address, chain_id) per `contains_safe`.
+    fn save_safe_and_return_to_dashboard(
+        &mut self,
+        primary: crate::wallet::SafeDescriptor,
+        siblings: Vec<crate::wallet::SafeDescriptor>,
+    ) -> iced::Task<Message> {
+        let Some(passphrase) = self.passphrase.as_ref() else {
+            return iced::Task::perform(
+                async { "missing passphrase; cannot save Safe".to_string() },
+                Message::WalletError,
+            );
+        };
+        let Some(mut wallet) = self.wallet.take() else {
+            return iced::Task::perform(
+                async { "no wallet loaded; add an account before adding a Safe".to_string() },
+                Message::WalletError,
+            );
+        };
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for s in std::iter::once(primary).chain(siblings) {
+            let addr = alloy::primitives::Address::from(s.address);
+            if wallet.contains_safe(addr, s.chain_id) {
+                skipped += 1;
+            } else {
+                wallet.safes.push(s);
+                added += 1;
+            }
+        }
+        debug!(added, skipped, total = wallet.safes.len(), "Safe(s) saved");
+        let save = save_descriptor_task(wallet.clone(), passphrase.clone());
+        self.wallet = Some(wallet);
+        iced::Task::batch(vec![save, self.cancel_add_account()])
+    }
+
+    /// Process the post-unlock Safe-refresh batch. For each successful
+    /// refresh: replace `wallet.safes[idx]` with the new descriptor;
+    /// collect any user-facing change summaries. After the batch:
+    /// - if any diff was non-empty, save the wallet once (single
+    ///   epoch bump for the whole batch)
+    /// - if any user-facing alerts collected, surface them as a toast
+    /// - push the updated safes vec into the WalletScreen so its
+    ///   dropdown stops rendering stale labels
+    ///
+    /// Refresh errors are logged but never toasted — a single
+    /// unreachable RPC shouldn't interrupt the user every unlock.
+    fn handle_safes_refreshed(
+        &mut self,
+        results: crate::safe::RefreshBatch,
+    ) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_mut() else {
+            // Unlock was undone (re-lock?) between the spawn and the
+            // result landing. Drop the refresh; we'll re-spawn on
+            // next unlock.
+            return iced::Task::none();
+        };
+        let mut any_changed = false;
+        let mut alerts: Vec<String> = Vec::new();
+        // Pre-resolve linked-signer addresses per safe so summarize can
+        // tell apart "your owner removed" from "someone else's owner
+        // removed". Use the existing accounts vec.
+        for (idx, result) in results {
+            match result {
+                Err(e) => {
+                    warn!(safe_idx = idx, error = %e, "Safe refresh failed");
+                }
+                Ok((new_desc, diff)) => {
+                    if let Some(slot) = wallet.safes.get_mut(idx) {
+                        let linked_addrs: Vec<alloy::primitives::Address> = slot
+                            .linked_signer_indices
+                            .iter()
+                            .filter_map(|i| wallet.accounts.get(*i as usize))
+                            .filter_map(wallet::account_address)
+                            .collect();
+                        let mut summarized =
+                            crate::safe::summarize_user_facing_changes(&diff, &linked_addrs);
+                        if !summarized.is_empty() {
+                            // Prefix each alert with the Safe's name so a
+                            // user with multiple Safes can tell which one
+                            // changed.
+                            let safe_name = new_desc.display_name(idx);
+                            for s in summarized.drain(..) {
+                                alerts.push(format!("{safe_name}: {s}"));
+                            }
+                        }
+                        if !diff.is_empty() {
+                            any_changed = true;
+                        }
+                        *slot = new_desc;
+                    } else {
+                        // Safe was removed between spawn and result —
+                        // discard silently.
+                        warn!(safe_idx = idx, "Safe refresh result has no slot to land in");
+                    }
+                }
+            }
+        }
+
+        // Build the follow-up tasks: push the updated safes into the
+        // dashboard, persist if anything changed, surface a toast if
+        // we collected alerts.
+        let updated_safes = wallet.safes.clone();
+        let push_to_dashboard = iced::Task::done(Message::WalletDashboard(
+            crate::ui::wallet_dashboard::Message::SafesUpdated(updated_safes),
+        ));
+        let mut tasks = vec![push_to_dashboard];
+        if any_changed && let Some(passphrase) = self.passphrase.as_ref() {
+            tasks.push(save_descriptor_task(wallet.clone(), passphrase.clone()));
+        }
+        if !alerts.is_empty() {
+            let msg = alerts.join(" · ");
+            tasks.push(iced::Task::done(Message::WalletError(msg)));
+        }
+        iced::Task::batch(tasks)
+    }
+
+    /// Persist a per-Safe transaction-service override. Mirrors the
+    /// contacts-save shape: mutate the in-memory wallet synchronously,
+    /// dispatch the disk write off-thread, and push the updated list
+    /// into the dashboard so its copy (and the open Settings → Safes
+    /// pane) reseeds from what actually persisted.
+    fn set_safe_service_url(&mut self, index: usize, url: Option<String>) -> iced::Task<Message> {
+        let Some(wallet) = self.wallet.as_mut() else {
+            warn!("set_safe_service_url: no wallet loaded");
+            return iced::Task::none();
+        };
+        let Some(slot) = wallet.safes.get_mut(index) else {
+            warn!(index, "set_safe_service_url: no Safe at index");
+            return iced::Task::none();
+        };
+        slot.tx_service_url = url;
+        let push = iced::Task::done(Message::WalletDashboard(
+            WalletDashboardMessage::SafesUpdated(wallet.safes.clone()),
+        ));
+        let save = match self.passphrase.as_ref() {
+            Some(pw) => save_descriptor_task(wallet.clone(), pw.clone()),
+            None => {
+                warn!("set_safe_service_url: no passphrase held; skipping disk write");
+                iced::Task::none()
+            }
+        };
+        iced::Task::batch(vec![push, save])
+    }
+
     fn cancel_add_account(&mut self) -> iced::Task<Message> {
         self.setup_context = None;
         if let Some(signer) = self.pending_signer.take() {
@@ -479,6 +663,248 @@ impl App {
         // No parked signer (shouldn't happen) — fall back to a full reload
         // of the active account.
         self.enter_active_from_wallet(None)
+    }
+
+    fn begin_add_signer_flow(
+        &mut self,
+        method: crate::ui::safe_onboarding::SignerMethod,
+        allowed_owners: Vec<alloy::primitives::Address>,
+    ) -> iced::Task<Message> {
+        use crate::ui::safe_onboarding::SignerMethod;
+        let placeholder = Screen::SetupMethod(SetupMethodScreen::default());
+        let prev = std::mem::replace(&mut self.screen, placeholder);
+        let Screen::SafeOnboarding(parked) = prev else {
+            warn!("begin_add_signer_flow: screen was not SafeOnboarding");
+            return iced::Task::none();
+        };
+        self.pending_add_signer.push(PendingAddSigner {
+            allowed_owners,
+            stash: Box::new(parked),
+        });
+        match method {
+            SignerMethod::SeedPhrase => {
+                self.screen = Screen::ImportSeedPhrase(ImportSeedPhraseScreen::default());
+                focus_widget(crate::ui::import_seed_phrase::PHRASE_INPUT_ID)
+                    .map(Message::ImportSeedPhrase)
+            }
+            SignerMethod::PrivateKey => {
+                self.screen = Screen::ImportPrivateKey(ImportPrivateKeyScreen::default());
+                focus_widget(crate::ui::import_private_key::KEY_INPUT_ID)
+                    .map(Message::ImportPrivateKey)
+            }
+            SignerMethod::Hardware => {
+                self.screen = Screen::SelectHardwareWallet(SelectHardwareWalletScreen::default());
+                iced::Task::none()
+            }
+            SignerMethod::NestedSafe => {
+                let existing = self.existing_accounts_snapshot();
+                let screen = SafeOnboardingScreen::new(self.network.clone(), existing);
+                self.screen = Screen::SafeOnboarding(screen);
+                focus_widget(crate::ui::safe_onboarding::ADDRESS_INPUT_ID)
+                    .map(Message::SafeOnboarding)
+            }
+        }
+    }
+
+    /// Snapshot of the wallet's accounts in the shape SafeOnboarding's
+    /// RoleSelection step needs. Returns an empty Vec when no wallet is
+    /// loaded (fresh-setup add-Safe path).
+    fn existing_accounts_snapshot(&self) -> Vec<crate::ui::safe_onboarding::ExistingAccount> {
+        self.wallet
+            .as_ref()
+            .map(|w| {
+                w.accounts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, acc)| {
+                        wallet::account_address(acc).map(|addr| {
+                            crate::ui::safe_onboarding::ExistingAccount {
+                                account_idx: idx as u32,
+                                address: addr,
+                                label: acc.display_name(idx),
+                            }
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// If an add-signer sub-flow is active, restore the parked
+    /// SafeOnboardingScreen and return its task. Otherwise invoke
+    /// `fallback` for the normal Back behavior. Used by every import
+    /// sub-screen's Back arm.
+    fn back_or_restore_safe_onboarding(
+        &mut self,
+        fallback: impl FnOnce(&mut Self) -> iced::Task<Message>,
+    ) -> iced::Task<Message> {
+        if let Some(pending) = self.pending_add_signer.pop() {
+            self.screen = Screen::SafeOnboarding(*pending.stash);
+            return iced::Task::none();
+        }
+        fallback(self)
+    }
+
+    /// Route a freshly-imported `Local` account: into the add-signer
+    /// flow if one is parked, otherwise straight to the dashboard.
+    /// Centralizes the same conditional that every import handler
+    /// would otherwise inline.
+    fn route_imported_local(
+        &mut self,
+        account: AccountDescriptor,
+        signer: PrivateKeySigner,
+    ) -> iced::Task<Message> {
+        if !self.pending_add_signer.is_empty() {
+            let addr = wallet::signer_address(&signer);
+            self.finish_add_signer(account, addr)
+        } else {
+            self.save_account_and_enter_dashboard(account, KaoSigner::Local(signer))
+        }
+    }
+
+    /// Route a freshly-imported hardware account: into the add-signer
+    /// flow if one is parked, otherwise straight to the dashboard.
+    /// Surfaces an explicit error if the address can't be derived (a
+    /// `ViewOnly`/programming-error case — `Ledger`/`Trezor` carry
+    /// their address inline).
+    fn route_imported_hardware(
+        &mut self,
+        account: AccountDescriptor,
+        signer: KaoSigner,
+    ) -> iced::Task<Message> {
+        if self.pending_add_signer.is_empty() {
+            return self.save_account_and_enter_dashboard(account, signer);
+        }
+        match wallet::account_address(&account) {
+            Some(addr) => self.finish_add_signer(account, addr),
+            None => {
+                self.pending_add_signer.pop();
+                iced::Task::done(Message::WalletError(
+                    "add-signer: imported account has no address".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Resume the parent SafeOnboardingScreen after an inner one
+    /// finished. Validates the inner's primary address against the
+    /// parent's `allowed_owners`, appends inner safe descriptors
+    /// (primary + any siblings the user selected) to the wallet,
+    /// persists, and informs the parent screen of the new link.
+    /// On rejection, the inner Safe is NOT persisted and the parent
+    /// is restored with an error.
+    fn finish_add_nested_safe(
+        &mut self,
+        primary: crate::wallet::SafeDescriptor,
+        siblings: Vec<crate::wallet::SafeDescriptor>,
+    ) -> iced::Task<Message> {
+        let Some(pending) = self.pending_add_signer.pop() else {
+            warn!("finish_add_nested_safe: no pending state");
+            return iced::Task::none();
+        };
+        let PendingAddSigner {
+            allowed_owners,
+            mut stash,
+        } = pending;
+        let primary_addr = alloy::primitives::Address::from(primary.address);
+        if !allowed_owners.contains(&primary_addr) {
+            stash.apply_signer_import_error(format!(
+                "Nested Safe {primary_addr} is not an owner of this Safe."
+            ));
+            self.screen = Screen::SafeOnboarding(*stash);
+            return iced::Task::none();
+        }
+
+        let Some(mut wallet) = self.wallet.take() else {
+            warn!("finish_add_nested_safe: no wallet loaded");
+            stash.apply_signer_import_error("No wallet loaded — try again.".to_string());
+            self.screen = Screen::SafeOnboarding(*stash);
+            return iced::Task::none();
+        };
+        let mut added = 0usize;
+        for s in std::iter::once(primary).chain(siblings) {
+            let addr = alloy::primitives::Address::from(s.address);
+            if !wallet.contains_safe(addr, s.chain_id) {
+                wallet.safes.push(s);
+                added += 1;
+            }
+        }
+        debug!(added, "nested Safe(s) saved");
+        let save = match self.passphrase.as_ref() {
+            Some(passphrase) => save_descriptor_task(wallet.clone(), passphrase.clone()),
+            None => {
+                warn!("finish_add_nested_safe: no passphrase held; skipping save");
+                iced::Task::none()
+            }
+        };
+        self.wallet = Some(wallet);
+
+        stash.apply_added_nested_safe(primary_addr);
+        self.screen = Screen::SafeOnboarding(*stash);
+        save
+    }
+
+    fn finish_add_signer(
+        &mut self,
+        account: AccountDescriptor,
+        address: alloy::primitives::Address,
+    ) -> iced::Task<Message> {
+        let Some(pending) = self.pending_add_signer.pop() else {
+            warn!("finish_add_signer: no pending add-signer state");
+            return iced::Task::none();
+        };
+        let PendingAddSigner {
+            allowed_owners,
+            mut stash,
+        } = pending;
+
+        if !allowed_owners.contains(&address) {
+            stash.apply_signer_import_error(format!(
+                "Imported address {address} is not an owner of this Safe."
+            ));
+            self.screen = Screen::SafeOnboarding(*stash);
+            return iced::Task::none();
+        }
+
+        // A hardware wallet can re-derive the same address via a
+        // different HD path, so the screen's owner-set filter isn't
+        // a tight enough duplicate guard on its own.
+        let Some(mut wallet) = self.wallet.take() else {
+            warn!("finish_add_signer: no wallet loaded");
+            stash.apply_signer_import_error("No wallet loaded — try again.".to_string());
+            self.screen = Screen::SafeOnboarding(*stash);
+            return iced::Task::none();
+        };
+        if wallet.contains_address(address) {
+            self.wallet = Some(wallet);
+            stash
+                .apply_signer_import_error(format!("Address {address} is already in your wallet."));
+            self.screen = Screen::SafeOnboarding(*stash);
+            return iced::Task::none();
+        }
+        let new_idx = wallet.accounts.len() as u32;
+        let label = account.display_name(new_idx as usize);
+        wallet.accounts.push(account);
+
+        // Signer addition is permanent regardless of whether the user
+        // later confirms the Safe — they may have already keyed in a
+        // mnemonic they don't want to retype.
+        let save = match self.passphrase.as_ref() {
+            Some(passphrase) => save_descriptor_task(wallet.clone(), passphrase.clone()),
+            None => {
+                warn!("finish_add_signer: no passphrase held; skipping save");
+                iced::Task::none()
+            }
+        };
+        self.wallet = Some(wallet);
+
+        stash.apply_added_signer(crate::ui::safe_onboarding::ExistingAccount {
+            account_idx: new_idx,
+            address,
+            label,
+        });
+        self.screen = Screen::SafeOnboarding(*stash);
+        save
     }
 
     /// Persist `active_index = idx` and rebuild the dashboard for that
@@ -622,9 +1048,28 @@ impl App {
                             .expect("passphrase just set")
                             .clone(),
                     );
+                    // Refresh-on-app-open: kick off a parallel
+                    // re-inspect for every Safe so the dashboard
+                    // renders against verified-fresh owner sets and
+                    // any chain-side changes since last open get
+                    // surfaced (owner removals affecting the user,
+                    // unknown modules added, etc.). Skipped when the
+                    // wallet has zero Safes — no work, no toast risk.
+                    let refresh_safes = match self.wallet.as_ref() {
+                        Some(w) if !w.safes.is_empty() => {
+                            let net = self.network.clone();
+                            let safes = w.safes.clone();
+                            iced::Task::perform(
+                                crate::safe::refresh_all_safes(net, safes),
+                                Message::SafesRefreshed,
+                            )
+                        }
+                        _ => iced::Task::none(),
+                    };
                     return iced::Task::batch(vec![
                         self.enter_active_from_wallet(None),
                         load_contacts,
+                        refresh_safes,
                     ]);
                 }
                 cmd.map(Message::Unlock)
@@ -764,6 +1209,19 @@ impl App {
                             focus_widget(crate::ui::import_address::ADDRESS_INPUT_ID)
                                 .map(Message::ImportAddress)
                         }
+                        SetupMethod::AddSafe => {
+                            // Wallet is `None` during fresh setup — the
+                            // empty snapshot means RoleSelection shows
+                            // "no matched owners" and the user proceeds
+                            // watch-only or backs out.
+                            let existing = self.existing_accounts_snapshot();
+                            self.screen = Screen::SafeOnboarding(SafeOnboardingScreen::new(
+                                self.network.clone(),
+                                existing,
+                            ));
+                            focus_widget(crate::ui::safe_onboarding::ADDRESS_INPUT_ID)
+                                .map(Message::SafeOnboarding)
+                        }
                     },
                     Some(SetupMethodOutcome::Cancel) => {
                         if matches!(self.setup_context, Some(SetupContext::AddAccount)) {
@@ -801,10 +1259,11 @@ impl App {
                         self.screen = Screen::ConnectTrezor(screen);
                         task.map(Message::ConnectTrezor)
                     }
-                    Some(SelectHardwareWalletOutcome::Back) => {
-                        self.screen = Screen::SetupMethod(SetupMethodScreen::default());
-                        iced::Task::none()
-                    }
+                    Some(SelectHardwareWalletOutcome::Back) => self
+                        .back_or_restore_safe_onboarding(|s| {
+                            s.screen = Screen::SetupMethod(SetupMethodScreen::default());
+                            iced::Task::none()
+                        }),
                     None => cmd.map(Message::SelectHardwareWallet),
                 }
             }
@@ -828,8 +1287,10 @@ impl App {
                         task.map(Message::SelectHdAccount)
                     }
                     Some(ImportSeedPhraseOutcome::Back) => {
-                        self.screen = Screen::SetupMethod(SetupMethodScreen::default());
-                        iced::Task::none()
+                        self.back_or_restore_safe_onboarding(|s| {
+                            s.screen = Screen::SetupMethod(SetupMethodScreen::default());
+                            iced::Task::none()
+                        })
                     }
                     None => cmd.map(Message::ImportSeedPhrase),
                 }
@@ -847,10 +1308,7 @@ impl App {
                         match wallet::signer_from_bytes(&b256) {
                             Ok(signer) => {
                                 let account = wallet::local_account(&signer);
-                                self.save_account_and_enter_dashboard(
-                                    account,
-                                    KaoSigner::Local(signer),
-                                )
+                                self.route_imported_local(account, signer)
                             }
                             Err(e) => iced::Task::perform(
                                 async move { e.to_string() },
@@ -865,6 +1323,41 @@ impl App {
                             .map(Message::ImportSeedPhrase)
                     }
                     None => cmd.map(Message::SelectHdAccount),
+                }
+            }
+
+            // ── SafeOnboarding ──────────────────────────────────────
+            Message::SafeOnboarding(msg) => {
+                let Screen::SafeOnboarding(screen) = &mut self.screen else {
+                    return iced::Task::none();
+                };
+                let (cmd, outcome) = screen.update(msg);
+                match outcome {
+                    Some(SafeOnboardingOutcome::Done { primary, siblings }) => {
+                        if !self.pending_add_signer.is_empty() {
+                            self.finish_add_nested_safe(*primary, siblings)
+                        } else {
+                            self.save_safe_and_return_to_dashboard(*primary, siblings)
+                        }
+                    }
+                    Some(SafeOnboardingOutcome::Back) => {
+                        // Nested: pop the parent and resume it. Top-level
+                        // back falls through to the usual fresh/add-account
+                        // split.
+                        self.back_or_restore_safe_onboarding(|s| {
+                            if matches!(s.setup_context, Some(SetupContext::AddAccount)) {
+                                s.cancel_add_account()
+                            } else {
+                                s.screen = Screen::SetupMethod(SetupMethodScreen::default());
+                                iced::Task::none()
+                            }
+                        })
+                    }
+                    Some(SafeOnboardingOutcome::RequestAddSigner {
+                        method,
+                        allowed_owners,
+                    }) => self.begin_add_signer_flow(method, allowed_owners),
+                    None => cmd.map(Message::SafeOnboarding),
                 }
             }
 
@@ -906,10 +1399,7 @@ impl App {
                         match wallet::signer_from_bytes(&b256) {
                             Ok(signer) => {
                                 let account = wallet::local_account(&signer);
-                                self.save_account_and_enter_dashboard(
-                                    account,
-                                    KaoSigner::Local(signer),
-                                )
+                                self.route_imported_local(account, signer)
                             }
                             Err(e) => iced::Task::perform(
                                 async move { e.to_string() },
@@ -918,8 +1408,10 @@ impl App {
                         }
                     }
                     Some(ImportPrivateKeyOutcome::Back) => {
-                        self.screen = Screen::SetupMethod(SetupMethodScreen::default());
-                        iced::Task::none()
+                        self.back_or_restore_safe_onboarding(|s| {
+                            s.screen = Screen::SetupMethod(SetupMethodScreen::default());
+                            iced::Task::none()
+                        })
                     }
                     None => cmd.map(Message::ImportPrivateKey),
                 }
@@ -1009,12 +1501,14 @@ impl App {
                 let (cmd, outcome) = screen.update(msg);
                 match outcome {
                     Some(ConnectLedgerOutcome::SetupComplete { account, signer }) => {
-                        self.save_account_and_enter_dashboard(account, signer)
+                        self.route_imported_hardware(account, signer)
                     }
                     Some(ConnectLedgerOutcome::ReconnectComplete { signer }) => {
                         self.finish_send_reconnect(signer)
                     }
-                    Some(ConnectLedgerOutcome::Back) => self.connect_back(),
+                    Some(ConnectLedgerOutcome::Back) => {
+                        self.back_or_restore_safe_onboarding(Self::connect_back)
+                    }
                     None => cmd.map(Message::ConnectLedger),
                 }
             }
@@ -1027,12 +1521,14 @@ impl App {
                 let (cmd, outcome) = screen.update(msg);
                 match outcome {
                     Some(ConnectTrezorOutcome::SetupComplete { account, signer }) => {
-                        self.save_account_and_enter_dashboard(account, signer)
+                        self.route_imported_hardware(account, signer)
                     }
                     Some(ConnectTrezorOutcome::ReconnectComplete { signer }) => {
                         self.finish_send_reconnect(signer)
                     }
-                    Some(ConnectTrezorOutcome::Back) => self.connect_back(),
+                    Some(ConnectTrezorOutcome::Back) => {
+                        self.back_or_restore_safe_onboarding(Self::connect_back)
+                    }
                     None => cmd.map(Message::ConnectTrezor),
                 }
             }
@@ -1074,6 +1570,10 @@ impl App {
                         };
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
                     }
+                    Some(WalletDashboardOutcome::SetSafeServiceUrl { index, url }) => {
+                        let save = self.set_safe_service_url(index, url);
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
+                    }
                     None => cmd.map(Message::WalletDashboard),
                 }
             }
@@ -1085,6 +1585,9 @@ impl App {
                 }
                 iced::Task::none()
             }
+
+            // ── Post-unlock Safe refresh batch ──────────────────────
+            Message::SafesRefreshed(results) => self.handle_safes_refreshed(results),
 
             // ── Contacts background load/save ───────────────────────
             Message::ContactsLoaded(result) => {
@@ -1154,6 +1657,7 @@ impl App {
             Screen::ImportAddress(screen) => screen.view().map(Message::ImportAddress),
             Screen::ImportPrivateKey(screen) => screen.view().map(Message::ImportPrivateKey),
             Screen::ImportSeedPhrase(screen) => screen.view().map(Message::ImportSeedPhrase),
+            Screen::SafeOnboarding(screen) => screen.view().map(Message::SafeOnboarding),
             Screen::SelectHdAccount(screen) => screen.view().map(Message::SelectHdAccount),
             Screen::ConnectLedger(screen) => screen.view().map(Message::ConnectLedger),
             Screen::ConnectTrezor(screen) => screen.view().map(Message::ConnectTrezor),
@@ -1187,6 +1691,7 @@ impl App {
             Screen::ImportSeedPhrase(screen) => {
                 screen.subscription().map(Message::ImportSeedPhrase)
             }
+            Screen::SafeOnboarding(screen) => screen.subscription().map(Message::SafeOnboarding),
             Screen::SelectHdAccount(screen) => screen.subscription().map(Message::SelectHdAccount),
             Screen::ConnectLedger(screen) => screen.subscription().map(Message::ConnectLedger),
             Screen::ConnectTrezor(screen) => screen.subscription().map(Message::ConnectTrezor),
@@ -1384,6 +1889,7 @@ mod tests {
             toast: None,
             toast_gen: 0,
             send_reconnect: None,
+            pending_add_signer: Vec::new(),
         }
     }
 
@@ -1426,6 +1932,7 @@ mod tests {
         let (_, a1) = local_signer_and_account(2);
         app.wallet = Some(WalletDescriptor {
             accounts: vec![a0, a1],
+            safes: Vec::new(),
             active_index: 0,
         });
         let _ = app.switch_account(1);

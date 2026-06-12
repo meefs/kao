@@ -9,7 +9,7 @@ use std::mem;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, TxHash};
+use alloy::primitives::{Address, B256, Bytes, TxHash};
 use iced::border::Radius;
 use iced::widget::operation::focus as focus_widget;
 use iced::widget::{Space, column, container, row, stack, text};
@@ -27,9 +27,13 @@ mod modal_chrome;
 mod nav;
 mod networks;
 mod receive;
+mod safe_send;
+mod safe_tx_detail;
+mod safes_settings;
 mod send;
 mod settings_root;
 mod sidebar;
+mod sim_view;
 mod swap;
 mod tx_details;
 
@@ -37,6 +41,9 @@ use account_dropdown::AccountDropdown;
 use contacts_settings::ContactsPane;
 use networks::NetworksPane;
 use receive::ReceivePane;
+use safe_send::{SafeSendPane, SafeSendRequest};
+use safe_tx_detail::SafeTxDetailPane;
+use safes_settings::SafesPane;
 use send::SendPane;
 use swap::SwapPane;
 use tx_details::TxDetailsPane;
@@ -66,9 +73,11 @@ use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::{fill_style, mono};
+use crate::wallet::sim::SimulationResult;
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
-    AccountDescriptor, Contact, ContactsBook, KaoSigner, SignerHandoff, handoff_with, short_address,
+    AccountDescriptor, Contact, ContactsBook, KaoSigner, SafeDescriptor, SignerHandoff,
+    account_address, handoff_with, short_address,
 };
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -80,6 +89,12 @@ pub enum Message {
     /// the header badge — no per-address state changes here, so a stale
     /// fetch landing after an account switch is harmless.
     VerificationRefreshed,
+    /// The App refreshed the wallet's Safes (typically on
+    /// app-open). Carries the new full safes vec — the dashboard
+    /// replaces its stale clone wholesale so the account dropdown
+    /// stops rendering old labels / owner sets / watch-vs-signer
+    /// classifications. Sent at most once per unlock.
+    SafesUpdated(Vec<SafeDescriptor>),
     /// Per-chain portfolio result. The dashboard issues one fetch per
     /// configured chain in parallel and merges by `chain` as each lands,
     /// so a slow Optimism RPC never blocks the Mainnet rows from
@@ -101,12 +116,26 @@ pub enum Message {
     },
     /// User clicked the "couldn't load activity" retry button.
     RetryHistory,
+    /// Result of fetching the active Safe's pending multisig queue from
+    /// the Safe Transaction Service. `safe` is the Safe address the fetch
+    /// was issued against — dropped on arrival if the user has switched
+    /// identity since (same staleness guard as `PortfolioFetched`).
+    SafePendingFetched {
+        safe: Address,
+        chain: crate::chain::Chain,
+        result: Result<Vec<crate::safe::service::PendingSafeTx>, String>,
+    },
     SelectNav(Nav),
     SelectTheme(ThemeKind),
     OpenSend,
     OpenReceive,
     OpenSwap,
     OpenAccountDropdown,
+    /// User clicked the refresh button next to the assets list.
+    /// Re-issues the portfolio fetch (and verification refresh) for
+    /// the current identity. Tokens stay visible during the refresh;
+    /// only the indicator on the button reflects the in-flight state.
+    RefreshPortfolio,
     /// User clicked an activity row. The argument is the index into
     /// `self.history` at the moment of the click; bounds-checked when
     /// handling because the history can refresh between view and event.
@@ -119,6 +148,8 @@ pub enum Message {
     Tick,
     OpenNetworksSettings,
     Networks(networks::Message),
+    OpenSafesSettings,
+    SafesSettings(safes_settings::Message),
     OpenAppearanceSettings,
     CloseAppearanceSettings,
     OpenContactsSettings,
@@ -131,6 +162,40 @@ pub enum Message {
         ens: Option<String>,
     },
     Contacts(contacts_settings::Message),
+    /// Child messages from the Safe-send modal.
+    SafeSend(safe_send::Message),
+    /// Result of a Safe-send sign+broadcast task. No signer handoff
+    /// needed: the executor was derived inside the task from a
+    /// linked owner's key, so nothing was moved out of the
+    /// dashboard.
+    SafeSendBroadcastReturn(Result<TxHash, String>),
+    /// Result of a Safe-send *propose-to-service* task (vs. the direct
+    /// broadcast above).
+    SafeSendProposeReturn(Result<(), String>),
+    /// User tapped a pending Safe queue row. Index into `safe_pending`
+    /// at click time; bounds-checked on handling.
+    OpenSafeTxDetails(usize),
+    /// Child messages from the Safe-tx detail modal.
+    SafeTxDetail(safe_tx_detail::Message),
+    /// Full detail (owners + signatures) for the open queued tx landed.
+    SafeTxDetailLoaded(Result<crate::safe::service::SafeTxDetail, String>),
+    /// Inner-call preflight for the open queued tx landed. Tagged with
+    /// the safeTxHash it was simulated for — the staleness guard (the
+    /// analogue of safe_send's seq): dropped unless the detail modal is
+    /// still showing that exact tx.
+    SafeTxInnerSimLoaded {
+        safe_tx_hash: B256,
+        result: SimulationResult,
+    },
+    /// Execute-time (`execTransaction`) preflight for the open queued
+    /// tx landed. Same safeTxHash staleness guard as the inner sim.
+    SafeTxExecSimLoaded {
+        safe_tx_hash: B256,
+        result: SimulationResult,
+    },
+    /// A confirm / execute / reject action finished. `Ok` carries a short
+    /// success label for the modal's notice line.
+    SafeTxActionDone(Result<String, String>),
     /// Header pencil clicked — switch the title slot to an editable text
     /// input pre-filled with the active account's current display name.
     BeginRenameAccount,
@@ -192,6 +257,13 @@ pub enum Outcome {
     /// re-enters the dashboard with the live signer and the Send modal
     /// pre-opened.
     NeedsHardwareReconnect,
+    /// User changed a Safe's transaction-service mirror in Settings →
+    /// Safes. The App writes it into `wallet.safes[index]`, persists,
+    /// and pushes the updated list back via `Message::SafesUpdated`.
+    SetSafeServiceUrl {
+        index: usize,
+        url: Option<String>,
+    },
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -204,6 +276,11 @@ enum Modal {
     Swap(SwapPane),
     AccountDropdown(AccountDropdown),
     TxDetails(TxDetailsPane),
+    SafeSend(SafeSendPane),
+    // Boxed: the pane carries two inline `Option<SimulationResult>`s,
+    // which would otherwise dominate the enum's size
+    // (clippy::large_enum_variant).
+    SafeTxDetail(Box<SafeTxDetailPane>),
 }
 
 /// Which settings pane is currently rendered. The Settings nav slot can show
@@ -212,6 +289,7 @@ enum Modal {
 enum SettingsPane {
     Root,
     Networks(NetworksPane),
+    Safes(SafesPane),
     Appearance,
     Contacts(ContactsPane),
 }
@@ -227,6 +305,12 @@ pub struct WalletScreen {
     /// All accounts in the unlocked wallet, used to render the account
     /// dropdown. `accounts[active_index]` corresponds to `signer`.
     accounts: Vec<AccountDescriptor>,
+    /// All Safes onboarded into this wallet. Surfaced in the account
+    /// dropdown alongside accounts, both for visibility and so the
+    /// `Safe signer` cross-badge can be computed for accounts that are
+    /// linked owners. Updated whenever the App pushes a new
+    /// `WalletDescriptor` (e.g. after Safe onboarding completes).
+    safes: Vec<SafeDescriptor>,
     active_index: usize,
     theme_kind: ThemeKind,
     nav: Nav,
@@ -247,6 +331,11 @@ pub struct WalletScreen {
     portfolio: Vec<LiveToken>,
     /// True while a portfolio fetch is in flight.
     portfolio_loading: bool,
+    /// True while a *user-initiated* refresh is in flight. The home
+    /// view shows tokens normally and renders a small busy hint on
+    /// the refresh button — distinct from `portfolio_loading`, which
+    /// is the cold-start path that hides the asset list entirely.
+    portfolio_refreshing: bool,
     /// Process-lifetime cache shared with `App` so switching back to a
     /// previously-loaded account renders its tokens immediately while a
     /// fresh fetch refreshes them in the background.
@@ -281,6 +370,26 @@ pub struct WalletScreen {
     /// `Arc<RwLock<…>>` so a contact edit is visible everywhere on the
     /// next view tick without rebuilding the dashboard.
     contacts: Arc<RwLock<ContactsBook>>,
+    /// When `Some(idx)`, the dashboard is in **Safe mode**: header,
+    /// hero, portfolio, and quick actions key off `safes[idx]`'s
+    /// address rather than the EOA `self.address`. The EOA signer
+    /// stays alive for Safe-TX execution (it pays gas as the
+    /// executor); only what the user *sees* re-keys. Clicking any
+    /// account in the dropdown clears this back to `None`.
+    active_safe: Option<usize>,
+    /// The active Safe's pending multisig queue, fetched from the Safe
+    /// Transaction Service and tagged with a lifecycle FSM state. Only
+    /// populated in Safe mode; cleared on switch back to an EOA. Empty in
+    /// EOA mode and when the active Safe has no queued transactions.
+    safe_pending: Vec<crate::safe::service::PendingSafeTx>,
+    /// True while the pending-queue fetch for the active Safe is in
+    /// flight. Drives a muted "loading" line in the Home pane without
+    /// blocking the asset list.
+    safe_pending_loading: bool,
+    /// Last pending-queue fetch error (service unreachable, decode
+    /// failure). Rendered as a muted one-liner; never blocks the rest of
+    /// the Home pane.
+    safe_pending_error: Option<String>,
     /// Active clipboard auto-clear, set when the user copies anything
     /// from a child modal (Send, TxDetails). Drives the bottom-right
     /// countdown chip and the deferred ownership-checked clear.
@@ -318,9 +427,15 @@ impl WalletScreen {
     /// `Some(_)` is passed by `App::switch_account` so switching
     /// accounts while reading the Activity feed doesn't yank the user
     /// back to Home.
+    // The constructor was already at clippy's 7-arg threshold before
+    // safes were added; bundling into a config struct would be a wider
+    // refactor of every WalletScreen::new caller for no real
+    // readability gain (the arg names are already self-documenting).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         signer: KaoSigner,
         accounts: Vec<AccountDescriptor>,
+        safes: Vec<SafeDescriptor>,
         active_index: usize,
         network: Arc<dyn BalanceFetcher>,
         portfolio_cache: PortfolioCache,
@@ -351,6 +466,7 @@ impl WalletScreen {
             signer,
             address,
             accounts,
+            safes,
             active_index,
             theme_kind: settings::theme(),
             nav: initial_nav.unwrap_or(Nav::Home),
@@ -361,7 +477,12 @@ impl WalletScreen {
             settings_pane: SettingsPane::Root,
             portfolio,
             portfolio_loading,
+            portfolio_refreshing: false,
             portfolio_cache,
+            active_safe: None,
+            safe_pending: Vec::new(),
+            safe_pending_loading: false,
+            safe_pending_error: None,
             rename_draft: None,
             history: Vec::new(),
             history_loading: false,
@@ -379,6 +500,82 @@ impl WalletScreen {
     /// and wants to park the signer to return cheaply later.
     pub fn into_signer(self) -> KaoSigner {
         self.signer
+    }
+
+    /// Address the dashboard currently *displays* — the active Safe's
+    /// address in Safe mode, otherwise the EOA. All portfolio /
+    /// balance / activity / verification fetches key off this. The
+    /// EOA signer (`self.signer` / `self.address`) stays in place for
+    /// transaction signing; only the user-visible identity moves.
+    fn display_address(&self) -> Address {
+        match self.active_safe {
+            Some(idx) => self
+                .safes
+                .get(idx)
+                .map(|s| s.address())
+                .unwrap_or(self.address),
+            None => self.address,
+        }
+    }
+
+    /// The active Safe descriptor when in Safe mode. `None` in EOA
+    /// mode or if `active_safe` points at a stale index (defensive —
+    /// shouldn't happen but cheaper than panicking).
+    fn active_safe_descriptor(&self) -> Option<&SafeDescriptor> {
+        self.active_safe.and_then(|i| self.safes.get(i))
+    }
+
+    /// Chains whose balances/history are valid for the current
+    /// display identity.
+    ///
+    /// In EOA mode: every chain Kao supports. The same hex EOA
+    /// address is a self-custodial wallet across chains, so its
+    /// per-chain balances are independently meaningful.
+    ///
+    /// In Safe mode: just the Safe's own chain. A Safe is a contract
+    /// pinned to a specific deployment; the same address on another
+    /// chain is either an unrelated contract or empty space, and
+    /// rendering its balance there would mislead the user.
+    fn allowed_chains(&self) -> Vec<crate::chain::Chain> {
+        match self.active_safe_descriptor() {
+            Some(safe) => crate::chain::Chain::ALL
+                .iter()
+                .copied()
+                .filter(|c| c.chain_id() == safe.chain_id)
+                .collect(),
+            None => crate::chain::Chain::ALL.to_vec(),
+        }
+    }
+
+    /// Reset `history_pending` to the set of chains the dashboard
+    /// will actually fetch — `allowed_chains()` intersected with
+    /// "has at least one configured RPC". Single source of truth
+    /// for the three callsites that kick a history refresh.
+    fn reset_history_pending(&mut self) {
+        self.history_pending = self
+            .allowed_chains()
+            .into_iter()
+            .filter(|c| !settings::rpcs(*c).is_empty())
+            .collect();
+    }
+
+    /// Seed `self.portfolio` from the cache for the currently
+    /// displayed address. Used on Safe-mode entry so the user sees
+    /// previously-fetched token rows immediately while the live
+    /// fetch refreshes them. Leaves the existing portfolio alone if
+    /// the cache misses entirely on this address.
+    fn seed_portfolio_from_cache(&mut self) {
+        let addr = self.display_address();
+        let allowed = self.allowed_chains();
+        let cached: Vec<LiveToken> = match self.portfolio_cache.lock() {
+            Ok(c) => allowed
+                .iter()
+                .filter_map(|chain| c.get(&(addr, *chain)).cloned())
+                .flatten()
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        self.portfolio = cached;
     }
 
     /// Write `text` to the system clipboard and arm the deferred clear.
@@ -415,6 +612,8 @@ impl WalletScreen {
     pub fn is_send_busy(&self) -> bool {
         match &self.modal {
             Modal::Send(p) => p.busy(),
+            Modal::SafeSend(p) => p.busy(),
+            Modal::SafeTxDetail(p) => p.busy(),
             _ => false,
         }
     }
@@ -431,16 +630,132 @@ impl WalletScreen {
         self.nav
     }
 
-    /// Whether the Send button should be live. True when the signer can
-    /// sign directly, or when the active descriptor is a hardware account
-    /// — in the hardware case the click escalates to a reconnect rather
-    /// than opening Send immediately. View-only accounts return false.
+    /// Whether the Send button should be live. In EOA mode: true when
+    /// the signer can sign directly, or when the active descriptor is
+    /// a hardware account (click escalates to reconnect). View-only
+    /// accounts return false. In Safe mode: true when at least one
+    /// linked owner is a Local account in this wallet — that owner
+    /// serves as both signer and gas-paying executor, so the active
+    /// EOA's signing capability is irrelevant.
     fn can_send(&self) -> bool {
+        if let Some(safe) = self.active_safe_descriptor() {
+            return self.has_local_linked_owner(safe);
+        }
         self.signer.can_sign()
             || matches!(
                 self.accounts.get(self.active_index),
                 Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
             )
+    }
+
+    /// Whether `safe` has at least one linked owner that's a `Local`
+    /// account in this wallet. Determines whether Safe-mode Send is
+    /// reachable.
+    fn has_local_linked_owner(&self, safe: &SafeDescriptor) -> bool {
+        safe.linked_signer_indices.iter().any(|idx| {
+            matches!(
+                self.accounts.get(*idx as usize),
+                Some(AccountDescriptor::Local { .. })
+            )
+        })
+    }
+
+    /// `(address, descriptor)` for every linked owner this wallet can
+    /// sign with — Local or hardware, excluding view-only. The Safe-tx
+    /// detail modal uses these to drive Confirm/Reject.
+    fn safe_signable_owners(&self, safe: &SafeDescriptor) -> Vec<(Address, AccountDescriptor)> {
+        signable_owners_of(safe, &self.accounts)
+    }
+
+    /// The account descriptor whose address matches `addr`, if this wallet
+    /// holds it. Used to rebuild a signer for a chosen owner.
+    fn owner_desc_for(&self, addr: Address) -> Option<AccountDescriptor> {
+        owner_desc_by_address(addr, &self.accounts)
+    }
+
+    /// First Local account key in the wallet — the gas-paying executor for
+    /// execute-from-queue. `None` when the wallet is hardware/view-only
+    /// only (execution then needs an external relayer).
+    fn first_local_key(&self) -> Option<B256> {
+        first_local_key_of(&self.accounts)
+    }
+
+    /// Mark the open Safe-tx detail modal busy (no-op if a different modal
+    /// is showing). Wrapped so the action handlers can mutate the pane
+    /// without holding its borrow across `self` helper calls.
+    fn mark_safe_detail_busy(&mut self) {
+        if let Modal::SafeTxDetail(p) = &mut self.modal {
+            p.mark_busy();
+        }
+    }
+
+    /// Push an action result into the open Safe-tx detail modal.
+    fn set_safe_detail_result(&mut self, result: Result<String, String>) {
+        if let Modal::SafeTxDetail(p) = &mut self.modal {
+            p.set_action_result(result);
+        }
+    }
+
+    /// Spawn the preflight tasks for the Safe-tx detail modal's loaded
+    /// detail. `inner`/`exec` select the subset (the targeted automatic
+    /// retries re-run only the sim that came back unverified);
+    /// `delayed` waits out the helios fallback cooldown first. No-op
+    /// when the modal is gone or the detail never loaded.
+    ///
+    /// Inner sim only fires for plain calls (the view renders the
+    /// delegatecall skip note without a task); exec sim only when the
+    /// tx is next-up and this wallet holds a local gas payer — and only
+    /// the executor *address* crosses into the task, derived
+    /// synchronously here.
+    fn safe_detail_sim_tasks(&self, inner: bool, exec: bool, delayed: bool) -> Task<Message> {
+        let Modal::SafeTxDetail(p) = &self.modal else {
+            return Task::none();
+        };
+        let Some(d) = p.loaded_detail() else {
+            return Task::none();
+        };
+        let (safe, chain, hash) = (p.safe(), p.chain(), p.safe_tx_hash());
+        let tx = d.tx.clone();
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        if inner && tx.operation == 0 {
+            tasks.push(spawn_safe_inner_sim_task(
+                self.network.clone(),
+                safe,
+                chain,
+                hash,
+                tx.clone(),
+                delayed,
+            ));
+        }
+        let next_up = matches!(
+            d.state,
+            crate::safe::service::SafeTxState::AwaitingExecution { is_next: true, .. }
+        );
+        if exec
+            && next_up
+            && !p.exec_submitted()
+            && let Some(key) = self.first_local_key()
+            && let Ok(signer) = crate::wallet::signer_from_bytes(&key)
+        {
+            let confirmations: Vec<(Address, Bytes)> = d
+                .confirmations
+                .iter()
+                .map(|c| (c.owner, c.signature.clone()))
+                .collect();
+            tasks.push(spawn_safe_exec_sim_task(
+                self.network.clone(),
+                ExecSimSpec {
+                    executor: signer.address(),
+                    safe,
+                    chain,
+                    safe_tx_hash: hash,
+                    tx,
+                    confirmations,
+                },
+                delayed,
+            ));
+        }
+        Task::batch(tasks)
     }
 
     /// Issue a Mainnet `network.balance` call purely to refresh the
@@ -452,7 +767,10 @@ impl WalletScreen {
     /// every clear-signing probe, and the portfolio fetch goes through
     /// the raw fallback provider rather than helios.
     pub fn refresh_verification_task(&self) -> Task<Message> {
-        let address = self.address;
+        // Helios verification probes the displayed address — in Safe
+        // mode that's the Safe's address, which is the right thing
+        // to probe because that's what the user is looking at.
+        let address = self.display_address();
         let network = self.network.clone();
         Task::perform(
             async move {
@@ -480,10 +798,10 @@ impl WalletScreen {
     /// `IndexerProvider::None` or any error, falls back to the on-chain
     /// `eth_getLogs` walk.
     pub fn fetch_history_task(&self) -> Task<Message> {
-        let address = self.address;
+        let address = self.display_address();
         let provider_kind = settings::indexer_provider();
         let mut tasks: Vec<Task<Message>> = Vec::new();
-        for chain in crate::chain::Chain::ALL {
+        for chain in self.allowed_chains() {
             if settings::rpcs(chain).is_empty() {
                 // L2 chain that the user never configured — skip silently.
                 continue;
@@ -568,10 +886,10 @@ impl WalletScreen {
     /// message; the handler merges by chain so a slow Optimism RPC
     /// can't stall the Mainnet rows from rendering.
     pub fn fetch_portfolio_task(&self) -> Task<Message> {
-        let address = self.address;
+        let address = self.display_address();
         let provider_kind = settings::indexer_provider();
         let mut tasks: Vec<Task<Message>> = Vec::new();
-        for chain in crate::chain::Chain::ALL {
+        for chain in self.allowed_chains() {
             if settings::rpcs(chain).is_empty() {
                 // L2 chain that the user never configured — skip silently.
                 continue;
@@ -662,6 +980,60 @@ impl WalletScreen {
         Task::batch(tasks)
     }
 
+    /// Fetch the active Safe's pending multisig queue from the Safe
+    /// Transaction Service. Returns `None` in EOA mode, when the Safe
+    /// sits on a chain Kao doesn't recognize, or when that chain has no
+    /// configured RPC (the queue's FSM needs the Safe's on-chain nonce,
+    /// read through `network`). `Option` rather than `Task::none()` so
+    /// callers can tie `safe_pending_loading` to whether a
+    /// `SafePendingFetched` will actually arrive to clear it — setting
+    /// the flag for a fetch that never launches leaves the queue spinner
+    /// stuck forever. Mirrors `fetch_portfolio_task`'s shape otherwise:
+    /// clone the shared fetcher into the task, log timing, tag the result
+    /// with the `(safe, chain)` it was issued against so a late landing
+    /// can't pollute another identity.
+    pub fn fetch_safe_pending_task(&self) -> Option<Task<Message>> {
+        let safe = self.active_safe_descriptor()?;
+        let chain = crate::chain::Chain::from_chain_id(safe.chain_id)?;
+        if settings::rpcs(chain).is_empty() {
+            return None;
+        }
+        let address = safe.address();
+        let threshold = safe.threshold;
+        let service_base = safe.tx_service_base().to_string();
+        let network = self.network.clone();
+        Some(Task::perform(
+            async move {
+                debug!(
+                    safe = %short_address(address),
+                    chain = %chain.label(),
+                    "fetching safe pending queue",
+                );
+                let started = std::time::Instant::now();
+                let result = crate::safe::service::fetch_pending(
+                    &*network,
+                    &service_base,
+                    address,
+                    chain,
+                    threshold,
+                )
+                .await;
+                debug!(
+                    elapsed = ?started.elapsed(),
+                    ok = result.is_ok(),
+                    count = result.as_ref().map(Vec::len).unwrap_or(0),
+                    "safe pending fetch completed",
+                );
+                (address, chain, result)
+            },
+            |(safe, chain, result)| Message::SafePendingFetched {
+                safe,
+                chain,
+                result,
+            },
+        ))
+    }
+
     /// Reverse-resolve the active address against ENS (forward-verified)
     /// and use the result as a default account name when none is set yet.
     /// Skipped when the user has already named the account: we never
@@ -704,6 +1076,42 @@ impl WalletScreen {
             Message::VerificationRefreshed => {
                 self.verification = self.network.last_status(crate::chain::Chain::Mainnet);
             }
+            Message::RefreshPortfolio => {
+                // Don't reset `portfolio_loading` if the portfolio is
+                // already populated — the rendered tokens stay
+                // visible during refresh, and the home view's
+                // refresh button carries its own busy hint. Setting
+                // `loading` only when empty preserves the existing
+                // first-render skeleton path.
+                self.portfolio_loading = self.portfolio.is_empty();
+                self.portfolio_refreshing = true;
+                // In Safe mode the refresh chip also reloads the pending
+                // queue so freshly-signed/executed txs surface promptly.
+                // The loading flag tracks whether a fetch was actually
+                // issued — `None` (EOA mode, unknown chain, no RPCs)
+                // means no `SafePendingFetched` will arrive to clear it.
+                let pending = self.fetch_safe_pending_task();
+                self.safe_pending_loading = pending.is_some();
+                return (
+                    Task::batch([
+                        self.refresh_verification_task(),
+                        self.fetch_portfolio_task(),
+                        pending.unwrap_or_else(Task::none),
+                    ]),
+                    None,
+                );
+            }
+            Message::SafesUpdated(safes) => {
+                // Wholesale replace — refresh-on-open runs in batch
+                // and returns the complete updated list, so there's
+                // nothing to merge.
+                self.safes = safes;
+                // Keep the Settings → Safes pane (if open) in sync so
+                // its drafts reseed from what actually persisted.
+                if let SettingsPane::Safes(p) = &mut self.settings_pane {
+                    p.set_safes(self.safes.clone());
+                }
+            }
             Message::PortfolioFetched {
                 address,
                 chain,
@@ -711,21 +1119,33 @@ impl WalletScreen {
             } => {
                 // Always write the (address, chain) we issued the fetch
                 // for into the cache — it's still the correct slot for
-                // that account's data even if the user has since
-                // switched away. Only the live portfolio merge is gated
-                // on `address == self.address`.
+                // that address's data even if the user has since
+                // switched away. Only the live portfolio merge is
+                // gated on `address == display_address` (which in
+                // Safe mode is the Safe's address).
                 if let Ok(tokens) = &result
                     && let Ok(mut cache) = self.portfolio_cache.lock()
                 {
                     cache.insert((address, chain), tokens.clone());
                 }
-                if address != self.address {
+                if address != self.display_address() {
+                    return (Task::none(), None);
+                }
+                // Cross-chain Safe rows: a stale fetch that was
+                // issued before SelectSafe but landed after can carry
+                // a chain that's no longer in scope for the active
+                // Safe. Drop it before merging so the user never
+                // sees Optimism balances on a Mainnet Safe.
+                if !self.allowed_chains().contains(&chain) {
                     return (Task::none(), None);
                 }
                 // Loading flag clears once *any* chain lands; the user
                 // sees results stream in rather than wait for the
-                // slowest chain.
+                // slowest chain. Refresh flag follows the same
+                // first-wins rule so the button's busy hint clears
+                // as soon as anything new arrives.
                 self.portfolio_loading = false;
+                self.portfolio_refreshing = false;
                 match result {
                     Ok(tokens) => {
                         // Merge by chain: replace the rows belonging to
@@ -756,12 +1176,50 @@ impl WalletScreen {
                     ),
                 }
             }
+            Message::SafePendingFetched {
+                safe,
+                chain,
+                result,
+            } => {
+                // Staleness guard: drop if the user has left this Safe
+                // (switched to an EOA or a different Safe) or if the
+                // active Safe has since moved off this chain. Mirrors the
+                // `PortfolioFetched` address/chain guards.
+                let still_active = self
+                    .active_safe_descriptor()
+                    .is_some_and(|s| s.address() == safe && s.chain_id == chain.chain_id());
+                if !still_active {
+                    return (Task::none(), None);
+                }
+                self.safe_pending_loading = false;
+                match result {
+                    Ok(pending) => {
+                        self.safe_pending = pending;
+                        self.safe_pending_error = None;
+                    }
+                    Err(e) => {
+                        warn!(
+                            safe = %short_address(safe),
+                            chain = %chain.label(),
+                            error = %e,
+                            "safe pending fetch failed",
+                        );
+                        self.safe_pending_error = Some(e);
+                    }
+                }
+            }
             Message::HistoryFetched {
                 address,
                 chain,
                 result,
             } => {
-                if address != self.address {
+                if address != self.display_address() {
+                    return (Task::none(), None);
+                }
+                if !self.allowed_chains().contains(&chain) {
+                    // Same staleness guard as PortfolioFetched — a
+                    // pre-Safe-mode history fetch on a different chain
+                    // shouldn't pollute the Safe's activity feed.
                     return (Task::none(), None);
                 }
                 self.history_loaded = true;
@@ -808,11 +1266,7 @@ impl WalletScreen {
                 }
                 self.history_loading = true;
                 self.history_errors = PerChain::default();
-                self.history_pending = crate::chain::Chain::ALL
-                    .iter()
-                    .copied()
-                    .filter(|c| !settings::rpcs(*c).is_empty())
-                    .collect();
+                self.reset_history_pending();
                 return (self.fetch_history_task(), None);
             }
             Message::SelectNav(nav) => {
@@ -826,11 +1280,7 @@ impl WalletScreen {
                 // account switch.
                 if matches!(nav, Nav::Activity) && !self.history_loaded && !self.history_loading {
                     self.history_loading = true;
-                    self.history_pending = crate::chain::Chain::ALL
-                        .iter()
-                        .copied()
-                        .filter(|c| !settings::rpcs(*c).is_empty())
-                        .collect();
+                    self.reset_history_pending();
                     return (self.fetch_history_task(), None);
                 }
             }
@@ -839,6 +1289,15 @@ impl WalletScreen {
                 settings::set_theme(k);
             }
             Message::OpenSend => {
+                // Safe mode: route Send to the SafeSend modal. The
+                // EOA signer is still alive in `self.signer` and gets
+                // moved into the broadcast task at Confirm time — it
+                // pays gas as the executor.
+                if let Some(safe) = self.active_safe_descriptor() {
+                    self.modal = Modal::SafeSend(SafeSendPane::new(safe, &self.accounts));
+                    self.chrome.open();
+                    return (Task::none(), None);
+                }
                 if !self.signer.can_sign() {
                     // Hardware accounts can sign — they just need the device
                     // reconnected. Escalate so the App can push the matching
@@ -871,20 +1330,6 @@ impl WalletScreen {
                 let Modal::Send(p) = &mut self.modal else {
                     return (Task::none(), None);
                 };
-                // Hold the contacts read guard for the duration of the
-                // pane's update. iced is single-threaded so there is no
-                // contention; the guard exists only because the pane's
-                // `update` signature takes `&ContactsBook`.
-                let contacts_guard = match self.contacts.read() {
-                    Ok(g) => g,
-                    Err(_) => {
-                        warn!("contacts lock poisoned; treating as empty for send update");
-                        // Fall through with a fresh empty book so the
-                        // pane still functions (no contacts shown).
-                        return (Task::none(), None);
-                    }
-                };
-                let book: &ContactsBook = &contacts_guard;
                 // ── Coordinator-side intercepts ────────────────────────
                 //
                 // Some pane messages need data the pane doesn't carry
@@ -920,7 +1365,7 @@ impl WalletScreen {
                         }
                         None => Task::none(),
                     };
-                    let (task, _outcome) = p.update(child_msg, book);
+                    let (task, _outcome) = p.update(child_msg);
                     let task = task.map(Message::Send);
                     return (Task::batch([pre_task, task]), None);
                 }
@@ -960,7 +1405,7 @@ impl WalletScreen {
                         let handoff = handoff_with(signer);
                         let pre_task =
                             spawn_broadcast_task(self.network.clone(), handoff, plan, quote);
-                        let (task, _outcome) = p.update(child_msg, book);
+                        let (task, _outcome) = p.update(child_msg);
                         let task = task.map(Message::Send);
                         return (Task::batch([pre_task, task]), None);
                     }
@@ -969,11 +1414,11 @@ impl WalletScreen {
                     // "send button does nothing" cause (button enabled,
                     // user clicks, no broadcast spawned).
                     warn!("send: confirm dropped — no plan or no quote");
-                    let (task, _outcome) = p.update(child_msg, book);
+                    let (task, _outcome) = p.update(child_msg);
                     return (task.map(Message::Send), None);
                 }
 
-                let (task, outcome) = p.update(child_msg, book);
+                let (task, outcome) = p.update(child_msg);
                 // After pumping the pane, check whether the recipient
                 // input now points at an ENS-shaped value that hasn't been
                 // dispatched yet. The pane bumps a sequence on each
@@ -984,9 +1429,6 @@ impl WalletScreen {
                     None => Task::none(),
                 };
                 let task = task.map(Message::Send);
-                // Drop the read guard before mutating self below (which
-                // happens in the SaveAsContact branch via OpenContactsPaneWith).
-                drop(contacts_guard);
                 match outcome {
                     Some(send::Outcome::Closed) => {
                         self.chrome.start_close();
@@ -1030,16 +1472,7 @@ impl WalletScreen {
                         Ok(hash) => info!(hash = %format!("{hash:#x}"), "broadcast ok"),
                         Err(e) => warn!(error = %e, "broadcast failed"),
                     }
-                    let contacts_guard = match self.contacts.read() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            warn!("contacts lock poisoned in broadcast return");
-                            return (Task::none(), None);
-                        }
-                    };
-                    let (task, _outcome) =
-                        p.update(send::Message::BroadcastDone(result), &contacts_guard);
-                    drop(contacts_guard);
+                    let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
                     // Refresh balance + portfolio + history on success so
                     // the dashboard reflects the new state (the hero
                     // balance, held-token list, and activity feed all
@@ -1053,11 +1486,7 @@ impl WalletScreen {
                         ];
                         if self.history_loaded {
                             self.history_loading = true;
-                            self.history_pending = crate::chain::Chain::ALL
-                                .iter()
-                                .copied()
-                                .filter(|c| !settings::rpcs(*c).is_empty())
-                                .collect();
+                            self.reset_history_pending();
                             tasks.push(self.fetch_history_task());
                         }
                         Task::batch(tasks)
@@ -1130,7 +1559,9 @@ impl WalletScreen {
                 return (Task::none(), None);
             }
             Message::OpenReceive => {
-                self.modal = Modal::Receive(ReceivePane::new(self.address));
+                // In Safe mode, hand the Safe's address to the
+                // existing Receive pane — it's address-agnostic.
+                self.modal = Modal::Receive(ReceivePane::new(self.display_address()));
                 self.chrome.open();
             }
             Message::Receive(child_msg) => {
@@ -1148,6 +1579,14 @@ impl WalletScreen {
                 }
             }
             Message::OpenSwap => {
+                // Swap is meaningless from a Safe in v1 (no Safe-TX
+                // calldata composer for swap routers yet). Silently
+                // no-op when in Safe mode; the quick-action button
+                // gates itself on `can_swap()` so users don't see a
+                // disabled affordance.
+                if self.active_safe.is_some() {
+                    return (Task::none(), None);
+                }
                 self.modal = Modal::Swap(SwapPane::new());
                 self.chrome.open();
             }
@@ -1205,8 +1644,77 @@ impl WalletScreen {
                 match outcome {
                     Some(account_dropdown::Outcome::Switch(idx)) => {
                         self.modal = Modal::None;
+                        // Switching to an EOA exits Safe mode in the
+                        // same gesture.
+                        let was_safe = self.active_safe.is_some();
+                        self.active_safe = None;
+                        if was_safe {
+                            // Drop the Safe's history so the EOA's
+                            // history lazy-loads on the next Activity
+                            // visit instead of showing stale Safe
+                            // txs. The pending queue is Safe-only, so
+                            // clear it outright.
+                            self.history.clear();
+                            self.history_loaded = false;
+                            self.history_errors = PerChain::default();
+                            self.safe_pending.clear();
+                            self.safe_pending_error = None;
+                            self.safe_pending_loading = false;
+                        }
                         if idx != self.active_index && idx < self.accounts.len() {
+                            // Different account: the App rebuilds the
+                            // dashboard and kicks the multi-chain
+                            // portfolio fetch for the new EOA there.
                             return (task, Some(Outcome::Switch(idx)));
+                        }
+                        // Same underlying EOA — the App does NOT rebuild,
+                        // so nothing else will refresh the portfolio. If
+                        // we just left Safe mode, `self.portfolio` still
+                        // holds the Safe's single-chain rows (a Base Safe
+                        // fetches Base only via `allowed_chains`). Re-seed
+                        // from the EOA's cache (now `display_address` is
+                        // the EOA and every chain is back in scope) and
+                        // refetch so all the EOA's chains repopulate.
+                        if was_safe {
+                            self.seed_portfolio_from_cache();
+                            self.portfolio_loading = self.portfolio.is_empty();
+                            let refresh = Task::batch([
+                                self.refresh_verification_task(),
+                                self.fetch_portfolio_task(),
+                            ]);
+                            return (Task::batch([task, refresh]), None);
+                        }
+                        return (task, None);
+                    }
+                    Some(account_dropdown::Outcome::SelectSafe(idx)) => {
+                        self.modal = Modal::None;
+                        if idx < self.safes.len() {
+                            self.active_safe = Some(idx);
+                            // Seed the Safe portfolio from cache if
+                            // we've viewed it before; kick a fresh
+                            // fetch either way so on-chain state
+                            // catches up. History resets so the
+                            // Activity tab lazy-loads for the Safe.
+                            self.seed_portfolio_from_cache();
+                            self.portfolio_loading = self.portfolio.is_empty();
+                            self.history.clear();
+                            self.history_loaded = false;
+                            self.history_errors = PerChain::default();
+                            // Reset the pending queue for the newly-active
+                            // Safe — no cache, so show the loading line
+                            // until the service answers. Loading only
+                            // when the fetch actually launches, else the
+                            // spinner would never clear.
+                            self.safe_pending.clear();
+                            self.safe_pending_error = None;
+                            let pending = self.fetch_safe_pending_task();
+                            self.safe_pending_loading = pending.is_some();
+                            let refresh = Task::batch([
+                                self.refresh_verification_task(),
+                                self.fetch_portfolio_task(),
+                                pending.unwrap_or_else(Task::none),
+                            ]);
+                            return (Task::batch([task, refresh]), None);
                         }
                         return (task, None);
                     }
@@ -1221,6 +1729,497 @@ impl WalletScreen {
                     None => return (task, None),
                 }
             }
+            Message::SafeSend(child_msg) => {
+                let Modal::SafeSend(p) = &mut self.modal else {
+                    return (Task::none(), None);
+                };
+                if let safe_send::Message::Confirm = &child_msg {
+                    let Some(req) = p.outgoing_request() else {
+                        warn!("safe-send: confirm dropped — form not ready");
+                        return (Task::none(), None);
+                    };
+                    let owner_keys =
+                        match collect_owner_keys(&req.linked_local_indices, &self.accounts) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(error = %e, "safe-send: owner key lookup failed");
+                                let _ = p.update(safe_send::Message::BroadcastDone(Err(e)));
+                                return (Task::none(), None);
+                            }
+                        };
+                    if owner_keys.is_empty() {
+                        let msg = "No local owners available to sign — link a Local account to this Safe before sending.".to_string();
+                        let _ = p.update(safe_send::Message::BroadcastDone(Err(msg)));
+                        return (Task::none(), None);
+                    }
+                    info!(
+                        chain = %req.chain.label(),
+                        chain_id = req.chain.chain_id(),
+                        safe = %req.safe_address,
+                        to = %req.to,
+                        value_wei = %req.value,
+                        threshold = req.threshold,
+                        owners_local = owner_keys.len(),
+                        "safe-send: spawning broadcast task",
+                    );
+                    p.mark_busy();
+                    let pre_task = spawn_safe_broadcast_task(self.network.clone(), req, owner_keys);
+                    return (pre_task, None);
+                }
+                if let safe_send::Message::Propose = &child_msg {
+                    let Some(req) = p.outgoing_request() else {
+                        warn!("safe-send: propose dropped — form not ready");
+                        return (Task::none(), None);
+                    };
+                    // Sign once with the first signable owner (Local or
+                    // hardware) and POST to the service for co-signers.
+                    let Some(owner_desc) = req
+                        .signable_indices
+                        .first()
+                        .and_then(|&idx| self.accounts.get(idx as usize).cloned())
+                    else {
+                        let _ = p.update(safe_send::Message::ProposeDone(Err(
+                            "no signable owner linked to this Safe".to_string(),
+                        )));
+                        return (Task::none(), None);
+                    };
+                    info!(
+                        chain = %req.chain.label(),
+                        safe = %req.safe_address,
+                        to = %req.to,
+                        value_wei = %req.value,
+                        "safe-send: spawning propose task",
+                    );
+                    p.mark_busy();
+                    return (
+                        spawn_safe_propose_task(self.network.clone(), owner_desc, req),
+                        None,
+                    );
+                }
+                let (task, outcome) = p.update(child_msg);
+                // After pumping the pane, check whether the recipient
+                // input now points at an ENS-shaped value that hasn't
+                // been dispatched yet. Same sequence-guarded pattern as
+                // the EOA Send pane.
+                let ens_task = match p.take_pending_ens() {
+                    Some((seq, name)) => {
+                        spawn_safe_send_ens_resolve_task(self.network.clone(), seq, name)
+                    }
+                    None => Task::none(),
+                };
+                // Likewise for the review-prep: entering review (or
+                // hitting Retry) arms a one-shot request to compute and
+                // on-chain-verify the safeTxHash the user will sign.
+                // The inner-call preflight rides the same trigger but
+                // doesn't depend on the pinned nonce, so it runs in
+                // parallel instead of blocking the hash pin.
+                let prepare_task = match p.take_pending_prepare() {
+                    Some((seq, req)) => Task::batch([
+                        spawn_safe_prepare_task(self.network.clone(), seq, req.clone()),
+                        spawn_safe_send_sim_task(self.network.clone(), seq, req, false),
+                    ]),
+                    None => Task::none(),
+                };
+                // Sim re-runs: the automatic verified-retry (delayed
+                // past the helios cooldown) and the manual Re-simulate
+                // button both arm this hook.
+                let sim_retry_task = match p.take_pending_sim_retry() {
+                    Some((seq, req, delayed)) => {
+                        spawn_safe_send_sim_task(self.network.clone(), seq, req, delayed)
+                    }
+                    None => Task::none(),
+                };
+                let task = task.map(Message::SafeSend);
+                match outcome {
+                    Some(safe_send::Outcome::Closed) => {
+                        self.modal = Modal::None;
+                        return (
+                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
+                            None,
+                        );
+                    }
+                    Some(safe_send::Outcome::CopyText(s)) => {
+                        let arm = self.arm_clipboard_clear(s);
+                        return (
+                            Task::batch([task, arm, ens_task, prepare_task, sim_retry_task]),
+                            None,
+                        );
+                    }
+                    Some(safe_send::Outcome::SaveAsContact { address, ens }) => {
+                        // Same path as the EOA Send pane's CTA: switch
+                        // nav to Settings → Contacts in Add mode
+                        // pre-filled. `OpenContactsPaneWith` also runs
+                        // the modal close animation, so the SafeSend
+                        // modal tears down on the next chrome tick.
+                        let open_task = Task::done(Message::OpenContactsPaneWith { address, ens });
+                        return (
+                            Task::batch([task, ens_task, prepare_task, sim_retry_task, open_task]),
+                            None,
+                        );
+                    }
+                    None => {
+                        return (
+                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
+                            None,
+                        );
+                    }
+                }
+            }
+            Message::SafeSendBroadcastReturn(result) => {
+                if let Modal::SafeSend(p) = &mut self.modal {
+                    let success = result.is_ok();
+                    match &result {
+                        Ok(hash) => info!(hash = %format!("{hash:#x}"), "safe-send broadcast ok"),
+                        Err(e) => warn!(error = %e, "safe-send broadcast failed"),
+                    }
+                    let (task, _outcome) = p.update(safe_send::Message::BroadcastDone(result));
+                    let refresh = if success {
+                        Task::batch([
+                            self.refresh_verification_task(),
+                            self.fetch_portfolio_task(),
+                        ])
+                    } else {
+                        Task::none()
+                    };
+                    return (Task::batch([task.map(Message::SafeSend), refresh]), None);
+                }
+            }
+            Message::SafeSendProposeReturn(result) => {
+                if let Modal::SafeSend(p) = &mut self.modal {
+                    let success = result.is_ok();
+                    match &result {
+                        Ok(()) => info!("safe-send propose ok"),
+                        Err(e) => warn!(error = %e, "safe-send propose failed"),
+                    }
+                    let (task, _outcome) = p.update(safe_send::Message::ProposeDone(result));
+                    // On success refresh the pending queue so the new
+                    // proposal shows up the moment the user closes.
+                    let refresh = if success {
+                        self.fetch_safe_pending_task().unwrap_or_else(Task::none)
+                    } else {
+                        Task::none()
+                    };
+                    return (Task::batch([task.map(Message::SafeSend), refresh]), None);
+                }
+            }
+            Message::OpenSafeTxDetails(idx) => {
+                let Some(pending) = self.safe_pending.get(idx).cloned() else {
+                    // Queue refreshed between view and click — ignore.
+                    return (Task::none(), None);
+                };
+                let Some(safe) = self.active_safe_descriptor() else {
+                    return (Task::none(), None);
+                };
+                let Some(chain) = crate::chain::Chain::from_chain_id(safe.chain_id) else {
+                    return (Task::none(), None);
+                };
+                let safe_addr = safe.address();
+                let threshold = safe.threshold;
+                let version = safe.version.clone();
+                let service_base = safe.tx_service_base().to_string();
+                let owners: Vec<Address> = safe.owners.iter().map(|o| Address::from(*o)).collect();
+                let signable: Vec<Address> = self
+                    .safe_signable_owners(safe)
+                    .into_iter()
+                    .map(|(a, _)| a)
+                    .collect();
+                let has_local_executor = self.first_local_key().is_some();
+                let hash = pending.safe_tx_hash;
+                self.modal = Modal::SafeTxDetail(Box::new(SafeTxDetailPane::new(
+                    safe_addr,
+                    chain,
+                    version,
+                    service_base.clone(),
+                    pending,
+                    owners,
+                    signable,
+                    has_local_executor,
+                )));
+                self.chrome.open();
+                return (
+                    spawn_safe_detail_load_task(
+                        self.network.clone(),
+                        service_base,
+                        safe_addr,
+                        chain,
+                        hash,
+                        threshold,
+                        /* delayed */ false,
+                    ),
+                    None,
+                );
+            }
+            Message::SafeTxDetailLoaded(result) => {
+                // Scope the modal borrow before calling the spawn
+                // helper (which re-borrows immutably). Only the loaded
+                // `detail.tx` is the authoritative SafeTx, so sims are
+                // spawned here — post-action reloads re-run them for
+                // free.
+                {
+                    let Modal::SafeTxDetail(p) = &mut self.modal else {
+                        return (Task::none(), None);
+                    };
+                    // Staleness guard: the delayed post-action reload
+                    // can land after the user opened a *different*
+                    // queued tx — only apply a payload describing the
+                    // tx this modal is showing.
+                    if let Ok(d) = &result
+                        && d.safe_tx_hash != p.safe_tx_hash()
+                    {
+                        return (Task::none(), None);
+                    }
+                    p.set_detail(result);
+                }
+                return (
+                    self.safe_detail_sim_tasks(true, true, /* delayed */ false),
+                    None,
+                );
+            }
+            Message::SafeTxInnerSimLoaded {
+                safe_tx_hash,
+                result,
+            } => {
+                let auto = if let Modal::SafeTxDetail(p) = &mut self.modal
+                    && p.safe_tx_hash() == safe_tx_hash
+                {
+                    p.set_inner_sim(result)
+                } else {
+                    false
+                };
+                // Succeeded on fallback state → one automatic re-run
+                // once the helios cooldown has passed.
+                if auto {
+                    return (
+                        self.safe_detail_sim_tasks(true, false, /* delayed */ true),
+                        None,
+                    );
+                }
+            }
+            Message::SafeTxExecSimLoaded {
+                safe_tx_hash,
+                result,
+            } => {
+                let auto = if let Modal::SafeTxDetail(p) = &mut self.modal
+                    && p.safe_tx_hash() == safe_tx_hash
+                {
+                    p.set_exec_sim(result)
+                } else {
+                    false
+                };
+                if auto {
+                    return (
+                        self.safe_detail_sim_tasks(false, true, /* delayed */ true),
+                        None,
+                    );
+                }
+            }
+            Message::SafeTxActionDone(result) => {
+                let Modal::SafeTxDetail(p) = &mut self.modal else {
+                    return (Task::none(), None);
+                };
+                let ok = result.is_ok();
+                match &result {
+                    Ok(msg) => info!(msg, "safe-tx action ok"),
+                    Err(e) => warn!(error = %e, "safe-tx action failed"),
+                }
+                let (safe, chain, hash, service_base) = (
+                    p.safe(),
+                    p.chain(),
+                    p.safe_tx_hash(),
+                    p.service_base().to_string(),
+                );
+                p.set_action_result(result);
+                if !ok {
+                    return (Task::none(), None);
+                }
+                // Reload the queue and this tx's detail so the FSM badge
+                // and owner checklist reflect the new state. Twice: once
+                // immediately (confirm/reject land in the service
+                // synchronously) and once after a delay — an *execution*
+                // only shows up after the service indexes the mined tx,
+                // so the immediate reload returns the stale state and
+                // the pane bridges the gap with its optimistic
+                // "Execution submitted" presentation.
+                let threshold = self
+                    .active_safe_descriptor()
+                    .map(|s| s.threshold)
+                    .unwrap_or(0);
+                let reload = spawn_safe_detail_load_task(
+                    self.network.clone(),
+                    service_base.clone(),
+                    safe,
+                    chain,
+                    hash,
+                    threshold,
+                    /* delayed */ false,
+                );
+                let delayed_reload = spawn_safe_detail_load_task(
+                    self.network.clone(),
+                    service_base,
+                    safe,
+                    chain,
+                    hash,
+                    threshold,
+                    /* delayed */ true,
+                );
+                let refresh = self.fetch_safe_pending_task().unwrap_or_else(Task::none);
+                return (Task::batch([reload, delayed_reload, refresh]), None);
+            }
+            Message::SafeTxDetail(child) => {
+                // Pump the child with a scoped &mut borrow so the rest of
+                // the arm can call `self` helpers (owner lookup) without
+                // overlapping the pane's borrow.
+                let (task, outcome) = {
+                    let Modal::SafeTxDetail(p) = &mut self.modal else {
+                        return (Task::none(), None);
+                    };
+                    let (t, o) = p.update(child);
+                    (t.map(Message::SafeTxDetail), o)
+                };
+                match outcome {
+                    Some(safe_tx_detail::Outcome::Closed) => {
+                        self.chrome.start_close();
+                        return (task, None);
+                    }
+                    Some(safe_tx_detail::Outcome::Confirm) => {
+                        // Sign with the first linked owner that hasn't
+                        // signed yet, then POST the confirmation.
+                        let prep = if let Modal::SafeTxDetail(p) = &self.modal {
+                            p.loaded_detail().map(|d| {
+                                (
+                                    d.tx.clone(),
+                                    d.safe_tx_hash,
+                                    p.unsigned_signable().first().copied(),
+                                    p.safe(),
+                                    p.chain(),
+                                    p.version().to_string(),
+                                    p.service_base().to_string(),
+                                )
+                            })
+                        } else {
+                            None
+                        };
+                        let Some((tx, hash, owner, safe, chain, version, service_base)) = prep
+                        else {
+                            return (task, None);
+                        };
+                        // Version gate before any signer is built: a
+                        // pre-1.3 (or unknown-shape) domain must refuse
+                        // with the explainable error, not a late
+                        // on-chain mismatch.
+                        if let Err(e) = crate::safe::tx::ensure_signable_version(&version) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
+                        let owner_desc = owner.and_then(|a| self.owner_desc_for(a));
+                        self.mark_safe_detail_busy();
+                        let Some(owner_desc) = owner_desc else {
+                            self.set_safe_detail_result(Err(
+                                "no linked owner left to sign with".to_string()
+                            ));
+                            return (task, None);
+                        };
+                        let confirm = spawn_safe_confirm_task(
+                            self.network.clone(),
+                            service_base,
+                            owner_desc,
+                            safe,
+                            chain,
+                            tx,
+                            hash,
+                        );
+                        return (Task::batch([task, confirm]), None);
+                    }
+                    Some(safe_tx_detail::Outcome::Execute) => {
+                        let prep = if let Modal::SafeTxDetail(p) = &self.modal {
+                            p.loaded_detail().map(|d| {
+                                let confs: Vec<(Address, Bytes)> = d
+                                    .confirmations
+                                    .iter()
+                                    .map(|c| (c.owner, c.signature.clone()))
+                                    .collect();
+                                (d.tx.clone(), confs, p.safe(), p.chain())
+                            })
+                        } else {
+                            None
+                        };
+                        let Some((tx, confirmations, safe, chain)) = prep else {
+                            return (task, None);
+                        };
+                        let executor_key = self.first_local_key();
+                        self.mark_safe_detail_busy();
+                        let Some(executor_key) = executor_key else {
+                            self.set_safe_detail_result(Err(
+                                "need a Local account to pay gas for execution".to_string(),
+                            ));
+                            return (task, None);
+                        };
+                        let exec = spawn_safe_execute_task(
+                            self.network.clone(),
+                            executor_key,
+                            safe,
+                            chain,
+                            tx,
+                            confirmations,
+                        );
+                        return (Task::batch([task, exec]), None);
+                    }
+                    Some(safe_tx_detail::Outcome::Reject) => {
+                        let prep = if let Modal::SafeTxDetail(p) = &self.modal {
+                            Some((
+                                p.safe(),
+                                p.chain(),
+                                p.nonce(),
+                                p.signable_owner(),
+                                p.version().to_string(),
+                                p.service_base().to_string(),
+                            ))
+                        } else {
+                            None
+                        };
+                        let Some((safe, chain, nonce, owner, version, service_base)) = prep else {
+                            return (task, None);
+                        };
+                        // Same version gate as Confirm — a rejection is
+                        // a SafeTx signature too.
+                        if let Err(e) = crate::safe::tx::ensure_signable_version(&version) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
+                        let owner_desc = owner.and_then(|a| self.owner_desc_for(a));
+                        self.mark_safe_detail_busy();
+                        let Some(owner_desc) = owner_desc else {
+                            self.set_safe_detail_result(Err(
+                                "no linked owner available to reject".to_string()
+                            ));
+                            return (task, None);
+                        };
+                        let reject = spawn_safe_reject_task(
+                            self.network.clone(),
+                            service_base,
+                            owner_desc,
+                            safe,
+                            chain,
+                            nonce,
+                        );
+                        return (Task::batch([task, reject]), None);
+                    }
+                    Some(safe_tx_detail::Outcome::RetrySims) => {
+                        // The pane already cleared its sim state; just
+                        // re-spawn both tasks immediately.
+                        return (
+                            Task::batch([
+                                task,
+                                self.safe_detail_sim_tasks(true, true, /* delayed */ false),
+                            ]),
+                            None,
+                        );
+                    }
+                    None => return (task, None),
+                }
+            }
             Message::Tick => {
                 if self.chrome.tick_settled() {
                     self.modal = Modal::None;
@@ -1229,6 +2228,29 @@ impl WalletScreen {
             Message::OpenNetworksSettings => {
                 self.settings_pane =
                     SettingsPane::Networks(NetworksPane::new(self.network.clone()));
+            }
+            Message::OpenSafesSettings => {
+                self.settings_pane = SettingsPane::Safes(SafesPane::new(self.safes.clone()));
+            }
+            Message::SafesSettings(child_msg) => {
+                let SettingsPane::Safes(p) = &mut self.settings_pane else {
+                    return (Task::none(), None);
+                };
+                let (task, outcome) = p.update(child_msg);
+                let task = task.map(Message::SafesSettings);
+                match outcome {
+                    Some(safes_settings::Outcome::Closed) => {
+                        self.settings_pane = SettingsPane::Root;
+                        return (task, None);
+                    }
+                    Some(safes_settings::Outcome::SetServiceUrl { index, url }) => {
+                        // Bubble to the App, which owns the wallet and
+                        // the disk write; it pushes the updated list
+                        // back via `SafesUpdated` (reseeding the pane).
+                        return (task, Some(Outcome::SetSafeServiceUrl { index, url }));
+                    }
+                    None => return (task, None),
+                }
             }
             Message::OpenAppearanceSettings => {
                 self.settings_pane = SettingsPane::Appearance;
@@ -1360,6 +2382,12 @@ impl WalletScreen {
             Modal::TxDetails(p) => {
                 subs.push(p.subscription().map(Message::TxDetails));
             }
+            Modal::SafeSend(p) => {
+                subs.push(p.subscription().map(Message::SafeSend));
+            }
+            Modal::SafeTxDetail(p) => {
+                subs.push(p.subscription().map(Message::SafeTxDetail));
+            }
             Modal::None => {}
         }
         match &self.settings_pane {
@@ -1404,12 +2432,6 @@ impl WalletScreen {
         // any modal/pane that wants borrow-free contact data. iced
         // views are synchronous so the lock is uncontested; this
         // sidesteps the lifetime issue of holding a read guard across
-        // the widget tree.
-        let contacts_view: send::ContactsView = match self.contacts.read() {
-            Ok(g) => send::ContactsView::from_book(&g),
-            Err(_) => send::ContactsView::default(),
-        };
-
         // Always render the same `stack![background, modal_layer]` tree
         // shape so iced doesn't reset child widget state when a modal
         // opens or closes. Without this, opening a modal changes the
@@ -1418,13 +2440,25 @@ impl WalletScreen {
         // widget state below) snaps back to its default.
         let modal_layer: Element<'_, Message> = match &self.modal {
             Modal::None => Space::new().width(0).height(0).into(),
-            Modal::Send(p) => p
-                .view(t, &self.portfolio, contacts_view, self.chrome.progress())
-                .map(Message::Send),
+            Modal::Send(p) => {
+                // EOA Send: exclude the active EOA from the picker
+                // so the user doesn't see themselves as a recipient.
+                // All Safes are valid destinations (deposit-to-Safe
+                // is a common flow).
+                let picker = self.recipient_picker(Some(self.active_index), None);
+                p.view(t, &self.portfolio, picker, self.chrome.progress())
+                    .map(Message::Send)
+            }
             Modal::Receive(p) => p.view(t, self.chrome.progress()).map(Message::Receive),
             Modal::Swap(p) => p.view(t, self.chrome.progress()).map(Message::Swap),
             Modal::AccountDropdown(d) => d
-                .view(t, &self.accounts, self.active_index)
+                .view(
+                    t,
+                    &self.accounts,
+                    &self.safes,
+                    self.active_index,
+                    self.active_safe,
+                )
                 .map(Message::AccountDropdown),
             Modal::TxDetails(p) => {
                 let tx_book = match self.contacts.read() {
@@ -1434,6 +2468,17 @@ impl WalletScreen {
                 p.view(t, self.chrome.progress(), &tx_book)
                     .map(Message::TxDetails)
             }
+            Modal::SafeSend(p) => {
+                // Safe Send: exclude the active Safe from the picker.
+                // Own EOAs stay visible — withdrawing from a Safe back
+                // to a signing key is a normal flow.
+                let picker = self.recipient_picker(None, self.active_safe);
+                p.view(t, picker, &self.portfolio, self.chrome.progress())
+                    .map(Message::SafeSend)
+            }
+            Modal::SafeTxDetail(p) => p
+                .view(t, &self.portfolio, self.chrome.progress())
+                .map(Message::SafeTxDetail),
         };
         let composed: Element<'_, Message> = stack![background, modal_layer].into();
 
@@ -1450,6 +2495,36 @@ impl WalletScreen {
 
     // ── Send-flow helpers used by the broadcast Tasks ──────────────────────
 
+    /// Build the merged recipient picker view for the Send /
+    /// SafeSend modals. Combines saved contacts with the user's own
+    /// accounts and Safes, dropping the active sender so the user
+    /// doesn't see themselves as a destination. Lock-poisoned books
+    /// degrade to the merged-without-contacts variant so own-account
+    /// picking still works.
+    fn recipient_picker(
+        &self,
+        exclude_account: Option<usize>,
+        exclude_safe: Option<usize>,
+    ) -> send::ContactsView {
+        let empty = ContactsBook::new();
+        match self.contacts.read() {
+            Ok(g) => send::ContactsView::merged(
+                &g,
+                &self.accounts,
+                &self.safes,
+                exclude_account,
+                exclude_safe,
+            ),
+            Err(_) => send::ContactsView::merged(
+                &empty,
+                &self.accounts,
+                &self.safes,
+                exclude_account,
+                exclude_safe,
+            ),
+        }
+    }
+
     // ── Main pane (header + body) ──────────────────────────────────────────
 
     fn main_pane<'a>(&'a self, t: KaoTheme) -> Element<'a, Message> {
@@ -1463,7 +2538,16 @@ impl WalletScreen {
             None => &empty_book,
         };
         let body: Element<'_, Message> = match self.nav {
-            Nav::Home => home::view(t, self.can_send(), &self.portfolio, self.portfolio_loading),
+            Nav::Home => home::view(
+                t,
+                self.can_send(),
+                &self.portfolio,
+                self.portfolio_loading,
+                self.portfolio_refreshing,
+                &self.safe_pending,
+                self.safe_pending_loading,
+                self.safe_pending_error.as_deref(),
+            ),
             Nav::Activity => {
                 // Show the error placeholder only when every configured
                 // chain failed *and* nothing rendered. Otherwise partial
@@ -1480,7 +2564,7 @@ impl WalletScreen {
                 };
                 activity::view(
                     t,
-                    self.address,
+                    self.display_address(),
                     &self.history,
                     self.history_loading,
                     merged_error,
@@ -1490,24 +2574,45 @@ impl WalletScreen {
             Nav::Settings => match &self.settings_pane {
                 SettingsPane::Root => settings_root::view(t),
                 SettingsPane::Networks(p) => p.view(t).map(Message::Networks),
+                SettingsPane::Safes(p) => p.view(t).map(Message::SafesSettings),
                 SettingsPane::Appearance => appearance::view(t, self.theme_kind),
                 SettingsPane::Contacts(p) => p.view(t).map(Message::Contacts),
             },
         };
 
-        let display_name = self
-            .accounts
-            .get(self.active_index)
-            .map(|a| a.display_name(self.active_index))
-            .unwrap_or_else(|| format!("Account {}", self.active_index + 1));
+        let display_addr = self.display_address();
+        let display_name: String = match self.active_safe_descriptor() {
+            Some(safe) => {
+                let idx = self.active_safe.unwrap_or(0);
+                let base = safe.display_name(idx);
+                let total_owners = safe.owners.len().max(safe.linked_signer_indices.len());
+                format!("{base} — Safe {} of {}", safe.threshold, total_owners)
+            }
+            None => self
+                .accounts
+                .get(self.active_index)
+                .map(|a| a.display_name(self.active_index))
+                .unwrap_or_else(|| format!("Account {}", self.active_index + 1)),
+        };
+        let network_label: &str = match self.active_safe_descriptor() {
+            Some(safe) => crate::chain::Chain::ALL
+                .iter()
+                .find(|c| c.chain_id() == safe.chain_id)
+                .map(|c| c.display_name())
+                .unwrap_or("Unknown chain"),
+            None => "Ethereum Mainnet",
+        };
+        let is_safe = self.active_safe.is_some();
 
         column![
             header::view(
                 t,
-                self.address,
+                display_addr,
                 self.verification,
                 display_name,
                 self.rename_draft.as_deref(),
+                network_label,
+                is_safe,
             ),
             body
         ]
@@ -1673,6 +2778,28 @@ fn spawn_ens_resolve_task(
     )
 }
 
+/// Forward ENS resolve for the SafeSend modal's recipient input. Same
+/// shape as `spawn_ens_resolve_task`; differs only in the message
+/// constructor it routes the result through.
+fn spawn_safe_send_ens_resolve_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    name: String,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = match network.provider(crate::chain::Chain::Mainnet).await {
+                Some(provider) => crate::ens::resolve_name(&provider, &name).await,
+                None => Err("no execution RPCs configured".to_string()),
+            };
+            (seq, name, result)
+        },
+        |(seq, name, result)| {
+            Message::SafeSend(safe_send::Message::EnsResolved { seq, name, result })
+        },
+    )
+}
+
 /// Forward ENS resolve for the Settings → Contacts add/edit form. Same
 /// shape as `spawn_ens_resolve_task`; differs only in the message
 /// constructor it routes the result through.
@@ -1744,6 +2871,576 @@ fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, plan: SendPlan) -> Task<Me
 /// signer in (the dashboard moved it out via `mem::replace`); the task
 /// puts it back when finished. The result message round-trips both the
 /// broadcast result and the handoff so the dashboard reclaims the signer.
+/// Pull the Local key bytes for the given account indices. Bails on
+/// the first non-Local entry rather than silently dropping — by the
+/// time we're spawning a broadcast, the SafeSend pane has already
+/// pre-flighted that all requested indices are Local, so a non-Local
+/// here is a wallet-state mismatch worth surfacing.
+fn collect_owner_keys(
+    indices: &[u32],
+    accounts: &[AccountDescriptor],
+) -> Result<Vec<alloy::primitives::B256>, String> {
+    let mut out = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        match accounts.get(idx as usize) {
+            Some(AccountDescriptor::Local { key_bytes, .. }) => {
+                out.push(alloy::primitives::B256::from_slice(key_bytes));
+            }
+            Some(_) => {
+                return Err(format!(
+                    "linked owner #{idx} is not a Local account in this wallet",
+                ));
+            }
+            None => return Err(format!("linked owner #{idx} not found in this wallet")),
+        }
+    }
+    Ok(out)
+}
+
+/// `(address, descriptor)` for every linked owner that can sign — Local
+/// or hardware, excluding view-only and dangling indices. Drives the
+/// detail modal's Confirm/Reject signer selection. Free function so it's
+/// testable without a full `WalletScreen`.
+fn signable_owners_of(
+    safe: &SafeDescriptor,
+    accounts: &[AccountDescriptor],
+) -> Vec<(Address, AccountDescriptor)> {
+    safe.linked_signer_indices
+        .iter()
+        .filter_map(|&idx| {
+            let desc = accounts.get(idx as usize)?;
+            if matches!(desc, AccountDescriptor::ViewOnly { .. }) {
+                return None;
+            }
+            Some((account_address(desc)?, desc.clone()))
+        })
+        .collect()
+}
+
+/// The descriptor whose address matches `addr`, if the wallet holds it.
+fn owner_desc_by_address(
+    addr: Address,
+    accounts: &[AccountDescriptor],
+) -> Option<AccountDescriptor> {
+    accounts
+        .iter()
+        .find(|a| account_address(a) == Some(addr))
+        .cloned()
+}
+
+/// First Local account's private key — the gas-paying executor for
+/// execute-from-queue. `None` if the wallet is hardware/view-only only.
+fn first_local_key_of(accounts: &[AccountDescriptor]) -> Option<B256> {
+    accounts.iter().find_map(|a| match a {
+        AccountDescriptor::Local { key_bytes, .. } => Some(B256::from_slice(key_bytes)),
+        _ => None,
+    })
+}
+
+/// Review-prep for the SafeSend modal: build the SafeTx at the live
+/// nonce, run both on-chain cross-checks (domain separator +
+/// `getTransactionHash`), and hand the pinned `(nonce, safeTxHash)`
+/// back to the pane so the review screen shows the exact hash the
+/// signer(s) will commit to. Touches no signer.
+fn spawn_safe_prepare_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    req: SafeSendRequest,
+) -> Task<Message> {
+    use crate::safe::tx::{
+        Operation, SafeTxInput, build_safe_tx_with_nonce, current_safe_nonce,
+        ensure_signable_version, safe_domain, safe_tx_hash, verify_safe_tx_before_signing,
+    };
+    let chain = req.chain;
+    Task::perform(
+        async move {
+            let result: Result<(u64, B256), String> = async {
+                ensure_signable_version(&req.version)?;
+                let nonce = current_safe_nonce(network.as_ref(), req.safe_address, chain).await?;
+                let tx = build_safe_tx_with_nonce(
+                    SafeTxInput {
+                        to: req.to,
+                        value: req.value,
+                        data: alloy::primitives::Bytes::new(),
+                        operation: Operation::Call,
+                    },
+                    nonce,
+                );
+                let domain = safe_domain(req.safe_address, chain);
+                let local = safe_tx_hash(&tx, &domain);
+                verify_safe_tx_before_signing(
+                    network.as_ref(),
+                    &tx,
+                    req.safe_address,
+                    chain,
+                    local,
+                )
+                .await?;
+                Ok((nonce, local))
+            }
+            .await;
+            (seq, result)
+        },
+        |(seq, result)| Message::SafeSend(safe_send::Message::HashReady { seq, result }),
+    )
+}
+
+/// How long the automatic verified-retry waits before re-running a sim
+/// that succeeded on fallback state: the helios cooldown window plus a
+/// margin, so the re-run lands back on the verified path instead of
+/// being short-circuited by `in_cooldown` again.
+fn sim_retry_delay() -> std::time::Duration {
+    crate::net::FALLBACK_COOLDOWN + std::time::Duration::from_secs(1)
+}
+
+/// Inner-call preflight for the SafeSend review: simulate the transfer
+/// the Safe would make (`from = Safe`, to/value from the form) against
+/// Helios-verified state. Runs in parallel with the prepare task — the
+/// inner call doesn't depend on the pinned nonce. Advisory: any failure
+/// degrades to `unavailable()` (same convention as the EOA quote path).
+///
+/// `delayed` waits out the helios fallback cooldown (plus a margin)
+/// before running — the automatic verified-retry path. The pane's seq
+/// guard drops the result if the user navigated away meanwhile.
+fn spawn_safe_send_sim_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    req: SafeSendRequest,
+    delayed: bool,
+) -> Task<Message> {
+    use crate::safe::tx::{Operation, SafeTxInput, build_safe_tx_with_nonce};
+    let chain = req.chain;
+    Task::perform(
+        async move {
+            if delayed {
+                tokio::time::sleep(sim_retry_delay()).await;
+            }
+            // Safe-send v1 composes native ETH transfers only —
+            // operation 0, empty calldata, the same SafeTx shape the
+            // prepare task pins. Nonce 0 is fine: the inner sim only
+            // reads to/value/data.
+            let tx = build_safe_tx_with_nonce(
+                SafeTxInput {
+                    to: req.to,
+                    value: req.value,
+                    data: alloy::primitives::Bytes::new(),
+                    operation: Operation::Call,
+                },
+                0,
+            );
+            let result =
+                match crate::safe::sim::simulate_safe_inner(network, req.safe_address, &tx, chain)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, "safe-send: inner sim failed, marking unavailable");
+                        SimulationResult::unavailable()
+                    }
+                };
+            (seq, result)
+        },
+        |(seq, result)| Message::SafeSend(safe_send::Message::SimReady { seq, result }),
+    )
+}
+
+/// Rebuild the SafeTx at the `(nonce, hash)` pin the user reviewed,
+/// re-running every pre-sign check. Shared front-half of the broadcast
+/// and propose tasks. Fails if the review pin is missing, the live
+/// nonce moved since review (another co-signer executed something), or
+/// any local/on-chain hash check diverges — in every case before a
+/// signature exists.
+async fn rebuild_reviewed_safe_tx(
+    network: &dyn BalanceFetcher,
+    req: &SafeSendRequest,
+) -> Result<(crate::safe::SafeTx, alloy::sol_types::Eip712Domain, B256), String> {
+    use crate::safe::tx::{
+        Operation, SafeTxInput, build_safe_tx_with_nonce, current_safe_nonce,
+        ensure_signable_version, safe_domain, safe_tx_hash, verify_safe_tx_before_signing,
+    };
+    ensure_signable_version(&req.version)?;
+    let pinned = req
+        .prepared
+        .ok_or("internal: sign requested before the reviewed hash was ready")?;
+    let live_nonce = current_safe_nonce(network, req.safe_address, req.chain).await?;
+    if live_nonce != pinned.nonce {
+        return Err(format!(
+            "Safe nonce advanced since review ({} → {live_nonce}) — go back and review again",
+            pinned.nonce,
+        ));
+    }
+    let tx = build_safe_tx_with_nonce(
+        SafeTxInput {
+            to: req.to,
+            value: req.value,
+            data: alloy::primitives::Bytes::new(),
+            operation: Operation::Call,
+        },
+        pinned.nonce,
+    );
+    let domain = safe_domain(req.safe_address, req.chain);
+    let local_hash = safe_tx_hash(&tx, &domain);
+    if local_hash != pinned.safe_tx_hash {
+        // Can only happen if the form and the pin desynced — a bug, but
+        // the invariant "we sign only what was displayed" must hold.
+        return Err("safe-tx differs from the reviewed hash — refusing to sign".to_string());
+    }
+    verify_safe_tx_before_signing(network, &tx, req.safe_address, req.chain, local_hash).await?;
+    Ok((tx, domain, local_hash))
+}
+
+/// Spawn the Safe-TX sign-and-broadcast task.
+///
+/// 1. Rebuild the SafeTx at the reviewed `(nonce, hash)` pin and re-run
+///    the on-chain cross-checks (`rebuild_reviewed_safe_tx`).
+/// 2. For the first `threshold` owner keys (in `owner_keys` order),
+///    derive a Local signer and sign the hash.
+/// 3. Pack signatures Safe-style (ascending by address, 65 B each).
+/// 4. Call `execute_safe_tx` using the first owner as gas payer.
+///
+/// The first entry in `owner_keys` doubles as the gas-paying
+/// executor — that way the dashboard's active EOA can be anything
+/// (including view-only), and Safe-mode Send works as long as ≥1
+/// linked owner is `Local` in this wallet. No handoff dance for the
+/// executor needed.
+fn spawn_safe_broadcast_task(
+    network: Arc<dyn BalanceFetcher>,
+    req: SafeSendRequest,
+    owner_keys: Vec<alloy::primitives::B256>,
+) -> Task<Message> {
+    use crate::safe::tx::{execute_safe_tx, pack_owner_signatures};
+    let chain = req.chain;
+    Task::perform(
+        async move {
+            let provider = match network.provider(chain).await {
+                Some(p) => p,
+                None => {
+                    warn!(chain = %chain.label(), "safe-broadcast: no execution RPC configured");
+                    return Err::<TxHash, String>("no execution RPCs configured".into());
+                }
+            };
+
+            // Executor = first linked Local owner. Derived inside the
+            // task so we never carry secret material across the
+            // Task::perform boundary explicitly.
+            let executor_key = match owner_keys.first().copied() {
+                Some(k) => k,
+                None => {
+                    warn!("safe-broadcast: no owner keys supplied");
+                    return Err("no local owners available".into());
+                }
+            };
+            let executor_signer = match crate::wallet::signer_from_bytes(&executor_key) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "safe-broadcast: derive executor failed");
+                    return Err(format!("derive executor: {e}"));
+                }
+            };
+            let executor = KaoSigner::Local(executor_signer);
+
+            let (safe_tx, _domain, local_hash) =
+                rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
+            let mut sigs = Vec::with_capacity(req.threshold as usize);
+            for key in owner_keys.into_iter().take(req.threshold as usize) {
+                let local = match crate::wallet::signer_from_bytes(&key) {
+                    Ok(s) => s,
+                    Err(e) => return Err(format!("derive signer: {e}")),
+                };
+                let kao = KaoSigner::Local(local);
+                let sig = match kao.sign_hash(local_hash).await {
+                    Ok(s) => s,
+                    Err(e) => return Err(format!("sign hash: {e}")),
+                };
+                sigs.push((kao.address(), sig));
+            }
+            let packed = pack_owner_signatures(sigs)?;
+            execute_safe_tx(
+                &provider,
+                &executor,
+                req.safe_address,
+                chain,
+                safe_tx,
+                packed,
+            )
+            .await
+        },
+        Message::SafeSendBroadcastReturn,
+    )
+}
+
+/// Propose a Safe-send tx to the Transaction Service: rebuild the SafeTx
+/// at the reviewed `(nonce, hash)` pin, re-run the on-chain checks, sign
+/// once as `owner_desc` (software or hardware), and POST. Co-signers
+/// finish it from their own wallets. Mirrors `spawn_safe_broadcast_task`'s
+/// rebuild→verify→sign front-half, but stops at the service instead of
+/// broadcasting.
+fn spawn_safe_propose_task(
+    network: Arc<dyn BalanceFetcher>,
+    owner_desc: AccountDescriptor,
+    req: SafeSendRequest,
+) -> Task<Message> {
+    use crate::safe::tx::sign_owner;
+    let chain = req.chain;
+    Task::perform(
+        async move {
+            let (tx, domain, local) = rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
+            let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
+            let owner_sig = sign_owner(&signer, &tx, &domain, local).await?;
+            crate::safe::service::propose(
+                &req.service_base,
+                req.safe_address,
+                chain,
+                &tx,
+                local,
+                &owner_sig,
+                Some("Kao"),
+            )
+            .await?;
+            Ok(())
+        },
+        Message::SafeSendProposeReturn,
+    )
+}
+
+/// Load full detail (reconstructed `SafeTx` + per-owner signatures) for
+/// one queued tx, for the detail modal's owner checklist and the
+/// execute-from-queue path.
+/// How long the post-action *second* detail reload waits for the
+/// Transaction Service to index a freshly-mined execution. The first
+/// (immediate) reload covers confirm/reject, which land synchronously.
+const SERVICE_REINDEX_DELAY: std::time::Duration = std::time::Duration::from_secs(8);
+
+fn spawn_safe_detail_load_task(
+    network: Arc<dyn BalanceFetcher>,
+    service_base: String,
+    safe: Address,
+    chain: crate::chain::Chain,
+    safe_tx_hash: B256,
+    threshold: u32,
+    delayed: bool,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            if delayed {
+                tokio::time::sleep(SERVICE_REINDEX_DELAY).await;
+            }
+            crate::safe::service::fetch_detail(
+                network.as_ref(),
+                &service_base,
+                safe,
+                chain,
+                safe_tx_hash,
+                threshold,
+            )
+            .await
+        },
+        Message::SafeTxDetailLoaded,
+    )
+}
+
+/// Inner-call preflight for the detail modal: the loaded SafeTx body
+/// simulated as the Safe itself. Only spawned for `operation == 0`.
+/// Advisory — failure degrades to `unavailable()`. Tagged with the
+/// safeTxHash so a result for a closed/switched modal is dropped.
+fn spawn_safe_inner_sim_task(
+    network: Arc<dyn BalanceFetcher>,
+    safe: Address,
+    chain: crate::chain::Chain,
+    safe_tx_hash: B256,
+    tx: crate::safe::SafeTx,
+    delayed: bool,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            if delayed {
+                tokio::time::sleep(sim_retry_delay()).await;
+            }
+            let result =
+                match crate::safe::sim::simulate_safe_inner(network, safe, &tx, chain).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, "safe-detail: inner sim failed, marking unavailable");
+                        SimulationResult::unavailable()
+                    }
+                };
+            (safe_tx_hash, result)
+        },
+        |(safe_tx_hash, result)| Message::SafeTxInnerSimLoaded {
+            safe_tx_hash,
+            result,
+        },
+    )
+}
+
+/// Everything the execute-time preflight needs about the queued tx:
+/// who pays gas, which Safe, the reconstructed SafeTx, and the
+/// service-held confirmations to assemble. Bundled so the task takes
+/// `(network, spec, delayed)` instead of eight loose arguments.
+struct ExecSimSpec {
+    executor: Address,
+    safe: Address,
+    chain: crate::chain::Chain,
+    safe_tx_hash: B256,
+    tx: crate::safe::SafeTx,
+    confirmations: Vec<(Address, Bytes)>,
+}
+
+/// Execute-time preflight: assemble the service-held signatures exactly
+/// like the Execute action does and simulate the full `execTransaction`
+/// calldata from the local executor. Catches GS-code failures (bad
+/// sigs, stale nonce) before any gas is spent. Faithful even for
+/// delegatecall — revm runs the real Safe code.
+///
+/// Note the MockFetcher-backed tests can't truly exercise
+/// `checkSignatures` (the Safe has no code in the mock, so the call is
+/// a silent success) — real coverage needs a future anvil harness.
+fn spawn_safe_exec_sim_task(
+    network: Arc<dyn BalanceFetcher>,
+    spec: ExecSimSpec,
+    delayed: bool,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            if delayed {
+                tokio::time::sleep(sim_retry_delay()).await;
+            }
+            let result = match crate::safe::tx::assemble_signatures(spec.confirmations) {
+                Ok(sigs) => {
+                    match crate::safe::sim::simulate_safe_execution(
+                        network,
+                        spec.executor,
+                        spec.safe,
+                        &spec.tx,
+                        sigs,
+                        spec.chain,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(error = %e, "safe-detail: exec sim failed, marking unavailable");
+                            SimulationResult::unavailable()
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "safe-detail: signature assembly failed, exec sim unavailable");
+                    SimulationResult::unavailable()
+                }
+            };
+            (spec.safe_tx_hash, result)
+        },
+        |(safe_tx_hash, result)| Message::SafeTxExecSimLoaded {
+            safe_tx_hash,
+            result,
+        },
+    )
+}
+
+/// Confirm a queued tx: re-verify the safeTxHash on-chain, sign it as
+/// `owner_desc` (software or hardware), and POST the confirmation. The
+/// hash checks are defense-in-depth — refuse to sign if the detail we
+/// loaded disagrees with what the Safe computes.
+fn spawn_safe_confirm_task(
+    network: Arc<dyn BalanceFetcher>,
+    service_base: String,
+    owner_desc: AccountDescriptor,
+    safe: Address,
+    chain: crate::chain::Chain,
+    tx: crate::safe::SafeTx,
+    safe_tx_hash: B256,
+) -> Task<Message> {
+    use crate::safe::tx::{
+        safe_domain, safe_tx_hash as compute_hash, sign_owner, verify_safe_tx_before_signing,
+    };
+    Task::perform(
+        async move {
+            let domain = safe_domain(safe, chain);
+            let local = compute_hash(&tx, &domain);
+            if local != safe_tx_hash {
+                return Err("safe-tx: detail hash drifted; refusing to sign".to_string());
+            }
+            verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local).await?;
+            let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
+            let (_, sig) = sign_owner(&signer, &tx, &domain, safe_tx_hash).await?;
+            crate::safe::service::confirm(&service_base, safe_tx_hash, chain, &sig).await?;
+            Ok("Signature added".to_string())
+        },
+        Message::SafeTxActionDone,
+    )
+}
+
+/// Execute a queued tx that reached threshold: assemble the signatures
+/// the service collected and broadcast `execTransaction`. `executor_key`
+/// is a Local account that pays gas (it need not be an owner — the Safe
+/// validates signatures against its owner set, not `msg.sender`).
+fn spawn_safe_execute_task(
+    network: Arc<dyn BalanceFetcher>,
+    executor_key: B256,
+    safe: Address,
+    chain: crate::chain::Chain,
+    tx: crate::safe::SafeTx,
+    confirmations: Vec<(Address, Bytes)>,
+) -> Task<Message> {
+    use crate::safe::tx::{assemble_signatures, execute_safe_tx};
+    Task::perform(
+        async move {
+            let provider = network
+                .provider(chain)
+                .await
+                .ok_or_else(|| "no execution RPCs configured".to_string())?;
+            let executor = KaoSigner::Local(
+                crate::wallet::signer_from_bytes(&executor_key).map_err(|e| e.to_string())?,
+            );
+            let packed = assemble_signatures(confirmations)?;
+            let hash = execute_safe_tx(&provider, &executor, safe, chain, tx, packed).await?;
+            Ok(format!("Executed · {hash:#x}"))
+        },
+        Message::SafeTxActionDone,
+    )
+}
+
+/// Propose a same-nonce rejection for a queued tx: build the canonical
+/// zero-value self-call at `nonce`, verify its hash on-chain, sign as
+/// `owner_desc`, and POST it. Co-owners then confirm/execute it to void
+/// the original.
+fn spawn_safe_reject_task(
+    network: Arc<dyn BalanceFetcher>,
+    service_base: String,
+    owner_desc: AccountDescriptor,
+    safe: Address,
+    chain: crate::chain::Chain,
+    nonce: u64,
+) -> Task<Message> {
+    use crate::safe::tx::{
+        build_rejection_tx, safe_domain, safe_tx_hash as compute_hash, sign_owner,
+        verify_safe_tx_before_signing,
+    };
+    Task::perform(
+        async move {
+            let domain = safe_domain(safe, chain);
+            let tx = build_rejection_tx(safe, nonce);
+            let local = compute_hash(&tx, &domain);
+            verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local).await?;
+            let signer = crate::wallet::build_owner_signer(&owner_desc).await?;
+            let owner_sig = sign_owner(&signer, &tx, &domain, local).await?;
+            crate::safe::service::propose(
+                &service_base,
+                safe,
+                chain,
+                &tx,
+                local,
+                &owner_sig,
+                Some("Kao:reject"),
+            )
+            .await?;
+            Ok("Rejection proposed".to_string())
+        },
+        Message::SafeTxActionDone,
+    )
+}
+
 fn spawn_broadcast_task(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
@@ -1814,6 +3511,7 @@ mod tests {
         WalletScreen::new(
             KaoSigner::ViewOnly(addr),
             vec![view_only_account(addr)],
+            Vec::new(),
             0,
             Arc::new(MockFetcher::new()),
             cache,
@@ -1936,6 +3634,337 @@ mod tests {
         assert!(!baseline_loading);
     }
 
+    fn safe_descriptor(byte: u8, chain_id: u64) -> SafeDescriptor {
+        SafeDescriptor {
+            name: None,
+            chain_id,
+            address: [byte; 20],
+            version: "1.4.1".into(),
+            trust: crate::wallet::SafeTrust::Canonical,
+            threshold: 1,
+            owners: Vec::new(),
+            modules: Vec::new(),
+            guard: None,
+            fallback_handler: None,
+            linked_signer_indices: vec![0],
+            sibling_chains: Vec::new(),
+            cached_at: 0,
+            tx_service_url: None,
+        }
+    }
+
+    fn screen_with_safes(addr: Address, safes: Vec<SafeDescriptor>) -> WalletScreen {
+        WalletScreen::new(
+            KaoSigner::ViewOnly(addr),
+            vec![view_only_account(addr)],
+            safes,
+            0,
+            Arc::new(MockFetcher::new()),
+            crate::portfolio::new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        )
+    }
+
+    #[test]
+    fn display_address_returns_safe_addr_when_active_safe_set() {
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        assert_eq!(screen.display_address(), addr(1));
+        screen.active_safe = Some(0);
+        assert_eq!(screen.display_address(), Address::from([0x55u8; 20]));
+    }
+
+    #[test]
+    fn select_safe_outcome_enters_safe_mode_and_resets_history() {
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x77, 1)]);
+        screen.history.push(IndexedTx {
+            hash: alloy::primitives::B256::ZERO,
+            block_number: 1,
+            timestamp: 0,
+            from: Address::ZERO,
+            to: None,
+            value: U256::ZERO,
+            gas_used: None,
+            gas_price: None,
+            status: crate::indexer::TxStatus::Success,
+            direction: crate::indexer::TxDirection::SelfTransfer,
+            method: None,
+            token: None,
+            chain: Chain::Mainnet,
+        });
+        screen.history_loaded = true;
+        // The handler bails unless the AccountDropdown modal is
+        // open; mirror what happens after the user clicks the
+        // address pill.
+        screen.modal = Modal::AccountDropdown(AccountDropdown::new());
+        let _ = screen.update(Message::AccountDropdown(
+            account_dropdown::Message::SelectSafe(0),
+        ));
+        assert_eq!(screen.active_safe, Some(0));
+        assert!(
+            screen.history.is_empty(),
+            "history should clear on Safe entry"
+        );
+        assert!(!screen.history_loaded);
+    }
+
+    #[test]
+    fn can_send_in_safe_mode_true_when_linked_local_exists() {
+        // Wallet: active = ViewOnly. Account 1 = Local (linked to Safe).
+        // EOA mode would gate Send off (active is view-only), but in
+        // Safe mode the linked Local owner serves as both signer and
+        // gas-paying executor, so Send must stay clickable.
+        let accounts = vec![
+            view_only_account(addr(1)),
+            crate::wallet::AccountDescriptor::Local {
+                name: None,
+                key_bytes: [0x7e; 32],
+            },
+        ];
+        let mut safe = safe_descriptor(0x99, 1);
+        safe.linked_signer_indices = vec![1];
+        let mut screen = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            accounts,
+            vec![safe],
+            0,
+            Arc::new(MockFetcher::new()),
+            crate::portfolio::new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        // EOA mode: ViewOnly active → can't send.
+        assert!(!screen.can_send());
+        // Safe mode: linked Local owner unlocks Send.
+        screen.active_safe = Some(0);
+        assert!(screen.can_send());
+    }
+
+    #[test]
+    fn allowed_chains_in_eoa_mode_returns_all_chains() {
+        let screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
+        assert_eq!(screen.allowed_chains(), Chain::ALL.to_vec());
+    }
+
+    #[test]
+    fn allowed_chains_in_safe_mode_returns_only_safe_chain() {
+        // Mainnet Safe — only Mainnet shows.
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x55, Chain::Mainnet.chain_id())],
+        );
+        screen.active_safe = Some(0);
+        assert_eq!(screen.allowed_chains(), vec![Chain::Mainnet]);
+
+        // Base Safe — only Base shows.
+        let mut screen =
+            screen_with_safes(addr(1), vec![safe_descriptor(0x66, Chain::Base.chain_id())]);
+        screen.active_safe = Some(0);
+        assert_eq!(screen.allowed_chains(), vec![Chain::Base]);
+
+        // Optimism Safe — only Optimism shows.
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x77, Chain::Optimism.chain_id())],
+        );
+        screen.active_safe = Some(0);
+        assert_eq!(screen.allowed_chains(), vec![Chain::Optimism]);
+    }
+
+    #[test]
+    fn portfolio_fetched_on_disallowed_chain_in_safe_mode_drops() {
+        // Mainnet Safe receives a late Base portfolio fetch — must
+        // not pollute the live view. The cache still gets written
+        // (it's keyed by (addr, chain) and might be useful when the
+        // user navigates back to that EOA), but `self.portfolio`
+        // stays Safe-chain-only.
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x55, Chain::Mainnet.chain_id())],
+        );
+        screen.active_safe = Some(0);
+        let safe_addr = Address::from([0x55u8; 20]);
+        // Stray Base fetch addressed to the Safe address.
+        let stray = vec![LiveToken {
+            chain: Chain::Base,
+            contract: None,
+            name: "Ether".into(),
+            symbol: "ETH".into(),
+            decimals: 18,
+            balance: "0.1".into(),
+            balance_f64: 0.1,
+            balance_raw: U256::ZERO,
+            usd_price: 1000.0,
+            usd_value: 100.0,
+        }];
+        let _ = screen.update(Message::PortfolioFetched {
+            address: safe_addr,
+            chain: Chain::Base,
+            result: Ok(stray),
+        });
+        assert!(
+            screen.portfolio.is_empty(),
+            "Base fetch must not surface on a Mainnet Safe",
+        );
+    }
+
+    #[test]
+    fn history_fetched_on_disallowed_chain_in_safe_mode_drops() {
+        let mut screen = screen_with_safes(
+            addr(1),
+            vec![safe_descriptor(0x55, Chain::Mainnet.chain_id())],
+        );
+        screen.active_safe = Some(0);
+        let safe_addr = Address::from([0x55u8; 20]);
+        let stray = vec![IndexedTx {
+            hash: alloy::primitives::B256::ZERO,
+            block_number: 1,
+            timestamp: 0,
+            from: Address::ZERO,
+            to: None,
+            value: U256::ZERO,
+            gas_used: None,
+            gas_price: None,
+            status: crate::indexer::TxStatus::Success,
+            direction: crate::indexer::TxDirection::SelfTransfer,
+            method: None,
+            token: None,
+            chain: Chain::Optimism,
+        }];
+        let _ = screen.update(Message::HistoryFetched {
+            address: safe_addr,
+            chain: Chain::Optimism,
+            result: Ok(stray),
+        });
+        assert!(
+            screen.history.is_empty(),
+            "Optimism history must not surface on a Mainnet Safe",
+        );
+    }
+
+    #[test]
+    fn switch_account_outcome_exits_safe_mode_and_resets_history() {
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x77, 1)]);
+        screen.active_safe = Some(0);
+        screen.history_loaded = true;
+        screen.modal = Modal::AccountDropdown(AccountDropdown::new());
+        // Outcome::Switch(0) — same account, but exit Safe mode.
+        let (_, outcome) = screen.update(Message::AccountDropdown(
+            account_dropdown::Message::Select(0),
+        ));
+        // Outcome only bubbles when idx != active_index, so for the
+        // same account we get None back. The state flip is what we
+        // assert.
+        assert!(outcome.is_none());
+        assert!(screen.active_safe.is_none());
+        assert!(!screen.history_loaded);
+    }
+
+    #[test]
+    fn collect_owner_keys_pulls_local_bytes_in_order() {
+        // Mix Local with other variants — collect should only walk
+        // the indices we hand it, in the order given, and return the
+        // matching key bytes verbatim.
+        let accounts = vec![
+            crate::wallet::AccountDescriptor::Local {
+                name: None,
+                key_bytes: [0xaa; 32],
+            },
+            crate::wallet::AccountDescriptor::ViewOnly {
+                name: None,
+                address: [0u8; 20],
+            },
+            crate::wallet::AccountDescriptor::Local {
+                name: None,
+                key_bytes: [0xbb; 32],
+            },
+        ];
+        let got = collect_owner_keys(&[2, 0], &accounts).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], alloy::primitives::B256::repeat_byte(0xbb));
+        assert_eq!(got[1], alloy::primitives::B256::repeat_byte(0xaa));
+    }
+
+    #[test]
+    fn collect_owner_keys_rejects_non_local_index() {
+        let accounts = vec![
+            crate::wallet::AccountDescriptor::Local {
+                name: None,
+                key_bytes: [0xaa; 32],
+            },
+            crate::wallet::AccountDescriptor::ViewOnly {
+                name: None,
+                address: [0u8; 20],
+            },
+        ];
+        let err = collect_owner_keys(&[1], &accounts).unwrap_err();
+        assert!(err.contains("not a Local account"), "got: {err}");
+    }
+
+    #[test]
+    fn collect_owner_keys_rejects_out_of_bounds_index() {
+        let accounts: Vec<crate::wallet::AccountDescriptor> = Vec::new();
+        let err = collect_owner_keys(&[0], &accounts).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    fn local_with_key(seed: u8) -> AccountDescriptor {
+        AccountDescriptor::Local {
+            name: None,
+            key_bytes: [seed; 32],
+        }
+    }
+
+    fn ledger_acct(a: Address) -> AccountDescriptor {
+        AccountDescriptor::Ledger {
+            name: None,
+            path: crate::wallet::LedgerHdPath::LedgerLive(0),
+            address: a.into_array(),
+        }
+    }
+
+    #[test]
+    fn signable_owners_excludes_view_only_and_dangling_indices() {
+        let accounts = vec![
+            local_with_key(0xaa),          // 0: signable
+            view_only_account(addr(0xbb)), // 1: excluded
+            ledger_acct(addr(0xcc)),       // 2: signable (hardware)
+        ];
+        let mut safe = safe_descriptor(0x11, 1);
+        safe.linked_signer_indices = vec![0, 1, 2, 9]; // 9 is dangling
+        let got = signable_owners_of(&safe, &accounts);
+        assert_eq!(got.len(), 2, "view-only + dangling dropped");
+        assert!(matches!(got[0].1, AccountDescriptor::Local { .. }));
+        assert!(matches!(got[1].1, AccountDescriptor::Ledger { .. }));
+        // Hardware owner's address is carried through from the descriptor.
+        assert_eq!(got[1].0, addr(0xcc));
+    }
+
+    #[test]
+    fn first_local_key_finds_first_local_only() {
+        let accounts = vec![
+            view_only_account(addr(0xbb)),
+            local_with_key(0x07),
+            local_with_key(0x09),
+        ];
+        assert_eq!(first_local_key_of(&accounts), Some(B256::repeat_byte(0x07)));
+        // Hardware/view-only-only wallet → no local executor.
+        let hw_only = vec![view_only_account(addr(0xbb)), ledger_acct(addr(0xcc))];
+        assert!(first_local_key_of(&hw_only).is_none());
+    }
+
+    #[test]
+    fn owner_desc_by_address_matches_or_none() {
+        let l = local_with_key(0x05);
+        let la = account_address(&l).expect("local has address");
+        let accounts = vec![view_only_account(addr(0xbb)), l];
+        assert!(matches!(
+            owner_desc_by_address(la, &accounts),
+            Some(AccountDescriptor::Local { .. })
+        ));
+        assert!(owner_desc_by_address(addr(0xff), &accounts).is_none());
+    }
+
     #[test]
     fn trim_trailing_decimal_zeros_strips_padding() {
         // `format_units` pads to `decimals`; "1 ETH" comes back with 18
@@ -1949,5 +3978,369 @@ mod tests {
             "0.123456789012"
         );
         assert_eq!(trim_trailing_decimal_zeros("42"), "42");
+    }
+
+    // ── Safe pending queue: task gating + staleness ──────────────────
+
+    fn safe_desc(chain_id: u64, address: Address) -> crate::wallet::SafeDescriptor {
+        crate::wallet::SafeDescriptor {
+            name: None,
+            chain_id,
+            address: address.into(),
+            version: "1.4.1".into(),
+            trust: crate::wallet::SafeTrust::Canonical,
+            threshold: 2,
+            owners: vec![addr(0x11).into(), addr(0x22).into()],
+            modules: Vec::new(),
+            guard: None,
+            fallback_handler: None,
+            linked_signer_indices: Vec::new(),
+            sibling_chains: Vec::new(),
+            cached_at: 0,
+            tx_service_url: None,
+        }
+    }
+
+    fn safe_screen(chain_id: u64, safe_addr: Address) -> WalletScreen {
+        let mut s = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(0xAA)),
+            vec![view_only_account(addr(0xAA))],
+            vec![safe_desc(chain_id, safe_addr)],
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        s.active_safe = Some(0);
+        s
+    }
+
+    fn pending_tx(nonce: u64) -> crate::safe::service::PendingSafeTx {
+        crate::safe::service::PendingSafeTx {
+            safe_tx_hash: B256::repeat_byte(0xab),
+            to: addr(0xdd),
+            value: U256::ZERO,
+            data: alloy::primitives::Bytes::new(),
+            operation: 0,
+            nonce,
+            state: crate::safe::service::SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
+            submission_ts: 0,
+        }
+    }
+
+    #[test]
+    fn fetch_safe_pending_task_is_none_in_eoa_mode() {
+        let s = screen_for(addr(0xAA), new_cache());
+        assert!(s.fetch_safe_pending_task().is_none());
+    }
+
+    #[test]
+    fn fetch_safe_pending_task_launches_for_mainnet_safe() {
+        // Mainnet always has the seeded default RPC, so an active
+        // Mainnet Safe must produce a real task.
+        let s = safe_screen(1, addr(0xCC));
+        assert!(s.fetch_safe_pending_task().is_some());
+    }
+
+    #[test]
+    fn fetch_safe_pending_task_is_none_for_unsupported_chain() {
+        // chain_id 42161 (Arbitrum) isn't in Chain::ALL — the fetch
+        // can't run, so no task may launch (and therefore no loading
+        // flag may be set by callers).
+        let s = safe_screen(42161, addr(0xCC));
+        assert!(s.fetch_safe_pending_task().is_none());
+    }
+
+    #[test]
+    fn refresh_portfolio_does_not_strand_pending_loading_when_fetch_cannot_launch() {
+        // Regression: RefreshPortfolio used to set `safe_pending_loading`
+        // for *any* active Safe, even when `fetch_safe_pending_task`
+        // couldn't launch — no SafePendingFetched ever arrived and the
+        // queue spinner hung forever.
+        let mut s = safe_screen(42161, addr(0xCC));
+        s.update(Message::RefreshPortfolio);
+        assert!(!s.safe_pending_loading);
+    }
+
+    #[test]
+    fn refresh_portfolio_marks_pending_loading_when_fetch_launches() {
+        let mut s = safe_screen(1, addr(0xCC));
+        s.update(Message::RefreshPortfolio);
+        assert!(s.safe_pending_loading);
+    }
+
+    #[test]
+    fn safe_pending_fetched_for_active_safe_applies_and_clears_loading() {
+        let safe = addr(0xCC);
+        let mut s = safe_screen(1, safe);
+        s.safe_pending_loading = true;
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Mainnet,
+            result: Ok(vec![pending_tx(5)]),
+        });
+        assert_eq!(s.safe_pending.len(), 1);
+        assert_eq!(s.safe_pending[0].nonce, 5);
+        assert!(s.safe_pending_error.is_none());
+        assert!(!s.safe_pending_loading);
+    }
+
+    #[test]
+    fn safe_pending_fetched_for_other_safe_is_dropped() {
+        // A fetch issued before the user switched Safes must not land in
+        // the new identity's queue — same staleness rule as
+        // PortfolioFetched/HistoryFetched.
+        let mut s = safe_screen(1, addr(0xCC));
+        s.update(Message::SafePendingFetched {
+            safe: addr(0xEE), // not the active Safe
+            chain: Chain::Mainnet,
+            result: Ok(vec![pending_tx(5)]),
+        });
+        assert!(s.safe_pending.is_empty());
+    }
+
+    #[test]
+    fn safe_pending_fetched_for_wrong_chain_is_dropped() {
+        // Same address, different chain — a different Safe. The cached
+        // descriptor pins (address, chain_id); a stale fetch tagged with
+        // another chain must not apply.
+        let safe = addr(0xCC);
+        let mut s = safe_screen(1, safe);
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Base,
+            result: Ok(vec![pending_tx(5)]),
+        });
+        assert!(s.safe_pending.is_empty());
+    }
+
+    #[test]
+    fn safe_pending_fetched_error_is_surfaced_not_swallowed() {
+        let safe = addr(0xCC);
+        let mut s = safe_screen(1, safe);
+        s.safe_pending_loading = true;
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Mainnet,
+            result: Err("safe-service queue: HTTP 503".into()),
+        });
+        assert!(!s.safe_pending_loading);
+        assert_eq!(
+            s.safe_pending_error.as_deref(),
+            Some("safe-service queue: HTTP 503"),
+        );
+        // A later successful refresh clears the error.
+        s.update(Message::SafePendingFetched {
+            safe,
+            chain: Chain::Mainnet,
+            result: Ok(Vec::new()),
+        });
+        assert!(s.safe_pending_error.is_none());
+    }
+
+    // ── rebuild_reviewed_safe_tx (the review-pin enforcement core) ────
+    //
+    // Every signature in the SafeSend flow goes through this fn. The
+    // invariant under test: a signature can only ever cover the exact
+    // `(nonce, safeTxHash)` the user verified on the review screen —
+    // any drift (missing pin, advanced nonce, hash divergence, wrong
+    // version) must abort BEFORE a signer is touched.
+
+    use crate::net::CallMock;
+    use alloy::sol_types::{SolCall, SolValue};
+
+    fn reviewed_req(prepared: Option<safe_send::PreparedSafeTx>) -> safe_send::SafeSendRequest {
+        safe_send::SafeSendRequest {
+            safe_address: addr(0x5A),
+            chain: Chain::Mainnet,
+            version: "1.4.1".into(),
+            service_base: crate::safe::service::DEFAULT_TX_SERVICE_BASE.into(),
+            to: addr(0xDD),
+            value: U256::from(1_000u64),
+            threshold: 1,
+            linked_local_indices: vec![0],
+            signable_indices: vec![0],
+            prepared,
+        }
+    }
+
+    /// The SafeTx `rebuild_reviewed_safe_tx` derives from `reviewed_req`
+    /// at `nonce`, plus its local EIP-712 hash.
+    fn expected_tx_and_hash(nonce: u64) -> (crate::safe::SafeTx, B256) {
+        use crate::safe::tx::{
+            Operation, SafeTxInput, build_safe_tx_with_nonce, safe_domain, safe_tx_hash,
+        };
+        let req = reviewed_req(None);
+        let tx = build_safe_tx_with_nonce(
+            SafeTxInput {
+                to: req.to,
+                value: req.value,
+                data: alloy::primitives::Bytes::new(),
+                operation: Operation::Call,
+            },
+            nonce,
+        );
+        let hash = safe_tx_hash(&tx, &safe_domain(req.safe_address, req.chain));
+        (tx, hash)
+    }
+
+    fn plant_safe_nonce(mock: &CallMock, safe: Address, nonce: u64) {
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(crate::safe::nonceCall {}.abi_encode()),
+            alloy::primitives::Bytes::from(U256::from(nonce).abi_encode()),
+            true,
+        );
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_without_a_review_pin() {
+        let mock = CallMock::new();
+        let err = rebuild_reviewed_safe_tx(&mock, &reviewed_req(None))
+            .await
+            .unwrap_err();
+        assert!(err.contains("reviewed hash"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_unsignable_version_before_any_chain_read() {
+        // Nothing planted on the mock: if the version guard didn't fire
+        // first, the nonce read would fail with a different error.
+        let mock = CallMock::new();
+        let mut req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: B256::repeat_byte(0xaa),
+        }));
+        req.version = "1.1.1".into();
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("outside the signable range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_when_nonce_advanced_since_review() {
+        // A co-signer executed something between review and click — the
+        // live nonce is past the pin. Clear error, no signature.
+        let mock = CallMock::new();
+        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: B256::repeat_byte(0xaa),
+        }));
+        plant_safe_nonce(&mock, req.safe_address, 8);
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("advanced since review"), "{err}");
+        assert!(err.contains("7 → 8"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_when_pin_hash_diverges_from_rebuilt_tx() {
+        // Pin carries the right nonce but a hash that doesn't match the
+        // rebuilt tx (form/pin desync — a bug, but the invariant holds).
+        let mock = CallMock::new();
+        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: B256::repeat_byte(0xaa), // not the real hash
+        }));
+        plant_safe_nonce(&mock, req.safe_address, 7);
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("differs from the reviewed hash"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_passes_when_pin_matches_and_contract_agrees() {
+        use crate::safe::tx::safe_domain;
+        let mock = CallMock::new();
+        let (tx, local_hash) = expected_tx_and_hash(7);
+        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: local_hash,
+        }));
+        let safe = req.safe_address;
+        plant_safe_nonce(&mock, safe, 7);
+        // Contract agrees on both pre-sign checks.
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(crate::safe::domainSeparatorCall {}.abi_encode()),
+            alloy::primitives::Bytes::from(
+                safe_domain(safe, Chain::Mainnet).separator().abi_encode(),
+            ),
+            true,
+        );
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(
+                crate::safe::getTransactionHashCall {
+                    to: tx.to,
+                    value: tx.value,
+                    data: tx.data.clone(),
+                    operation: tx.operation,
+                    safeTxGas: tx.safeTxGas,
+                    baseGas: tx.baseGas,
+                    gasPrice: tx.gasPrice,
+                    gasToken: tx.gasToken,
+                    refundReceiver: tx.refundReceiver,
+                    _nonce: tx.nonce,
+                }
+                .abi_encode(),
+            ),
+            alloy::primitives::Bytes::from(local_hash.abi_encode()),
+            true,
+        );
+        let (got_tx, _domain, got_hash) = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap();
+        assert_eq!(got_hash, local_hash);
+        assert_eq!(got_tx.to, tx.to);
+        assert_eq!(got_tx.value, tx.value);
+        assert_eq!(got_tx.nonce, tx.nonce);
+        assert_eq!(got_tx.operation, tx.operation);
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_when_contract_disputes_the_hash() {
+        // Pin and local rebuild agree, but the contract's
+        // getTransactionHash differs (wrong contract / encoding drift).
+        // The on-chain cross-check must still veto.
+        let mock = CallMock::new();
+        let (tx, local_hash) = expected_tx_and_hash(7);
+        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: local_hash,
+        }));
+        let safe = req.safe_address;
+        plant_safe_nonce(&mock, safe, 7);
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(crate::safe::domainSeparatorCall {}.abi_encode()),
+            alloy::primitives::Bytes::from(
+                crate::safe::tx::safe_domain(safe, Chain::Mainnet)
+                    .separator()
+                    .abi_encode(),
+            ),
+            true,
+        );
+        mock.set_call(
+            safe,
+            alloy::primitives::Bytes::from(
+                crate::safe::getTransactionHashCall {
+                    to: tx.to,
+                    value: tx.value,
+                    data: tx.data.clone(),
+                    operation: tx.operation,
+                    safeTxGas: tx.safeTxGas,
+                    baseGas: tx.baseGas,
+                    gasPrice: tx.gasPrice,
+                    gasToken: tx.gasToken,
+                    refundReceiver: tx.refundReceiver,
+                    _nonce: tx.nonce,
+                }
+                .abi_encode(),
+            ),
+            alloy::primitives::Bytes::from(B256::repeat_byte(0x66).abi_encode()),
+            true,
+        );
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("safe hash mismatch"), "{err}");
     }
 }

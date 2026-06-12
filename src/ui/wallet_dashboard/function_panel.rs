@@ -265,5 +265,9 @@ fn ty_short(ty: &alloy::dyn_abi::DynSolType) -> String {
         DynSolType::Array(inner) => format!("{}[]", ty_short(inner)),
         DynSolType::FixedArray(inner, n) => format!("{}[{}]", ty_short(inner), n),
         DynSolType::Function => "function".into(),
+        // `CustomStruct` only materializes from EIP-712 typed-data
+        // decoding, which the function panel (evmole-derived calldata
+        // types) never produces — render its name rather than its fields.
+        DynSolType::CustomStruct { name, .. } => name.clone(),
     }
 }

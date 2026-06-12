@@ -10,6 +10,28 @@ publish = false
 
 [dependencies]
 alloy = { version = "2.0.1", features = ["full", "signer-mnemonic", "signer-ledger", "signer-trezor"] }
+# EIP-712 support, deliberately NOT via alloy's `eip712` meta-feature. That
+# meta-feature weak-references the cloud signers (`alloy-signer-aws?/eip712`,
+# -gcp, -turnkey), and cargo's version resolver locks weak-referenced optional
+# deps even when no feature ever activates them (rust-lang/cargo#10801) — so
+# turning it on dragged the entire AWS/GCP/Turnkey SDK trees (~50 crates that
+# are never compiled) into Cargo.lock, where cargo-vet and cargo-deny audit
+# them. Enabling the same per-crate features directly yields an identical
+# build with none of the lockfile pollution:
+#   - alloy-core/eip712 → dyn-abi's `DynSolType::CustomStruct` (typed-data
+#     decode rendering) + sol-types' Eip712Domain serde impls — exactly what
+#     the meta-feature forwarded.
+#   - alloy-signer/eip712 → `Signer::sign_typed_data`, the default path used
+#     by software keys and Trezor (which has no eip712 feature of its own).
+#   - alloy-signer-local/eip712, alloy-signer-ledger/eip712 → the cfg-gated
+#     native impls (Ledger's on-device domain-hash + struct-hash flow).
+# Versions pin to the same builds alloy 2.0.1 already resolves to, so no new
+# packages enter the tree. Drop these four (back to the meta-feature) if
+# cargo#10801 is ever fixed.
+alloy-core = { version = "1.5.7", features = ["eip712"] }
+alloy-signer = { version = "2.0.1", features = ["eip712"] }
+alloy-signer-local = { version = "2.0.1", features = ["eip712"] }
+alloy-signer-ledger = { version = "2.0.1", features = ["eip712"] }
 async-trait = "0.1"
 # Helios's API is built against alloy 1.x; we need its BlockId type to call
 # eth_getBalance against the verified light-client. alloy 1.x and 2.x share
@@ -112,6 +134,10 @@ keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust",
 
 [dev-dependencies]
 tempfile = "3"
+# Only for synthesizing `reqwest::Response`s in `safe::service` tests
+# (via reqwest's `From<http::Response<T>>`) — the same http 1.x that
+# reqwest already depends on, so nothing new enters the tree.
+http = "1"
 
 # Workarounds for two upstream-broken transitive deps pulled in by
 # helios-opstack. Drop both entries the moment the upstreams ship fixes

@@ -34,6 +34,26 @@ impl Chain {
         }
     }
 
+    /// Map an EIP-155 chain id back to a `Chain`. Inverse of
+    /// [`Chain::chain_id`]. Returns `None` for ids Kao doesn't support —
+    /// used to locate a `SafeDescriptor` (which stores a raw `chain_id`)
+    /// on one of the three supported networks.
+    pub fn from_chain_id(id: u64) -> Option<Chain> {
+        Chain::ALL.into_iter().find(|c| c.chain_id() == id)
+    }
+
+    /// EIP-3770 short name used as the chain segment in Safe Transaction
+    /// Service URLs (`https://api.safe.global/tx-service/{shortName}/…`).
+    /// These are the registry short names, NOT `label()` lowercased —
+    /// Optimism's is `oeth`, not `optimism`.
+    pub fn safe_tx_service_shortname(self) -> &'static str {
+        match self {
+            Chain::Mainnet => "eth",
+            Chain::Base => "base",
+            Chain::Optimism => "oeth",
+        }
+    }
+
     /// Human-friendly network label for the review screen
     /// ("Ethereum Mainnet", "OP Mainnet", "Base"). Distinct from `label()`,
     /// which is the short navigation-row name.
@@ -164,6 +184,24 @@ mod tests {
         assert_eq!(Chain::Mainnet.chain_id(), 1);
         assert_eq!(Chain::Base.chain_id(), 8453);
         assert_eq!(Chain::Optimism.chain_id(), 10);
+    }
+
+    #[test]
+    fn from_chain_id_round_trips() {
+        for c in Chain::ALL {
+            assert_eq!(Chain::from_chain_id(c.chain_id()), Some(c));
+        }
+        assert_eq!(Chain::from_chain_id(42161), None); // Arbitrum: unsupported
+        assert_eq!(Chain::from_chain_id(0), None);
+    }
+
+    #[test]
+    fn safe_tx_service_shortnames() {
+        // EIP-3770 registry short names — Optimism is `oeth`, a common
+        // foot-gun if derived from the label instead.
+        assert_eq!(Chain::Mainnet.safe_tx_service_shortname(), "eth");
+        assert_eq!(Chain::Base.safe_tx_service_shortname(), "base");
+        assert_eq!(Chain::Optimism.safe_tx_service_shortname(), "oeth");
     }
 
     #[test]

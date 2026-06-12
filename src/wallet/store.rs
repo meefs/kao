@@ -50,11 +50,14 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use zeroize::Zeroizing;
 
-use super::{AccountDescriptor, Contact, WalletDescriptor, WalletError, keyring as kr};
+use super::{
+    AccountDescriptor, Contact, SafeDescriptor, WalletDescriptor, WalletError, keyring as kr,
+};
 
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const ACCOUNTS_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("accounts");
 const CONTACTS_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("contacts");
+const SAFES_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("safes");
 
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
@@ -65,6 +68,7 @@ const ACTIVE_INDEX_KEY: &str = "active_index";
 const HEADER_AAD: &[u8] = b"header:auth_check";
 const ACCOUNT_AAD_PREFIX: &[u8] = b"accounts:";
 const CONTACT_AAD_PREFIX: &[u8] = b"contacts:";
+const SAFE_AAD_PREFIX: &[u8] = b"safes:";
 
 const AUTH_CONSTANT: &[u8] = b"KAO_AUTH";
 
@@ -311,6 +315,35 @@ fn save_to(path: &Path, desc: &WalletDescriptor, pw: &SecretString) -> Result<()
         }
     }
 
+    // Safes table: same shape as accounts — wipe and re-insert from
+    // `desc.safes` so a removed Safe drops its row. The `safes:` AAD
+    // prefix prevents a Safe ciphertext from being silently swapped into
+    // the accounts table or vice versa. Bundled into the same write txn
+    // so the file is internally consistent on every commit.
+    {
+        let mut safes = txn.open_table(SAFES_TABLE).map_err(redb_err)?;
+        let existing_keys: Vec<u32> = {
+            let mut acc = Vec::new();
+            for entry in safes.iter().map_err(redb_err)? {
+                let (k, _) = entry.map_err(redb_err)?;
+                acc.push(k.value());
+            }
+            acc
+        };
+        for k in existing_keys {
+            safes.remove(k).map_err(redb_err)?;
+        }
+
+        for (i, safe) in desc.safes.iter().enumerate() {
+            let idx = i as u32;
+            let plaintext = postcard::to_stdvec(safe)
+                .map_err(|e| WalletError::Encryption(format!("serialize safe {i}: {e}")))?;
+            let aad = safe_aad(idx);
+            let blob = encrypt_blob(master_key.as_slice(), &aad, &plaintext)?;
+            safes.insert(idx, blob.as_slice()).map_err(redb_err)?;
+        }
+    }
+
     txn.commit().map_err(redb_err)?;
 
     // File is durable. Now mirror the new epoch to the keyring. If this
@@ -531,10 +564,86 @@ fn load_from_with_policy(
         return Err(WalletError::Encryption("no accounts in store".into()));
     }
 
+    // Safes table: same shape as contacts loader — a wallet written
+    // before the safes feature shipped has no `safes` table at all, and
+    // `open_table` on a read txn returns `TableDoesNotExist` in that
+    // case. Collapse to an empty vec so old wallets load cleanly; the
+    // next save lazily creates the table.
+    let safes = match txn.open_table(SAFES_TABLE) {
+        Ok(safes_tbl) => {
+            let mut entries: Vec<(u32, SafeDescriptor)> = Vec::new();
+            for entry in safes_tbl.iter().map_err(redb_err)? {
+                let (k, v) = entry.map_err(redb_err)?;
+                let idx = k.value();
+                let aad = safe_aad(idx);
+                let plaintext = decrypt_blob(master_key.as_slice(), &aad, v.value())?;
+                let safe = decode_safe(&plaintext, idx)?;
+                entries.push((idx, safe));
+            }
+            entries.sort_by_key(|(i, _)| *i);
+            entries.into_iter().map(|(_, s)| s).collect()
+        }
+        Err(redb::TableError::TableDoesNotExist(_)) => Vec::new(),
+        Err(e) => return Err(redb_err(e)),
+    };
+
     let active_index = active_index.min(accounts.len() - 1);
     Ok(WalletDescriptor {
         accounts,
+        safes,
         active_index,
+    })
+}
+
+/// Decode one decrypted Safe row, tolerating the pre-`tx_service_url`
+/// layout.
+///
+/// Postcard isn't self-describing: appending a field to
+/// `SafeDescriptor` makes blobs written before the field one byte
+/// short, and a plain `from_bytes` would hard-fail the whole wallet
+/// load. Try the current shape first; on failure re-read as the legacy
+/// shape and default the new field. New fields MUST keep appending to
+/// the end of `SafeDescriptor` and extend the legacy fallback here.
+fn decode_safe(plaintext: &[u8], idx: u32) -> Result<SafeDescriptor, WalletError> {
+    /// `SafeDescriptor` exactly as persisted before `tx_service_url`
+    /// shipped. Field order/types must never change.
+    #[derive(serde::Deserialize)]
+    struct LegacySafeV1 {
+        name: Option<String>,
+        chain_id: u64,
+        address: [u8; 20],
+        version: String,
+        trust: crate::wallet::SafeTrust,
+        threshold: u32,
+        owners: Vec<[u8; 20]>,
+        modules: Vec<[u8; 20]>,
+        guard: Option<[u8; 20]>,
+        fallback_handler: Option<[u8; 20]>,
+        linked_signer_indices: Vec<u32>,
+        sibling_chains: Vec<u64>,
+        cached_at: u64,
+    }
+
+    if let Ok(safe) = postcard::from_bytes::<SafeDescriptor>(plaintext) {
+        return Ok(safe);
+    }
+    let legacy: LegacySafeV1 = postcard::from_bytes(plaintext)
+        .map_err(|e| WalletError::Encryption(format!("deserialize safe {idx}: {e}")))?;
+    Ok(SafeDescriptor {
+        name: legacy.name,
+        chain_id: legacy.chain_id,
+        address: legacy.address,
+        version: legacy.version,
+        trust: legacy.trust,
+        threshold: legacy.threshold,
+        owners: legacy.owners,
+        modules: legacy.modules,
+        guard: legacy.guard,
+        fallback_handler: legacy.fallback_handler,
+        linked_signer_indices: legacy.linked_signer_indices,
+        sibling_chains: legacy.sibling_chains,
+        cached_at: legacy.cached_at,
+        tx_service_url: None,
     })
 }
 
@@ -607,6 +716,13 @@ fn account_aad(idx: u32) -> Vec<u8> {
 fn contact_aad(idx: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(CONTACT_AAD_PREFIX.len() + 4);
     out.extend_from_slice(CONTACT_AAD_PREFIX);
+    out.extend_from_slice(&idx.to_le_bytes());
+    out
+}
+
+fn safe_aad(idx: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SAFE_AAD_PREFIX.len() + 4);
+    out.extend_from_slice(SAFE_AAD_PREFIX);
     out.extend_from_slice(&idx.to_le_bytes());
     out
 }
@@ -811,6 +927,7 @@ mod tests {
                     key_bytes: [0xcd; 32],
                 },
             ],
+            safes: Vec::new(),
             active_index: 2,
         };
         save_to(&path, &desc, &pw("hunter2")).unwrap();
@@ -985,6 +1102,7 @@ mod tests {
                     key_bytes: [0x03; 32],
                 },
             ],
+            safes: Vec::new(),
             active_index: 2,
         };
         save_to(&path, &big, &pw("pw")).unwrap();
@@ -1293,6 +1411,7 @@ mod tests {
                     key_bytes: [0x02; 32],
                 },
             ],
+            safes: Vec::new(),
             active_index: 0,
         };
         save_to(&path, &desc, &pw("pw")).unwrap();
@@ -1462,5 +1581,437 @@ mod tests {
             decrypt_blob(&key, &account_aad(0), &blob_a).unwrap(),
             plaintext,
         );
+    }
+
+    // ── Safes tests ──────────────────────────────────────────────────────
+
+    use crate::wallet::{SafeDescriptor, SafeTrust};
+
+    /// Minimal Canonical Safe — owner-of-one threshold-one. Tests that
+    /// don't care about the contents use this and override fields as
+    /// needed.
+    fn minimal_safe(seed: u8, chain_id: u64) -> SafeDescriptor {
+        SafeDescriptor {
+            name: Some(format!("Safe seed {seed:02x}")),
+            chain_id,
+            address: [seed; 20],
+            version: "1.4.1".into(),
+            trust: SafeTrust::Canonical,
+            threshold: 1,
+            owners: vec![[seed.wrapping_add(1); 20]],
+            modules: Vec::new(),
+            guard: None,
+            fallback_handler: None,
+            linked_signer_indices: vec![0],
+            sibling_chains: Vec::new(),
+            cached_at: 1_700_000_000,
+            tx_service_url: None,
+        }
+    }
+
+    /// Safe with every optional field populated — exercises the
+    /// "loud surfaces" (modules, guard, fallback handler), the
+    /// unrecognized-implementation branch, multiple owners and signer
+    /// links, and the sibling-chains list. The deserialized round-trip
+    /// of this must equal the input bit-for-bit.
+    fn rich_safe(seed: u8) -> SafeDescriptor {
+        SafeDescriptor {
+            name: None,   // exercise the unnamed path
+            chain_id: 10, // Optimism
+            address: [seed; 20],
+            version: "1.3.0".into(),
+            trust: SafeTrust::UnrecognizedImpl,
+            threshold: 3,
+            owners: vec![[0xa1; 20], [0xa2; 20], [0xa3; 20], [0xa4; 20]],
+            modules: vec![[0xb1; 20], [0xb2; 20]],
+            guard: Some([0xc1; 20]),
+            fallback_handler: Some([0xd1; 20]),
+            linked_signer_indices: vec![0, 2],
+            sibling_chains: vec![1, 8453], // mainnet, base
+            cached_at: 1_700_000_042,
+            tx_service_url: Some("https://txs.example-dao.org".into()),
+        }
+    }
+
+    #[test]
+    fn decode_safe_falls_back_to_pre_service_url_layout() {
+        // Serialize the legacy 13-field shape verbatim (everything up to
+        // `cached_at`) and decode through the loader's fallback — older
+        // wallets must load with `tx_service_url: None`, not error.
+        let current = minimal_safe(0x07, 1);
+        let legacy_bytes = postcard::to_stdvec(&(
+            &current.name,
+            current.chain_id,
+            current.address,
+            &current.version,
+            &current.trust,
+            current.threshold,
+            &current.owners,
+            &current.modules,
+            current.guard,
+            current.fallback_handler,
+            &current.linked_signer_indices,
+            &current.sibling_chains,
+            current.cached_at,
+        ))
+        .unwrap();
+        let decoded = decode_safe(&legacy_bytes, 0).unwrap();
+        assert_eq!(decoded, current);
+        assert!(decoded.tx_service_url.is_none());
+
+        // And the current shape still round-trips, custom URL intact.
+        let rich = rich_safe(0x42);
+        let bytes = postcard::to_stdvec(&rich).unwrap();
+        assert_eq!(decode_safe(&bytes, 1).unwrap(), rich);
+    }
+
+    fn wallet_with_safes(safes: Vec<SafeDescriptor>) -> WalletDescriptor {
+        WalletDescriptor {
+            accounts: vec![AccountDescriptor::Local {
+                name: None,
+                key_bytes: [0x42; 32],
+            }],
+            safes,
+            active_index: 0,
+        }
+    }
+
+    #[test]
+    fn safes_save_and_load_roundtrip_preserves_every_field() {
+        // The rich variant exercises both SafeTrust branches, optional
+        // guard/fallback (Some), multi-element owners/modules/linked-
+        // signers/siblings, and the unnamed display-name fallback path.
+        // Anything that gets lost between save and load shows up here.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = wallet_with_safes(vec![minimal_safe(0x01, 1), rich_safe(0x55)]);
+        save_to(&path, &desc, &pw("hunter2")).unwrap();
+        let loaded = load_from(&path, &pw("hunter2")).unwrap();
+        assert_eq!(loaded.safes, desc.safes);
+        // Sanity: accounts didn't get scrambled by the new safes loop.
+        assert_eq!(loaded.accounts.len(), 1);
+    }
+
+    #[test]
+    fn safes_load_returns_empty_when_table_missing() {
+        // A wallet saved before the safes feature has no `safes` table at
+        // all — the redb file only contains `meta`, `accounts`, and
+        // possibly `contacts`. `load_from` must collapse the missing
+        // table to an empty vec rather than erroring, otherwise unlock
+        // breaks for every pre-feature wallet on upgrade.
+        //
+        // We can't easily construct a "pre-feature" file in-test (the
+        // current `save_to` always opens the safes table). So we save
+        // normally, then drop the safes table out-of-band and reload.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = wallet_with_safes(Vec::new());
+        save_to(&path, &desc, &pw("pw")).unwrap();
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.delete_table(SAFES_TABLE).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        assert!(loaded.safes.is_empty());
+        assert_eq!(loaded.accounts.len(), 1);
+    }
+
+    #[test]
+    fn safes_save_overwrite_drops_removed_rows() {
+        // A second save with fewer safes must actually shrink the table —
+        // not silently leave the deleted rows as ghosts that re-appear on
+        // load. Same shape as `save_overwrite_replaces_account_set`.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let big = wallet_with_safes(vec![
+            minimal_safe(0x01, 1),
+            minimal_safe(0x02, 10),
+            minimal_safe(0x03, 8453),
+        ]);
+        save_to(&path, &big, &pw("pw")).unwrap();
+        let small = wallet_with_safes(vec![minimal_safe(0x09, 1)]);
+        save_to(&path, &small, &pw("pw")).unwrap();
+
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.safes.len(), 1);
+        assert_eq!(loaded.safes[0].address, [0x09; 20]);
+    }
+
+    #[test]
+    fn safes_save_with_empty_vec_clears_existing_table() {
+        // Onboarding flow inverse: a wallet that had safes, all removed.
+        // The table must end up empty, not retain old entries.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let with_safes = wallet_with_safes(vec![minimal_safe(0x01, 1), minimal_safe(0x02, 10)]);
+        save_to(&path, &with_safes, &pw("pw")).unwrap();
+        let without = wallet_with_safes(Vec::new());
+        save_to(&path, &without, &pw("pw")).unwrap();
+
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        assert!(loaded.safes.is_empty());
+    }
+
+    #[test]
+    fn safes_preserve_insertion_order_via_index() {
+        // Iteration order from `load_from` must match the order in the
+        // input vec, because the UI surfaces Safes in the user's
+        // chronological add order (matches accounts behavior). The
+        // explicit sort-by-key in load_from is what guarantees this.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = wallet_with_safes(vec![
+            minimal_safe(0xaa, 8453), // base
+            minimal_safe(0xbb, 1),    // mainnet
+            minimal_safe(0xcc, 10),   // optimism
+        ]);
+        save_to(&path, &desc, &pw("pw")).unwrap();
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        let chain_ids: Vec<u64> = loaded.safes.iter().map(|s| s.chain_id).collect();
+        assert_eq!(chain_ids, vec![8453, 1, 10]);
+    }
+
+    #[test]
+    fn safes_and_accounts_save_atomically_under_one_commit() {
+        // The whole point of bundling safes into `save_to` (rather than
+        // a contacts-style sidecar) is that a wallet snapshot is always
+        // internally consistent: you cannot observe "new safe added but
+        // accounts still old" or vice versa. This test does a save that
+        // changes BOTH and asserts both are visible after a single
+        // reload. (A regression that committed safes after accounts in
+        // a separate txn would leave a window where this fails.)
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let initial = wallet_with_safes(Vec::new());
+        save_to(&path, &initial, &pw("pw")).unwrap();
+
+        let updated = WalletDescriptor {
+            accounts: vec![
+                AccountDescriptor::Local {
+                    name: Some("primary".into()),
+                    key_bytes: [0x42; 32],
+                },
+                AccountDescriptor::Local {
+                    name: Some("hardware-backup".into()),
+                    key_bytes: [0x43; 32],
+                },
+            ],
+            safes: vec![minimal_safe(0x77, 1)],
+            active_index: 1,
+        };
+        save_to(&path, &updated, &pw("pw")).unwrap();
+
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.accounts.len(), 2);
+        assert_eq!(loaded.safes.len(), 1);
+        assert_eq!(loaded.active_index, 1);
+    }
+
+    #[test]
+    fn safes_save_bumps_rollback_epoch() {
+        // Safes ARE security-bearing for rollback (unlike contacts) —
+        // an attacker who could roll back the safes table could
+        // resurrect a kicked owner key or hide a freshly removed
+        // malicious module. Bundling safes into `save_to` means every
+        // save bumps the file's epoch and re-mirrors to the keyring,
+        // so any rollback to a prior file snapshot trips the policy
+        // check. This test pins that contract: a save that only changes
+        // the safes list still bumps the epoch.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let initial = wallet_with_safes(Vec::new());
+        save_to(&path, &initial, &pw("pw")).unwrap();
+        let salt = read_salt_from_file(&path);
+        let entry = keyring_entry_name(&salt);
+        let before = epoch_from_keyring(&entry);
+
+        let with_safe = wallet_with_safes(vec![minimal_safe(0x01, 1)]);
+        save_to(&path, &with_safe, &pw("pw")).unwrap();
+        let after = epoch_from_keyring(&entry);
+
+        assert!(
+            after > before,
+            "safes save must bump epoch (before={before}, after={after})",
+        );
+    }
+
+    #[test]
+    fn safe_aad_namespaces_against_account_and_contact_aads() {
+        // Three-way AAD isolation: a safe ciphertext must not decrypt
+        // under the accounts or contacts AAD (and vice versa). Without
+        // this, an attacker with file-write access could copy an
+        // encrypted safe row into the accounts table and have it
+        // silently load as an account, or copy an account row into the
+        // safes table to forge owner sets.
+        let key = [0x77u8; 32];
+        let plaintext = b"hello-safe";
+        let blob_s = encrypt_blob(&key, &safe_aad(0), plaintext).unwrap();
+        let blob_a = encrypt_blob(&key, &account_aad(0), plaintext).unwrap();
+        let blob_c = encrypt_blob(&key, &contact_aad(0), plaintext).unwrap();
+
+        // safe blob must not open under account or contact AAD.
+        assert!(decrypt_blob(&key, &account_aad(0), &blob_s).is_err());
+        assert!(decrypt_blob(&key, &contact_aad(0), &blob_s).is_err());
+        // account / contact blobs must not open under safe AAD.
+        assert!(decrypt_blob(&key, &safe_aad(0), &blob_a).is_err());
+        assert!(decrypt_blob(&key, &safe_aad(0), &blob_c).is_err());
+
+        // Sanity: the safe AAD round-trip works on its own blob.
+        assert_eq!(
+            decrypt_blob(&key, &safe_aad(0), &blob_s).unwrap(),
+            plaintext,
+        );
+    }
+
+    #[test]
+    fn aad_binding_rejects_swapped_safe_record() {
+        // Mirror of `aad_binding_rejects_swapped_account_record` for the
+        // safes table. Per-row AAD includes the row index, so swapping
+        // the bytes between row 0 and row 1 must produce a decrypt
+        // failure on load — otherwise an attacker with file-write
+        // access could reorder safes (e.g. promote a watch-only Safe
+        // into a signer slot by swapping it with one that has linked
+        // signers, if the UI ever derived role from position).
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = wallet_with_safes(vec![minimal_safe(0x01, 1), minimal_safe(0x02, 10)]);
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut safes = txn.open_table(SAFES_TABLE).unwrap();
+                let a = safes.get(0u32).unwrap().unwrap().value().to_vec();
+                let b = safes.get(1u32).unwrap().unwrap().value().to_vec();
+                safes.insert(0u32, b.as_slice()).unwrap();
+                safes.insert(1u32, a.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let err = load_from(&path, &pw("pw")).unwrap_err();
+        match err {
+            WalletError::Encryption(msg) => {
+                assert!(msg.contains("decrypt"), "got: {msg}");
+            }
+            other => panic!("expected Encryption error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_accepts_legacy_safe_row_written_before_tx_service_url() {
+        // End-to-end guarantee for wallets saved before `tx_service_url`
+        // shipped: a safes row whose plaintext uses the OLD 13-field
+        // postcard layout — encrypted under the real per-row AAD — must
+        // load as `tx_service_url: None`, not fail the whole wallet
+        // open. Exercises the full path (decrypt → `decode_safe`
+        // fallback), unlike the codec-only unit test.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let expected = minimal_safe(0x07, 1);
+        let desc = wallet_with_safes(vec![expected.clone()]);
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        // Overwrite row 0 with a legacy-encoded, properly-encrypted blob.
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let header = {
+                    let meta = txn.open_table(META_TABLE).unwrap();
+                    let raw = meta.get(HEADER_KEY).unwrap().unwrap().value().to_vec();
+                    deserialize_header(&raw).unwrap()
+                };
+                let key = derive_master_key(
+                    &pw("pw"),
+                    &header.salt,
+                    header.argon2_m_cost_kib,
+                    header.argon2_t_cost,
+                    header.argon2_p_cost,
+                )
+                .unwrap();
+                let legacy_plaintext = postcard::to_stdvec(&(
+                    &expected.name,
+                    expected.chain_id,
+                    expected.address,
+                    &expected.version,
+                    &expected.trust,
+                    expected.threshold,
+                    &expected.owners,
+                    &expected.modules,
+                    expected.guard,
+                    expected.fallback_handler,
+                    &expected.linked_signer_indices,
+                    &expected.sibling_chains,
+                    expected.cached_at,
+                ))
+                .unwrap();
+                let blob = encrypt_blob(key.as_slice(), &safe_aad(0), &legacy_plaintext).unwrap();
+                let mut safes = txn.open_table(SAFES_TABLE).unwrap();
+                safes.insert(0u32, blob.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let loaded = load_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.safes, vec![expected]);
+        assert!(loaded.safes[0].tx_service_url.is_none());
+    }
+
+    #[test]
+    fn safe_descriptor_display_name_falls_back_to_indexed_default() {
+        // Mirror of the account `display_name` behavior — unnamed safes
+        // render as "Safe N" so the account list never has a blank row.
+        let unnamed = SafeDescriptor {
+            name: None,
+            ..minimal_safe(0x01, 1)
+        };
+        assert_eq!(unnamed.display_name(0), "Safe 1");
+        assert_eq!(unnamed.display_name(4), "Safe 5");
+
+        let mut named = minimal_safe(0x01, 1);
+        named.set_name(Some("  Treasury  ".into()));
+        // set_name must trim whitespace; the rendered name is the trim.
+        assert_eq!(named.display_name(0), "Treasury");
+
+        // Empty-after-trim collapses to unnamed default.
+        named.set_name(Some("   ".into()));
+        assert_eq!(named.display_name(2), "Safe 3");
+    }
+
+    #[test]
+    fn safe_descriptor_is_signer_reflects_linked_indices() {
+        // The watch-only Safe path produces `linked_signer_indices: []`.
+        // Anything non-empty marks the user as a signer. This is what
+        // the UI checks to decide between the muted watch-only style
+        // and the actuatable signer style.
+        let mut s = minimal_safe(0x01, 1);
+        assert!(s.is_signer(), "minimal_safe links signer 0");
+        s.linked_signer_indices.clear();
+        assert!(!s.is_signer());
+        s.linked_signer_indices.push(7);
+        assert!(s.is_signer());
+    }
+
+    #[test]
+    fn contains_safe_distinguishes_address_and_chain() {
+        // Dedup at onboarding is (address, chain_id) — the same address
+        // on a different chain is a different Safe (separate owner set,
+        // separate everything). This guard belongs in WalletDescriptor
+        // rather than UI so every add path uses the same definition of
+        // "already added".
+        use alloy::primitives::Address;
+        let desc = wallet_with_safes(vec![minimal_safe(0x42, 1)]);
+        let same = Address::from([0x42; 20]);
+        let other = Address::from([0x43; 20]);
+        assert!(desc.contains_safe(same, 1));
+        // Same address, different chain → not a duplicate.
+        assert!(!desc.contains_safe(same, 10));
+        // Different address, same chain → not a duplicate.
+        assert!(!desc.contains_safe(other, 1));
     }
 }

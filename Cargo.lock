@@ -335,6 +335,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-type-parser",
  "alloy-sol-types",
+ "derive_more",
  "itoa",
  "serde",
  "serde_json",
@@ -1046,7 +1047,9 @@ version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c5da9ae50f9b48d7b4e2e5cde87175257be7e5e56909a7794720597c1d9806f6"
 dependencies = [
+ "alloy-dyn-abi",
  "alloy-primitives",
+ "alloy-sol-types",
  "async-trait",
  "auto_impl",
  "either",
@@ -1062,9 +1065,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "943c0105e0294b34cd06417129fadc591aed464d06f0614a7e998e585d27fbb1"
 dependencies = [
  "alloy-consensus 2.0.1",
+ "alloy-dyn-abi",
  "alloy-network 2.0.1",
  "alloy-primitives",
  "alloy-signer 2.0.1",
+ "alloy-sol-types",
  "async-trait",
  "coins-ledger",
  "futures-util",
@@ -6365,8 +6370,12 @@ name = "kao"
 version = "0.1.0"
 dependencies = [
  "alloy 2.0.1",
+ "alloy-core",
  "alloy-eips 1.8.3",
  "alloy-rpc-types-eth 1.8.3",
+ "alloy-signer 2.0.1",
+ "alloy-signer-ledger",
+ "alloy-signer-local 2.0.1",
  "argon2",
  "async-trait",
  "chacha20poly1305",
@@ -6377,6 +6386,7 @@ dependencies = [
  "getrandom 0.4.2",
  "helios-ethereum",
  "helios-opstack",
+ "http 1.4.0",
  "iced",
  "keyring",
  "op-alloy-rpc-types",

@@ -2,7 +2,7 @@
 //! wallet dashboard. Generic over the message type so each screen can use them
 //! with its own local `Message` enum.
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use iced::border::Radius;
 use iced::widget::text::Wrapping;
 use iced::widget::{
@@ -255,6 +255,107 @@ pub fn ghost_button<'a, M: Clone + 'a>(
             },
             ..button::Style::default()
         })
+}
+
+/// Tinted card with a numbered chip, label and sub-label, used by the
+/// initial setup-method picker and the Safe-onboarding "add a new
+/// signer" picker. Click anywhere on the card to fire `on_press`.
+///
+/// `bg` is the card's tint (one of `t.ab1` / `t.ab2` / `t.ab3` for the
+/// rotating palette); `accent` matches it (`t.a1` / `t.a2` / `t.a3`).
+pub fn method_card<'a, M: Clone + 'a>(
+    t: KaoTheme,
+    bg: Color,
+    accent: Color,
+    number: &'a str,
+    label: &'a str,
+    sub: &'a str,
+    on_press: M,
+) -> Element<'a, M> {
+    let info = column![
+        row![
+            container(text(number).size(11).color(accent).font(black()))
+                .padding(Padding::from([2, 7]))
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(bg)),
+                    border: Border {
+                        color: with_alpha(accent, 0.3),
+                        width: 1.0,
+                        radius: Radius::from(6),
+                    },
+                    text_color: Some(accent),
+                    ..container::Style::default()
+                }),
+            Space::new().width(8),
+            text(label).size(15).color(t.text).font(black()),
+        ]
+        .align_y(Alignment::Center),
+        Space::new().height(2),
+        text(sub).size(12).color(t.sub),
+    ]
+    .spacing(0);
+
+    let row_content = row![
+        container(info).width(Length::Fill),
+        text("→").size(18).color(accent).font(bold()),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let styled = container(row_content)
+        .padding(Padding::from([14, 16]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: with_alpha(accent, 0.25),
+                width: 1.5,
+                radius: Radius::from(15),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        });
+
+    mouse_area(styled)
+        .on_press(on_press)
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
+}
+
+/// Themed checkbox factory. Builds a `checkbox` with Kao's accent
+/// fill, accent-tinted border on hover, and a white tick. Caller
+/// wires `.label(...)`, `.on_toggle(...)`, and `.size(...)` as
+/// usual; this returns the widget after the style is set so iced's
+/// builder chain remains ergonomic.
+pub fn kao_checkbox<'a, M: 'a>(t: KaoTheme, is_checked: bool) -> iced::widget::Checkbox<'a, M> {
+    use iced::widget::checkbox::{self, Status};
+    iced::widget::checkbox(is_checked).style(move |_theme, status| {
+        let (checked, hovered) = match status {
+            Status::Active { is_checked } => (is_checked, false),
+            Status::Hovered { is_checked } => (is_checked, true),
+            Status::Disabled { is_checked } => (is_checked, false),
+        };
+        let bg = if checked {
+            t.a1
+        } else if hovered {
+            with_alpha(t.a1, 0.10)
+        } else {
+            Color::TRANSPARENT
+        };
+        // Active border on either checked OR hovered, so the tick box
+        // visually previews its selectable state on pointer-over.
+        let border_color = if checked || hovered { t.a1 } else { t.border };
+        checkbox::Style {
+            background: Background::Color(bg),
+            icon_color: Color::WHITE,
+            border: Border {
+                color: border_color,
+                width: 1.5,
+                radius: Radius::from(5),
+            },
+            text_color: Some(t.text),
+        }
+    })
 }
 
 pub fn primary_button<'a, M: Clone + 'a>(
@@ -657,25 +758,7 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
     debug_assert_eq!(checksum.len(), 42);
     let body = &checksum[2..]; // drop the "0x"
 
-    // Ten distinct accent colours for the ten 2-byte chunks. Each
-    // adjacent pair flips on *both* axes — hue (rotating through the
-    // three accents with stride 2) and lightness (alternating bright /
-    // deep). That dual flip makes neighbours pop apart far more than a
-    // smooth gradient does, and keeps homoglyph swaps from blending into
-    // a same-coloured neighbour.
-    let chunk_colors: [Color; 10] = [
-        t.a1,                    // 0: bright a1
-        mix(t.a3, t.text, 0.55), // 1: deep a3
-        t.a2,                    // 2: bright a2
-        mix(t.a1, t.text, 0.55), // 3: deep a1
-        t.a3,                    // 4: bright a3
-        mix(t.a2, t.text, 0.55), // 5: deep a2
-        mix(t.a1, t.a3, 0.5),    // 6: bright a1+a3
-        mix(t.a2, t.text, 0.75), // 7: very deep a2
-        mix(t.a2, t.a3, 0.5),    // 8: bright a2+a3
-        mix(t.a1, t.text, 0.75), // 9: very deep a1
-    ];
-
+    let chunk_colors = chunk_palette(t);
     let mut spans = row![text("0x").size(14).color(t.sub).font(mono_bold())].spacing(0);
 
     for (i, color) in chunk_colors.iter().enumerate() {
@@ -689,6 +772,106 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
         .center_x(Length::Fill)
         .padding(Padding::from([2, 0]))
         .into()
+}
+
+/// Ten distinct accent colours for 4-hex-char chunks. Each adjacent
+/// pair flips on *both* axes — hue (rotating through the three accents
+/// with stride 2) and lightness (alternating bright / deep). That dual
+/// flip makes neighbours pop apart far more than a smooth gradient
+/// does, and keeps homoglyph swaps from blending into a same-coloured
+/// neighbour. Shared by [`colored_address`] (10 chunks, exactly one
+/// cycle) and [`colored_hash`] (16 chunks, wraps — the 9→0 seam still
+/// flips lightness within the a1 hue, so no two neighbours merge).
+fn chunk_palette(t: KaoTheme) -> [Color; 10] {
+    [
+        t.a1,                    // 0: bright a1
+        mix(t.a3, t.text, 0.55), // 1: deep a3
+        t.a2,                    // 2: bright a2
+        mix(t.a1, t.text, 0.55), // 3: deep a1
+        t.a3,                    // 4: bright a3
+        mix(t.a2, t.text, 0.55), // 5: deep a2
+        mix(t.a1, t.a3, 0.5),    // 6: bright a1+a3
+        mix(t.a2, t.text, 0.75), // 7: very deep a2
+        mix(t.a2, t.a3, 0.5),    // 8: bright a2+a3
+        mix(t.a1, t.text, 0.75), // 9: very deep a1
+    ]
+}
+
+/// Render a 32-byte hash (safeTxHash, message hash) in full, chunked
+/// like [`colored_address`]: 64 hex chars split into sixteen 4-char
+/// chunks over two rows of eight, each chunk coloured from the shared
+/// palette.
+///
+/// This is the verification surface for multisig signing — the same
+/// grouping Ledger/Trezor and the Safe web app use when they display a
+/// safeTxHash, so a user can compare chunk-by-chunk across devices and
+/// co-signers. Never truncated: a prefix/suffix display is exactly what
+/// a hash-collision phisher relies on.
+pub fn colored_hash<'a, M: 'a>(t: KaoTheme, hash: B256) -> Element<'a, M> {
+    let hex = format!("{hash:x}"); // 64 lowercase hex chars, no 0x
+    debug_assert_eq!(hex.len(), 64);
+    let chunk_colors = chunk_palette(t);
+
+    let mut lines = column![].spacing(2);
+    for line_idx in 0..2 {
+        let mut spans = row![].spacing(0);
+        if line_idx == 0 {
+            spans = spans.push(text("0x").size(13).color(t.sub).font(mono_bold()));
+        } else {
+            // Two invisible chars keep the second row's chunks aligned
+            // with the first row's (which carries the "0x" prefix).
+            spans = spans.push(text("  ").size(13).font(mono_bold()));
+        }
+        for i in (line_idx * 8)..(line_idx * 8 + 8) {
+            let start = i * 4;
+            let chunk = hex[start..start + 4].to_string();
+            spans = spans.push(
+                text(chunk)
+                    .size(13)
+                    .color(chunk_colors[i % 10])
+                    .font(mono_bold()),
+            );
+        }
+        lines = lines.push(spans);
+    }
+
+    container(lines)
+        .width(Length::Fill)
+        .center_x(Length::Fill)
+        .padding(Padding::from([2, 0]))
+        .into()
+}
+
+/// Bordered section card: an uppercase caption over the body. Groups
+/// modal content into scannable units — the Safe review and Safe-tx
+/// detail modals build their TRANSACTION / VERIFY / SIMULATION / …
+/// stacks out of these. (Distinct from [`section`], the settings-page
+/// header block.)
+pub fn section_card<'a, M: 'a>(t: KaoTheme, title: &str, body: Element<'a, M>) -> Element<'a, M> {
+    container(
+        column![
+            text(title.to_string())
+                .size(11)
+                .color(t.sub)
+                .font(mono_bold()),
+            Space::new().height(8),
+            body,
+        ]
+        .width(Length::Fill),
+    )
+    .padding(Padding::from([12, 14]))
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(t.card_alt)),
+        border: Border {
+            color: t.border,
+            width: 1.0,
+            radius: Radius::from(12),
+        },
+        text_color: Some(t.text),
+        ..container::Style::default()
+    })
+    .into()
 }
 
 /// "Label …….. value" row used in the Send review step. `big` bumps the value

@@ -8,6 +8,7 @@ mod indexer;
 mod net;
 mod paths;
 mod portfolio;
+mod safe;
 mod settings;
 mod ui;
 mod wallet;
