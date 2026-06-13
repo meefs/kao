@@ -1,0 +1,351 @@
+//! ERC-7730 descriptor-based clear signing. Tries curated JSON
+//! descriptors first (via `clear_signing::BundledRegistrySource`);
+//! falls back to the existing heuristic pipeline when no descriptor
+//! matches.
+//!
+//! The `KaoDataProvider` bridges Kao's Helios-verified RPC layer into
+//! the `clear_signing::DataProvider` trait, so token metadata and ENS
+//! reverse lookups go through the same verified path the heuristic
+//! pipeline already uses.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+
+use alloy::primitives::{Address, Bytes, U256};
+use tracing::{debug, info, trace, warn};
+
+use clear_signing::{
+    BundledRegistrySource, DataProvider, DisplayModel, FormatDiagnostic, FormatOutcome,
+    ResolvedDescriptorResolution, TokenMeta, TransactionContext, format_calldata,
+    resolve_descriptors_for_tx,
+};
+
+use crate::chain::Chain;
+use crate::decode::proxy;
+use crate::decode::render::{DecodedCall, decode_call, read_token_meta};
+use crate::ens;
+use crate::net::BalanceFetcher;
+
+// ---------------------------------------------------------------------------
+// Data provider
+
+/// Bridges Kao's Helios-verified network layer into the `clear_signing`
+/// crate's `DataProvider` trait. Token metadata goes through verified
+/// `eth_call`; ENS goes through forward-verified reverse resolution.
+/// Local names (contacts + own accounts) are resolved from a pre-built
+/// snapshot so no locking happens on the async path.
+pub struct KaoDataProvider<'a> {
+    net: &'a dyn BalanceFetcher,
+    chain: Chain,
+    /// Snapshot of contacts + own account names, keyed by address.
+    /// Built once at task-spawn time so the async decode doesn't need
+    /// the `RwLock<ContactsBook>`.
+    local_names: HashMap<Address, String>,
+}
+
+impl<'a> KaoDataProvider<'a> {
+    pub fn new(
+        net: &'a dyn BalanceFetcher,
+        chain: Chain,
+        local_names: HashMap<Address, String>,
+    ) -> Self {
+        Self {
+            net,
+            chain,
+            local_names,
+        }
+    }
+}
+
+impl DataProvider for KaoDataProvider<'_> {
+    fn resolve_token(
+        &self,
+        _chain_id: u64,
+        address: &str,
+    ) -> Pin<Box<dyn Future<Output = Option<TokenMeta>> + Send + '_>> {
+        let address = address.to_string();
+        Box::pin(async move {
+            let addr: Address = match address.parse() {
+                Ok(a) => a,
+                Err(_) => {
+                    debug!(address, "clear-sign: resolve_token: bad address");
+                    return None;
+                }
+            };
+            match read_token_meta(self.net, self.chain, addr).await {
+                Some((info, verified)) => {
+                    debug!(
+                        symbol = %info.symbol,
+                        decimals = info.decimals,
+                        verified,
+                        %addr,
+                        "clear-sign: resolved token metadata"
+                    );
+                    Some(TokenMeta {
+                        symbol: info.symbol.clone(),
+                        decimals: info.decimals,
+                        name: info.symbol,
+                    })
+                }
+                None => {
+                    trace!(%addr, "clear-sign: no token metadata for address");
+                    None
+                }
+            }
+        })
+    }
+
+    fn resolve_local_name(
+        &self,
+        address: &str,
+        _chain_id: u64,
+        _types: Option<&[String]>,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+        let hit = address
+            .parse::<Address>()
+            .ok()
+            .and_then(|addr| self.local_names.get(&addr).cloned());
+        match &hit {
+            Some(name) => debug!(address, %name, "clear-sign: resolved local name"),
+            None => debug!(
+                address,
+                known = self.local_names.len(),
+                "clear-sign: no local name"
+            ),
+        }
+        Box::pin(async move { hit })
+    }
+
+    fn resolve_ens_name(
+        &self,
+        address: &str,
+        _chain_id: u64,
+        _types: Option<&[String]>,
+    ) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+        // Reverse ENS only on Mainnet — reverse records live there.
+        if !matches!(self.chain, Chain::Mainnet) {
+            trace!(address, chain = ?self.chain, "clear-sign: skipping ENS (non-mainnet)");
+            return Box::pin(async { None });
+        }
+        let address = address.to_string();
+        Box::pin(async move {
+            let addr: Address = match address.parse() {
+                Ok(a) => a,
+                Err(_) => {
+                    debug!(address, "clear-sign: resolve_ens_name: bad address");
+                    return None;
+                }
+            };
+            let provider = match self.net.provider(self.chain).await {
+                Some(p) => p,
+                None => {
+                    debug!(%addr, "clear-sign: no provider for ENS lookup");
+                    return None;
+                }
+            };
+            match ens::lookup_address(&provider, addr).await {
+                Ok(Some(name)) => {
+                    debug!(%addr, %name, "clear-sign: resolved ENS name");
+                    Some(name)
+                }
+                Ok(None) => {
+                    trace!(%addr, "clear-sign: no ENS reverse record");
+                    None
+                }
+                Err(e) => {
+                    debug!(%addr, error = %e, "clear-sign: ENS lookup failed");
+                    None
+                }
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decode result
+
+/// Union of ERC-7730 clear-signing and heuristic decode results.
+/// The function panel dispatches on this to pick the right renderer.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub enum DecodeResult {
+    /// ERC-7730 descriptor matched. Intent + labeled entries.
+    ClearSigned {
+        model: DisplayModel,
+        diagnostics: Vec<FormatDiagnostic>,
+        proxy_hops: Vec<Address>,
+        all_verified: bool,
+    },
+    /// Descriptor returned Fallback (partial match). Show DisplayModel
+    /// but carry heuristic decode for cross-reference.
+    Fallback {
+        model: DisplayModel,
+        reason: clear_signing::FallbackReason,
+        diagnostics: Vec<FormatDiagnostic>,
+        heuristic: DecodedCall,
+    },
+    /// No descriptor or format failure. Existing heuristic pipeline.
+    Heuristic(DecodedCall),
+    /// Native ETH transfer -- no calldata.
+    Empty,
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator
+
+/// Top-level decode entry point. Tries ERC-7730 descriptors first, then
+/// falls back to the heuristic pipeline.
+pub async fn decode_transaction(
+    net: &dyn BalanceFetcher,
+    chain: Chain,
+    from: Address,
+    to: Address,
+    calldata: Bytes,
+    value: U256,
+    local_names: HashMap<Address, String>,
+) -> DecodeResult {
+    if calldata.is_empty() {
+        debug!(%to, "clear-sign: empty calldata, native transfer");
+        return DecodeResult::Empty;
+    }
+
+    let selector = if calldata.len() >= 4 {
+        format!(
+            "0x{:02x}{:02x}{:02x}{:02x}",
+            calldata[0], calldata[1], calldata[2], calldata[3]
+        )
+    } else {
+        format!("0x{}", alloy::hex::encode(&calldata))
+    };
+
+    info!(
+        %to,
+        %from,
+        %selector,
+        calldata_len = calldata.len(),
+        chain = ?chain,
+        local_names = local_names.len(),
+        "clear-sign: decoding transaction"
+    );
+
+    // Walk the proxy chain so we can pass the implementation address to
+    // the descriptor resolver. The heuristic path re-walks this (cheap,
+    // cached in Helios); keeping it self-contained simplifies the
+    // fallback.
+    let resolved = proxy::resolve_implementation(net, chain, to).await;
+    let impl_addr = resolved.implementation;
+    let proxy_hops = resolved.hops.clone();
+    let all_verified = resolved.all_verified;
+
+    if !proxy_hops.is_empty() {
+        debug!(
+            %to,
+            %impl_addr,
+            hops = proxy_hops.len(),
+            all_verified,
+            "clear-sign: proxy resolved"
+        );
+    }
+
+    // Build the descriptor-resolver context.
+    let to_str = format!("{to:#x}");
+    let from_str = format!("{from:#x}");
+    let impl_str = format!("{impl_addr:#x}");
+    let value_bytes = value.to_be_bytes::<32>();
+
+    let tx_ctx = TransactionContext {
+        chain_id: chain.chain_id(),
+        to: &to_str,
+        calldata: &calldata,
+        value: if value.is_zero() {
+            None
+        } else {
+            Some(&value_bytes[..])
+        },
+        from: Some(&from_str),
+        implementation_address: if impl_addr != to {
+            Some(&impl_str)
+        } else {
+            None
+        },
+    };
+
+    let data_provider = KaoDataProvider::new(net, chain, local_names);
+
+    // Try the bundled registry.
+    match BundledRegistrySource::new() {
+        Ok(source) => {
+            debug!("clear-sign: bundled registry loaded");
+            match resolve_descriptors_for_tx(&tx_ctx, &source, Some(&data_provider)).await {
+                Ok(ResolvedDescriptorResolution::Found(descriptors)) => {
+                    info!(
+                        count = descriptors.len(),
+                        %selector,
+                        "clear-sign: descriptor(s) found"
+                    );
+                    match format_calldata(&descriptors, &tx_ctx, &data_provider).await {
+                        Ok(FormatOutcome::ClearSigned { model, diagnostics }) => {
+                            info!(
+                                intent = %model.intent,
+                                entries = model.entries.len(),
+                                diagnostics = diagnostics.len(),
+                                "clear-sign: clear-signed result"
+                            );
+                            return DecodeResult::ClearSigned {
+                                model,
+                                diagnostics,
+                                proxy_hops,
+                                all_verified,
+                            };
+                        }
+                        Ok(FormatOutcome::Fallback {
+                            model,
+                            reason,
+                            diagnostics,
+                        }) => {
+                            info!(
+                                intent = %model.intent,
+                                reason = ?reason,
+                                diagnostics = diagnostics.len(),
+                                "clear-sign: fallback result, running heuristic too"
+                            );
+                            let heuristic = decode_call(net, chain, to, calldata).await;
+                            return DecodeResult::Fallback {
+                                model,
+                                reason,
+                                diagnostics,
+                                heuristic,
+                            };
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = ?e,
+                                %selector,
+                                "clear-sign: format_calldata failed, falling back to heuristic"
+                            );
+                        }
+                    }
+                }
+                Ok(ResolvedDescriptorResolution::NotFound) => {
+                    debug!(%selector, %to, "clear-sign: no descriptor found");
+                }
+                Err(e) => {
+                    warn!(
+                        error = ?e,
+                        %selector,
+                        "clear-sign: descriptor resolution error"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = ?e, "clear-sign: failed to load bundled registry");
+        }
+    }
+
+    // Heuristic fallback.
+    debug!(%selector, "clear-sign: using heuristic pipeline");
+    let decoded = decode_call(net, chain, to, calldata).await;
+    DecodeResult::Heuristic(decoded)
+}

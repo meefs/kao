@@ -363,7 +363,7 @@ async fn humanize_arg(
 /// review screen would format the amount accordingly. With
 /// verification, the symbol/decimals returned were re-executed by
 /// Helios against proof-checked bytecode and storage.
-async fn read_token_meta(
+pub(crate) async fn read_token_meta(
     net: &dyn BalanceFetcher,
     chain: Chain,
     addr: Address,

@@ -16,7 +16,7 @@ use iced::widget::{Space, button, column, container, row, scrollable, text, text
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
 use super::home::format_symbol;
-use crate::decode::render::DecodedCall;
+use crate::decode::clear_sign::DecodeResult;
 use crate::ens;
 use crate::portfolio::LiveToken;
 use crate::ui::kao_theme::KaoTheme;
@@ -199,7 +199,7 @@ pub enum Message {
     /// `seq` is the decode-generation counter; stale results dropped.
     DecodedReady {
         seq: u64,
-        decoded: Box<DecodedCall>,
+        decoded: Box<DecodeResult>,
     },
     /// Result of an ENS forward-resolution task spawned by the dashboard.
     /// `seq` is the input-generation counter that was current when the task
@@ -326,7 +326,7 @@ pub struct SendPane {
     /// Clear-signing result for the current SendPlan. `None` while a
     /// decode is in flight (with `decoded_loading = true`) or when the
     /// plan has empty calldata (native send — no decode needed).
-    decoded: Option<Box<DecodedCall>>,
+    decoded: Option<Box<DecodeResult>>,
     decoded_loading: bool,
     /// Bumped each time the dashboard kicks a fresh decode. Stale
     /// results (slow decoder finishing after the plan changed) are

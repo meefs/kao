@@ -32,6 +32,7 @@ alloy-core = { version = "1.5.7", features = ["eip712"] }
 alloy-signer = { version = "2.0.1", features = ["eip712"] }
 alloy-signer-local = { version = "2.0.1", features = ["eip712"] }
 alloy-signer-ledger = { version = "2.0.1", features = ["eip712"] }
+clear-signing = { git = "https://github.com/kaowallet/clear-signing", features = ["bundled-registry"] }
 async-trait = "0.1"
 # Helios's API is built against alloy 1.x; we need its BlockId type to call
 # eth_getBalance against the verified light-client. alloy 1.x and 2.x share

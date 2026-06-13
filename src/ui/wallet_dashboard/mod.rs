@@ -1359,8 +1359,14 @@ impl WalletScreen {
                             p.quote_started();
                             let decode_seq = p.decode_started();
                             let quote_task = spawn_quote_task(self.network.clone(), pl.clone());
-                            let decode_task =
-                                spawn_decode_task(self.network.clone(), decode_seq, pl);
+                            let local_names =
+                                build_local_names(&self.accounts, &self.safes, &self.contacts);
+                            let decode_task = spawn_decode_task(
+                                self.network.clone(),
+                                decode_seq,
+                                pl,
+                                local_names,
+                            );
                             Task::batch([quote_task, decode_task])
                         }
                         None => Task::none(),
@@ -2822,18 +2828,65 @@ fn spawn_contacts_ens_resolve_task(
     )
 }
 
-/// Spawn a clear-signing decode task. Walks the proxy chain rooted at
-/// the plan's target, fetches verified bytecode, runs evmole + 4byte +
-/// matcher, and humanizes the resulting args. Result message carries
+/// Build a snapshot of locally-known address → name mappings for the
+/// clear-signing `DataProvider`. Merges own accounts, Safes, and
+/// contacts so `resolve_local_name` can label addresses without
+/// network calls.
+///
+/// Free function to avoid borrowing the whole `WalletScreen` — the
+/// call site has `&mut self.modal` live, so a `&self` method won't fly.
+fn build_local_names(
+    accounts: &[AccountDescriptor],
+    safes: &[SafeDescriptor],
+    contacts: &Arc<RwLock<ContactsBook>>,
+) -> std::collections::HashMap<Address, String> {
+    let mut map = std::collections::HashMap::new();
+    // Own accounts.
+    for (i, acct) in accounts.iter().enumerate() {
+        if let Some(addr) = account_address(acct) {
+            map.insert(addr, acct.display_name(i));
+        }
+    }
+    // Safes.
+    for (i, safe) in safes.iter().enumerate() {
+        map.insert(Address::from(safe.address), safe.display_name(i));
+    }
+    // Contacts (highest priority — overwrite if an address is both an
+    // own account/safe and a contact).
+    if let Ok(book) = contacts.read() {
+        for c in book.iter() {
+            map.insert(c.address(), c.name.clone());
+        }
+    }
+    map
+}
+
+/// Spawn a clear-signing decode task. Tries ERC-7730 descriptor-based
+/// formatting first; falls back to the heuristic pipeline (evmole +
+/// 4byte + matcher) when no descriptor matches. Result message carries
 /// `seq` so the SendPane can drop stale completions if the user backed
 /// out of review and built a different plan.
-fn spawn_decode_task(network: Arc<dyn BalanceFetcher>, seq: u64, plan: SendPlan) -> Task<Message> {
-    let (to, _value, calldata) = plan.tx_target();
+fn spawn_decode_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    plan: SendPlan,
+    local_names: std::collections::HashMap<Address, String>,
+) -> Task<Message> {
+    let (to, value, calldata) = plan.tx_target();
     let chain = plan.chain;
+    let from = plan.from;
     Task::perform(
         async move {
-            let decoded =
-                crate::decode::render::decode_call(network.as_ref(), chain, to, calldata).await;
+            let decoded = crate::decode::clear_sign::decode_transaction(
+                network.as_ref(),
+                chain,
+                from,
+                to,
+                calldata,
+                value,
+                local_names,
+            )
+            .await;
             (seq, decoded)
         },
         |(seq, decoded)| {
