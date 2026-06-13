@@ -1499,7 +1499,25 @@ impl WalletScreen {
                     } else {
                         Task::none()
                     };
-                    return (Task::batch([task.map(Message::Send), refresh]), None);
+                    // Delayed step 3 → 4 transition: after broadcast
+                    // succeeds, wait a beat then advance to the success
+                    // screen. The pane's `AdvanceToDone` handler guards on
+                    // `broadcast_done`, so a stale timer (user closed the
+                    // modal) is a safe no-op.
+                    let advance_task = if success {
+                        Task::perform(
+                            async {
+                                tokio::time::sleep(Duration::from_millis(2200)).await;
+                            },
+                            |_| Message::Send(send::Message::AdvanceToDone),
+                        )
+                    } else {
+                        Task::none()
+                    };
+                    return (
+                        Task::batch([task.map(Message::Send), refresh, advance_task]),
+                        None,
+                    );
                 }
             }
             Message::EnsAutoNameResolved { address, result } => {

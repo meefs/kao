@@ -782,7 +782,7 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
 /// neighbour. Shared by [`colored_address`] (10 chunks, exactly one
 /// cycle) and [`colored_hash`] (16 chunks, wraps — the 9→0 seam still
 /// flips lightness within the a1 hue, so no two neighbours merge).
-fn chunk_palette(t: KaoTheme) -> [Color; 10] {
+pub(crate) fn chunk_palette(t: KaoTheme) -> [Color; 10] {
     [
         t.a1,                    // 0: bright a1
         mix(t.a3, t.text, 0.55), // 1: deep a3
