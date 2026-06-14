@@ -18,19 +18,41 @@ jobs:
     name: verify ci passed
     runs-on: ubuntu-latest
     steps:
-      - name: check ci.yml succeeded for this commit
+      - name: wait for ci.yml to succeed
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh run list \
-            --commit "${{ github.sha }}" \
-            --workflow ci.yml \
-            --status success \
-            --limit 1 \
-            --json conclusion \
-            | grep -q '"conclusion":"success"'
+          echo "Waiting for ci.yml to finish for ${{ github.sha }}..."
+          for i in $(seq 1 30); do
+            result=$(gh run list \
+              --commit "${{ github.sha }}" \
+              --workflow ci.yml \
+              --limit 1 \
+              --json status,conclusion \
+              --jq '.[0] // empty')
+            if [ -z "$result" ]; then
+              echo "Attempt $i/30: no ci.yml run found yet, waiting 60s..."
+              sleep 60
+              continue
+            fi
+            status=$(echo "$result" | jq -r '.status')
+            conclusion=$(echo "$result" | jq -r '.conclusion')
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CI passed."
+                exit 0
+              else
+                echo "CI finished with conclusion: $conclusion"
+                exit 1
+              fi
+            fi
+            echo "Attempt $i/30: CI status=$status, waiting 60s..."
+            sleep 60
+          done
+          echo "Timed out waiting for CI."
+          exit 1
 
   build:
     name: build (${{ matrix.target }})
