@@ -161,3 +161,25 @@ core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84bcb0f235b12e2135
 # Drop when: op-alloy-rs ships a release without the explicit impl AND
 # helios-opstack's pinned rev consumes that release.
 op-alloy-network = { path = "vendor/op-alloy-network" }
+
+[package.metadata.packager]
+product-name = "Kao Wallet"
+identifier = "com.kaowallet.kao"
+description = "Cute+Secure desktop wallet for Ethereum"
+icons = ["assets/icons/icon.png", "assets/icons/icon.ico", "assets/icons/icon.icns"]
+
+[[package.metadata.packager.binaries]]
+path = "kao"
+main = true
+
+[package.metadata.packager.nsis]
+install-mode = "both"
+
+[package.metadata.packager.deb]
+section = "utils"
+
+[package.metadata.packager.appimage]
+
+[package.metadata.packager.pacman]
+
+[package.metadata.packager.dmg]

@@ -11,6 +11,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_PACKAGER_VERSION: "0.11.8"
 
 jobs:
   verify-ci:
@@ -41,14 +42,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            packager-formats: appimage,deb,pacman
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            packager-formats: appimage,deb,pacman
           - os: macos-latest
             target: x86_64-apple-darwin
+            packager-formats: dmg
           - os: macos-latest
             target: aarch64-apple-darwin
+            packager-formats: dmg
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            packager-formats: nsis
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -57,27 +63,67 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+
+      - name: cache cargo-packager
+        id: cache-packager
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-packager
+            ~/.cargo/bin/cargo-packager.exe
+          key: cargo-packager-${{ env.CARGO_PACKAGER_VERSION }}-${{ runner.os }}-${{ runner.arch }}
+
+      - name: install cargo-packager
+        if: steps.cache-packager.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --version ${{ env.CARGO_PACKAGER_VERSION }} --locked
+
+      - name: install NSIS
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install nsis -y
+
+      - name: install AppImage deps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse2
+
       - name: build
         run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: package (unix)
-        if: runner.os != 'Windows'
+
+      - name: package
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
-          name="kao-${{ github.ref_name }}-${{ matrix.target }}"
-          tar czf "dist/${name}.tar.gz" -C "target/${{ matrix.target }}/release" kao
-      - name: package (windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+          cargo packager --release \
+            --formats ${{ matrix.packager-formats }} \
+            --binaries-dir "target/${{ matrix.target }}/release" \
+            --out-dir dist/installers
+
+      - name: rename artifacts
+        shell: bash
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $name = "kao-${{ github.ref_name }}-${{ matrix.target }}"
-          7z a "dist/$name.zip" "target/${{ matrix.target }}/release/kao.exe"
+          set -euo pipefail
+          mkdir -p dist/out
+          for f in dist/installers/*; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            ext="${base##*.}"
+            case "$base" in
+              *.pkg.tar.gz) mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.pkg.tar.gz" ;;
+              *.exe)        mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}-setup.exe" ;;
+              *.dmg)        mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.dmg" ;;
+              *.AppImage)   mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.AppImage" ;;
+              *.deb)        mv "$f" "dist/out/kao-${{ github.ref_name }}-${{ matrix.target }}.deb" ;;
+              *)            mv "$f" "dist/out/${base}" ;;
+            esac
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/*
+          path: dist/out/*
           if-no-files-found: error
 
   release:
@@ -101,7 +147,7 @@ jobs:
           set -euo pipefail
           cd dist
           shopt -s nullglob
-          for f in *.tar.gz *.zip SHA256SUMS; do
+          for f in *.exe *.dmg *.AppImage *.deb *.pkg.tar.gz SHA256SUMS; do
             cosign sign-blob --yes "$f" \
               --output-signature "$f.sig" \
               --output-certificate "$f.pem"
