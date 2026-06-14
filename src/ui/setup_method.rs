@@ -172,14 +172,11 @@ impl SetupMethodScreen {
         .center_x(Length::Fill);
 
         let grid = column![
-            row![seed_card, Space::new().width(10), key_card]
-                .width(Length::Fill),
+            row![seed_card, Space::new().width(10), key_card].width(Length::Fill),
             vspace(10),
-            row![create_card, Space::new().width(10), hardware_card]
-                .width(Length::Fill),
+            row![create_card, Space::new().width(10), hardware_card].width(Length::Fill),
             vspace(10),
-            row![watch_card, Space::new().width(10), safe_card]
-                .width(Length::Fill),
+            row![watch_card, Space::new().width(10), safe_card].width(Length::Fill),
         ]
         .width(Length::Fill);
 
