@@ -68,7 +68,7 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             packager-formats: appimage,deb,pacman
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
             packager-formats: dmg
           - os: macos-latest
