@@ -1,8 +1,10 @@
 # ♡o。+..:*♡o。+..:*♡o。+..:* Cute+Secure desktop wallet for Ethereum *:..+。o♡:..+。o♡*:..+。o♡
 
+<img width="1899" height="1002" alt="image" src="https://github.com/user-attachments/assets/3eeb3027-728d-461c-a04f-82d9e7768108" />
+
 ## ִ ࣪𖤐 Supported chains ༉‧₊˚.
 
-Kao uses [Helios light client](https://github.com/a16z/helios) for verification of RPC data, so the only supported chains are: `Ethereum mainnet`, `Base` and `Optimism`.
+Kao uses [Helios light client](https://github.com/a16z/helios) for verification of RPC data, so the only supported chains are: `Ethereum Mainnet`, `Base` and `Optimism`.
 
 ## ⋆˚✿˖° No 3rd party APIs by default (*•̀ᴗ•́*)و
 
