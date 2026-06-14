@@ -6402,7 +6402,7 @@ dependencies = [
 
 [[package]]
 name = "kao"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alloy 2.0.1",
  "alloy-core",

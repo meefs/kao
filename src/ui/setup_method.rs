@@ -171,6 +171,18 @@ impl SetupMethodScreen {
         .width(Length::Fill)
         .center_x(Length::Fill);
 
+        let grid = column![
+            row![seed_card, Space::new().width(10), key_card]
+                .width(Length::Fill),
+            vspace(10),
+            row![create_card, Space::new().width(10), hardware_card]
+                .width(Length::Fill),
+            vspace(10),
+            row![watch_card, Space::new().width(10), safe_card]
+                .width(Length::Fill),
+        ]
+        .width(Length::Fill);
+
         let content = column![
             kao_hero(t, "٩(◕‿◕｡)۶", 56.0),
             vspace(10),
@@ -178,24 +190,14 @@ impl SetupMethodScreen {
             vspace(6),
             screen_subtitle(t, "Choose how you'd like to get started."),
             vspace(22),
-            seed_card,
-            vspace(10),
-            key_card,
-            vspace(10),
-            create_card,
-            vspace(10),
-            hardware_card,
-            vspace(10),
-            watch_card,
-            vspace(10),
-            safe_card,
+            grid,
             vspace(16),
             hint,
         ]
         .width(Length::Fill)
         .align_x(Alignment::Center);
 
-        let card = auth_card(t, 460.0, content.into());
+        let card = auth_card(t, 520.0, content.into());
 
         let back_bar = container(link_button(t, "← Back").on_press(Message::BackPressed))
             .padding(Padding::from([12, 14]))
