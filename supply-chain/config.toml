@@ -1662,6 +1662,14 @@ criteria = "safe-to-deploy"
 version = "0.2.3"
 criteria = "safe-to-deploy"
 
+[[exemptions.include_dir]]
+version = "0.7.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.include_dir_macros]]
+version = "0.7.4"
+criteria = "safe-to-deploy"
+
 [[exemptions.indenter]]
 version = "0.3.4"
 criteria = "safe-to-deploy"
@@ -3284,6 +3292,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.time]]
 version = "0.3.47"
+criteria = "safe-to-deploy"
+
+[[exemptions.tiny-keccak]]
+version = "2.0.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.tiny-skia]]

@@ -1,16 +1,14 @@
 //! Decoded function call panel — read-only view that slots into the
 //! send review screen between the gas row and the warning band.
 //!
-//! Renders four outcomes from `decode::render::DecodedCall`:
-//! - **Loading** — small "decoding…" line; sized so the review card
-//!   doesn't pop when the result lands.
-//! - **Resolved / Ambiguous** — function name + per-arg rows
-//!   (name : type → display value). ENS-resolved addresses get the
-//!   resolved name above the chunked checksum address.
-//! - **TypesOnly** — same per-arg rows but the header is the raw
-//!   selector hex; no function name.
-//! - **Unknown** — selector + "Unverified call" hint and truncated
-//!   raw calldata.
+//! Dispatches on `DecodeResult`:
+//! - **ClearSigned** — ERC-7730 descriptor matched. Shows intent header
+//!   + labeled entries from the `DisplayModel`.
+//! - **Fallback** — partial descriptor match. Shows `DisplayModel` with
+//!   a fallback hint.
+//! - **Heuristic** — no descriptor. Existing heuristic panel
+//!   (function name + per-arg rows from evmole/4byte).
+//! - **Empty** — native ETH transfer, no calldata. Returns `None`.
 //!
 //! Warnings render as tinted strips. `AmbiguousSignature` rides *above*
 //! the header — when several signatures collide on the same selector,
@@ -19,15 +17,19 @@
 //! `InfiniteApproval` / `UnverifiedBytecode` qualify the call without
 //! contradicting the title and stay in the strip below the args.
 //!
-//! `Empty` (native ETH transfer, no calldata) returns `None` — the
-//! caller skips the panel and the divider so the review card stays the
-//! same shape it had before clear signing landed.
+//! Loading state shows a small "decoding…" line; sized so the review
+//! card doesn't pop when the result lands.
 
 use alloy::primitives::Address;
 use iced::border::Radius;
 use iced::widget::{Space, column, container, row, text};
 use iced::{Background, Border, Element, Length, Padding};
 
+use clear_signing::{
+    DiagnosticSeverity, DisplayEntry, DisplayItem, DisplayModel, FormatDiagnostic,
+};
+
+use crate::decode::clear_sign::DecodeResult;
 use crate::decode::render::{ArgDisplay, DecodedArg, DecodedCall, ResolutionState, Warning};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{bold, mono};
@@ -37,32 +39,226 @@ use crate::ui::kao_widgets::{bold, mono};
 /// divider so the review card layout stays clean.
 pub fn view<'a, M: 'a>(
     t: KaoTheme,
-    decoded: Option<&'a DecodedCall>,
+    decoded: Option<&'a DecodeResult>,
     loading: bool,
 ) -> Option<Element<'a, M>> {
     if loading {
         return Some(loading_view(t));
     }
-    let decoded = decoded?;
-    if matches!(decoded.state, ResolutionState::Empty) {
-        return None;
+    match decoded? {
+        DecodeResult::ClearSigned {
+            model,
+            diagnostics,
+            proxy_hops,
+            all_verified,
+        } => Some(clear_signed_panel(
+            t,
+            model,
+            diagnostics,
+            proxy_hops,
+            *all_verified,
+        )),
+        DecodeResult::Fallback {
+            model,
+            diagnostics,
+            heuristic,
+            ..
+        } => Some(clear_signed_panel(
+            t,
+            model,
+            diagnostics,
+            &heuristic.proxy_hops,
+            heuristic.all_verified,
+        )),
+        DecodeResult::Heuristic(decoded) => {
+            if matches!(decoded.state, ResolutionState::Empty) {
+                None
+            } else {
+                Some(heuristic_panel(t, decoded))
+            }
+        }
+        DecodeResult::Empty => None,
     }
-    Some(panel(t, decoded))
 }
 
 fn loading_view<'a, M: 'a>(t: KaoTheme) -> Element<'a, M> {
-    container(
-        text("(・_・;) decoding call…")
+    let mut col = column![].spacing(6);
+    col = col.push(text("Intent").size(11).color(t.sub).font(bold()));
+    col = col.push(Space::new().height(2));
+    col = col.push(
+        text("(・_・;) resolving…")
+            .size(13)
+            .color(t.sub)
+            .font(mono()),
+    );
+    // Placeholder rows so the card doesn't jump when the result lands.
+    for label in ["· ···", "· ···"] {
+        col = col.push(
+            row![
+                text(label)
+                    .size(11)
+                    .color(with_alpha(t.sub, 0.4))
+                    .font(mono()),
+                Space::new().width(Length::Fill),
+                text("···")
+                    .size(12)
+                    .color(with_alpha(t.sub, 0.4))
+                    .font(mono()),
+            ]
+            .width(Length::Fill),
+        );
+    }
+    col.width(Length::Fill).into()
+}
+
+// ---------------------------------------------------------------------------
+// ERC-7730 clear-signed panel
+
+fn clear_signed_panel<'a, M: 'a>(
+    t: KaoTheme,
+    model: &'a DisplayModel,
+    diagnostics: &'a [FormatDiagnostic],
+    proxy_hops: &'a [Address],
+    all_verified: bool,
+) -> Element<'a, M> {
+    let mut col = column![].spacing(6);
+
+    // Intent header.
+    let intent = model
+        .interpolated_intent
+        .as_deref()
+        .unwrap_or(&model.intent);
+    col = col.push(text("Intent").size(11).color(t.sub).font(bold()));
+    col = col.push(Space::new().height(2));
+    col = col.push(text(intent).size(13).color(t.text).font(bold()));
+
+    if let Some(name) = &model.contract_name {
+        col = col.push(text(name).size(11).color(t.sub).font(mono()));
+    }
+    if !proxy_hops.is_empty() {
+        col = col.push(text("(via proxy)").size(10).color(t.sub).font(mono()));
+    }
+    if !all_verified {
+        col = col.push(
+            text("⚠ some reads fell back to unverified RPC")
+                .size(10)
+                .color(t.down)
+                .font(mono()),
+        );
+    }
+
+    col = col.push(Space::new().height(4));
+
+    // Entries.
+    for entry in &model.entries {
+        col = push_display_entry(&mut col, t, entry, 0);
+    }
+
+    // Diagnostics (warning-severity only).
+    let warnings: Vec<&FormatDiagnostic> = diagnostics
+        .iter()
+        .filter(|d| matches!(d.severity, DiagnosticSeverity::Warning))
+        .collect();
+    if !warnings.is_empty() {
+        col = col.push(Space::new().height(4));
+        for diag in warnings {
+            col = col.push(diagnostic_strip(t, diag));
+        }
+    }
+
+    col.width(Length::Fill).into()
+}
+
+/// Recursively push a `DisplayEntry` into the column. `depth` controls
+/// indentation for nested entries.
+fn push_display_entry<'a, M: 'a>(
+    col: &mut iced::widget::Column<'a, M>,
+    t: KaoTheme,
+    entry: &'a DisplayEntry,
+    depth: u16,
+) -> iced::widget::Column<'a, M> {
+    let indent = (depth as f32) * 12.0;
+    let col_taken = std::mem::replace(col, column![]);
+    let mut col = col_taken;
+    match entry {
+        DisplayEntry::Item(item) => {
+            col = col.push(display_item_row(t, item, indent));
+        }
+        DisplayEntry::Group { label, items, .. } => {
+            // Group label as sub-header.
+            let label_el = row![
+                Space::new().width(Length::Fixed(indent)),
+                text(label).size(11).color(t.sub).font(bold()),
+            ];
+            col = col.push(label_el);
+            for item in items {
+                col = col.push(display_item_row(t, item, indent + 8.0));
+            }
+        }
+        DisplayEntry::Nested {
+            label,
+            intent,
+            entries,
+            ..
+        } => {
+            // Nested card: label + intent as a sub-header, entries indented.
+            let nested_header = row![
+                Space::new().width(Length::Fixed(indent)),
+                column![
+                    text(label).size(11).color(t.sub).font(bold()),
+                    text(intent).size(12).color(t.text).font(bold()),
+                ]
+                .spacing(2),
+            ];
+            col = col.push(nested_header);
+            for sub_entry in entries {
+                col = push_display_entry(&mut col, t, sub_entry, depth + 1);
+            }
+        }
+    }
+    col
+}
+
+fn display_item_row<'a, M: 'a>(t: KaoTheme, item: &'a DisplayItem, indent: f32) -> Element<'a, M> {
+    let value_display = truncate(&item.value, 48);
+    row![
+        Space::new().width(Length::Fixed(indent)),
+        text(format!("· {}", item.label))
             .size(11)
             .color(t.sub)
             .font(mono()),
-    )
-    .padding(Padding::from([6, 0]))
+        Space::new().width(Length::Fill),
+        text(value_display.into_owned())
+            .size(12)
+            .color(t.text)
+            .font(mono()),
+    ]
     .width(Length::Fill)
     .into()
 }
 
-fn panel<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
+fn diagnostic_strip<'a, M: 'a>(t: KaoTheme, diag: &'a FormatDiagnostic) -> Element<'a, M> {
+    let line = format!("⚠ {}", diag.message);
+    container(text(line).size(11).color(t.down).font(bold()))
+        .padding(Padding::from([6, 8]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.down, 0.12))),
+            border: Border {
+                color: with_alpha(t.down, 0.4),
+                width: 1.0,
+                radius: Radius::from(8),
+            },
+            text_color: Some(t.down),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+// ---------------------------------------------------------------------------
+// Heuristic panel (existing renderer, extracted from the old `panel`)
+
+fn heuristic_panel<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
     // AmbiguousSignature warnings precede the header — they cast doubt
     // on the title itself, so the user must see them first. The other
     // warning kinds qualify the call without undermining the name and
@@ -138,12 +334,6 @@ fn header<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
         col = col.push(text(s).size(11).color(t.sub).font(mono()));
     }
     if !d.proxy_hops.is_empty() {
-        // Just the fact, no implementation address. The user can't act
-        // on the impl address (it changes when the proxy upgrades),
-        // and showing 0x4350…02dd reads as a technical leak rather
-        // than reassurance. The fact that bytecode was Helios-verified
-        // is implicit — `UnverifiedBytecode` would have fired
-        // otherwise.
         col = col.push(text("(via proxy)").size(10).color(t.sub).font(mono()));
     }
     col.into()

@@ -172,6 +172,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/a16z/helios",
     "https://github.com/bbqsrc/core2",
+    "https://github.com/kaowallet/clear-signing",
 ]
 
 [sources.allow-org]

@@ -20,6 +20,7 @@
 //! appear here as they're added.
 
 pub mod bytecode;
+pub mod clear_sign;
 pub mod fourbyte;
 pub mod matcher;
 pub mod proxy;

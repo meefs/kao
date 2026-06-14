@@ -782,7 +782,7 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
 /// neighbour. Shared by [`colored_address`] (10 chunks, exactly one
 /// cycle) and [`colored_hash`] (16 chunks, wraps — the 9→0 seam still
 /// flips lightness within the a1 hue, so no two neighbours merge).
-fn chunk_palette(t: KaoTheme) -> [Color; 10] {
+pub(crate) fn chunk_palette(t: KaoTheme) -> [Color; 10] {
     [
         t.a1,                    // 0: bright a1
         mix(t.a3, t.text, 0.55), // 1: deep a3
@@ -871,32 +871,6 @@ pub fn section_card<'a, M: 'a>(t: KaoTheme, title: &str, body: Element<'a, M>) -
         text_color: Some(t.text),
         ..container::Style::default()
     })
-    .into()
-}
-
-/// "Label …….. value" row used in the Send review step. `big` bumps the value
-/// font; `muted` greys it.
-pub fn review_row<'a, M: 'a>(
-    t: KaoTheme,
-    label: &str,
-    value: &str,
-    big: bool,
-    muted: bool,
-) -> Element<'a, M> {
-    let value_size = if big { 17 } else { 14 };
-    let value_color = if muted { t.sub } else { t.text };
-    let value_font = if big { mono_black() } else { mono_bold() };
-    row![
-        text(label.to_string()).size(13).color(t.sub),
-        Space::new().width(Length::Fill),
-        text(value.to_string())
-            .size(value_size)
-            .color(value_color)
-            .font(value_font),
-    ]
-    .align_y(Alignment::Center)
-    .padding(Padding::from([2, 0]))
-    .width(Length::Fill)
     .into()
 }
 
