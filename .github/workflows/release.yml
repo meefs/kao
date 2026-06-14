@@ -119,8 +119,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo packager --release \
+            --target ${{ matrix.target }} \
             --formats ${{ matrix.packager-formats }} \
-            --binaries-dir "target/${{ matrix.target }}/release" \
             --out-dir dist/installers
 
       - name: rename artifacts
