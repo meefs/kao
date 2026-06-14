@@ -178,7 +178,7 @@ path = "kao"
 main = true
 
 [package.metadata.packager.nsis]
-install-mode = "both"
+installMode = "both"
 
 [package.metadata.packager.deb]
 section = "utils"
