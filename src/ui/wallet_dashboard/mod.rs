@@ -27,7 +27,6 @@ mod modal_chrome;
 mod nav;
 mod networks;
 mod receive;
-mod safe_send;
 mod safe_tx_detail;
 mod safes_settings;
 mod send;
@@ -41,9 +40,9 @@ use account_dropdown::AccountDropdown;
 use contacts_settings::ContactsPane;
 use networks::NetworksPane;
 use receive::ReceivePane;
-use safe_send::{SafeSendPane, SafeSendRequest};
 use safe_tx_detail::SafeTxDetailPane;
 use safes_settings::SafesPane;
+use send::SafeSendRequest;
 use send::SendPane;
 use swap::SwapPane;
 use tx_details::TxDetailsPane;
@@ -162,8 +161,6 @@ pub enum Message {
         ens: Option<String>,
     },
     Contacts(contacts_settings::Message),
-    /// Child messages from the Safe-send modal.
-    SafeSend(safe_send::Message),
     /// Result of a Safe-send sign+broadcast task. No signer handoff
     /// needed: the executor was derived inside the task from a
     /// linked owner's key, so nothing was moved out of the
@@ -271,12 +268,14 @@ pub enum Outcome {
 #[derive(Debug)]
 enum Modal {
     None,
-    Send(SendPane),
+    // Boxed: the unified SendPane carries EoaState/SafeState + SimulationResult
+    // inline, which would otherwise dominate the enum's size
+    // (clippy::large_enum_variant).
+    Send(Box<SendPane>),
     Receive(ReceivePane),
     Swap(SwapPane),
     AccountDropdown(AccountDropdown),
     TxDetails(TxDetailsPane),
-    SafeSend(SafeSendPane),
     // Boxed: the pane carries two inline `Option<SimulationResult>`s,
     // which would otherwise dominate the enum's size
     // (clippy::large_enum_variant).
@@ -612,7 +611,6 @@ impl WalletScreen {
     pub fn is_send_busy(&self) -> bool {
         match &self.modal {
             Modal::Send(p) => p.busy(),
-            Modal::SafeSend(p) => p.busy(),
             Modal::SafeTxDetail(p) => p.busy(),
             _ => false,
         }
@@ -1289,12 +1287,12 @@ impl WalletScreen {
                 settings::set_theme(k);
             }
             Message::OpenSend => {
-                // Safe mode: route Send to the SafeSend modal. The
-                // EOA signer is still alive in `self.signer` and gets
-                // moved into the broadcast task at Confirm time — it
-                // pays gas as the executor.
+                // Safe mode: route Send to the unified SendPane in
+                // Safe mode. The EOA signer stays alive in
+                // `self.signer` and gets moved into the broadcast
+                // task at Confirm time — it pays gas as the executor.
                 if let Some(safe) = self.active_safe_descriptor() {
-                    self.modal = Modal::SafeSend(SafeSendPane::new(safe, &self.accounts));
+                    self.modal = Modal::Send(Box::new(SendPane::new_safe(safe, &self.accounts)));
                     self.chrome.open();
                     return (Task::none(), None);
                 }
@@ -1313,7 +1311,7 @@ impl WalletScreen {
                     info!("send disabled: active account is view-only");
                     return (Task::none(), None);
                 }
-                self.modal = Modal::Send(SendPane::new(self.address));
+                self.modal = Modal::Send(Box::new(SendPane::new_eoa(self.address)));
                 self.chrome.open();
                 // Refresh portfolio + hero balance as the modal opens so
                 // the token tabs and Max button work off fresh numbers
@@ -1338,8 +1336,9 @@ impl WalletScreen {
                 // or forward to the pane.
 
                 // Max: compute the largest sendable amount for the active
-                // token. For native ETH, subtract the (loaded) gas cost so
-                // the user isn't left dust-stuck at broadcast time.
+                // token. EOA mode subtracts the loaded gas cost for
+                // native ETH; Safe mode uses the raw balance (no gas
+                // deduction — the executor pays gas separately).
                 if let send::Message::Max = &child_msg {
                     if let Some(tk) = self.portfolio.get(p.token_idx()) {
                         let max_str = compute_max_amount(tk, p);
@@ -1348,83 +1347,146 @@ impl WalletScreen {
                     return (Task::none(), None);
                 }
 
-                // Step(2): user clicked "Review →". Spawn a quote task
-                // (gas + 1559 fees + nonce) AND a clear-signing decode
-                // task — both against the same plan the pane will
-                // eventually broadcast.
+                // Step(2): user clicked "Review →". EOA spawns a quote
+                // task (gas + 1559 fees + nonce) AND a clear-signing
+                // decode task. Safe is a no-op here — the prepare and
+                // sim tasks fire via take_pending_prepare after the
+                // pane's update.
                 if let send::Message::Step(2) = &child_msg {
-                    let plan = p.build_plan(&self.portfolio);
-                    let pre_task = match plan {
-                        Some(pl) => {
-                            p.quote_started();
-                            let decode_seq = p.decode_started();
-                            let quote_task = spawn_quote_task(self.network.clone(), pl.clone());
-                            let local_names =
-                                build_local_names(&self.accounts, &self.safes, &self.contacts);
-                            let decode_task = spawn_decode_task(
-                                self.network.clone(),
-                                decode_seq,
-                                pl,
-                                local_names,
-                            );
-                            Task::batch([quote_task, decode_task])
+                    let pre_task = if p.is_eoa() {
+                        let plan = p.build_plan(&self.portfolio);
+                        match plan {
+                            Some(pl) => {
+                                p.quote_started();
+                                let decode_seq = p.decode_started();
+                                let quote_task = spawn_quote_task(self.network.clone(), pl.clone());
+                                let local_names =
+                                    build_local_names(&self.accounts, &self.safes, &self.contacts);
+                                let decode_task = spawn_decode_task(
+                                    self.network.clone(),
+                                    decode_seq,
+                                    pl,
+                                    local_names,
+                                );
+                                Task::batch([quote_task, decode_task])
+                            }
+                            None => Task::none(),
                         }
-                        None => Task::none(),
+                    } else {
+                        Task::none()
                     };
                     let (task, _outcome) = p.update(child_msg);
                     let task = task.map(Message::Send);
                     return (Task::batch([pre_task, task]), None);
                 }
 
-                // Confirm: user clicked "Confirm Send ✓". Need to move
-                // the signer out of the dashboard, run sign+broadcast in
-                // a task, and route the signer back via `SignerHandoff`.
+                // Confirm: mode-aware.
+                // EOA: move the signer out of the dashboard, run
+                // sign+broadcast in a task, route the signer back via
+                // `SignerHandoff`.
+                // Safe: collect linked owner keys, spawn the Safe
+                // sign+broadcast task (executor derived inside).
                 if let send::Message::Confirm = &child_msg {
-                    let plan = p.build_plan(&self.portfolio);
-                    // Clone the quote — TxQuote stopped being Copy when it
-                    // grew the SimulationResult field; spawn_broadcast_task
-                    // still takes ownership.
-                    let quote = p.quote().cloned();
-                    info!(
-                        has_plan = plan.is_some(),
-                        has_quote = quote.is_some(),
-                        "send: confirm clicked",
-                    );
-                    if let (Some(plan), Some(quote)) = (plan, quote) {
+                    if p.is_eoa() {
+                        let plan = p.build_plan(&self.portfolio);
+                        let quote = p.quote().cloned();
                         info!(
-                            chain = %plan.chain.label(),
-                            chain_id = plan.chain.chain_id(),
-                            from = %plan.from,
-                            recipient = %plan.recipient,
-                            amount_units = %plan.amount_units,
-                            erc20 = matches!(plan.token, crate::wallet::tx::SendToken::Erc20 { .. }),
-                            gas_limit = quote.gas_limit,
-                            nonce = quote.nonce,
-                            "send: spawning broadcast task",
+                            has_plan = plan.is_some(),
+                            has_quote = quote.is_some(),
+                            "send: confirm clicked",
                         );
-                        // Move the signer out — only ViewOnly stays
-                        // behind so the dashboard view doesn't crash if
-                        // it dereferences the signer's address while the
-                        // task is running. self.address stays correct.
-                        let signer =
-                            mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
-                        let handoff = handoff_with(signer);
-                        let pre_task =
-                            spawn_broadcast_task(self.network.clone(), handoff, plan, quote);
+                        if let (Some(plan), Some(quote)) = (plan, quote) {
+                            info!(
+                                chain = %plan.chain.label(),
+                                chain_id = plan.chain.chain_id(),
+                                from = %plan.from,
+                                recipient = %plan.recipient,
+                                amount_units = %plan.amount_units,
+                                erc20 = matches!(plan.token, crate::wallet::tx::SendToken::Erc20 { .. }),
+                                gas_limit = quote.gas_limit,
+                                nonce = quote.nonce,
+                                "send: spawning broadcast task",
+                            );
+                            let signer =
+                                mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
+                            let handoff = handoff_with(signer);
+                            let pre_task =
+                                spawn_broadcast_task(self.network.clone(), handoff, plan, quote);
+                            let (task, _outcome) = p.update(child_msg);
+                            let task = task.map(Message::Send);
+                            return (Task::batch([pre_task, task]), None);
+                        }
+                        warn!("send: confirm dropped — no plan or no quote");
                         let (task, _outcome) = p.update(child_msg);
-                        let task = task.map(Message::Send);
-                        return (Task::batch([pre_task, task]), None);
+                        return (task.map(Message::Send), None);
                     }
-                    // Missing plan or quote — let the pane no-op the
-                    // confirm. Surface this loudly: it's the most common
-                    // "send button does nothing" cause (button enabled,
-                    // user clicks, no broadcast spawned).
-                    warn!("send: confirm dropped — no plan or no quote");
-                    let (task, _outcome) = p.update(child_msg);
-                    return (task.map(Message::Send), None);
+                    // Safe mode: collect owner keys and broadcast.
+                    let Some(req) = p.outgoing_request(&self.portfolio) else {
+                        warn!("safe-send: confirm dropped — form not ready");
+                        return (Task::none(), None);
+                    };
+                    let owner_keys =
+                        match collect_owner_keys(&req.linked_local_indices, &self.accounts) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                warn!(error = %e, "safe-send: owner key lookup failed");
+                                let _ = p.update(send::Message::BroadcastDone(Err(e)));
+                                return (Task::none(), None);
+                            }
+                        };
+                    if owner_keys.is_empty() {
+                        let msg = "No local owners available to sign — link a Local account to this Safe before sending.".to_string();
+                        let _ = p.update(send::Message::BroadcastDone(Err(msg)));
+                        return (Task::none(), None);
+                    }
+                    info!(
+                        chain = %req.chain.label(),
+                        chain_id = req.chain.chain_id(),
+                        safe = %req.safe_address,
+                        to = %req.recipient,
+                        value_wei = %req.amount_units,
+                        threshold = req.threshold,
+                        owners_local = owner_keys.len(),
+                        "safe-send: spawning broadcast task",
+                    );
+                    p.mark_busy();
+                    let pre_task = spawn_safe_broadcast_task(self.network.clone(), req, owner_keys);
+                    return (pre_task, None);
+                }
+
+                // Propose: Safe-only. Sign once with the first signable
+                // owner and POST to the tx service for co-signers.
+                if let send::Message::Propose = &child_msg {
+                    let Some(req) = p.outgoing_request(&self.portfolio) else {
+                        warn!("safe-send: propose dropped — form not ready");
+                        return (Task::none(), None);
+                    };
+                    let Some(owner_desc) = req
+                        .signable_indices
+                        .first()
+                        .and_then(|&idx| self.accounts.get(idx as usize).cloned())
+                    else {
+                        let _ = p.update(send::Message::ProposeDone(Err(
+                            "no signable owner linked to this Safe".to_string(),
+                        )));
+                        return (Task::none(), None);
+                    };
+                    info!(
+                        chain = %req.chain.label(),
+                        safe = %req.safe_address,
+                        to = %req.recipient,
+                        value_wei = %req.amount_units,
+                        "safe-send: spawning propose task",
+                    );
+                    p.mark_busy();
+                    return (
+                        spawn_safe_propose_task(self.network.clone(), owner_desc, req),
+                        None,
+                    );
                 }
 
                 let (task, outcome) = p.update(child_msg);
+
                 // After pumping the pane, check whether the recipient
                 // input now points at an ENS-shaped value that hasn't been
                 // dispatched yet. The pane bumps a sequence on each
@@ -1434,28 +1496,56 @@ impl WalletScreen {
                     Some((seq, name)) => spawn_ens_resolve_task(self.network.clone(), seq, name),
                     None => Task::none(),
                 };
+
+                // Safe-only post-pump hooks: prepare+sim and sim retry.
+                let prepare_task = match p.take_pending_prepare(&self.portfolio) {
+                    Some((seq, req)) => Task::batch([
+                        spawn_safe_prepare_task(self.network.clone(), seq, req.clone()),
+                        spawn_safe_send_sim_task(self.network.clone(), seq, req, false),
+                    ]),
+                    None => Task::none(),
+                };
+                let sim_retry_task = match p.take_pending_sim_retry(&self.portfolio) {
+                    Some((seq, req, delayed)) => {
+                        spawn_safe_send_sim_task(self.network.clone(), seq, req, delayed)
+                    }
+                    None => Task::none(),
+                };
+
                 let task = task.map(Message::Send);
                 match outcome {
                     Some(send::Outcome::Closed) => {
-                        self.chrome.start_close();
-                        return (Task::batch([task, ens_task]), None);
+                        // Safe mode closes instantly; EOA animates.
+                        if p.is_safe() {
+                            self.modal = Modal::None;
+                        } else {
+                            self.chrome.start_close();
+                        }
+                        return (
+                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
+                            None,
+                        );
                     }
                     Some(send::Outcome::CopyText(s)) => {
                         let copy_task = self.arm_clipboard_clear(s);
-                        return (Task::batch([task, copy_task, ens_task]), None);
+                        return (
+                            Task::batch([task, copy_task, ens_task, prepare_task, sim_retry_task]),
+                            None,
+                        );
                     }
                     Some(send::Outcome::SaveAsContact { address, ens }) => {
-                        // Reuse the existing OpenContactsPaneWith path —
-                        // switches nav, opens contacts pane in Add mode
-                        // pre-filled, and starts the modal close
-                        // animation. We synthesize the same Message
-                        // here and forward it to ourselves on the next
-                        // tick rather than inlining the body to keep
-                        // the two entry points behaviourally identical.
                         let open_task = Task::done(Message::OpenContactsPaneWith { address, ens });
-                        return (Task::batch([task, ens_task, open_task]), None);
+                        return (
+                            Task::batch([task, ens_task, prepare_task, sim_retry_task, open_task]),
+                            None,
+                        );
                     }
-                    None => return (Task::batch([task, ens_task]), None),
+                    None => {
+                        return (
+                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
+                            None,
+                        );
+                    }
                 }
             }
             Message::SendBroadcastReturn { result, signer } => {
@@ -1753,150 +1843,14 @@ impl WalletScreen {
                     None => return (task, None),
                 }
             }
-            Message::SafeSend(child_msg) => {
-                let Modal::SafeSend(p) = &mut self.modal else {
-                    return (Task::none(), None);
-                };
-                if let safe_send::Message::Confirm = &child_msg {
-                    let Some(req) = p.outgoing_request() else {
-                        warn!("safe-send: confirm dropped — form not ready");
-                        return (Task::none(), None);
-                    };
-                    let owner_keys =
-                        match collect_owner_keys(&req.linked_local_indices, &self.accounts) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!(error = %e, "safe-send: owner key lookup failed");
-                                let _ = p.update(safe_send::Message::BroadcastDone(Err(e)));
-                                return (Task::none(), None);
-                            }
-                        };
-                    if owner_keys.is_empty() {
-                        let msg = "No local owners available to sign — link a Local account to this Safe before sending.".to_string();
-                        let _ = p.update(safe_send::Message::BroadcastDone(Err(msg)));
-                        return (Task::none(), None);
-                    }
-                    info!(
-                        chain = %req.chain.label(),
-                        chain_id = req.chain.chain_id(),
-                        safe = %req.safe_address,
-                        to = %req.to,
-                        value_wei = %req.value,
-                        threshold = req.threshold,
-                        owners_local = owner_keys.len(),
-                        "safe-send: spawning broadcast task",
-                    );
-                    p.mark_busy();
-                    let pre_task = spawn_safe_broadcast_task(self.network.clone(), req, owner_keys);
-                    return (pre_task, None);
-                }
-                if let safe_send::Message::Propose = &child_msg {
-                    let Some(req) = p.outgoing_request() else {
-                        warn!("safe-send: propose dropped — form not ready");
-                        return (Task::none(), None);
-                    };
-                    // Sign once with the first signable owner (Local or
-                    // hardware) and POST to the service for co-signers.
-                    let Some(owner_desc) = req
-                        .signable_indices
-                        .first()
-                        .and_then(|&idx| self.accounts.get(idx as usize).cloned())
-                    else {
-                        let _ = p.update(safe_send::Message::ProposeDone(Err(
-                            "no signable owner linked to this Safe".to_string(),
-                        )));
-                        return (Task::none(), None);
-                    };
-                    info!(
-                        chain = %req.chain.label(),
-                        safe = %req.safe_address,
-                        to = %req.to,
-                        value_wei = %req.value,
-                        "safe-send: spawning propose task",
-                    );
-                    p.mark_busy();
-                    return (
-                        spawn_safe_propose_task(self.network.clone(), owner_desc, req),
-                        None,
-                    );
-                }
-                let (task, outcome) = p.update(child_msg);
-                // After pumping the pane, check whether the recipient
-                // input now points at an ENS-shaped value that hasn't
-                // been dispatched yet. Same sequence-guarded pattern as
-                // the EOA Send pane.
-                let ens_task = match p.take_pending_ens() {
-                    Some((seq, name)) => {
-                        spawn_safe_send_ens_resolve_task(self.network.clone(), seq, name)
-                    }
-                    None => Task::none(),
-                };
-                // Likewise for the review-prep: entering review (or
-                // hitting Retry) arms a one-shot request to compute and
-                // on-chain-verify the safeTxHash the user will sign.
-                // The inner-call preflight rides the same trigger but
-                // doesn't depend on the pinned nonce, so it runs in
-                // parallel instead of blocking the hash pin.
-                let prepare_task = match p.take_pending_prepare() {
-                    Some((seq, req)) => Task::batch([
-                        spawn_safe_prepare_task(self.network.clone(), seq, req.clone()),
-                        spawn_safe_send_sim_task(self.network.clone(), seq, req, false),
-                    ]),
-                    None => Task::none(),
-                };
-                // Sim re-runs: the automatic verified-retry (delayed
-                // past the helios cooldown) and the manual Re-simulate
-                // button both arm this hook.
-                let sim_retry_task = match p.take_pending_sim_retry() {
-                    Some((seq, req, delayed)) => {
-                        spawn_safe_send_sim_task(self.network.clone(), seq, req, delayed)
-                    }
-                    None => Task::none(),
-                };
-                let task = task.map(Message::SafeSend);
-                match outcome {
-                    Some(safe_send::Outcome::Closed) => {
-                        self.modal = Modal::None;
-                        return (
-                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
-                            None,
-                        );
-                    }
-                    Some(safe_send::Outcome::CopyText(s)) => {
-                        let arm = self.arm_clipboard_clear(s);
-                        return (
-                            Task::batch([task, arm, ens_task, prepare_task, sim_retry_task]),
-                            None,
-                        );
-                    }
-                    Some(safe_send::Outcome::SaveAsContact { address, ens }) => {
-                        // Same path as the EOA Send pane's CTA: switch
-                        // nav to Settings → Contacts in Add mode
-                        // pre-filled. `OpenContactsPaneWith` also runs
-                        // the modal close animation, so the SafeSend
-                        // modal tears down on the next chrome tick.
-                        let open_task = Task::done(Message::OpenContactsPaneWith { address, ens });
-                        return (
-                            Task::batch([task, ens_task, prepare_task, sim_retry_task, open_task]),
-                            None,
-                        );
-                    }
-                    None => {
-                        return (
-                            Task::batch([task, ens_task, prepare_task, sim_retry_task]),
-                            None,
-                        );
-                    }
-                }
-            }
             Message::SafeSendBroadcastReturn(result) => {
-                if let Modal::SafeSend(p) = &mut self.modal {
+                if let Modal::Send(p) = &mut self.modal {
                     let success = result.is_ok();
                     match &result {
                         Ok(hash) => info!(hash = %format!("{hash:#x}"), "safe-send broadcast ok"),
                         Err(e) => warn!(error = %e, "safe-send broadcast failed"),
                     }
-                    let (task, _outcome) = p.update(safe_send::Message::BroadcastDone(result));
+                    let (task, _outcome) = p.update(send::Message::BroadcastDone(result));
                     let refresh = if success {
                         Task::batch([
                             self.refresh_verification_task(),
@@ -1905,17 +1859,17 @@ impl WalletScreen {
                     } else {
                         Task::none()
                     };
-                    return (Task::batch([task.map(Message::SafeSend), refresh]), None);
+                    return (Task::batch([task.map(Message::Send), refresh]), None);
                 }
             }
             Message::SafeSendProposeReturn(result) => {
-                if let Modal::SafeSend(p) = &mut self.modal {
+                if let Modal::Send(p) = &mut self.modal {
                     let success = result.is_ok();
                     match &result {
                         Ok(()) => info!("safe-send propose ok"),
                         Err(e) => warn!(error = %e, "safe-send propose failed"),
                     }
-                    let (task, _outcome) = p.update(safe_send::Message::ProposeDone(result));
+                    let (task, _outcome) = p.update(send::Message::ProposeDone(result));
                     // On success refresh the pending queue so the new
                     // proposal shows up the moment the user closes.
                     let refresh = if success {
@@ -1923,7 +1877,7 @@ impl WalletScreen {
                     } else {
                         Task::none()
                     };
-                    return (Task::batch([task.map(Message::SafeSend), refresh]), None);
+                    return (Task::batch([task.map(Message::Send), refresh]), None);
                 }
             }
             Message::OpenSafeTxDetails(idx) => {
@@ -2406,9 +2360,6 @@ impl WalletScreen {
             Modal::TxDetails(p) => {
                 subs.push(p.subscription().map(Message::TxDetails));
             }
-            Modal::SafeSend(p) => {
-                subs.push(p.subscription().map(Message::SafeSend));
-            }
             Modal::SafeTxDetail(p) => {
                 subs.push(p.subscription().map(Message::SafeTxDetail));
             }
@@ -2465,11 +2416,14 @@ impl WalletScreen {
         let modal_layer: Element<'_, Message> = match &self.modal {
             Modal::None => Space::new().width(0).height(0).into(),
             Modal::Send(p) => {
-                // EOA Send: exclude the active EOA from the picker
-                // so the user doesn't see themselves as a recipient.
-                // All Safes are valid destinations (deposit-to-Safe
-                // is a common flow).
-                let picker = self.recipient_picker(Some(self.active_index), None);
+                // Mode-aware picker: EOA excludes the active account;
+                // Safe excludes the active Safe but keeps all EOAs
+                // visible (withdraw-to-signer is a common flow).
+                let picker = if p.is_safe() {
+                    self.recipient_picker(None, self.active_safe)
+                } else {
+                    self.recipient_picker(Some(self.active_index), None)
+                };
                 p.view(t, &self.portfolio, picker, self.chrome.progress())
                     .map(Message::Send)
             }
@@ -2491,14 +2445,6 @@ impl WalletScreen {
                 };
                 p.view(t, self.chrome.progress(), &tx_book)
                     .map(Message::TxDetails)
-            }
-            Modal::SafeSend(p) => {
-                // Safe Send: exclude the active Safe from the picker.
-                // Own EOAs stay visible — withdrawing from a Safe back
-                // to a signing key is a normal flow.
-                let picker = self.recipient_picker(None, self.active_safe);
-                p.view(t, picker, &self.portfolio, self.chrome.progress())
-                    .map(Message::SafeSend)
             }
             Modal::SafeTxDetail(p) => p
                 .view(t, &self.portfolio, self.chrome.progress())
@@ -2802,28 +2748,6 @@ fn spawn_ens_resolve_task(
     )
 }
 
-/// Forward ENS resolve for the SafeSend modal's recipient input. Same
-/// shape as `spawn_ens_resolve_task`; differs only in the message
-/// constructor it routes the result through.
-fn spawn_safe_send_ens_resolve_task(
-    network: Arc<dyn BalanceFetcher>,
-    seq: u64,
-    name: String,
-) -> Task<Message> {
-    Task::perform(
-        async move {
-            let result = match network.provider(crate::chain::Chain::Mainnet).await {
-                Some(provider) => crate::ens::resolve_name(&provider, &name).await,
-                None => Err("no execution RPCs configured".to_string()),
-            };
-            (seq, name, result)
-        },
-        |(seq, name, result)| {
-            Message::SafeSend(safe_send::Message::EnsResolved { seq, name, result })
-        },
-    )
-}
-
 /// Forward ENS resolve for the Settings → Contacts add/edit form. Same
 /// shape as `spawn_ens_resolve_task`; differs only in the message
 /// constructor it routes the result through.
@@ -3019,8 +2943,8 @@ fn spawn_safe_prepare_task(
     req: SafeSendRequest,
 ) -> Task<Message> {
     use crate::safe::tx::{
-        Operation, SafeTxInput, build_safe_tx_with_nonce, current_safe_nonce,
-        ensure_signable_version, safe_domain, safe_tx_hash, verify_safe_tx_before_signing,
+        build_safe_tx_with_nonce, current_safe_nonce, ensure_signable_version, safe_domain,
+        safe_tx_hash, verify_safe_tx_before_signing,
     };
     let chain = req.chain;
     Task::perform(
@@ -3028,15 +2952,7 @@ fn spawn_safe_prepare_task(
             let result: Result<(u64, B256), String> = async {
                 ensure_signable_version(&req.version)?;
                 let nonce = current_safe_nonce(network.as_ref(), req.safe_address, chain).await?;
-                let tx = build_safe_tx_with_nonce(
-                    SafeTxInput {
-                        to: req.to,
-                        value: req.value,
-                        data: alloy::primitives::Bytes::new(),
-                        operation: Operation::Call,
-                    },
-                    nonce,
-                );
+                let tx = build_safe_tx_with_nonce(req.safe_tx_input(), nonce);
                 let domain = safe_domain(req.safe_address, chain);
                 let local = safe_tx_hash(&tx, &domain);
                 verify_safe_tx_before_signing(
@@ -3052,7 +2968,7 @@ fn spawn_safe_prepare_task(
             .await;
             (seq, result)
         },
-        |(seq, result)| Message::SafeSend(safe_send::Message::HashReady { seq, result }),
+        |(seq, result)| Message::Send(send::Message::HashReady { seq, result }),
     )
 }
 
@@ -3079,26 +2995,15 @@ fn spawn_safe_send_sim_task(
     req: SafeSendRequest,
     delayed: bool,
 ) -> Task<Message> {
-    use crate::safe::tx::{Operation, SafeTxInput, build_safe_tx_with_nonce};
+    use crate::safe::tx::build_safe_tx_with_nonce;
     let chain = req.chain;
     Task::perform(
         async move {
             if delayed {
                 tokio::time::sleep(sim_retry_delay()).await;
             }
-            // Safe-send v1 composes native ETH transfers only —
-            // operation 0, empty calldata, the same SafeTx shape the
-            // prepare task pins. Nonce 0 is fine: the inner sim only
-            // reads to/value/data.
-            let tx = build_safe_tx_with_nonce(
-                SafeTxInput {
-                    to: req.to,
-                    value: req.value,
-                    data: alloy::primitives::Bytes::new(),
-                    operation: Operation::Call,
-                },
-                0,
-            );
+            // Nonce 0 is fine: the inner sim only reads to/value/data.
+            let tx = build_safe_tx_with_nonce(req.safe_tx_input(), 0);
             let result =
                 match crate::safe::sim::simulate_safe_inner(network, req.safe_address, &tx, chain)
                     .await
@@ -3111,7 +3016,7 @@ fn spawn_safe_send_sim_task(
                 };
             (seq, result)
         },
-        |(seq, result)| Message::SafeSend(safe_send::Message::SimReady { seq, result }),
+        |(seq, result)| Message::Send(send::Message::SimReady { seq, result }),
     )
 }
 
@@ -3126,8 +3031,8 @@ async fn rebuild_reviewed_safe_tx(
     req: &SafeSendRequest,
 ) -> Result<(crate::safe::SafeTx, alloy::sol_types::Eip712Domain, B256), String> {
     use crate::safe::tx::{
-        Operation, SafeTxInput, build_safe_tx_with_nonce, current_safe_nonce,
-        ensure_signable_version, safe_domain, safe_tx_hash, verify_safe_tx_before_signing,
+        build_safe_tx_with_nonce, current_safe_nonce, ensure_signable_version, safe_domain,
+        safe_tx_hash, verify_safe_tx_before_signing,
     };
     ensure_signable_version(&req.version)?;
     let pinned = req
@@ -3140,15 +3045,7 @@ async fn rebuild_reviewed_safe_tx(
             pinned.nonce,
         ));
     }
-    let tx = build_safe_tx_with_nonce(
-        SafeTxInput {
-            to: req.to,
-            value: req.value,
-            data: alloy::primitives::Bytes::new(),
-            operation: Operation::Call,
-        },
-        pinned.nonce,
-    );
+    let tx = build_safe_tx_with_nonce(req.safe_tx_input(), pinned.nonce);
     let domain = safe_domain(req.safe_address, req.chain);
     let local_hash = safe_tx_hash(&tx, &domain);
     if local_hash != pinned.safe_tx_hash {
@@ -4222,16 +4119,18 @@ mod tests {
     // version) must abort BEFORE a signer is touched.
 
     use crate::net::CallMock;
+    use crate::wallet::tx::SendToken;
     use alloy::sol_types::{SolCall, SolValue};
 
-    fn reviewed_req(prepared: Option<safe_send::PreparedSafeTx>) -> safe_send::SafeSendRequest {
-        safe_send::SafeSendRequest {
+    fn reviewed_req(prepared: Option<send::PreparedSafeTx>) -> send::SafeSendRequest {
+        send::SafeSendRequest {
             safe_address: addr(0x5A),
             chain: Chain::Mainnet,
             version: "1.4.1".into(),
             service_base: crate::safe::service::DEFAULT_TX_SERVICE_BASE.into(),
-            to: addr(0xDD),
-            value: U256::from(1_000u64),
+            recipient: addr(0xDD),
+            amount_units: U256::from(1_000u64),
+            token: SendToken::Native,
             threshold: 1,
             linked_local_indices: vec![0],
             signable_indices: vec![0],
@@ -4242,19 +4141,9 @@ mod tests {
     /// The SafeTx `rebuild_reviewed_safe_tx` derives from `reviewed_req`
     /// at `nonce`, plus its local EIP-712 hash.
     fn expected_tx_and_hash(nonce: u64) -> (crate::safe::SafeTx, B256) {
-        use crate::safe::tx::{
-            Operation, SafeTxInput, build_safe_tx_with_nonce, safe_domain, safe_tx_hash,
-        };
+        use crate::safe::tx::{build_safe_tx_with_nonce, safe_domain, safe_tx_hash};
         let req = reviewed_req(None);
-        let tx = build_safe_tx_with_nonce(
-            SafeTxInput {
-                to: req.to,
-                value: req.value,
-                data: alloy::primitives::Bytes::new(),
-                operation: Operation::Call,
-            },
-            nonce,
-        );
+        let tx = build_safe_tx_with_nonce(req.safe_tx_input(), nonce);
         let hash = safe_tx_hash(&tx, &safe_domain(req.safe_address, req.chain));
         (tx, hash)
     }
@@ -4282,7 +4171,7 @@ mod tests {
         // Nothing planted on the mock: if the version guard didn't fire
         // first, the nonce read would fail with a different error.
         let mock = CallMock::new();
-        let mut req = reviewed_req(Some(safe_send::PreparedSafeTx {
+        let mut req = reviewed_req(Some(send::PreparedSafeTx {
             nonce: 7,
             safe_tx_hash: B256::repeat_byte(0xaa),
         }));
@@ -4296,7 +4185,7 @@ mod tests {
         // A co-signer executed something between review and click — the
         // live nonce is past the pin. Clear error, no signature.
         let mock = CallMock::new();
-        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+        let req = reviewed_req(Some(send::PreparedSafeTx {
             nonce: 7,
             safe_tx_hash: B256::repeat_byte(0xaa),
         }));
@@ -4311,7 +4200,7 @@ mod tests {
         // Pin carries the right nonce but a hash that doesn't match the
         // rebuilt tx (form/pin desync — a bug, but the invariant holds).
         let mock = CallMock::new();
-        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+        let req = reviewed_req(Some(send::PreparedSafeTx {
             nonce: 7,
             safe_tx_hash: B256::repeat_byte(0xaa), // not the real hash
         }));
@@ -4325,7 +4214,7 @@ mod tests {
         use crate::safe::tx::safe_domain;
         let mock = CallMock::new();
         let (tx, local_hash) = expected_tx_and_hash(7);
-        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+        let req = reviewed_req(Some(send::PreparedSafeTx {
             nonce: 7,
             safe_tx_hash: local_hash,
         }));
@@ -4375,7 +4264,7 @@ mod tests {
         // The on-chain cross-check must still veto.
         let mock = CallMock::new();
         let (tx, local_hash) = expected_tx_and_hash(7);
-        let req = reviewed_req(Some(safe_send::PreparedSafeTx {
+        let req = reviewed_req(Some(send::PreparedSafeTx {
             nonce: 7,
             safe_tx_hash: local_hash,
         }));

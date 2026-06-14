@@ -874,32 +874,6 @@ pub fn section_card<'a, M: 'a>(t: KaoTheme, title: &str, body: Element<'a, M>) -
     .into()
 }
 
-/// "Label …….. value" row used in the Send review step. `big` bumps the value
-/// font; `muted` greys it.
-pub fn review_row<'a, M: 'a>(
-    t: KaoTheme,
-    label: &str,
-    value: &str,
-    big: bool,
-    muted: bool,
-) -> Element<'a, M> {
-    let value_size = if big { 17 } else { 14 };
-    let value_color = if muted { t.sub } else { t.text };
-    let value_font = if big { mono_black() } else { mono_bold() };
-    row![
-        text(label.to_string()).size(13).color(t.sub),
-        Space::new().width(Length::Fill),
-        text(value.to_string())
-            .size(value_size)
-            .color(value_color)
-            .font(value_font),
-    ]
-    .align_y(Alignment::Center)
-    .padding(Padding::from([2, 0]))
-    .width(Length::Fill)
-    .into()
-}
-
 /// Themed card with an avatar + title/subtitle header and an arbitrary body.
 /// Used for settings sections and similar grouped panels.
 pub fn section<'a, M: 'a>(
