@@ -489,9 +489,9 @@ mod tests {
                 name: "Ethereum".into(),
                 contract: None,
                 decimals: 18,
-                balance_raw: alloy::primitives::U256::ZERO,
-                balance_f64: 0.0,
-                balance: "0".into(),
+                balance_raw: alloy::primitives::U256::from(1u8),
+                balance_f64: 0.000000000000000001,
+                balance: "0.0000".into(),
                 usd_price: Some(2000.0),
                 usd_value: Some(0.0),
                 logo_url: None,
@@ -533,6 +533,41 @@ mod tests {
         for tk in &live {
             assert_eq!(tk.chain, Chain::Mainnet);
         }
+    }
+
+    #[test]
+    fn into_live_tokens_drops_zero_balance_entries() {
+        let usdc: Address = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+            .parse()
+            .unwrap();
+        let tokens = vec![
+            IndexedToken {
+                symbol: "ETH".into(),
+                name: "Ethereum".into(),
+                contract: None,
+                decimals: 18,
+                balance_raw: alloy::primitives::U256::ZERO,
+                balance_f64: 0.0,
+                balance: "0".into(),
+                usd_price: Some(2000.0),
+                usd_value: Some(0.0),
+                logo_url: None,
+            },
+            IndexedToken {
+                symbol: "USDC".into(),
+                name: "USD Coin".into(),
+                contract: Some(usdc),
+                decimals: 6,
+                balance_raw: alloy::primitives::U256::ZERO,
+                balance_f64: 0.0,
+                balance: "0".into(),
+                usd_price: Some(1.0),
+                usd_value: Some(0.0),
+                logo_url: None,
+            },
+        ];
+        let live = into_live_tokens(Chain::Optimism, tokens);
+        assert!(live.is_empty(), "all zero-balance tokens must be filtered out");
     }
 
     #[test]
