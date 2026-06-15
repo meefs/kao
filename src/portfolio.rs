@@ -1030,19 +1030,28 @@ async fn fetch_portfolio_for_tokens(
     // ── Build LiveToken vec ────────────────────────────────────────────
     let mut tokens: Vec<LiveToken> = Vec::with_capacity(plans.len() + 1);
 
-    let (eth_bal_str, eth_bal_f64) = format_eth_balance(eth_balance_raw);
-    tokens.push(LiveToken {
-        symbol: "ETH".into(),
-        name: "Ethereum".into(),
-        balance: eth_bal_str,
-        balance_f64: eth_bal_f64,
-        balance_raw: eth_balance_raw,
-        decimals: 18,
-        contract: None,
-        usd_price: eth_usd,
-        usd_value: eth_bal_f64 * eth_usd,
-        chain,
-    });
+    let has_eth = !eth_balance_raw.is_zero();
+    if !has_eth {
+        debug!(
+            chain = %chain.label(),
+            "dropping zero-balance native ETH",
+        );
+    }
+    if has_eth {
+        let (eth_bal_str, eth_bal_f64) = format_eth_balance(eth_balance_raw);
+        tokens.push(LiveToken {
+            symbol: "ETH".into(),
+            name: "Ethereum".into(),
+            balance: eth_bal_str,
+            balance_f64: eth_bal_f64,
+            balance_raw: eth_balance_raw,
+            decimals: 18,
+            contract: None,
+            usd_price: eth_usd,
+            usd_value: eth_bal_f64 * eth_usd,
+            chain,
+        });
+    }
 
     for (token_idx, plan) in plans {
         let token = &token_list[token_idx];
@@ -1085,7 +1094,8 @@ async fn fetch_portfolio_for_tokens(
 
     // ETH first, then by USD value descending. Matches the per-chain
     // sort the dashboard relies on for stable row ordering.
-    tokens[1..].sort_by(|a, b| {
+    let erc20_start = if has_eth { 1 } else { 0 };
+    tokens[erc20_start..].sort_by(|a, b| {
         b.usd_value
             .partial_cmp(&a.usd_value)
             .unwrap_or(std::cmp::Ordering::Equal)

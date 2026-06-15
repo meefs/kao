@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, B256, U256};
 use async_trait::async_trait;
+use tracing::debug;
 
 use crate::chain::Chain;
 use crate::portfolio::{DiscoveredToken, LiveToken};
@@ -332,6 +333,18 @@ pub fn into_discovered_tokens(tokens: Vec<IndexedToken>) -> Vec<DiscoveredToken>
 pub fn into_live_tokens(chain: Chain, tokens: Vec<IndexedToken>) -> Vec<LiveToken> {
     tokens
         .into_iter()
+        .filter(|t| {
+            if t.balance_raw.is_zero() {
+                debug!(
+                    chain = %chain.label(),
+                    symbol = %t.symbol,
+                    "dropping zero-balance token from indexer",
+                );
+                false
+            } else {
+                true
+            }
+        })
         .map(|t| LiveToken {
             symbol: t.symbol,
             name: t.name,
