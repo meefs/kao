@@ -232,7 +232,6 @@ const TOAST_LIFETIME_SECS: u64 = 5;
 impl App {
     pub fn new() -> (Self, iced::Task<Message>) {
         crate::settings::load();
-        crate::net::refresh_auto_checkpoint();
         let network: Arc<dyn BalanceFetcher> = Arc::new(NetworkClient::new());
         let portfolio_cache = portfolio::new_cache();
 

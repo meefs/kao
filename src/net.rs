@@ -472,13 +472,22 @@ impl NetworkClient {
     /// sync) if needed. Rebuilds when the user's RPC endpoints have
     /// drifted from the last build.
     async fn get(&self, chain: Chain) -> Result<HeliosBackend, String> {
+        // Refresh the community-fallback checkpoint lazily, on the first
+        // Mainnet sync rather than at startup: kao makes no network calls
+        // until the user actively connects, and the checkpoint is only a
+        // bootstrap hint for Mainnet helios sync. `Once` keeps it to a
+        // single spawn per process.
+        if chain == Chain::Mainnet {
+            static REFRESH_CHECKPOINT: std::sync::Once = std::sync::Once::new();
+            REFRESH_CHECKPOINT.call_once(refresh_auto_checkpoint);
+        }
         let snapshot = current_snapshot(chain);
         let mut s = self.state_for(chain).lock().await;
 
         // Reuse the existing client when the *endpoints* match. The
         // checkpoint is deliberately excluded from the comparison: it's
         // only a bootstrap hint, and `refresh_auto_checkpoint` updates it
-        // asynchronously shortly after startup — tearing down an
+        // asynchronously on the first Mainnet sync — tearing down an
         // already-synced client over checkpoint drift would force a
         // pointless re-sync. A user-entered checkpoint override flows
         // through `invalidate()` (networks-pane save), which clears
