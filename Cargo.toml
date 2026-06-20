@@ -38,6 +38,15 @@ alloy-signer = { version = "2.0.1", features = ["eip712"] }
 alloy-signer-local = { version = "2.0.1", features = ["eip712"] }
 alloy-signer-ledger = { version = "2.0.1", features = ["eip712"] }
 clear-signing = { git = "https://github.com/kaowallet/clear-signing", features = ["bundled-registry"] }
+# rusb reaches us transitively via alloy-signer-ledger -> hidapi-rusb -> rusb.
+# Its default build dynamically links the host's libusb, baking an absolute
+# path (e.g. /opt/homebrew/opt/libusb/lib/libusb-1.0.0.dylib) into the binary —
+# so a build made on a machine with Homebrew libusb crashes at launch on any
+# clean Mac with "Library not loaded". We declare rusb here ONLY to flip on the
+# `vendored` feature, which compiles libusb from source and links it statically;
+# feature unification then applies it to the whole graph. Requires a C compiler
+# at build time (CI runners have one). Version tracks what alloy already resolves.
+rusb = { version = "0.9.4", features = ["vendored"] }
 async-trait = "0.1"
 # Helios's API is built against alloy 1.x; we need its BlockId type to call
 # eth_getBalance against the verified light-client. alloy 1.x and 2.x share

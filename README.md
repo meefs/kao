@@ -32,3 +32,17 @@ For too long we've been relying on slow and vulnerable JavaScript for building u
 - [ ] optional Revoke Cash integration
 - [ ] CoW Swap integration
 - [ ] Tor support
+
+# ⊹ ࣪ ˖ macOS: "Kao Wallet is damaged and can't be opened" ૮₍ ˶•⤙•˶ ₎ა
+
+It's not damaged ♡ — our builds just aren't signed with an Apple Developer ID
+(that requires a paid, KYC'd Apple account). macOS quarantines unsigned apps it
+didn't download itself and shows that scary message. Clear the quarantine flag:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Kao Wallet.app"
+```
+
+Then open it normally. (If it lives somewhere other than `/Applications`, point
+the path at wherever you put it. Still complaining? `xattr -cr "/Applications/Kao Wallet.app"`
+strips every extended attribute.)
