@@ -110,6 +110,7 @@ pub trait BalanceFetcher: Send + Sync + std::fmt::Debug {
     async fn balance(&self, addr: Address, chain: Chain) -> Result<String, String>;
     /// Drop every cached client across all chains. The next per-chain
     /// `balance` call rebuilds from settings.
+    #[allow(dead_code)]
     async fn invalidate(&self);
     /// Verification state of the most recent `balance` call on `chain`.
     /// Sync getter so the UI thread can read it without awaiting.

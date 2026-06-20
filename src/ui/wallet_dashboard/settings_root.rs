@@ -13,7 +13,7 @@ use super::Message;
 
 const SETTINGS_ROWS: &[(&str, &str, &str)] = &[
     ("Security", "(⌐■_■)", "Seed phrase · lock screen"),
-    ("Networks", "( ・∀・)ﾉ", "Mainnet · testnets · L2s"),
+    ("Networks", "( ・∀・)ﾉ", "RPC · API · proxy · privacy"),
     ("Safes", "(◐‿◐)", "Multisigs · transaction service"),
     ("Contacts", "(✿◠‿◠)", "Named addresses · saved recipients"),
     ("Notifications", "ヾ(＾∇＾)", "Price alerts · tx updates"),

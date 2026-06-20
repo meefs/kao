@@ -38,7 +38,6 @@ mod tx_details;
 
 use account_dropdown::AccountDropdown;
 use contacts_settings::ContactsPane;
-use networks::NetworksPane;
 use receive::ReceivePane;
 use safe_tx_detail::SafeTxDetailPane;
 use safes_settings::SafesPane;
@@ -72,6 +71,7 @@ use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::{fill_style, mono};
+use crate::ui::network_setup::{self, NetworkSetupScreen, WizardMode};
 use crate::wallet::sim::SimulationResult;
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
@@ -146,7 +146,9 @@ pub enum Message {
     TxDetails(tx_details::Message),
     Tick,
     OpenNetworksSettings,
+    #[allow(dead_code)]
     Networks(networks::Message),
+    NetworkWizard(network_setup::Message),
     OpenSafesSettings,
     SafesSettings(safes_settings::Message),
     OpenAppearanceSettings,
@@ -287,7 +289,7 @@ enum Modal {
 #[derive(Debug)]
 enum SettingsPane {
     Root,
-    Networks(NetworksPane),
+    NetworkWizard(NetworkSetupScreen),
     Safes(SafesPane),
     Appearance,
     Contacts(ContactsPane),
@@ -2205,7 +2207,7 @@ impl WalletScreen {
             }
             Message::OpenNetworksSettings => {
                 self.settings_pane =
-                    SettingsPane::Networks(NetworksPane::new(self.network.clone()));
+                    SettingsPane::NetworkWizard(NetworkSetupScreen::new(WizardMode::Settings));
             }
             Message::OpenSafesSettings => {
                 self.settings_pane = SettingsPane::Safes(SafesPane::new(self.safes.clone()));
@@ -2324,14 +2326,24 @@ impl WalletScreen {
             Message::CancelRename => {
                 self.rename_draft = None;
             }
-            Message::Networks(child_msg) => {
-                let SettingsPane::Networks(p) = &mut self.settings_pane else {
+            Message::Networks(_child_msg) => {
+                // Legacy Networks pane — routing removed; wizard handles
+                // network configuration now.
+            }
+            Message::NetworkWizard(child_msg) => {
+                let SettingsPane::NetworkWizard(p) = &mut self.settings_pane else {
                     return (Task::none(), None);
                 };
                 let (task, outcome) = p.update(child_msg);
-                let task = task.map(Message::Networks);
+                let task = task.map(Message::NetworkWizard);
                 match outcome {
-                    Some(networks::Outcome::Closed) => {
+                    Some(network_setup::Outcome::Completed)
+                    | Some(network_setup::Outcome::Closed) => {
+                        self.settings_pane = SettingsPane::Root;
+                        return (task, None);
+                    }
+                    Some(network_setup::Outcome::Back) => {
+                        // In settings mode, Back returns to root.
                         self.settings_pane = SettingsPane::Root;
                         return (task, None);
                     }
@@ -2366,7 +2378,9 @@ impl WalletScreen {
             Modal::None => {}
         }
         match &self.settings_pane {
-            SettingsPane::Networks(p) => subs.push(p.subscription().map(Message::Networks)),
+            SettingsPane::NetworkWizard(p) => {
+                subs.push(p.subscription().map(Message::NetworkWizard))
+            }
             SettingsPane::Contacts(p) => subs.push(p.subscription().map(Message::Contacts)),
             _ => {}
         }
@@ -2543,7 +2557,7 @@ impl WalletScreen {
             }
             Nav::Settings => match &self.settings_pane {
                 SettingsPane::Root => settings_root::view(t),
-                SettingsPane::Networks(p) => p.view(t).map(Message::Networks),
+                SettingsPane::NetworkWizard(p) => p.view().map(Message::NetworkWizard),
                 SettingsPane::Safes(p) => p.view(t).map(Message::SafesSettings),
                 SettingsPane::Appearance => appearance::view(t, self.theme_kind),
                 SettingsPane::Contacts(p) => p.view(t).map(Message::Contacts),

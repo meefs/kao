@@ -24,6 +24,10 @@ const DEFAULT_RPCS: &[&str] = &["https://eth.llamarpc.com"];
 /// the light-client bootstrap before any consensus signatures get verified.
 const DEFAULT_CONSENSUS_RPCS: &[&str] = &["https://ethereum-beacon-api.publicnode.com"];
 
+/// Default Kao privacy-proxy server. All Kao-proxied RPC and indexer
+/// queries are relayed through this endpoint.
+pub const DEFAULT_KAO_SERVER_URL: &str = "https://api.kaowallet.com";
+
 /// Hex hash of the built-in mainnet checkpoint shipped with the binary.
 /// Update at release time together with `BUILTIN_CHECKPOINT_PUBLISHED`.
 /// If older than `BUILTIN_FRESHNESS_DAYS`, the auto-resolver prefers a
@@ -76,6 +80,137 @@ impl IndexerProvider {
     }
 }
 
+/// Wizard-level RPC provider choice. Maps to per-chain URL generation
+/// and drives the privacy posture score. Persisted in `settings.toml`
+/// as a simple string key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RpcProvider {
+    /// Kao privacy proxy (placeholder until the proxy backend ships).
+    #[default]
+    Kao,
+    /// 1RPC relay — strips metadata before forwarding to the upstream.
+    OneRpc,
+    /// dRPC decentralized load-balancer — requires an API key.
+    Drpc,
+    /// Alchemy — fast, requires an API key.
+    Alchemy,
+    /// User-supplied URL(s).
+    Custom,
+}
+
+impl RpcProvider {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Kao => "kao",
+            Self::OneRpc => "1rpc",
+            Self::Drpc => "drpc",
+            Self::Alchemy => "alchemy",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "kao" => Some(Self::Kao),
+            "1rpc" => Some(Self::OneRpc),
+            "drpc" => Some(Self::Drpc),
+            "alchemy" => Some(Self::Alchemy),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+/// Wizard-level API/indexer provider choice (simplified from
+/// `IndexerProvider` — the wizard exposes fewer options).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApiProvider {
+    /// Kao privacy proxy for indexer queries.
+    #[default]
+    Kao,
+    /// Blockscout open-source explorer — optional custom URL + API key.
+    Blockscout,
+    /// dRPC Wallet API — requires a (paid) API key.
+    Drpc,
+    /// No indexer — slower, history limited to txs sent from Kao.
+    None,
+}
+
+impl ApiProvider {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Kao => "kao",
+            Self::Blockscout => "blockscout",
+            Self::Drpc => "drpc",
+            Self::None => "none",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "kao" => Some(Self::Kao),
+            "blockscout" => Some(Self::Blockscout),
+            "drpc" => Some(Self::Drpc),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+/// Safe Transaction Service endpoint choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SafeTxService {
+    /// Use the default Safe Transaction Service endpoints.
+    #[default]
+    Default,
+    /// User-supplied custom URL.
+    Custom,
+}
+
+impl SafeTxService {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "default" => Some(Self::Default),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+/// SOCKS proxy type for network tunneling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyType {
+    /// Tor/Whonix SOCKS5 proxy (typically 127.0.0.1:9050).
+    #[default]
+    Tor,
+    /// Custom SOCKS5 proxy address.
+    Socks,
+}
+
+impl ProxyType {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Tor => "tor",
+            Self::Socks => "socks",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "tor" => Some(Self::Tor),
+            "socks" => Some(Self::Socks),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct State {
     theme: ThemeKind,
@@ -103,6 +238,19 @@ struct State {
     /// to the public mainnet endpoint baked into the indexer.
     blockscout_base_url: Option<String>,
     blockscout_api_key: Option<String>,
+    // ── Wizard-level network config ──────────────────────────────────
+    /// Kao privacy-proxy base URL. Defaults to `DEFAULT_KAO_SERVER_URL`.
+    kao_server_url: String,
+    rpc_provider: RpcProvider,
+    rpc_key: Option<String>,
+    custom_rpc_url: Option<String>,
+    api_provider: ApiProvider,
+    api_key: Option<String>,
+    safe_tx_service: SafeTxService,
+    safe_tx_service_url: Option<String>,
+    proxy_enabled: bool,
+    proxy_type: ProxyType,
+    proxy_address: String,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -138,6 +286,17 @@ fn default_state() -> State {
         drpc_api_key: None,
         blockscout_base_url: None,
         blockscout_api_key: None,
+        kao_server_url: DEFAULT_KAO_SERVER_URL.to_string(),
+        rpc_provider: RpcProvider::default(),
+        rpc_key: None,
+        custom_rpc_url: None,
+        api_provider: ApiProvider::default(),
+        api_key: None,
+        safe_tx_service: SafeTxService::default(),
+        safe_tx_service_url: None,
+        proxy_enabled: false,
+        proxy_type: ProxyType::default(),
+        proxy_address: "127.0.0.1:9050".to_string(),
     }
 }
 
@@ -197,12 +356,35 @@ struct OnDisk {
     blockscout_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blockscout_api_key: Option<String>,
+    // ── Wizard-level network config ──────────────────────────────────
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kao_server_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rpc_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rpc_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_rpc_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    safe_tx_service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    safe_tx_service_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_address: Option<String>,
 }
 
 /// True iff `s` parses as an HTTPS URL. Non-HTTPS endpoints are dropped on
 /// load so a hand-edited `settings.toml` can't bypass the UI's HTTPS check
 /// and steer the wallet onto a MITM-able transport.
-fn is_https_url(s: &str) -> bool {
+pub fn is_https_url(s: &str) -> bool {
     url::Url::parse(s)
         .map(|u| u.scheme() == "https")
         .unwrap_or(false)
@@ -269,6 +451,82 @@ fn parse(text: &str) -> State {
         .blockscout_base_url
         .filter(|s| !s.is_empty() && is_https_url(s));
     state.blockscout_api_key = on_disk.blockscout_api_key.filter(|s| !s.is_empty());
+
+    // ── Wizard-level network config ──────────────────────────────────
+    if let Some(url) = on_disk.kao_server_url.as_deref()
+        && !url.is_empty()
+        && is_https_url(url)
+    {
+        state.kao_server_url = url.to_string();
+    }
+    if let Some(p) = on_disk.rpc_provider.as_deref()
+        && let Some(parsed) = RpcProvider::from_key(p)
+    {
+        state.rpc_provider = parsed;
+    } else {
+        // Backwards compat: infer provider from existing config.
+        if state.alchemy_api_key.is_some() {
+            state.rpc_provider = RpcProvider::Alchemy;
+        } else if state.drpc_api_key.is_some() {
+            state.rpc_provider = RpcProvider::Drpc;
+        }
+    }
+    state.rpc_key = on_disk.rpc_key.filter(|s| !s.is_empty());
+    // Backwards compat: if rpc_key is unset, populate from the legacy
+    // provider-specific key so the wizard shows the key the user already
+    // entered.
+    if state.rpc_key.is_none() {
+        match state.rpc_provider {
+            RpcProvider::Drpc => state.rpc_key = state.drpc_api_key.clone(),
+            RpcProvider::Alchemy => state.rpc_key = state.alchemy_api_key.clone(),
+            _ => {}
+        }
+    }
+    state.custom_rpc_url = on_disk.custom_rpc_url.filter(|s| !s.is_empty());
+
+    if let Some(p) = on_disk.api_provider.as_deref()
+        && let Some(parsed) = ApiProvider::from_key(p)
+    {
+        state.api_provider = parsed;
+    } else {
+        // Backwards compat: infer API provider from existing indexer config.
+        match state.indexer_provider {
+            IndexerProvider::Blockscout => state.api_provider = ApiProvider::Blockscout,
+            IndexerProvider::Drpc => state.api_provider = ApiProvider::Drpc,
+            IndexerProvider::None => state.api_provider = ApiProvider::None,
+            _ => {}
+        }
+    }
+    state.api_key = on_disk.api_key.filter(|s| !s.is_empty());
+    // Backwards compat: if api_key is unset, populate from the legacy
+    // drpc_api_key so the wizard shows the key the user already entered.
+    if state.api_key.is_none() && state.api_provider == ApiProvider::Drpc {
+        state.api_key = state.drpc_api_key.clone();
+    }
+
+    if let Some(p) = on_disk.safe_tx_service.as_deref()
+        && let Some(parsed) = SafeTxService::from_key(p)
+    {
+        state.safe_tx_service = parsed;
+    }
+    state.safe_tx_service_url = on_disk
+        .safe_tx_service_url
+        .filter(|s| !s.is_empty() && is_https_url(s));
+
+    if let Some(enabled) = on_disk.proxy_enabled {
+        state.proxy_enabled = enabled;
+    }
+    if let Some(p) = on_disk.proxy_type.as_deref()
+        && let Some(parsed) = ProxyType::from_key(p)
+    {
+        state.proxy_type = parsed;
+    }
+    if let Some(addr) = on_disk.proxy_address.as_deref()
+        && !addr.is_empty()
+    {
+        state.proxy_address = addr.to_string();
+    }
+
     state
 }
 
@@ -300,6 +558,33 @@ fn serialize(state: &State) -> String {
         drpc_api_key: state.drpc_api_key.clone(),
         blockscout_base_url: state.blockscout_base_url.clone(),
         blockscout_api_key: state.blockscout_api_key.clone(),
+        kao_server_url: if state.kao_server_url != DEFAULT_KAO_SERVER_URL {
+            Some(state.kao_server_url.clone())
+        } else {
+            None
+        },
+        rpc_provider: Some(state.rpc_provider.key().to_string()),
+        rpc_key: state.rpc_key.clone(),
+        custom_rpc_url: state.custom_rpc_url.clone(),
+        api_provider: Some(state.api_provider.key().to_string()),
+        api_key: state.api_key.clone(),
+        safe_tx_service: Some(state.safe_tx_service.key().to_string()),
+        safe_tx_service_url: state.safe_tx_service_url.clone(),
+        proxy_enabled: if state.proxy_enabled {
+            Some(true)
+        } else {
+            None
+        },
+        proxy_type: if state.proxy_enabled {
+            Some(state.proxy_type.key().to_string())
+        } else {
+            None
+        },
+        proxy_address: if state.proxy_enabled && state.proxy_address != "127.0.0.1:9050" {
+            Some(state.proxy_address.clone())
+        } else {
+            None
+        },
     };
     toml::to_string(&on_disk).expect("serializing settings cannot fail")
 }
@@ -313,15 +598,15 @@ pub fn set_theme(kind: ThemeKind) {
     write_all();
 }
 
-/// The built-in execution-RPC list for Mainnet. Exposed so the setup UI can
-/// show the user exactly which endpoints "use defaults" enrolls them in.
-pub fn default_rpcs() -> &'static [&'static str] {
+/// The built-in execution-RPC list for Mainnet.
+#[cfg(test)]
+fn default_rpcs() -> &'static [&'static str] {
     DEFAULT_RPCS
 }
 
-/// The built-in consensus (beacon-chain LC) RPC list for Mainnet. Mirrors
-/// `default_rpcs` so the setup flow can reset both lists in one go.
-pub fn default_consensus_rpcs() -> &'static [&'static str] {
+/// The built-in consensus (beacon-chain LC) RPC list for Mainnet.
+#[cfg(test)]
+fn default_consensus_rpcs() -> &'static [&'static str] {
     DEFAULT_CONSENSUS_RPCS
 }
 
@@ -449,6 +734,7 @@ pub fn etherscan_api_key() -> Option<String> {
         .clone()
 }
 
+#[allow(dead_code)]
 pub fn set_etherscan_api_key(value: Option<String>) {
     ensure()
         .lock()
@@ -522,6 +808,28 @@ pub fn set_blockscout_api_key(value: Option<String>) {
     write_all();
 }
 
+pub fn kao_server_url() -> String {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .kao_server_url
+        .clone()
+}
+
+pub fn set_kao_server_url(value: String) {
+    let url = value.trim().to_string();
+    let url = if url.is_empty() || !is_https_url(&url) {
+        DEFAULT_KAO_SERVER_URL.to_string()
+    } else {
+        url
+    };
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .kao_server_url = url;
+    write_all();
+}
+
 /// Resolved checkpoint (built-in or freshly fetched fallback) used when no
 /// user override is set. Mutated by `crate::net` on startup.
 pub fn auto_checkpoint() -> B256 {
@@ -537,6 +845,430 @@ pub fn set_auto_checkpoint(value: B256) {
         .expect("settings mutex poisoned")
         .auto_checkpoint = value;
     // Not persisted to disk: this value is rederived on each app start.
+}
+
+// ── Wizard-level getters/setters ─────────────────────────────────────────
+
+pub fn rpc_provider() -> RpcProvider {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .rpc_provider
+}
+
+pub fn set_rpc_provider(value: RpcProvider) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .rpc_provider = value;
+    write_all();
+}
+
+pub fn rpc_key() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .rpc_key
+        .clone()
+}
+
+pub fn set_rpc_key(value: Option<String>) {
+    ensure().lock().expect("settings mutex poisoned").rpc_key = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+pub fn custom_rpc_url() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .custom_rpc_url
+        .clone()
+}
+
+pub fn set_custom_rpc_url(value: Option<String>) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .custom_rpc_url = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+pub fn api_provider() -> ApiProvider {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .api_provider
+}
+
+pub fn set_api_provider(value: ApiProvider) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .api_provider = value;
+    write_all();
+}
+
+pub fn api_key() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .api_key
+        .clone()
+}
+
+pub fn set_api_key(value: Option<String>) {
+    ensure().lock().expect("settings mutex poisoned").api_key = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+pub fn safe_tx_service() -> SafeTxService {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .safe_tx_service
+}
+
+pub fn set_safe_tx_service(value: SafeTxService) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .safe_tx_service = value;
+    write_all();
+}
+
+pub fn safe_tx_service_url() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .safe_tx_service_url
+        .clone()
+}
+
+pub fn set_safe_tx_service_url(value: Option<String>) {
+    let cleaned = value.filter(|s| !s.is_empty() && is_https_url(s));
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .safe_tx_service_url = cleaned;
+    write_all();
+}
+
+pub fn proxy_enabled() -> bool {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .proxy_enabled
+}
+
+pub fn set_proxy_enabled(value: bool) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .proxy_enabled = value;
+    write_all();
+}
+
+pub fn proxy_type() -> ProxyType {
+    ensure().lock().expect("settings mutex poisoned").proxy_type
+}
+
+pub fn set_proxy_type(value: ProxyType) {
+    ensure().lock().expect("settings mutex poisoned").proxy_type = value;
+    write_all();
+}
+
+pub fn proxy_address() -> String {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .proxy_address
+        .clone()
+}
+
+pub fn set_proxy_address(value: String) {
+    let v = if value.is_empty() {
+        "127.0.0.1:9050".to_string()
+    } else {
+        value
+    };
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .proxy_address = v;
+    write_all();
+}
+
+// ── URL generation helpers ──────────────────────────────────────────────
+
+/// Build a per-chain map of Alchemy exec URLs from a single API key.
+pub fn alchemy_exec_urls(key: &str) -> PerChain<String> {
+    let mut out = PerChain::<String>::default();
+    out.set(
+        Chain::Mainnet,
+        format!("https://eth-mainnet.g.alchemy.com/v2/{key}"),
+    );
+    out.set(
+        Chain::Base,
+        format!("https://base-mainnet.g.alchemy.com/v2/{key}"),
+    );
+    out.set(
+        Chain::Optimism,
+        format!("https://opt-mainnet.g.alchemy.com/v2/{key}"),
+    );
+    out
+}
+
+/// Build a per-chain map of dRPC exec URLs from a single API key.
+pub fn drpc_exec_urls(key: &str) -> PerChain<String> {
+    let mut out = PerChain::<String>::default();
+    for chain in Chain::ALL {
+        let slug = match chain {
+            Chain::Mainnet => "ethereum",
+            Chain::Base => "base",
+            Chain::Optimism => "optimism",
+        };
+        out.set(chain, format!("https://lb.drpc.live/{slug}/{key}"));
+    }
+    out
+}
+
+/// Build per-chain Kao proxy RPC URLs from the server base URL.
+pub fn kao_exec_urls(base: &str) -> PerChain<String> {
+    let base = base.trim_end_matches('/');
+    let mut out = PerChain::<String>::default();
+    for chain in Chain::ALL {
+        let slug = match chain {
+            Chain::Mainnet => "ethereum",
+            Chain::Base => "base",
+            Chain::Optimism => "optimism",
+        };
+        out.set(chain, format!("{base}/rpc/{slug}"));
+    }
+    out
+}
+
+/// Per-chain consensus URL defaults.
+pub fn default_consensus_url_map() -> PerChain<String> {
+    let mut out = PerChain::<String>::default();
+    for chain in Chain::ALL {
+        out.set(chain, chain.default_consensus_url().to_string());
+    }
+    out
+}
+
+/// 1RPC relay endpoints — privacy-preserving relay that strips metadata
+/// before forwarding to an upstream provider. No API key required.
+fn one_rpc_exec_urls() -> PerChain<String> {
+    let mut out = PerChain::<String>::default();
+    out.set(Chain::Mainnet, "https://1rpc.io/eth".to_string());
+    out.set(Chain::Base, "https://1rpc.io/base".to_string());
+    out.set(Chain::Optimism, "https://1rpc.io/op".to_string());
+    out
+}
+
+/// Expand the wizard's RPC provider + key + custom URL into the low-level
+/// per-chain settings. Called at wizard finish to persist the provider
+/// choice into the existing `rpcs` / `consensus_rpcs` / API-key slots.
+pub fn apply_rpc_provider(provider: RpcProvider, key: &str, custom_url: &str) {
+    // Persist the wizard-level choice.
+    set_rpc_provider(provider);
+    set_rpc_key(if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    });
+    set_custom_rpc_url(if custom_url.is_empty() {
+        None
+    } else {
+        Some(custom_url.to_string())
+    });
+
+    // Generate per-chain URL lists.
+    let consensus = default_consensus_url_map();
+    match provider {
+        RpcProvider::Kao => {
+            let exec = kao_exec_urls(&kao_server_url());
+            for chain in Chain::ALL {
+                set_rpcs(chain, vec![exec.get(chain).clone()]);
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+        }
+        RpcProvider::OneRpc => {
+            let exec = one_rpc_exec_urls();
+            for chain in Chain::ALL {
+                set_rpcs(chain, vec![exec.get(chain).clone()]);
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+        }
+        RpcProvider::Drpc => {
+            let exec = drpc_exec_urls(key);
+            set_drpc_api_key(Some(key.to_string()));
+            for chain in Chain::ALL {
+                set_rpcs(chain, vec![exec.get(chain).clone()]);
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+        }
+        RpcProvider::Alchemy => {
+            let exec = alchemy_exec_urls(key);
+            set_alchemy_api_key(Some(key.to_string()));
+            for chain in Chain::ALL {
+                set_rpcs(chain, vec![exec.get(chain).clone()]);
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+        }
+        RpcProvider::Custom => {
+            if !custom_url.is_empty() {
+                set_rpcs(Chain::Mainnet, vec![custom_url.to_string()]);
+            }
+            // Seed L2 with defaults for consensus.
+            for chain in Chain::ALL {
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+            // L2 exec URLs default to each chain's built-in.
+            for chain in [Chain::Base, Chain::Optimism] {
+                set_rpcs(chain, vec![chain.default_exec_url().to_string()]);
+            }
+        }
+    }
+}
+
+/// Expand the wizard's API provider + key into the low-level indexer
+/// settings.
+pub fn apply_api_provider(provider: ApiProvider, key: &str) {
+    set_api_provider(provider);
+    set_api_key(if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    });
+
+    match provider {
+        ApiProvider::Kao => {
+            // Kao proxy routes through dRPC.
+            set_indexer_provider(IndexerProvider::Drpc);
+        }
+        ApiProvider::Blockscout => {
+            set_indexer_provider(IndexerProvider::Blockscout);
+        }
+        ApiProvider::Drpc => {
+            set_drpc_api_key(Some(key.to_string()));
+            set_indexer_provider(IndexerProvider::Drpc);
+        }
+        ApiProvider::None => {
+            set_indexer_provider(IndexerProvider::None);
+        }
+    }
+}
+
+/// Validate and normalize a custom RPC input. Accepts:
+/// - an explicit `https://` URL (kept as-is),
+/// - a bare hostname with optional `:port` and `/path` (wrapped as `https://`),
+/// - a bare IP address with optional `:port` and `/path` (wrapped as `http://`,
+///   since local nodes typically do not have TLS).
+///
+/// Explicit non-https schemes (`http://`, `ws://`, …) are rejected so users
+/// cannot downgrade themselves; if they want plain http they must type the
+/// host without a scheme and we will pick the right scheme automatically.
+pub fn parse_rpc_input(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.contains("://") {
+        let url = url::Url::parse(s).ok()?;
+        if url.scheme() != "https" {
+            return None;
+        }
+        let host = url.host_str()?;
+        if !is_plausible_host(host) {
+            return None;
+        }
+        return Some(s.to_string());
+    }
+    let (host_port, _) = s.find('/').map_or((s, ""), |i| (&s[..i], &s[i..]));
+    let host = match host_port.rsplit_once(':') {
+        Some((host, port)) => {
+            if port.parse::<u16>().is_err() {
+                return None;
+            }
+            host
+        }
+        None => host_port,
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() || host.eq_ignore_ascii_case("localhost") {
+        return Some(format!("http://{s}"));
+    }
+    if !is_plausible_host(host) {
+        return None;
+    }
+    Some(format!("https://{s}"))
+}
+
+/// A host is plausible if it's an IP, `localhost`, or a multi-label hostname.
+fn is_plausible_host(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if s.eq_ignore_ascii_case("localhost") || s.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if !s.contains('.') {
+        return false;
+    }
+    is_valid_hostname(s)
+}
+
+fn is_valid_hostname(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
+/// Pull an Alchemy API key out of an RPC URL like
+/// `https://eth-mainnet.g.alchemy.com/v2/{key}`.
+#[cfg(test)]
+fn extract_alchemy_key(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if !host.ends_with(".g.alchemy.com") {
+        return None;
+    }
+    let mut segs = parsed.path_segments()?;
+    if segs.next()? != "v2" {
+        return None;
+    }
+    let key = segs.next()?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.to_string())
+}
+
+/// Pull a dRPC API key out of an RPC URL like
+/// `https://lb.drpc.live/{chain}/{key}`.
+#[cfg(test)]
+fn extract_drpc_key(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if host != "lb.drpc.live" {
+        return None;
+    }
+    let mut segs = parsed.path_segments()?;
+    let _chain = segs.next()?;
+    let key = segs.next()?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.to_string())
 }
 
 /// True when the binary's built-in checkpoint is recent enough that we don't
@@ -757,6 +1489,7 @@ mod tests {
             drpc_api_key: Some("DRPC_TEST_KEY".into()),
             blockscout_base_url: Some("https://base.blockscout.com".into()),
             blockscout_api_key: Some("BLOCKSCOUT_TEST_KEY".into()),
+            ..default_state()
         };
         let serialized = serialize(&original);
         let parsed = parse(&serialized);
@@ -1044,17 +1777,11 @@ mod tests {
             vec!["https://c".into(), "https://d".into(), "https://e".into()],
         );
         let state = State {
-            theme: default_state().theme,
             rpcs,
             consensus_rpcs,
             checkpoint_override: None,
-            auto_checkpoint: default_state().auto_checkpoint,
             indexer_provider: IndexerProvider::Blockscout,
-            etherscan_api_key: None,
-            alchemy_api_key: None,
-            drpc_api_key: None,
-            blockscout_base_url: None,
-            blockscout_api_key: None,
+            ..default_state()
         };
         let text = serialize(&state);
         let reparsed: OnDisk = toml::from_str(&text).expect("output must be valid toml");
@@ -1075,5 +1802,187 @@ mod tests {
         );
         // Unset overrides are dropped from the output rather than emitted as "".
         assert!(reparsed.checkpoint_override.is_none());
+    }
+
+    // ── New wizard-level enum round-trip tests ──────────────────────
+
+    #[test]
+    fn rpc_provider_key_round_trip() {
+        for p in [
+            RpcProvider::Kao,
+            RpcProvider::OneRpc,
+            RpcProvider::Drpc,
+            RpcProvider::Alchemy,
+            RpcProvider::Custom,
+        ] {
+            assert_eq!(RpcProvider::from_key(p.key()), Some(p));
+        }
+        assert!(RpcProvider::from_key("bogus").is_none());
+    }
+
+    #[test]
+    fn api_provider_key_round_trip() {
+        for p in [
+            ApiProvider::Kao,
+            ApiProvider::Blockscout,
+            ApiProvider::Drpc,
+            ApiProvider::None,
+        ] {
+            assert_eq!(ApiProvider::from_key(p.key()), Some(p));
+        }
+        assert!(ApiProvider::from_key("bogus").is_none());
+    }
+
+    #[test]
+    fn safe_tx_service_key_round_trip() {
+        for p in [SafeTxService::Default, SafeTxService::Custom] {
+            assert_eq!(SafeTxService::from_key(p.key()), Some(p));
+        }
+        assert!(SafeTxService::from_key("bogus").is_none());
+    }
+
+    #[test]
+    fn proxy_type_key_round_trip() {
+        for p in [ProxyType::Tor, ProxyType::Socks] {
+            assert_eq!(ProxyType::from_key(p.key()), Some(p));
+        }
+        assert!(ProxyType::from_key("bogus").is_none());
+    }
+
+    #[test]
+    fn parse_rpc_input_accepts_bare_ip() {
+        assert_eq!(
+            parse_rpc_input("192.168.1.5"),
+            Some("http://192.168.1.5".into())
+        );
+    }
+
+    #[test]
+    fn parse_rpc_input_accepts_ip_with_port_and_path() {
+        assert_eq!(
+            parse_rpc_input("192.168.1.5:8545/rpc"),
+            Some("http://192.168.1.5:8545/rpc".into())
+        );
+    }
+
+    #[test]
+    fn parse_rpc_input_accepts_bare_hostname() {
+        assert_eq!(
+            parse_rpc_input("my-node.example"),
+            Some("https://my-node.example".into())
+        );
+    }
+
+    #[test]
+    fn parse_rpc_input_rejects_empty_and_invalid() {
+        assert_eq!(parse_rpc_input(""), None);
+        assert_eq!(parse_rpc_input("   "), None);
+        assert_eq!(parse_rpc_input("my-node.example:abc"), None);
+        assert_eq!(parse_rpc_input("--bad-label.example"), None);
+    }
+
+    #[test]
+    fn parse_rpc_input_rejects_single_label_hosts() {
+        assert_eq!(parse_rpc_input("https://d"), None);
+        assert_eq!(parse_rpc_input("d"), None);
+        assert_eq!(parse_rpc_input("asdf"), None);
+    }
+
+    #[test]
+    fn parse_rpc_input_accepts_localhost_as_http() {
+        assert_eq!(
+            parse_rpc_input("localhost"),
+            Some("http://localhost".into())
+        );
+        assert_eq!(
+            parse_rpc_input("localhost:8545"),
+            Some("http://localhost:8545".into())
+        );
+    }
+
+    #[test]
+    fn parse_rpc_input_rejects_http_url() {
+        assert_eq!(parse_rpc_input("http://my-node.example"), None);
+    }
+
+    #[test]
+    fn extract_alchemy_key_from_v2_url() {
+        assert_eq!(
+            extract_alchemy_key("https://eth-mainnet.g.alchemy.com/v2/abc123"),
+            Some("abc123".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_alchemy_key_rejects_other_hosts() {
+        assert_eq!(extract_alchemy_key("https://eth.llamarpc.com"), None);
+        assert_eq!(extract_alchemy_key("not-a-url"), None);
+    }
+
+    #[test]
+    fn extract_drpc_key_from_rpc_url() {
+        assert_eq!(
+            extract_drpc_key("https://lb.drpc.live/ethereum/abc123"),
+            Some("abc123".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_drpc_key_rejects_other_hosts() {
+        assert_eq!(extract_drpc_key("https://eth.drpc.org/"), None);
+        assert_eq!(extract_drpc_key("not-a-url"), None);
+    }
+
+    #[test]
+    fn alchemy_exec_urls_generates_all_chains() {
+        let urls = alchemy_exec_urls("testkey");
+        assert!(urls.get(Chain::Mainnet).contains("eth-mainnet"));
+        assert!(urls.get(Chain::Base).contains("base-mainnet"));
+        assert!(urls.get(Chain::Optimism).contains("opt-mainnet"));
+    }
+
+    #[test]
+    fn drpc_exec_urls_generates_all_chains() {
+        let urls = drpc_exec_urls("testkey");
+        assert!(urls.get(Chain::Mainnet).contains("ethereum"));
+        assert!(urls.get(Chain::Base).contains("base"));
+        assert!(urls.get(Chain::Optimism).contains("optimism"));
+    }
+
+    #[test]
+    fn backwards_compat_infers_alchemy_provider() {
+        let s = parse("alchemy_api_key = \"testkey\"\n");
+        assert_eq!(s.rpc_provider, RpcProvider::Alchemy);
+    }
+
+    #[test]
+    fn backwards_compat_infers_drpc_provider() {
+        let s = parse("drpc_api_key = \"testkey\"\n");
+        assert_eq!(s.rpc_provider, RpcProvider::Drpc);
+    }
+
+    #[test]
+    fn backwards_compat_defaults_to_kao_provider() {
+        let s = parse("");
+        assert_eq!(s.rpc_provider, RpcProvider::Kao);
+    }
+
+    #[test]
+    fn explicit_rpc_provider_overrides_inference() {
+        let s = parse("rpc_provider = \"1rpc\"\nalchemy_api_key = \"testkey\"\n");
+        assert_eq!(s.rpc_provider, RpcProvider::OneRpc);
+    }
+
+    #[test]
+    fn backwards_compat_infers_blockscout_api_provider() {
+        let s = parse("indexer_provider = \"blockscout\"\n");
+        assert_eq!(s.api_provider, ApiProvider::Blockscout);
+    }
+
+    #[test]
+    fn backwards_compat_infers_drpc_api_provider() {
+        let s = parse("indexer_provider = \"drpc\"\ndrpc_api_key = \"testkey\"\n");
+        assert_eq!(s.api_provider, ApiProvider::Drpc);
+        assert_eq!(s.api_key.as_deref(), Some("testkey"));
     }
 }

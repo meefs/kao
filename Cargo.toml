@@ -106,7 +106,7 @@ revm = { version = "29.0.1", default-features = false, features = [
     "optional_eip3607",
     "optional_no_base_fee",
 ] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

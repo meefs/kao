@@ -988,6 +988,168 @@ pub fn modal_wrapper<'a, M: Clone + 'a>(
     stack![backdrop, modal_layer].into()
 }
 
+// ── Wizard widgets ──────────────────────────────────────────────────────────
+
+/// Privacy badge variant — drives the colour and icon of the badge chip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeKind {
+    /// Green check — private, recommended.
+    Good,
+    /// Yellow/amber caution.
+    Caution,
+    /// Red/orange warning — leaks data.
+    Warning,
+    /// Neutral/informational.
+    Info,
+}
+
+/// Colored status chip with a prefix symbol and a short label. Used by the
+/// network wizard to annotate option cards with privacy posture hints.
+pub fn privacy_badge<'a, M: 'a>(t: KaoTheme, kind: BadgeKind, label: &str) -> Element<'a, M> {
+    let (prefix, fg, bg) = match kind {
+        BadgeKind::Good => ("\u{2713}", t.up, with_alpha(t.up, 0.12)),
+        BadgeKind::Caution => (
+            "!",
+            Color::from_rgb(0.85, 0.65, 0.0),
+            with_alpha(Color::from_rgb(0.85, 0.65, 0.0), 0.12),
+        ),
+        BadgeKind::Warning => ("!", t.down, with_alpha(t.down, 0.12)),
+        BadgeKind::Info => ("\u{2022}", t.sub, with_alpha(t.sub, 0.10)),
+    };
+    let label_owned = format!("{prefix} {label}");
+    container(text(label_owned).size(10).color(fg).font(mono_bold()))
+        .padding(Padding::from([2, 7]))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(bg)),
+            border: Border {
+                color: with_alpha(fg, 0.25),
+                width: 1.0,
+                radius: Radius::from(6),
+            },
+            text_color: Some(fg),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Toggle switch built from containers + mouse_area. Pill-shaped track with
+/// a positioned circle that snaps between off/on. `on_toggle` fires when the
+/// user clicks anywhere on the track.
+pub fn kao_toggle<'a, M: Clone + 'a>(t: KaoTheme, is_on: bool, on_toggle: M) -> Element<'a, M> {
+    let track_w: f32 = 44.0;
+    let track_h: f32 = 24.0;
+    let knob_size: f32 = 18.0;
+    let knob_pad: f32 = 3.0;
+
+    let (track_bg, knob_bg) = if is_on {
+        (t.a1, Color::WHITE)
+    } else {
+        (with_alpha(t.sub, 0.30), with_alpha(t.text, 0.7))
+    };
+
+    let knob = container(Space::new())
+        .width(Length::Fixed(knob_size))
+        .height(Length::Fixed(knob_size))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(knob_bg)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(knob_size / 2.0),
+            },
+            ..container::Style::default()
+        });
+
+    // Position the knob left (off) or right (on) inside the track.
+    let left_pad = if is_on {
+        track_w - knob_size - knob_pad
+    } else {
+        knob_pad
+    };
+
+    let track = container(container(knob).padding(Padding {
+        top: knob_pad,
+        right: 0.0,
+        bottom: 0.0,
+        left: left_pad,
+    }))
+    .width(Length::Fixed(track_w))
+    .height(Length::Fixed(track_h))
+    .style(move |_| container::Style {
+        background: Some(Background::Color(track_bg)),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(track_h / 2.0),
+        },
+        ..container::Style::default()
+    });
+
+    mouse_area(track)
+        .on_press(on_toggle)
+        .interaction(iced::mouse::Interaction::Pointer)
+        .into()
+}
+
+/// Colored fill bar for the privacy posture meter. `fraction` is 0.0–1.0.
+/// Outer container (track) with inner container (fill) at variable width.
+pub fn progress_bar<'a, M: 'a>(t: KaoTheme, fraction: f32, fill_color: Color) -> Element<'a, M> {
+    let bar_h: f32 = 8.0;
+    let fraction = fraction.clamp(0.0, 1.0);
+    let track_bg = with_alpha(t.sub, 0.15);
+
+    // The fill is a nested container whose width is set relative to parent
+    // via Length::FillPortion. We use a two-column row trick: fill gets
+    // `portion` parts, remainder gets `(100 - portion)` parts.
+    let portion = (fraction * 100.0).round() as u16;
+    let remainder = 100u16.saturating_sub(portion);
+
+    let fill: Element<'a, M> = container(Space::new())
+        .width(Length::FillPortion(portion.max(1)))
+        .height(Length::Fixed(bar_h))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(fill_color)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(bar_h / 2.0),
+            },
+            ..container::Style::default()
+        })
+        .into();
+
+    let empty: Element<'a, M> = Space::new()
+        .width(Length::FillPortion(if remainder == 0 {
+            1
+        } else {
+            remainder
+        }))
+        .height(bar_h)
+        .into();
+
+    let inner: Element<'a, M> = if portion >= 100 {
+        row![fill].width(Length::Fill).into()
+    } else if portion == 0 {
+        row![empty].width(Length::Fill).into()
+    } else {
+        row![fill, empty].width(Length::Fill).into()
+    };
+
+    container(inner)
+        .width(Length::Fill)
+        .height(Length::Fixed(bar_h))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(track_bg)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(bar_h / 2.0),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 // ── Kaomoji palettes ───────────────────────────────────────────────────────
 
 /// Stable kaomoji for asset/portfolio rows; cycles after 7 entries.
