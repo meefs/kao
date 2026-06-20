@@ -40,12 +40,24 @@ pub fn main() -> iced::Result {
     // next launch, not mid-session.
     settings::load();
     if settings::proxy_enabled() {
-        let addr = settings::proxy_address();
-        let addr = addr.trim();
-        if !addr.is_empty() {
-            proxy_env::set_all_proxy(&format!("socks5h://{addr}"));
-            tracing::info!("routing all outbound traffic through the configured SOCKS5 proxy");
-        }
+        let stored = settings::proxy_address();
+        let stored = stored.trim();
+        // Defence in depth: `load()` reads the address straight from disk
+        // without going through `set_proxy_address`, so a hand-edited config
+        // could carry a malformed value. Never install an invalid proxy URL —
+        // reqwest would silently ignore it and connect directly, leaking the
+        // real IP. Fall back to the Tor default, which fails closed if Tor
+        // isn't running.
+        let addr = if settings::valid_proxy_address(stored) {
+            stored.to_string()
+        } else {
+            tracing::warn!(
+                "configured proxy address is invalid; falling back to the default to avoid a direct connection"
+            );
+            "127.0.0.1:9050".to_string()
+        };
+        proxy_env::set_all_proxy(&format!("socks5h://{addr}"));
+        tracing::info!("routing all outbound traffic through the configured SOCKS5 proxy");
     }
 
     iced::application(App::new, App::update, App::view)

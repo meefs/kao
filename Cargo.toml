@@ -112,6 +112,12 @@ revm = { version = "29.0.1", default-features = false, features = [
     "optional_no_base_fee",
 ] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
+# `http::Uri` is the exact parser reqwest/hyper-util use for the `ALL_PROXY`
+# value, so we reuse it to validate a user's proxy address before storing it —
+# rejecting anything that would make reqwest silently ignore the proxy and
+# connect directly (see `settings::valid_proxy_address`). The same http 1.x
+# reqwest already depends on, so nothing new enters the tree.
+http = "1"
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -145,10 +151,9 @@ keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust",
 
 [dev-dependencies]
 tempfile = "3"
-# Only for synthesizing `reqwest::Response`s in `safe::service` tests
-# (via reqwest's `From<http::Response<T>>`) — the same http 1.x that
-# reqwest already depends on, so nothing new enters the tree.
-http = "1"
+# `http` (used in `safe::service` tests to synthesize `reqwest::Response`s via
+# reqwest's `From<http::Response<T>>`) is a regular dependency now — see the
+# `[dependencies]` entry.
 
 # Workarounds for two upstream-broken transitive deps pulled in by
 # helios-opstack. Drop both entries the moment the upstreams ship fixes

@@ -517,11 +517,11 @@ impl NetworkSetupScreen {
                 _ => true,
             },
             WizardStep::Proxy => {
-                if self.draft.proxy_enabled {
-                    !self.draft.proxy_address.trim().is_empty()
-                } else {
-                    true
-                }
+                // A malformed address would make reqwest silently ignore the
+                // proxy and connect directly, leaking the real IP — so block
+                // advancing until it's a valid `host:port`.
+                !self.draft.proxy_enabled
+                    || settings::valid_proxy_address(self.draft.proxy_address.trim())
             }
             WizardStep::Consensus => {
                 for chain in Chain::ALL {
@@ -1475,7 +1475,18 @@ impl NetworkSetupScreen {
                     .size(13)
                     .font(mono())
                     .style(move |_theme, status| text_input_style(t, status));
-                Some(input.into())
+                let mut body = column![input].spacing(6);
+                // Surface the fail-open risk as a visible error: an
+                // authority-illegal address would otherwise be silently
+                // ignored by reqwest and connect directly.
+                let addr = self.draft.proxy_address.trim();
+                if !addr.is_empty() && !settings::valid_proxy_address(addr) {
+                    body = body.push(error_text(
+                        t,
+                        "Enter a valid host:port (e.g. 127.0.0.1:1080) — no spaces or special characters.",
+                    ));
+                }
+                Some(body.into())
             } else {
                 None
             };

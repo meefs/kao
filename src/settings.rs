@@ -978,16 +978,43 @@ pub fn proxy_address() -> String {
 }
 
 pub fn set_proxy_address(value: String) {
-    let v = if value.is_empty() {
-        "127.0.0.1:9050".to_string()
+    // Fall back to the Tor default for an empty or malformed address. The
+    // wallet installs the proxy as `socks5h://{addr}` in `ALL_PROXY`, and
+    // reqwest *silently ignores* a value it can't parse — connecting directly
+    // and leaking the user's real IP. So a value that wouldn't yield a valid
+    // proxy URI must never be persisted; the Tor default fails closed if Tor
+    // isn't running, rather than fail open.
+    let trimmed = value.trim();
+    let v = if valid_proxy_address(trimmed) {
+        trimmed.to_string()
     } else {
-        value
+        "127.0.0.1:9050".to_string()
     };
     ensure()
         .lock()
         .expect("settings mutex poisoned")
         .proxy_address = v;
     write_all();
+}
+
+/// True when `addr` is a well-formed `host:port` that reqwest will accept as a
+/// proxy. The wallet installs the proxy as `socks5h://{addr}`, and reqwest /
+/// hyper-util parse that value via [`http::Uri`], silently ignoring it (and
+/// connecting *directly*) if it doesn't parse. We mirror that exact parser so
+/// an authority-illegal value (spaces, non-ASCII, missing host, missing or
+/// out-of-range port, trailing path) is rejected at input time instead of
+/// turning into a silent direct connection that deanonymizes the user.
+pub fn valid_proxy_address(addr: &str) -> bool {
+    let addr = addr.trim();
+    let Ok(uri) = format!("socks5h://{addr}").parse::<http::Uri>() else {
+        return false;
+    };
+    match uri.authority() {
+        // The whole input must be exactly the authority — `host:port` with an
+        // explicit, in-range port and no path/query/trailing junk.
+        Some(auth) => auth.as_str() == addr && auth.port_u16().is_some(),
+        None => false,
+    }
 }
 
 // ── URL generation helpers ──────────────────────────────────────────────
@@ -1514,6 +1541,36 @@ mod tests {
         assert!(!is_https_url("ftp://example.com"));
         assert!(!is_https_url(""));
         assert!(!is_https_url("not a url"));
+    }
+
+    #[test]
+    fn valid_proxy_address_accepts_host_port_forms() {
+        assert!(valid_proxy_address("127.0.0.1:9050")); // Tor default
+        assert!(valid_proxy_address("127.0.0.1:1080"));
+        assert!(valid_proxy_address("proxy.example.com:1080")); // hostname
+        assert!(valid_proxy_address("[::1]:9050")); // bracketed IPv6
+        assert!(valid_proxy_address("  127.0.0.1:9050  ")); // trimmed
+    }
+
+    #[test]
+    fn valid_proxy_address_rejects_fail_open_inputs() {
+        // The security-critical cases: authority-illegal values that reqwest
+        // would silently ignore (→ direct connection / IP leak) rather than
+        // proxy. These MUST be rejected at input time.
+        assert!(!valid_proxy_address("127.0.0.1:90 50")); // inner space
+        assert!(!valid_proxy_address("тор:9050")); // non-ASCII host
+        assert!(!valid_proxy_address("proxy host:1080")); // inner space in host
+    }
+
+    #[test]
+    fn valid_proxy_address_rejects_malformed_host_port() {
+        assert!(!valid_proxy_address("")); // empty
+        assert!(!valid_proxy_address("127.0.0.1")); // no port
+        assert!(!valid_proxy_address("127.0.0.1:")); // empty port
+        assert!(!valid_proxy_address("127.0.0.1:abc")); // non-numeric port
+        assert!(!valid_proxy_address("127.0.0.1:99999")); // out-of-range port
+        assert!(!valid_proxy_address("127.0.0.1:9050/path")); // trailing path
+        assert!(!valid_proxy_address("socks5://127.0.0.1:9050")); // includes scheme
     }
 
     #[test]
