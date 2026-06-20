@@ -25,7 +25,7 @@ use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     BadgeKind, auth_background, black, bold, error_text, kao_scrollable_style, kao_text,
     kao_toggle, link_button, mono, mono_bold, primary_button, privacy_badge, progress_bar,
-    text_input_style, vspace,
+    small_secondary_button, text_input_style, vspace,
 };
 
 // ── Input IDs for focus management ──────────────────────────────────────────
@@ -211,6 +211,10 @@ pub enum Message {
     ProxyAddressInput(String),
     ConsensusRpcInput(Chain, String),
     CheckpointInput(String),
+    /// Fetch a fresh mainnet checkpoint through the draft's proxy.
+    RefreshCheckpoint,
+    /// Result of an in-flight checkpoint refresh.
+    CheckpointFetched(Result<B256, String>),
     MostPrivatePreset,
     Continue,
     Back,
@@ -233,6 +237,8 @@ pub struct NetworkSetupScreen {
     step: WizardStep,
     draft: WizardDraft,
     error: Option<String>,
+    /// True while a checkpoint refresh is in flight (Consensus step).
+    checkpoint_fetching: bool,
 }
 
 impl NetworkSetupScreen {
@@ -276,6 +282,7 @@ impl NetworkSetupScreen {
             step: WizardStep::Rpc,
             draft,
             error: None,
+            checkpoint_fetching: false,
         }
     }
 
@@ -355,6 +362,32 @@ impl NetworkSetupScreen {
                 self.draft.checkpoint_override = s;
                 (Task::none(), None)
             }
+            Message::RefreshCheckpoint => {
+                if self.checkpoint_fetching {
+                    return (Task::none(), None);
+                }
+                self.checkpoint_fetching = true;
+                self.error = None;
+                (
+                    Task::perform(
+                        crate::net::fetch_latest_checkpoint(self.draft_proxy()),
+                        Message::CheckpointFetched,
+                    ),
+                    None,
+                )
+            }
+            Message::CheckpointFetched(result) => {
+                self.checkpoint_fetching = false;
+                match result {
+                    Ok(cp) => {
+                        self.draft.checkpoint_override =
+                            format!("0x{}", alloy::hex::encode(cp.as_slice()));
+                        self.error = None;
+                    }
+                    Err(e) => self.error = Some(format!("Checkpoint refresh failed: {e}")),
+                }
+                (Task::none(), None)
+            }
             Message::MostPrivatePreset => {
                 self.draft.rpc_provider = RpcProvider::Kao;
                 self.draft.rpc_key.clear();
@@ -402,8 +435,11 @@ impl NetworkSetupScreen {
         match key {
             keyboard::Key::Named(keyboard::key::Named::Enter) => {
                 if self.step == WizardStep::Review {
-                    self.apply_draft();
-                    return (Task::none(), Some(Outcome::Completed));
+                    if self.can_advance() {
+                        self.apply_draft();
+                        return (Task::none(), Some(Outcome::Completed));
+                    }
+                    return (Task::none(), None);
                 }
                 if self.can_advance() {
                     self.error = None;
@@ -427,10 +463,29 @@ impl NetworkSetupScreen {
         }
     }
 
+    /// The SOCKS5 proxy address to route a checkpoint refresh through, taken
+    /// from the wizard's **draft** rather than persisted settings — during
+    /// onboarding the proxy isn't applied until Finish, so reading settings
+    /// would ignore the proxy the user is configuring right now. `None` means
+    /// connect directly.
+    fn draft_proxy(&self) -> Option<String> {
+        self.draft
+            .proxy_enabled
+            .then(|| self.draft.proxy_address.trim().to_string())
+    }
+
     // ── Validation ──────────────────────────────────────────────────────
 
     fn can_advance(&self) -> bool {
-        match self.step {
+        self.step_valid(self.step)
+    }
+
+    /// Validate a single step's draft. The rail lets the user jump to any
+    /// step (including Review) via `GoToStep`, bypassing the linear
+    /// `Continue` gate — so Review re-checks every step rather than trusting
+    /// that prior steps were passed in order.
+    fn step_valid(&self, step: WizardStep) -> bool {
+        match step {
             WizardStep::Rpc => match self.draft.rpc_provider {
                 RpcProvider::Kao => settings::is_https_url(self.draft.kao_server_url.trim()),
                 RpcProvider::Alchemy => !self.draft.rpc_key.trim().is_empty(),
@@ -479,7 +534,7 @@ impl NetworkSetupScreen {
                 let cp = self.draft.checkpoint_override.trim();
                 cp.is_empty() || B256::from_str(cp).is_ok()
             }
-            WizardStep::Review => true,
+            WizardStep::Review => WizardStep::ALL.iter().all(|s| self.step_valid(*s)),
         }
     }
 
@@ -1440,7 +1495,16 @@ impl NetworkSetupScreen {
                 .push(vspace(12))
                 .push(tor_card)
                 .push(vspace(8))
-                .push(socks_card);
+                .push(socks_card)
+                .push(vspace(10))
+                .push(
+                    text(
+                        "Applies on next launch — restart Kao after finishing setup for the \
+                         proxy to take effect for all traffic.",
+                    )
+                    .size(11)
+                    .color(t.sub),
+                );
         }
 
         content.into()
@@ -1507,6 +1571,30 @@ impl NetworkSetupScreen {
             .font(mono())
             .style(move |_theme, status| text_input_style(t, status));
 
+        let refresh_label = if self.checkpoint_fetching {
+            "Fetching…"
+        } else {
+            "Refresh"
+        };
+        let mut refresh_btn = small_secondary_button(t, refresh_label);
+        if !self.checkpoint_fetching {
+            refresh_btn = refresh_btn.on_press(Message::RefreshCheckpoint);
+        }
+
+        let input_row = row![
+            container(checkpoint_input).width(Length::Fill),
+            Space::new().width(8),
+            refresh_btn,
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+
+        let refresh_hint = if self.draft.proxy_enabled {
+            "Refresh fetches the latest community checkpoint through your proxy."
+        } else {
+            "Refresh fetches the latest community checkpoint over a direct connection."
+        };
+
         let checkpoint_section = container(
             column![
                 text("Checkpoint Override")
@@ -1518,7 +1606,9 @@ impl NetworkSetupScreen {
                     .size(12)
                     .color(t.sub),
                 vspace(12),
-                checkpoint_input,
+                input_row,
+                vspace(6),
+                text(refresh_hint).size(11).color(t.sub),
             ]
             .width(Length::Fill),
         )
@@ -1848,5 +1938,97 @@ impl NetworkSetupScreen {
 
     pub fn subscription(&self) -> Subscription<Message> {
         keyboard::listen().map(Message::KeyboardEvent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Selecting the custom Safe TX Service with an empty URL must not let
+    /// the wizard finish, even when the user jumps straight to Review via the
+    /// rail (which bypasses the linear `Continue` gate).
+    #[test]
+    fn empty_custom_safe_tx_url_blocks_review() {
+        let mut s = NetworkSetupScreen::new(WizardMode::Onboarding);
+        let _ = s.update(Message::SetSafeTxService(SafeTxService::Custom));
+
+        // Jump past the SafeTx step's own gate straight to Review.
+        let _ = s.update(Message::GoToStep(WizardStep::Review));
+        assert!(
+            !s.can_advance(),
+            "empty custom URL should leave Review un-finishable"
+        );
+
+        // A whitespace-only URL is just as empty.
+        let _ = s.update(Message::SafeTxServiceUrlInput("   ".to_string()));
+        assert!(!s.can_advance());
+
+        // A non-HTTPS URL is rejected too.
+        let _ = s.update(Message::SafeTxServiceUrlInput(
+            "http://safe.example".to_string(),
+        ));
+        assert!(!s.can_advance());
+
+        // A valid HTTPS URL unblocks finishing.
+        let _ = s.update(Message::SafeTxServiceUrlInput(
+            "https://safe-tx.example.com".to_string(),
+        ));
+        assert!(s.can_advance());
+    }
+
+    /// A successful refresh overwrites whatever was in the override field
+    /// with the fetched root, as `0x…` hex that round-trips back to the same
+    /// `B256`, clears the in-flight flag, and leaves the Consensus step valid.
+    #[test]
+    fn checkpoint_refresh_success_populates_override() {
+        let mut s = NetworkSetupScreen::new(WizardMode::Onboarding);
+        // A stale value already sitting in the field — refresh must replace it.
+        let _ = s.update(Message::CheckpointInput("0xdeadbeef".to_string()));
+
+        let _ = s.update(Message::RefreshCheckpoint);
+        assert!(s.checkpoint_fetching, "refresh should mark fetch in flight");
+
+        let root = B256::repeat_byte(0xab);
+        let _ = s.update(Message::CheckpointFetched(Ok(root)));
+        assert!(!s.checkpoint_fetching);
+        assert!(s.error.is_none());
+        // The override is the fetched root, and it parses back to that root.
+        assert_eq!(
+            B256::from_str(s.draft.checkpoint_override.trim_start_matches("0x")).unwrap(),
+            root,
+        );
+        // A fetched root is a valid 32-byte hash, so the step stays valid.
+        let _ = s.update(Message::GoToStep(WizardStep::Consensus));
+        assert!(s.can_advance());
+    }
+
+    /// A failed refresh clears the in-flight flag and surfaces an error
+    /// without touching the override field.
+    #[test]
+    fn checkpoint_refresh_failure_surfaces_error() {
+        let mut s = NetworkSetupScreen::new(WizardMode::Onboarding);
+        let _ = s.update(Message::RefreshCheckpoint);
+        let _ = s.update(Message::CheckpointFetched(Err("tor down".to_string())));
+        assert!(!s.checkpoint_fetching);
+        assert!(s.draft.checkpoint_override.is_empty());
+        assert!(s.error.as_deref().unwrap_or_default().contains("tor down"));
+    }
+
+    /// The checkpoint fetch routes through the *draft* proxy (what the user is
+    /// configuring), not persisted settings, and only when the proxy is
+    /// enabled. The address is trimmed.
+    #[test]
+    fn draft_proxy_reflects_draft_not_settings() {
+        let mut s = NetworkSetupScreen::new(WizardMode::Onboarding);
+
+        // Disabled by default → connect directly.
+        assert_eq!(s.draft_proxy(), None);
+
+        // Enable + a padded custom address → Some(trimmed).
+        let _ = s.update(Message::ToggleProxy);
+        let _ = s.update(Message::SetProxyType(ProxyType::Socks));
+        let _ = s.update(Message::ProxyAddressInput("  1.2.3.4:1080  ".to_string()));
+        assert_eq!(s.draft_proxy().as_deref(), Some("1.2.3.4:1080"));
     }
 }

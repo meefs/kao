@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::B256;
 use serde::{Deserialize, Serialize};
@@ -28,19 +27,17 @@ const DEFAULT_CONSENSUS_RPCS: &[&str] = &["https://ethereum-beacon-api.publicnod
 /// queries are relayed through this endpoint.
 pub const DEFAULT_KAO_SERVER_URL: &str = "https://api.kaowallet.com";
 
-/// Hex hash of the built-in mainnet checkpoint shipped with the binary.
-/// Update at release time together with `BUILTIN_CHECKPOINT_PUBLISHED`.
-/// If older than `BUILTIN_FRESHNESS_DAYS`, the auto-resolver prefers a
-/// freshly fetched community fallback (see `crate::net::refresh_auto_checkpoint`).
+/// Hex hash of the built-in mainnet checkpoint shipped with the binary, used
+/// to bootstrap Mainnet helios sync when the user has set no override.
 ///
 /// IMPORTANT: this must be a finalized beacon block root from a sync-committee
 /// period that public LC servers still index — they prune older periods (~27h
 /// rotation), so a checkpoint that's more than a day or two stale will fail
-/// every bootstrap call.
+/// every bootstrap call. There is no automatic refresh: if it goes stale the
+/// user resolves a fresh one via the network setup wizard's manual refresh
+/// button (stored as `checkpoint_override`). Bump this at release time.
 pub const BUILTIN_CHECKPOINT: &str =
     "0x56d275d9bdf4afb040ecbbba7da0dff9ed384b062c321d5f2b9a4a4f0eb83b4d";
-pub const BUILTIN_CHECKPOINT_PUBLISHED: u64 = 1777188238;
-pub const BUILTIN_FRESHNESS_DAYS: u64 = 14;
 
 /// Third-party indexer used for transaction history and unverified balance
 /// fan-outs. Helios verification of native ETH stays in `crate::net`; this
@@ -319,8 +316,9 @@ pub fn load() {
 
 /// On-disk TOML schema. All fields are optional so a partial or older config
 /// file falls back to defaults per-key rather than failing the whole load.
-/// `auto_checkpoint` is intentionally absent — it's rederived on each app
-/// start from the network and never persisted.
+/// `auto_checkpoint` is intentionally absent — it's the binary's built-in
+/// `BUILTIN_CHECKPOINT` and never persisted; a user-resolved checkpoint is
+/// stored under `checkpoint_override` instead.
 ///
 /// Per-chain RPC keys: `rpcs` / `consensus_rpcs` carry Mainnet (kept under
 /// these names so an upgrade from the pre-L2 schema is a no-op). L2 lists
@@ -830,21 +828,15 @@ pub fn set_kao_server_url(value: String) {
     write_all();
 }
 
-/// Resolved checkpoint (built-in or freshly fetched fallback) used when no
-/// user override is set. Mutated by `crate::net` on startup.
+/// Built-in checkpoint used to bootstrap Mainnet sync when no user override is
+/// set. Always the binary's `BUILTIN_CHECKPOINT`; a fresh value is obtained
+/// only through the network setup wizard's manual refresh, which is stored as
+/// `checkpoint_override` rather than mutating this.
 pub fn auto_checkpoint() -> B256 {
     ensure()
         .lock()
         .expect("settings mutex poisoned")
         .auto_checkpoint
-}
-
-pub fn set_auto_checkpoint(value: B256) {
-    ensure()
-        .lock()
-        .expect("settings mutex poisoned")
-        .auto_checkpoint = value;
-    // Not persisted to disk: this value is rederived on each app start.
 }
 
 // ── Wizard-level getters/setters ─────────────────────────────────────────
@@ -1271,17 +1263,6 @@ fn extract_drpc_key(url: &str) -> Option<String> {
     Some(key.to_string())
 }
 
-/// True when the binary's built-in checkpoint is recent enough that we don't
-/// need to fetch a community fallback before the first sync.
-pub fn builtin_is_fresh() -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let age_secs = now.saturating_sub(BUILTIN_CHECKPOINT_PUBLISHED);
-    age_secs < BUILTIN_FRESHNESS_DAYS * 86400
-}
-
 fn write_all() {
     let path = settings_path();
     if let Some(parent) = path.parent() {
@@ -1686,14 +1667,6 @@ mod tests {
         restrict_to_owner(f.path(), 0o600).unwrap();
         let meta = std::fs::metadata(f.path()).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-    }
-
-    #[test]
-    fn builtin_is_fresh_returns_bool() {
-        // `builtin_is_fresh` is a pure (now − published) < freshness window
-        // check. The output depends on wall clock, but the function must
-        // always return without panicking — assert it produces a result.
-        let _ = builtin_is_fresh();
     }
 
     #[test]

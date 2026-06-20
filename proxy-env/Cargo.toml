@@ -1,0 +1,9 @@
+[package]
+name = "proxy-env"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Isolated helper to install a process-wide proxy via environment variables."
+# Part of the kao workspace; same license. Declared explicitly because this
+# subcrate has no LICENSE file of its own for cargo-deny to infer from.
+license = "AGPL-3.0-or-later"

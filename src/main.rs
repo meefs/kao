@@ -29,6 +29,25 @@ pub fn main() -> iced::Result {
         .with_target(true)
         .init();
 
+    // Load persisted settings and, if the user enabled a proxy, install it
+    // process-wide *before* iced spawns any thread or builds any HTTP client.
+    // reqwest's `ALL_PROXY` is the only proxy hook helios's internally-built
+    // clients honour, so this is what routes ALL outbound traffic (helios
+    // consensus/execution, the alloy fallback provider, indexers, the Safe
+    // service, ENS) through the proxy. It must run here, single-threaded, at
+    // startup: installing it mutates the environment, which is only sound
+    // before other threads exist. A proxy change therefore applies on the
+    // next launch, not mid-session.
+    settings::load();
+    if settings::proxy_enabled() {
+        let addr = settings::proxy_address();
+        let addr = addr.trim();
+        if !addr.is_empty() {
+            proxy_env::set_all_proxy(&format!("socks5h://{addr}"));
+            tracing::info!("routing all outbound traffic through the configured SOCKS5 proxy");
+        }
+    }
+
     iced::application(App::new, App::update, App::view)
         .title("Kao Wallet")
         .subscription(App::subscription)

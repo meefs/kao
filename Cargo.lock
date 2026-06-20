@@ -6427,6 +6427,7 @@ dependencies = [
  "keyring",
  "op-alloy-rpc-types",
  "postcard",
+ "proxy-env",
  "rand 0.8.6",
  "redb",
  "reqwest 0.12.28",
@@ -8975,6 +8976,10 @@ checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
 dependencies = [
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "proxy-env"
+version = "0.0.0"
 
 [[package]]
 name = "pxfm"
