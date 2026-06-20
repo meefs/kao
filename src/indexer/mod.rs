@@ -567,7 +567,10 @@ mod tests {
             },
         ];
         let live = into_live_tokens(Chain::Optimism, tokens);
-        assert!(live.is_empty(), "all zero-balance tokens must be filtered out");
+        assert!(
+            live.is_empty(),
+            "all zero-balance tokens must be filtered out"
+        );
     }
 
     #[test]
