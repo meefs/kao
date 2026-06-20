@@ -1328,7 +1328,7 @@ impl NetworkSetupScreen {
 
         let info_note = container(
             row![
-                text("\u{2139}").size(13).color(t.sub),
+                text("ദ്ദി◝ ⩊ ◜.ᐟ").size(13).color(t.sub),
                 Space::new().width(8),
                 text("The Safe TX Service is only used for multisig (Safe) wallets. If you only use EOA wallets, this setting has no effect.")
                     .size(12)
