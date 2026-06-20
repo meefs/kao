@@ -35,7 +35,7 @@ pub mod onchain;
 
 pub use alchemy::AlchemyClient;
 pub use blockscout::BlockscoutClient;
-pub use drpc::DrpcClient;
+pub use drpc::{DrpcClient, KaoClient};
 pub use etherscan::EtherscanClient;
 
 /// Outcome of a single transaction relative to the queried address.
@@ -245,6 +245,9 @@ pub fn build_indexer_for(chain: Chain) -> Arc<dyn Indexer> {
             Some(key) => Arc::new(DrpcClient::new(key, chain)),
             None => blockscout(chain),
         },
+        // The Kao proxy holds the dRPC key and supports every chain we do,
+        // so there's no per-chain fallback — it answers for all of them.
+        (_, IndexerProvider::Kao) => Arc::new(KaoClient::new(settings::kao_server_url(), chain)),
         (_, IndexerProvider::None) => noop(),
         // L2 + Etherscan: Etherscan v2 supports multi-chain via
         // `chainid` but our `EtherscanClient` doesn't carry that yet.

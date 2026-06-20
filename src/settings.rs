@@ -51,6 +51,9 @@ pub enum IndexerProvider {
     Etherscan,
     Alchemy,
     Drpc,
+    /// Kao privacy proxy — fronts dRPC's Wallet API and holds the key, so
+    /// the wallet sends no API key and no client identity upstream.
+    Kao,
     None,
 }
 
@@ -61,6 +64,7 @@ impl IndexerProvider {
             Self::Etherscan => "etherscan",
             Self::Alchemy => "alchemy",
             Self::Drpc => "drpc",
+            Self::Kao => "kao",
             Self::None => "none",
         }
     }
@@ -71,6 +75,7 @@ impl IndexerProvider {
             "etherscan" => Some(Self::Etherscan),
             "alchemy" => Some(Self::Alchemy),
             "drpc" => Some(Self::Drpc),
+            "kao" => Some(Self::Kao),
             "none" => Some(Self::None),
             _ => None,
         }
@@ -491,6 +496,7 @@ fn parse(text: &str) -> State {
         match state.indexer_provider {
             IndexerProvider::Blockscout => state.api_provider = ApiProvider::Blockscout,
             IndexerProvider::Drpc => state.api_provider = ApiProvider::Drpc,
+            IndexerProvider::Kao => state.api_provider = ApiProvider::Kao,
             IndexerProvider::None => state.api_provider = ApiProvider::None,
             _ => {}
         }
@@ -1163,8 +1169,10 @@ pub fn apply_api_provider(provider: ApiProvider, key: &str) {
 
     match provider {
         ApiProvider::Kao => {
-            // Kao proxy routes through dRPC.
-            set_indexer_provider(IndexerProvider::Drpc);
+            // Route indexer queries through the Kao proxy. The proxy holds the
+            // dRPC key, so — unlike `ApiProvider::Drpc` — no key is stored here
+            // and none is sent upstream from the wallet.
+            set_indexer_provider(IndexerProvider::Kao);
         }
         ApiProvider::Blockscout => {
             set_indexer_provider(IndexerProvider::Blockscout);
@@ -1586,6 +1594,7 @@ mod tests {
             IndexerProvider::Etherscan,
             IndexerProvider::Alchemy,
             IndexerProvider::Drpc,
+            IndexerProvider::Kao,
             IndexerProvider::None,
         ] {
             assert_eq!(IndexerProvider::from_key(p.key()), Some(p));
@@ -1601,6 +1610,7 @@ mod tests {
             IndexerProvider::Etherscan,
             IndexerProvider::Alchemy,
             IndexerProvider::Drpc,
+            IndexerProvider::Kao,
             IndexerProvider::None,
         ] {
             let mut s = default_state();
