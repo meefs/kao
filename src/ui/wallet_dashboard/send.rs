@@ -3214,7 +3214,7 @@ mod tests {
         }
         AccountDescriptor::Local {
             name: name.map(str::to_string),
-            key_bytes: bytes,
+            key_bytes: bytes.into(),
         }
     }
 
@@ -3381,7 +3381,7 @@ mod tests {
         }
         AccountDescriptor::Local {
             name: None,
-            key_bytes: bytes,
+            key_bytes: bytes.into(),
         }
     }
 

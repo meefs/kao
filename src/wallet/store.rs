@@ -307,8 +307,12 @@ fn save_to(path: &Path, desc: &WalletDescriptor, pw: &SecretString) -> Result<()
 
         for (i, account) in desc.accounts.iter().enumerate() {
             let idx = i as u32;
-            let plaintext = postcard::to_stdvec(account)
-                .map_err(|e| WalletError::Encryption(format!("serialize account {i}: {e}")))?;
+            // Holds the account's private-key bytes — scrub it on drop rather
+            // than leaving the serialized key in a freed allocation.
+            let plaintext = Zeroizing::new(
+                postcard::to_stdvec(account)
+                    .map_err(|e| WalletError::Encryption(format!("serialize account {i}: {e}")))?,
+            );
             let aad = account_aad(idx);
             let blob = encrypt_blob(master_key.as_slice(), &aad, &plaintext)?;
             accounts.insert(idx, blob.as_slice()).map_err(redb_err)?;
@@ -336,8 +340,10 @@ fn save_to(path: &Path, desc: &WalletDescriptor, pw: &SecretString) -> Result<()
 
         for (i, safe) in desc.safes.iter().enumerate() {
             let idx = i as u32;
-            let plaintext = postcard::to_stdvec(safe)
-                .map_err(|e| WalletError::Encryption(format!("serialize safe {i}: {e}")))?;
+            let plaintext = Zeroizing::new(
+                postcard::to_stdvec(safe)
+                    .map_err(|e| WalletError::Encryption(format!("serialize safe {i}: {e}")))?,
+            );
             let aad = safe_aad(idx);
             let blob = encrypt_blob(master_key.as_slice(), &aad, &plaintext)?;
             safes.insert(idx, blob.as_slice()).map_err(redb_err)?;
@@ -689,7 +695,10 @@ fn encrypt_blob(key: &[u8], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Wal
     Ok(out)
 }
 
-fn decrypt_blob(key: &[u8], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>, WalletError> {
+/// Decrypt one record. The returned plaintext may contain private-key
+/// material (account rows), so it is wrapped in `Zeroizing` to scrub the
+/// buffer when the caller drops it rather than leaving it in freed memory.
+fn decrypt_blob(key: &[u8], aad: &[u8], blob: &[u8]) -> Result<Zeroizing<Vec<u8>>, WalletError> {
     if blob.len() < NONCE_LEN + TAG_LEN {
         return Err(WalletError::Encryption("ciphertext too short".into()));
     }
@@ -703,6 +712,7 @@ fn decrypt_blob(key: &[u8], aad: &[u8], blob: &[u8]) -> Result<Vec<u8>, WalletEr
                 aad,
             },
         )
+        .map(Zeroizing::new)
         .map_err(|e| WalletError::Encryption(format!("decrypt: {e}")))
 }
 
@@ -802,8 +812,10 @@ fn save_contacts_to(
         }
         for (i, contact) in contacts.iter().enumerate() {
             let idx = i as u32;
-            let plaintext = postcard::to_stdvec(contact)
-                .map_err(|e| WalletError::Encryption(format!("serialize contact {i}: {e}")))?;
+            let plaintext = Zeroizing::new(
+                postcard::to_stdvec(contact)
+                    .map_err(|e| WalletError::Encryption(format!("serialize contact {i}: {e}")))?,
+            );
             let aad = contact_aad(idx);
             let blob = encrypt_blob(master_key.as_slice(), &aad, &plaintext)?;
             tbl.insert(idx, blob.as_slice()).map_err(redb_err)?;
@@ -915,7 +927,7 @@ mod tests {
             accounts: vec![
                 AccountDescriptor::Local {
                     name: Some("Treasury".into()),
-                    key_bytes: [0xab; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0xab; 32]),
                 },
                 AccountDescriptor::Ledger {
                     name: None,
@@ -924,7 +936,7 @@ mod tests {
                 },
                 AccountDescriptor::Local {
                     name: None,
-                    key_bytes: [0xcd; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0xcd; 32]),
                 },
             ],
             safes: Vec::new(),
@@ -937,7 +949,7 @@ mod tests {
         match &loaded.accounts[0] {
             AccountDescriptor::Local { name, key_bytes } => {
                 assert_eq!(name.as_deref(), Some("Treasury"));
-                assert_eq!(*key_bytes, [0xab; 32]);
+                assert_eq!(key_bytes.as_array(), &[0xab; 32]);
             }
             _ => panic!("expected Local"),
         }
@@ -954,7 +966,9 @@ mod tests {
             _ => panic!("expected Ledger"),
         }
         match &loaded.accounts[2] {
-            AccountDescriptor::Local { key_bytes, .. } => assert_eq!(*key_bytes, [0xcd; 32]),
+            AccountDescriptor::Local { key_bytes, .. } => {
+                assert_eq!(key_bytes.as_array(), &[0xcd; 32])
+            }
             _ => panic!("expected Local"),
         }
     }
@@ -968,7 +982,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -1000,7 +1014,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("correct")).unwrap();
         let err = load_from(&path, &pw("wrong")).unwrap_err();
@@ -1016,7 +1030,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x11; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x11; 32]),
         });
         save_to(&path, &desc, &pw("right")).unwrap();
         let err = save_to(&path, &desc, &pw("wrong")).unwrap_err();
@@ -1055,7 +1069,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x55; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x55; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
 
@@ -1091,15 +1105,15 @@ mod tests {
             accounts: vec![
                 AccountDescriptor::Local {
                     name: None,
-                    key_bytes: [0x01; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0x01; 32]),
                 },
                 AccountDescriptor::Local {
                     name: None,
-                    key_bytes: [0x02; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0x02; 32]),
                 },
                 AccountDescriptor::Local {
                     name: None,
-                    key_bytes: [0x03; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0x03; 32]),
                 },
             ],
             safes: Vec::new(),
@@ -1109,7 +1123,7 @@ mod tests {
 
         let small = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x09; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x09; 32]),
         });
         save_to(&path, &small, &pw("pw")).unwrap();
 
@@ -1117,7 +1131,9 @@ mod tests {
         assert_eq!(loaded.accounts.len(), 1);
         assert_eq!(loaded.active_index, 0);
         match &loaded.accounts[0] {
-            AccountDescriptor::Local { key_bytes, .. } => assert_eq!(*key_bytes, [0x09; 32]),
+            AccountDescriptor::Local { key_bytes, .. } => {
+                assert_eq!(key_bytes.as_array(), &[0x09; 32])
+            }
             _ => panic!("expected Local"),
         }
     }
@@ -1147,7 +1163,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         let salt = read_salt_from_file(&path);
@@ -1172,7 +1188,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         let snapshot = std::fs::read(&path).unwrap();
@@ -1199,7 +1215,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         let salt = read_salt_from_file(&path);
@@ -1221,7 +1237,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         save_to(&path, &desc, &pw("pw")).unwrap(); // file=2, keyring=2
@@ -1248,7 +1264,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         save_to(&path, &desc, &pw("pw")).unwrap(); // file=2, keyring=2
@@ -1298,7 +1314,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         let salt = read_salt_from_file(&path);
@@ -1345,7 +1361,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
 
@@ -1376,7 +1392,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         let snapshot = std::fs::read(&path).unwrap();
@@ -1404,11 +1420,11 @@ mod tests {
             accounts: vec![
                 AccountDescriptor::Local {
                     name: None,
-                    key_bytes: [0x01; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0x01; 32]),
                 },
                 AccountDescriptor::Local {
                     name: None,
-                    key_bytes: [0x02; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0x02; 32]),
                 },
             ],
             safes: Vec::new(),
@@ -1457,7 +1473,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
 
@@ -1489,7 +1505,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         let loaded = load_contacts_from(&path, &pw("pw")).unwrap();
@@ -1502,7 +1518,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
 
@@ -1529,7 +1545,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("pw")).unwrap();
         let salt = read_salt_from_file(&path);
@@ -1550,7 +1566,7 @@ mod tests {
         let path = dir.path().join("wallet.redb");
         let desc = WalletDescriptor::single(AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         });
         save_to(&path, &desc, &pw("right")).unwrap();
         let err = save_contacts_to(&path, &[sample_contact(0x01, "A")], &pw("wrong")).unwrap_err();
@@ -1574,11 +1590,15 @@ mod tests {
         assert!(decrypt_blob(&key, &contact_aad(0), &blob_a).is_err());
         // Sanity: same AAD on both sides round-trips.
         assert_eq!(
-            decrypt_blob(&key, &contact_aad(0), &blob_c).unwrap(),
+            decrypt_blob(&key, &contact_aad(0), &blob_c)
+                .unwrap()
+                .as_slice(),
             plaintext,
         );
         assert_eq!(
-            decrypt_blob(&key, &account_aad(0), &blob_a).unwrap(),
+            decrypt_blob(&key, &account_aad(0), &blob_a)
+                .unwrap()
+                .as_slice(),
             plaintext,
         );
     }
@@ -1669,7 +1689,7 @@ mod tests {
         WalletDescriptor {
             accounts: vec![AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0x42; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
             }],
             safes,
             active_index: 0,
@@ -1792,11 +1812,11 @@ mod tests {
             accounts: vec![
                 AccountDescriptor::Local {
                     name: Some("primary".into()),
-                    key_bytes: [0x42; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
                 },
                 AccountDescriptor::Local {
                     name: Some("hardware-backup".into()),
-                    key_bytes: [0x43; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0x43; 32]),
                 },
             ],
             safes: vec![minimal_safe(0x77, 1)],
@@ -1861,7 +1881,9 @@ mod tests {
 
         // Sanity: the safe AAD round-trip works on its own blob.
         assert_eq!(
-            decrypt_blob(&key, &safe_aad(0), &blob_s).unwrap(),
+            decrypt_blob(&key, &safe_aad(0), &blob_s)
+                .unwrap()
+                .as_slice(),
             plaintext,
         );
     }

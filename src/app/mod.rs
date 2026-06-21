@@ -398,7 +398,7 @@ impl App {
         };
         match wallet.active().clone() {
             AccountDescriptor::Local { key_bytes, .. } => {
-                let b = alloy::primitives::B256::from_slice(&key_bytes);
+                let b = key_bytes.to_b256();
                 match wallet::signer_from_bytes(&b) {
                     Ok(s) => self.enter_dashboard(KaoSigner::Local(s), initial_nav),
                     Err(e) => {

@@ -75,16 +75,29 @@ impl ShowSeedScreen {
         (self.seed_phrase, self.key_bytes, self.address)
     }
 
-    /// Build the (Task, Outcome) pair that moves the user past this screen,
-    /// overwriting the clipboard if we put the seed there. Best-effort: this
-    /// only clears the current clipboard slot, not clipboard-manager history.
-    fn continue_outcome(&self) -> (Task<Message>, Option<Outcome>) {
-        let clear = if self.did_copy {
+    /// Best-effort wipe of the clipboard slot we wrote the seed into. Returns
+    /// an empty task when we never copied, so we don't clobber unrelated
+    /// clipboard contents. Only clears the current slot, not clipboard-manager
+    /// history.
+    fn clear_clipboard_task(&self) -> Task<Message> {
+        if self.did_copy {
             clipboard::write(String::new()).map(|_: ()| Message::SeedCopied)
         } else {
             Task::none()
-        };
-        (clear, Some(Outcome::Continue))
+        }
+    }
+
+    /// Build the (Task, Outcome) pair that moves the user *past* this screen,
+    /// overwriting the clipboard if we put the seed there.
+    fn continue_outcome(&self) -> (Task<Message>, Option<Outcome>) {
+        (self.clear_clipboard_task(), Some(Outcome::Continue))
+    }
+
+    /// Build the (Task, Outcome) pair that takes the user *back* off this
+    /// screen. Clears the clipboard on the way out too — leaving Back/Escape
+    /// would otherwise strand a copied seed in the clipboard.
+    fn back_outcome(&self) -> (Task<Message>, Option<Outcome>) {
+        (self.clear_clipboard_task(), Some(Outcome::Back))
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
@@ -104,11 +117,9 @@ impl ShowSeedScreen {
                 (Task::none(), None)
             }
             Message::Continue => self.continue_outcome(),
-            Message::BackPressed => (Task::none(), Some(Outcome::Back)),
+            Message::BackPressed => self.back_outcome(),
             Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => match key {
-                keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                    (Task::none(), Some(Outcome::Back))
-                }
+                keyboard::Key::Named(keyboard::key::Named::Escape) => self.back_outcome(),
                 keyboard::Key::Named(keyboard::key::Named::Enter) => self.continue_outcome(),
                 _ => (Task::none(), None),
             },

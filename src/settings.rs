@@ -213,7 +213,7 @@ impl ProxyType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct State {
     theme: ThemeKind,
     /// Per-chain execution RPC lists. Mainnet seeds from `DEFAULT_RPCS`; L2
@@ -253,6 +253,40 @@ struct State {
     proxy_enabled: bool,
     proxy_type: ProxyType,
     proxy_address: String,
+}
+
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // API keys are deliberately redacted: they live behind owner-only file
+        // perms on disk, but a stray `{:?}` / log line / panic backtrace
+        // shouldn't spill them. Presence (`Some`/`None`) is preserved so the
+        // dump still tells you whether a key is configured.
+        let redact = |o: &Option<String>| o.as_ref().map(|_| "<redacted>");
+        f.debug_struct("State")
+            .field("theme", &self.theme)
+            .field("rpcs", &self.rpcs)
+            .field("consensus_rpcs", &self.consensus_rpcs)
+            .field("checkpoint_override", &self.checkpoint_override)
+            .field("auto_checkpoint", &self.auto_checkpoint)
+            .field("indexer_provider", &self.indexer_provider)
+            .field("etherscan_api_key", &redact(&self.etherscan_api_key))
+            .field("alchemy_api_key", &redact(&self.alchemy_api_key))
+            .field("drpc_api_key", &redact(&self.drpc_api_key))
+            .field("blockscout_base_url", &self.blockscout_base_url)
+            .field("blockscout_api_key", &redact(&self.blockscout_api_key))
+            .field("kao_server_url", &self.kao_server_url)
+            .field("rpc_provider", &self.rpc_provider)
+            .field("rpc_key", &redact(&self.rpc_key))
+            .field("custom_rpc_url", &self.custom_rpc_url)
+            .field("api_provider", &self.api_provider)
+            .field("api_key", &redact(&self.api_key))
+            .field("safe_tx_service", &self.safe_tx_service)
+            .field("safe_tx_service_url", &self.safe_tx_service_url)
+            .field("proxy_enabled", &self.proxy_enabled)
+            .field("proxy_type", &self.proxy_type)
+            .field("proxy_address", &self.proxy_address)
+            .finish()
+    }
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();

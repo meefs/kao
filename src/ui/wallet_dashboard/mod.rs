@@ -2893,7 +2893,7 @@ fn collect_owner_keys(
     for &idx in indices {
         match accounts.get(idx as usize) {
             Some(AccountDescriptor::Local { key_bytes, .. }) => {
-                out.push(alloy::primitives::B256::from_slice(key_bytes));
+                out.push(key_bytes.to_b256());
             }
             Some(_) => {
                 return Err(format!(
@@ -2941,7 +2941,7 @@ fn owner_desc_by_address(
 /// execute-from-queue. `None` if the wallet is hardware/view-only only.
 fn first_local_key_of(accounts: &[AccountDescriptor]) -> Option<B256> {
     accounts.iter().find_map(|a| match a {
-        AccountDescriptor::Local { key_bytes, .. } => Some(B256::from_slice(key_bytes)),
+        AccountDescriptor::Local { key_bytes, .. } => Some(key_bytes.to_b256()),
         _ => None,
     })
 }
@@ -3700,7 +3700,7 @@ mod tests {
             view_only_account(addr(1)),
             crate::wallet::AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0x7e; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0x7e; 32]),
             },
         ];
         let mut safe = safe_descriptor(0x99, 1);
@@ -3850,7 +3850,7 @@ mod tests {
         let accounts = vec![
             crate::wallet::AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0xaa; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0xaa; 32]),
             },
             crate::wallet::AccountDescriptor::ViewOnly {
                 name: None,
@@ -3858,7 +3858,7 @@ mod tests {
             },
             crate::wallet::AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0xbb; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0xbb; 32]),
             },
         ];
         let got = collect_owner_keys(&[2, 0], &accounts).unwrap();
@@ -3872,7 +3872,7 @@ mod tests {
         let accounts = vec![
             crate::wallet::AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0xaa; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0xaa; 32]),
             },
             crate::wallet::AccountDescriptor::ViewOnly {
                 name: None,
@@ -3893,7 +3893,7 @@ mod tests {
     fn local_with_key(seed: u8) -> AccountDescriptor {
         AccountDescriptor::Local {
             name: None,
-            key_bytes: [seed; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([seed; 32]),
         }
     }
 

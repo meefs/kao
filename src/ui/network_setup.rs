@@ -144,16 +144,48 @@ pub enum WizardMode {
     Settings,
 }
 
+/// A user-typed secret (an API key) held in the wizard draft and in the
+/// key-carrying `Message` variants. Behaves like a `String` for the wizard's
+/// purposes, but its `Debug` is redacted so a stray `{:?}` on a `Message` or
+/// `WizardDraft` — or a panic backtrace that formats one — never prints the
+/// key. (The key is still persisted to `settings.toml` in plaintext; that file
+/// is owner-only by design. This guards only against in-memory disclosure
+/// through formatting/logging.)
+#[derive(Clone, Default)]
+pub(crate) struct SecretInput(String);
+
+impl SecretInput {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretInput(redacted)")
+    }
+}
+
+impl From<String> for SecretInput {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WizardDraft {
     rpc_provider: RpcProvider,
-    rpc_key: String,
+    rpc_key: SecretInput,
     custom_rpc_url: String,
     kao_server_url: String,
     api_provider: ApiProvider,
-    api_key: String,
+    api_key: SecretInput,
     blockscout_url: String,
-    blockscout_api_key: String,
+    blockscout_api_key: SecretInput,
     safe_tx_service: SafeTxService,
     safe_tx_service_url: String,
     proxy_enabled: bool,
@@ -173,13 +205,13 @@ impl Default for WizardDraft {
         }
         Self {
             rpc_provider: RpcProvider::default(),
-            rpc_key: String::new(),
+            rpc_key: SecretInput::default(),
             custom_rpc_url: String::new(),
             kao_server_url: settings::DEFAULT_KAO_SERVER_URL.to_string(),
             api_provider: ApiProvider::default(),
-            api_key: String::new(),
+            api_key: SecretInput::default(),
             blockscout_url: String::new(),
-            blockscout_api_key: String::new(),
+            blockscout_api_key: SecretInput::default(),
             safe_tx_service: SafeTxService::default(),
             safe_tx_service_url: String::new(),
             proxy_enabled: false,
@@ -197,13 +229,13 @@ impl Default for WizardDraft {
 pub enum Message {
     GoToStep(WizardStep),
     SetRpcProvider(RpcProvider),
-    RpcKeyInput(String),
+    RpcKeyInput(SecretInput),
     CustomRpcUrlInput(String),
     KaoServerUrlInput(String),
     SetApiProvider(ApiProvider),
-    ApiKeyInput(String),
+    ApiKeyInput(SecretInput),
     BlockscoutUrlInput(String),
-    BlockscoutApiKeyInput(String),
+    BlockscoutApiKeyInput(SecretInput),
     SetSafeTxService(SafeTxService),
     SafeTxServiceUrlInput(String),
     ToggleProxy,
@@ -258,13 +290,13 @@ impl NetworkSetupScreen {
                 }
                 WizardDraft {
                     rpc_provider: settings::rpc_provider(),
-                    rpc_key: settings::rpc_key().unwrap_or_default(),
+                    rpc_key: settings::rpc_key().unwrap_or_default().into(),
                     custom_rpc_url: settings::custom_rpc_url().unwrap_or_default(),
                     kao_server_url: settings::kao_server_url(),
                     api_provider: settings::api_provider(),
-                    api_key: settings::api_key().unwrap_or_default(),
+                    api_key: settings::api_key().unwrap_or_default().into(),
                     blockscout_url: settings::blockscout_base_url().unwrap_or_default(),
-                    blockscout_api_key: settings::blockscout_api_key().unwrap_or_default(),
+                    blockscout_api_key: settings::blockscout_api_key().unwrap_or_default().into(),
                     safe_tx_service: settings::safe_tx_service(),
                     safe_tx_service_url: settings::safe_tx_service_url().unwrap_or_default(),
                     proxy_enabled: settings::proxy_enabled(),
@@ -488,8 +520,8 @@ impl NetworkSetupScreen {
         match step {
             WizardStep::Rpc => match self.draft.rpc_provider {
                 RpcProvider::Kao => settings::is_https_url(self.draft.kao_server_url.trim()),
-                RpcProvider::Alchemy => !self.draft.rpc_key.trim().is_empty(),
-                RpcProvider::Drpc => !self.draft.rpc_key.trim().is_empty(),
+                RpcProvider::Alchemy => !self.draft.rpc_key.as_str().trim().is_empty(),
+                RpcProvider::Drpc => !self.draft.rpc_key.as_str().trim().is_empty(),
                 RpcProvider::Custom => {
                     settings::parse_rpc_input(self.draft.custom_rpc_url.trim()).is_some()
                 }
@@ -504,7 +536,7 @@ impl NetworkSetupScreen {
                             .map(|u| u.scheme() == "https")
                             .unwrap_or(false)
                 }
-                ApiProvider::Drpc => !self.draft.api_key.trim().is_empty(),
+                ApiProvider::Drpc => !self.draft.api_key.as_str().trim().is_empty(),
                 _ => true,
             },
             WizardStep::SafeTx => match self.draft.safe_tx_service {
@@ -598,10 +630,10 @@ impl NetworkSetupScreen {
         settings::set_kao_server_url(self.draft.kao_server_url.clone());
         settings::apply_rpc_provider(
             self.draft.rpc_provider,
-            self.draft.rpc_key.trim(),
+            self.draft.rpc_key.as_str().trim(),
             self.draft.custom_rpc_url.trim(),
         );
-        settings::apply_api_provider(self.draft.api_provider, self.draft.api_key.trim());
+        settings::apply_api_provider(self.draft.api_provider, self.draft.api_key.as_str().trim());
         if self.draft.api_provider == ApiProvider::Blockscout {
             let url = self.draft.blockscout_url.trim();
             settings::set_blockscout_base_url(if url.is_empty() {
@@ -609,7 +641,7 @@ impl NetworkSetupScreen {
             } else {
                 Some(url.to_string())
             });
-            let key = self.draft.blockscout_api_key.trim();
+            let key = self.draft.blockscout_api_key.as_str().trim();
             settings::set_blockscout_api_key(if key.is_empty() {
                 None
             } else {
@@ -1118,9 +1150,9 @@ impl NetworkSetupScreen {
         );
 
         let drpc_body: Option<Element<'_, Message>> = if selected == RpcProvider::Drpc {
-            let input = text_input("Your dRPC API key", &self.draft.rpc_key)
+            let input = text_input("Your dRPC API key", self.draft.rpc_key.as_str())
                 .id(RPC_KEY_INPUT_ID)
-                .on_input(Message::RpcKeyInput)
+                .on_input(|s| Message::RpcKeyInput(s.into()))
                 .padding(Padding::from([10, 12]))
                 .size(13)
                 .font(mono())
@@ -1145,9 +1177,9 @@ impl NetworkSetupScreen {
         );
 
         let alchemy_body: Option<Element<'_, Message>> = if selected == RpcProvider::Alchemy {
-            let input = text_input("Your Alchemy API key", &self.draft.rpc_key)
+            let input = text_input("Your Alchemy API key", self.draft.rpc_key.as_str())
                 .id(RPC_KEY_INPUT_ID)
-                .on_input(Message::RpcKeyInput)
+                .on_input(|s| Message::RpcKeyInput(s.into()))
                 .padding(Padding::from([10, 12]))
                 .size(13)
                 .font(mono())
@@ -1237,13 +1269,14 @@ impl NetworkSetupScreen {
             .size(13)
             .font(mono())
             .style(move |_theme, status| text_input_style(t, status));
-            let key_input = text_input("API key (optional)", &self.draft.blockscout_api_key)
-                .id(BLOCKSCOUT_KEY_INPUT_ID)
-                .on_input(Message::BlockscoutApiKeyInput)
-                .padding(Padding::from([10, 12]))
-                .size(13)
-                .font(mono())
-                .style(move |_theme, status| text_input_style(t, status));
+            let key_input =
+                text_input("API key (optional)", self.draft.blockscout_api_key.as_str())
+                    .id(BLOCKSCOUT_KEY_INPUT_ID)
+                    .on_input(|s| Message::BlockscoutApiKeyInput(s.into()))
+                    .padding(Padding::from([10, 12]))
+                    .size(13)
+                    .font(mono())
+                    .style(move |_theme, status| text_input_style(t, status));
             Some(
                 column![
                     text("Custom URL (optional)")
@@ -1282,9 +1315,9 @@ impl NetworkSetupScreen {
         );
 
         let drpc_body: Option<Element<'_, Message>> = if selected == ApiProvider::Drpc {
-            let input = text_input("Your dRPC API key", &self.draft.api_key)
+            let input = text_input("Your dRPC API key", self.draft.api_key.as_str())
                 .id(API_KEY_INPUT_ID)
-                .on_input(Message::ApiKeyInput)
+                .on_input(|s| Message::ApiKeyInput(s.into()))
                 .padding(Padding::from([10, 12]))
                 .size(13)
                 .font(mono())
