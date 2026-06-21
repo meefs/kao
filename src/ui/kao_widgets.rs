@@ -756,14 +756,18 @@ pub fn thin_divider<'a, M: 'a>(t: KaoTheme) -> Element<'a, M> {
 pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> {
     let checksum = addr.to_checksum(None); // "0xAbCd...EF01" (42 chars)
     debug_assert_eq!(checksum.len(), 42);
-    let body = &checksum[2..]; // drop the "0x"
+    // `.get()` rather than `[2..]` / `[start..start + 4]`: the lengths above are
+    // structurally guaranteed for a 20-byte Address, but an unchecked slice
+    // would panic the whole GUI in a release build (where the debug_assert is
+    // stripped) if that ever stopped holding. A short chunk renders empty.
+    let body = checksum.get(2..).unwrap_or(""); // drop the "0x"
 
     let chunk_colors = chunk_palette(t);
     let mut spans = row![text("0x").size(14).color(t.sub).font(mono_bold())].spacing(0);
 
     for (i, color) in chunk_colors.iter().enumerate() {
         let start = i * 4;
-        let chunk = body[start..start + 4].to_string();
+        let chunk = body.get(start..start + 4).unwrap_or("").to_string();
         spans = spans.push(text(chunk).size(14).color(*color).font(mono_bold()));
     }
 
@@ -824,7 +828,9 @@ pub fn colored_hash<'a, M: 'a>(t: KaoTheme, hash: B256) -> Element<'a, M> {
         }
         for i in (line_idx * 8)..(line_idx * 8 + 8) {
             let start = i * 4;
-            let chunk = hex[start..start + 4].to_string();
+            // `.get()` over `[start..start + 4]`: see `colored_address` — avoids
+            // a release-build GUI panic if the hash hex is ever not 64 chars.
+            let chunk = hex.get(start..start + 4).unwrap_or("").to_string();
             spans = spans.push(
                 text(chunk)
                     .size(13)

@@ -314,7 +314,11 @@ impl SelectHdAccountScreen {
 
     fn account_row<'a>(&self, t: KaoTheme, account: &'a HdAccount) -> Element<'a, Message> {
         let addr = format!("{}", account.address);
-        let addr_display = format!("{}…{}", &addr[..8], &addr[addr.len() - 4..]);
+        let addr_display = if addr.len() >= 12 {
+            format!("{}…{}", &addr[..8], &addr[addr.len() - 4..])
+        } else {
+            addr.clone()
+        };
         let balance_display = match &account.balance {
             None => "Loading…".to_string(),
             Some(Ok(eth)) => {

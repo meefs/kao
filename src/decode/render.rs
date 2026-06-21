@@ -334,7 +334,11 @@ async fn humanize_arg(
         DynSolValue::String(s) => ArgDisplay::String(s.clone()),
         DynSolValue::Bytes(b) => ArgDisplay::Bytes(Bytes::copy_from_slice(b)),
         DynSolValue::FixedBytes(word, n) => {
-            ArgDisplay::Bytes(Bytes::copy_from_slice(&word.as_slice()[..*n]))
+            // `n` is the FixedBytes width (1..=32 per the ABI), but clamp to the
+            // 32-byte word length so a decoder bug / malformed value can't slice
+            // out of bounds and panic the decode path.
+            let n = (*n).min(word.as_slice().len());
+            ArgDisplay::Bytes(Bytes::copy_from_slice(&word.as_slice()[..n]))
         }
         // Tuple / Array / FixedArray / Function get the canonical-string
         // fallback for now; the FunctionPanel can iterate later.

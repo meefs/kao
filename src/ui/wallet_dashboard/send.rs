@@ -1605,7 +1605,12 @@ impl SendPane {
         recipient_kao: Option<String>,
         recipient_chip: Option<&'static str>,
     ) -> Element<'a, Message> {
-        let eoa = self.eoa().unwrap();
+        let Some(eoa) = self.eoa() else {
+            return text("Account state unavailable.")
+                .size(13)
+                .color(t.down)
+                .into();
+        };
         let token = portfolio.get(self.token_idx);
         let token_sym = token.map(|t| t.symbol.as_str()).unwrap_or("ETH");
         let recipient = self.resolution.recipient();
@@ -2097,7 +2102,12 @@ impl SendPane {
         portfolio: &'a [LiveToken],
         recipient_name: Option<String>,
     ) -> Element<'a, Message> {
-        let eoa = self.eoa().unwrap();
+        let Some(eoa) = self.eoa() else {
+            return text("Account state unavailable.")
+                .size(13)
+                .color(t.down)
+                .into();
+        };
         let token_sym = portfolio
             .get(self.token_idx)
             .map(|t| t.symbol.as_str())

@@ -584,15 +584,20 @@ impl SafeOnboardingScreen {
     }
 
     fn enter_inspect_from_results(&mut self, chain: Chain, results: Vec<(Chain, ScanResult)>) {
-        let (metadata, trust) = results
+        let found = results
             .iter()
             .find(|(c, _)| *c == chain)
             .and_then(|(_, r)| match r {
                 ScanResult::Canonical(md) => Some((md.clone(), SafeTrust::Canonical)),
                 ScanResult::UnrecognizedImpl(md) => Some((md.clone(), SafeTrust::UnrecognizedImpl)),
                 _ => None,
-            })
-            .expect("caller pre-filtered for Canonical/UnrecognizedImpl");
+            });
+        // Callers pre-filter so `chain` always has a Canonical/UnrecognizedImpl
+        // result, but don't panic the whole GUI if that ever stops holding —
+        // just decline the transition into Inspect.
+        let Some((metadata, trust)) = found else {
+            return;
+        };
         self.step = Step::Inspect {
             chain,
             metadata,

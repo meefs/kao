@@ -132,7 +132,7 @@ impl ConnectTrezorScreen {
                 (Task::none(), None)
             }
             Message::ReconnectProbed(Ok(cell)) => {
-                let signer = match cell.lock().unwrap().take() {
+                let signer = match cell.lock().ok().and_then(|mut guard| guard.take()) {
                     Some(s) => s,
                     None => {
                         self.stage = Stage::Error("internal: empty signer handoff".into());
@@ -195,7 +195,7 @@ impl ConnectTrezorScreen {
                     Stage::Building { picked } => picked,
                     _ => return (Task::none(), None),
                 };
-                let signer = match cell.lock().unwrap().take() {
+                let signer = match cell.lock().ok().and_then(|mut guard| guard.take()) {
                     Some(s) => s,
                     None => {
                         self.stage = Stage::Error("internal: empty signer handoff".into());
@@ -481,7 +481,11 @@ fn back_hint<'a>(t: KaoTheme) -> Element<'a, Message> {
 
 fn account_row<'a>(t: KaoTheme, r: &'a PickRow) -> Element<'a, Message> {
     let addr = format!("{}", r.address);
-    let addr_display = format!("{}…{}", &addr[..8], &addr[addr.len() - 4..]);
+    let addr_display = if addr.len() >= 12 {
+        format!("{}…{}", &addr[..8], &addr[addr.len() - 4..])
+    } else {
+        addr.clone()
+    };
     let balance_display = match &r.balance {
         None => "Loading…".to_string(),
         Some(Ok(eth)) => {

@@ -22,8 +22,8 @@ use crate::portfolio::{format_eth_balance, format_token_balance};
 use crate::chain::Chain;
 
 use super::{
-    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
-    redact_url_in_err,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction,
+    http_client_or_err, redact_url_in_err,
 };
 
 const BASE: &str = "https://api.etherscan.io/v2/api";
@@ -286,7 +286,7 @@ async fn fetch_envelope<T: for<'de> Deserialize<'de>>(
     url: &str,
     label: &'static str,
 ) -> Result<T, String> {
-    let body: Envelope<EnvelopeResult<T>> = http_client()
+    let body: Envelope<EnvelopeResult<T>> = http_client_or_err()?
         .get(url)
         .send()
         .await

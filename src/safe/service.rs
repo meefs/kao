@@ -422,7 +422,7 @@ pub async fn fetch_pending(
 ) -> Result<Vec<PendingSafeTx>, String> {
     let current_nonce = current_safe_nonce(net, safe, chain).await?;
     let url = queue_url(base, safe, chain);
-    let resp = crate::indexer::http_client()
+    let resp = crate::indexer::http_client_or_err()?
         .get(&url)
         .send()
         .await
@@ -514,7 +514,7 @@ pub async fn fetch_detail(
 ) -> Result<SafeTxDetail, String> {
     let current_nonce = current_safe_nonce(net, safe, chain).await?;
     let url = detail_url(base, safe_tx_hash, chain);
-    let resp = crate::indexer::http_client()
+    let resp = crate::indexer::http_client_or_err()?
         .get(&url)
         .send()
         .await
@@ -630,7 +630,7 @@ pub async fn propose(
         signature: signature.to_string(),
         origin: origin.map(str::to_string),
     };
-    let resp = crate::indexer::http_client()
+    let resp = crate::indexer::http_client_or_err()?
         .post(propose_url(base, safe, chain))
         .json(&body)
         .send()
@@ -656,7 +656,7 @@ pub async fn confirm(
     let body = ConfirmBody {
         signature: signature.to_string(),
     };
-    let resp = crate::indexer::http_client()
+    let resp = crate::indexer::http_client_or_err()?
         .post(confirmations_url(base, safe_tx_hash, chain))
         .json(&body)
         .send()

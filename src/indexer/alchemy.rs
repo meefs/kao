@@ -19,8 +19,8 @@ use crate::chain::Chain;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
-    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
-    parse_iso8601, redact_url_in_err,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction,
+    http_client_or_err, parse_iso8601, redact_url_in_err,
 };
 
 const PORTFOLIO_BASE: &str = "https://api.g.alchemy.com/data/v1";
@@ -96,7 +96,7 @@ async fn rpc<T: for<'de> Deserialize<'de>>(
         method,
         params,
     };
-    let resp: RpcResponse<T> = http_client()
+    let resp: RpcResponse<T> = http_client_or_err()?
         .post(url)
         .json(&body)
         .send()
@@ -305,7 +305,7 @@ impl Indexer for AlchemyClient {
             "includeNativeTokens": true,
         });
 
-        let resp: PortfolioResponse = http_client()
+        let resp: PortfolioResponse = http_client_or_err()?
             .post(&url)
             .json(&body)
             .send()

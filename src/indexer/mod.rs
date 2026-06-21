@@ -177,15 +177,29 @@ pub(crate) fn redact_url_in_err(e: reqwest::Error) -> String {
 
 /// Shared `reqwest::Client` for every indexer impl. One TLS pool per process,
 /// reused across account switches and provider changes.
-pub(crate) fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .user_agent(concat!("kao/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("reqwest client must build")
-    })
+pub(crate) fn http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            // Build failure means the TLS backend couldn't initialize — an
+            // unrecoverable environment fault. Cache `None` and let callers
+            // surface a network error rather than panicking a UI task (which
+            // would take down the whole window). The failure is deterministic,
+            // so caching it is correct: a retry would fail identically.
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .user_agent(concat!("kao/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|e| tracing::error!("failed to build shared HTTP client: {e}"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// `http_client()` or a uniform error string for the indexer / Safe-service
+/// call sites.
+pub(crate) fn http_client_or_err() -> Result<&'static reqwest::Client, String> {
+    http_client().ok_or_else(|| "HTTP client unavailable (TLS init failed)".to_string())
 }
 
 /// Build an indexer for `chain` matching the user's settings.
@@ -616,8 +630,8 @@ mod tests {
 
     #[test]
     fn http_client_singleton() {
-        let a = http_client();
-        let b = http_client();
+        let a = http_client().unwrap();
+        let b = http_client().unwrap();
         assert!(std::ptr::eq(a, b));
     }
 
@@ -627,7 +641,7 @@ mod tests {
         // its `source()`. The helper must surface that cause instead of
         // collapsing to reqwest's terse top-level message — that's the
         // whole point of the verbose-logging change.
-        let err = http_client().get("not a url").build().unwrap_err();
+        let err = http_client().unwrap().get("not a url").build().unwrap_err();
         let redacted = redact_url_in_err(err);
         assert!(
             redacted.contains(": "),

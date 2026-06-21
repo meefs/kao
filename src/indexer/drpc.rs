@@ -20,8 +20,8 @@ use crate::chain::Chain;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
-    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
-    redact_url_in_err,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction,
+    http_client_or_err, redact_url_in_err,
 };
 
 const BASE: &str = "https://lb.drpc.live";
@@ -280,7 +280,7 @@ async fn fetch_json<T>(url: &str, label: &'static str) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let resp = http_client()
+    let resp = http_client_or_err()?
         .get(url)
         .header("accept", "application/json")
         .send()

@@ -22,8 +22,8 @@ use crate::portfolio::{format_eth_balance, format_token_balance};
 use crate::chain::Chain;
 
 use super::{
-    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
-    parse_iso8601, redact_url_in_err,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction,
+    http_client_or_err, parse_iso8601, redact_url_in_err,
 };
 
 const DEFAULT_BASE: &str = "https://eth.blockscout.com";
@@ -195,7 +195,7 @@ impl Indexer for BlockscoutClient {
             "type=ERC-20",
         );
 
-        let client = http_client();
+        let client = http_client_or_err()?;
         let (txs_res, tokens_res): (
             Result<TxListResponse, String>,
             Result<TokenTransfersResponse, String>,
@@ -257,7 +257,7 @@ impl Indexer for BlockscoutClient {
             "type=ERC-20",
         );
 
-        let client = http_client();
+        let client = http_client_or_err()?;
         let (detail, tokens) = futures::future::join(
             async {
                 client

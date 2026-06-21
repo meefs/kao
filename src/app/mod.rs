@@ -1033,14 +1033,13 @@ impl App {
                 {
                     // Hold the passphrase for the unlocked session so we
                     // can re-save the wallet file on add/switch account.
-                    self.passphrase = Some(passphrase);
+                    // Clone the passphrase into the session slot and move the
+                    // original into the contacts task — avoids re-fetching from
+                    // `self.passphrase` with an `.expect()` that would panic the
+                    // whole app if the invariant ever changed under refactoring.
+                    self.passphrase = Some(passphrase.clone());
                     self.wallet = Some(descriptor);
-                    let load_contacts = load_contacts_task(
-                        self.passphrase
-                            .as_ref()
-                            .expect("passphrase just set")
-                            .clone(),
-                    );
+                    let load_contacts = load_contacts_task(passphrase);
                     // Refresh-on-app-open: kick off a parallel
                     // re-inspect for every Safe so the dashboard
                     // renders against verified-fresh owner sets and
