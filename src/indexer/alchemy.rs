@@ -19,8 +19,8 @@ use crate::chain::Chain;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
-    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction,
-    http_client_or_err, parse_iso8601, redact_url_in_err,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, amount_or_zero_logged,
+    classify_direction, decimals_or_default, http_client_or_err, parse_iso8601, redact_url_in_err,
 };
 
 const PORTFOLIO_BASE: &str = "https://api.g.alchemy.com/data/v1";
@@ -326,8 +326,10 @@ fn parse_portfolio(tokens: Vec<PortfolioToken>) -> Vec<IndexedToken> {
     let mut erc20: Vec<IndexedToken> = Vec::with_capacity(tokens.len());
 
     for t in tokens {
-        let raw = U256::from_str_radix(t.token_balance.trim_start_matches("0x"), 16)
-            .unwrap_or(U256::ZERO);
+        let raw = amount_or_zero_logged(
+            U256::from_str_radix(t.token_balance.trim_start_matches("0x"), 16),
+            t.token_address.as_deref().unwrap_or("native"),
+        );
         let meta = t.token_metadata.unwrap_or_default();
         let price = extract_usd(&t.token_prices);
 
@@ -354,7 +356,7 @@ fn parse_portfolio(tokens: Vec<PortfolioToken>) -> Vec<IndexedToken> {
                 let Ok(contract) = Address::from_str(addr_str) else {
                     continue;
                 };
-                let decimals = meta.decimals.unwrap_or(18);
+                let decimals = decimals_or_default(meta.decimals, contract);
                 let (bal_str, bal_f64) = format_token_balance(raw, decimals);
                 erc20.push(IndexedToken {
                     symbol: meta.symbol.unwrap_or_default(),
@@ -429,12 +431,13 @@ fn convert_transfer(t: RawTransfer, owner: Address) -> Option<IndexedTx> {
         .and_then(|s| Address::from_str(s).ok());
     let (value, token) = match (t.category.as_str(), token_contract) {
         ("erc20", Some(contract)) => {
-            let decimals = t
-                .raw_contract
-                .as_ref()
-                .and_then(|c| c.decimal.as_deref())
-                .and_then(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).ok())
-                .unwrap_or(18);
+            let decimals = decimals_or_default(
+                t.raw_contract
+                    .as_ref()
+                    .and_then(|c| c.decimal.as_deref())
+                    .and_then(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).ok()),
+                contract,
+            );
             let symbol = t.asset.clone().unwrap_or_default();
             (
                 U256::ZERO,

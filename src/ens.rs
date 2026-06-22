@@ -266,6 +266,10 @@ async fn registry_resolver(
         .await
         .map_err(|e| format!("registry.resolver: {e}"))?;
     if result.len() < 32 {
+        debug!(
+            len = result.len(),
+            "registry.resolver returned short data; treating as no resolver"
+        );
         return Ok(Address::ZERO);
     }
     Ok(decode_address(&result))

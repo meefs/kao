@@ -22,8 +22,8 @@ use crate::portfolio::{format_eth_balance, format_token_balance};
 use crate::chain::Chain;
 
 use super::{
-    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction,
-    http_client_or_err, redact_url_in_err,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, amount_or_zero_logged,
+    classify_direction, decimals_or_default, http_client_or_err, redact_url_in_err,
 };
 
 const BASE: &str = "https://api.etherscan.io/v2/api";
@@ -258,8 +258,8 @@ fn parse_token_balances(rows: Vec<RawTokenBalance>) -> Vec<IndexedToken> {
     rows.into_iter()
         .filter_map(|row| {
             let contract = Address::from_str(&row.token_address).ok()?;
-            let decimals = row.token_divisor.parse::<u8>().unwrap_or(18);
-            let raw = U256::from_str(&row.token_quantity).unwrap_or(U256::ZERO);
+            let decimals = decimals_or_default(row.token_divisor.parse::<u8>().ok(), contract);
+            let raw = amount_or_zero_logged(U256::from_str(&row.token_quantity), contract);
             if raw.is_zero() {
                 return None;
             }
@@ -320,7 +320,7 @@ fn convert_tx(r: RawTx, owner: Address) -> Option<IndexedTx> {
     } else {
         Address::from_str(&r.to).ok()
     };
-    let value = U256::from_str(&r.value).unwrap_or(U256::ZERO);
+    let value = amount_or_zero_logged(U256::from_str(&r.value), hash);
     let gas_used = r.gas_used.parse::<u64>().ok();
     let gas_price = r.gas_price.parse::<u128>().ok();
     // Etherscan uses `txreceipt_status` post-Byzantium (the receipt's status
@@ -373,8 +373,8 @@ fn convert_token_tx(r: RawTokenTx, owner: Address) -> Option<IndexedTx> {
         Address::from_str(&r.to).ok()
     };
     let contract = Address::from_str(&r.contract_address).ok()?;
-    let amount_raw = U256::from_str(&r.value).unwrap_or(U256::ZERO);
-    let decimals = r.token_decimal.parse::<u8>().unwrap_or(18);
+    let amount_raw = amount_or_zero_logged(U256::from_str(&r.value), contract);
+    let decimals = decimals_or_default(r.token_decimal.parse::<u8>().ok(), contract);
     let gas_used = r.gas_used.parse::<u64>().ok();
     let gas_price = r.gas_price.parse::<u128>().ok();
     Some(IndexedTx {

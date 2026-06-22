@@ -30,6 +30,7 @@
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::chain::Chain;
 use crate::net::BalanceFetcher;
@@ -292,6 +293,16 @@ fn parse_addr_field(s: &Option<String>) -> Address {
 fn raw_to_safe_tx(raw: &RawMultisigTx) -> Option<SafeTx> {
     let to = raw.to.parse::<Address>().ok()?;
     let nonce = raw.nonce.parse::<u64>().ok()?;
+    // `value` is the amount being moved — drop the row on a parse failure
+    // (matching `to`/`nonce`) rather than silently rendering a 0-value send,
+    // which would hide a real transfer in the pending queue.
+    let value = match raw.value.parse::<U256>() {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(value = %raw.value, error = %e, "dropping Safe tx: unparseable value");
+            return None;
+        }
+    };
     let data = raw
         .data
         .as_deref()
@@ -300,7 +311,7 @@ fn raw_to_safe_tx(raw: &RawMultisigTx) -> Option<SafeTx> {
         .unwrap_or_default();
     Some(SafeTx {
         to,
-        value: raw.value.parse::<U256>().unwrap_or(U256::ZERO),
+        value,
         data,
         operation: raw.operation,
         safeTxGas: parse_u256_field(&raw.safe_tx_gas),
@@ -322,7 +333,16 @@ fn map_raw(raw: RawMultisigTx, threshold: u32, current_nonce: u64) -> Option<Pen
     let safe_tx_hash = raw.safe_tx_hash.parse::<B256>().ok()?;
     let to = raw.to.parse::<Address>().ok()?;
     let nonce = raw.nonce.parse::<u64>().ok()?;
-    let value = raw.value.parse::<U256>().unwrap_or(U256::ZERO);
+    // Drop the row on an unparseable value rather than showing 0 — same
+    // reasoning as `raw_to_safe_tx`: a 0-value pending tx would mask a real
+    // transfer awaiting co-signers.
+    let value = match raw.value.parse::<U256>() {
+        Ok(v) => v,
+        Err(e) => {
+            debug!(value = %raw.value, error = %e, "dropping pending Safe tx: unparseable value");
+            return None;
+        }
+    };
     let data = raw
         .data
         .as_deref()

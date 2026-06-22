@@ -395,6 +395,7 @@ fn parse_tokenlist() -> (Vec<TokenMeta>, Vec<TokenMeta>) {
             _ => continue,
         };
         let Ok(addr) = Address::from_str(&entry.address) else {
+            debug!(address = %entry.address, "skipping tokenlist entry with unparseable address");
             continue;
         };
         bucket.push(TokenMeta {

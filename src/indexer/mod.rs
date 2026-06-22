@@ -202,6 +202,31 @@ pub(crate) fn http_client_or_err() -> Result<&'static reqwest::Client, String> {
     http_client().ok_or_else(|| "HTTP client unavailable (TLS init failed)".to_string())
 }
 
+/// Token `decimals` from an indexer's metadata, or a **logged** fallback to 18.
+/// Indexer JSON is untrusted and can omit or garble `decimals`; defaulting
+/// silently would rescale a balance/amount by up to 10^12 (a 6-decimal USDC
+/// rendered as 18), so surface the gap. Live balances are re-read on-chain;
+/// this keeps the indexer/activity-feed fallback visible (`RUST_LOG=kao=warn`).
+pub(crate) fn decimals_or_default(parsed: Option<u8>, token: impl std::fmt::Display) -> u8 {
+    parsed.unwrap_or_else(|| {
+        tracing::warn!(%token, "token decimals missing/unparseable from indexer; defaulting to 18 — displayed scale may be wrong");
+        18
+    })
+}
+
+/// A parsed token amount, or a **logged** fallback to zero. A silent
+/// `unwrap_or(U256::ZERO)` on untrusted indexer data would hide a real balance
+/// or transfer behind a plausible "0"; this records the parse failure instead.
+pub(crate) fn amount_or_zero_logged<E: std::fmt::Display>(
+    parsed: Result<U256, E>,
+    token: impl std::fmt::Display,
+) -> U256 {
+    parsed.unwrap_or_else(|e| {
+        tracing::warn!(%token, error = %e, "unparseable amount from indexer; showing 0");
+        U256::ZERO
+    })
+}
+
 /// Build an indexer for `chain` matching the user's settings.
 ///
 /// Mainnet keeps the full provider matrix (Blockscout / Etherscan /

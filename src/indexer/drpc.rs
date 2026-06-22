@@ -21,7 +21,7 @@ use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
     IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction,
-    http_client_or_err, redact_url_in_err,
+    decimals_or_default, http_client_or_err, redact_url_in_err,
 };
 
 const BASE: &str = "https://lb.drpc.live";
@@ -378,7 +378,7 @@ fn parse_balances(assets: Vec<Asset>) -> Vec<IndexedToken> {
             let Ok(contract) = Address::from_str(addr_str) else {
                 continue;
             };
-            let decimals = attrs.decimals.unwrap_or(18);
+            let decimals = decimals_or_default(attrs.decimals, contract);
             let (bal_str, bal_f64) = format_token_balance(raw, decimals);
             erc20.push(IndexedToken {
                 symbol: attrs.token_symbol.unwrap_or_default(),
@@ -503,7 +503,7 @@ fn decode_transfer(tr: &RawTransfer) -> (U256, Option<TokenTransfer>) {
         // Native ETH transfer — amount is wei.
         (raw_amount, None)
     } else if let Ok(contract) = Address::from_str(address) {
-        let decimals = tr.decimals.unwrap_or(18);
+        let decimals = decimals_or_default(tr.decimals, contract);
         let symbol = token.and_then(|t| t.symbol.clone()).unwrap_or_default();
         (
             U256::ZERO,

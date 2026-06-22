@@ -45,10 +45,11 @@ pub fn parse_amount_units(amount: &str, decimals: u8) -> Result<U256, String> {
     }
     // alloy's `parse_units` accepts a leading '-' and `<ParseUnits as
     // Into<U256>>` reinterprets the signed value's two's-complement bytes as a
-    // huge U256 (e.g. "-1" → 2^256 - 1e18). The Send screen's digit-only field
-    // guards against this, but reject it here too so the public API matches its
-    // "rejects negative inputs" contract and a non-UI caller can't sign an
-    // astronomically large transfer. (See the rejects-negative test.)
+    // huge U256 (e.g. "-1" → 2^256 - 1e18). The Send screen's `parsed_amount`
+    // also rejects negatives, but enforce it in this public helper too so the
+    // API matches its "rejects negative inputs" contract and a non-UI caller
+    // can't sign an astronomically large transfer. (See the rejects-negative
+    // test.)
     if trimmed.starts_with('-') {
         return Err("amount must not be negative".into());
     }

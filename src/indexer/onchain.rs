@@ -26,7 +26,7 @@ use tracing::{debug, warn};
 use crate::chain::Chain;
 use crate::portfolio::{multicall_pairs, with_rate_limit_retry};
 
-use super::{IndexedTx, TokenTransfer, TxStatus, classify_direction};
+use super::{IndexedTx, TokenTransfer, TxStatus, classify_direction, decimals_or_default};
 
 /// `keccak256("Transfer(address,address,uint256)")` — shared by ERC-20
 /// and ERC-721 (the latter just adds a 4th indexed `tokenId` topic).
@@ -503,10 +503,12 @@ async fn enrich_token_metadata(provider: &RootProvider<Ethereum>, rows: &mut [In
                 }
             })
             .unwrap_or_default();
-        let decimals = results
-            .get(dec_idx)
-            .and_then(|(ok, data)| if *ok { decode_decimals(data) } else { None })
-            .unwrap_or(18);
+        let decimals = decimals_or_default(
+            results
+                .get(dec_idx)
+                .and_then(|(ok, data)| if *ok { decode_decimals(data) } else { None }),
+            *contract,
+        );
         meta.insert(*contract, (symbol, decimals));
     }
 
