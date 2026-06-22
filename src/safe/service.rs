@@ -269,6 +269,26 @@ fn parsable_confirmations(confirmations: &[RawConfirmation]) -> u64 {
         .count() as u64
 }
 
+/// Decode the service's raw confirmations into `(owner, signature)` pairs,
+/// keeping only the ones we can actually use to execute. A confirmation whose
+/// owner OR signature is absent/unparseable, or whose signature is empty, is
+/// dropped: an empty/garbage signature would break the 65-byte-per-sig packing
+/// in `execTransaction` (on-chain GS020/GS026) and inflate `confirmations.len()`
+/// above the count of usable signatures that `derive_state` relies on.
+fn parse_confirmations(confirmations: &[RawConfirmation]) -> Vec<ServiceConfirmation> {
+    confirmations
+        .iter()
+        .filter_map(|c| {
+            let owner = c.owner.as_deref()?.parse::<Address>().ok()?;
+            let signature = c.signature.as_deref()?.parse::<Bytes>().ok()?;
+            if signature.is_empty() {
+                return None;
+            }
+            Some(ServiceConfirmation { owner, signature })
+        })
+        .collect()
+}
+
 /// Parse a decimal/0x numeric string field to `U256`, treating
 /// absent/empty/garbage as zero (relay fields legitimately arrive null).
 fn parse_u256_field(s: &Option<String>) -> U256 {
@@ -561,19 +581,7 @@ pub async fn fetch_detail(
         .confirmations_required
         .unwrap_or(threshold as u64)
         .max(1);
-    let confirmations: Vec<ServiceConfirmation> = raw
-        .confirmations
-        .iter()
-        .filter_map(|c| {
-            let owner = c.owner.as_deref()?.parse::<Address>().ok()?;
-            let signature = c
-                .signature
-                .as_deref()
-                .and_then(|s| s.parse::<Bytes>().ok())
-                .unwrap_or_default();
-            Some(ServiceConfirmation { owner, signature })
-        })
-        .collect();
+    let confirmations = parse_confirmations(&raw.confirmations);
     let state = derive_state(
         confirmations.len() as u64,
         required,
@@ -706,6 +714,44 @@ mod tests {
                 required: 2
             }
         );
+    }
+
+    #[test]
+    fn parse_confirmations_drops_empty_or_unparsable_signatures() {
+        let owner_a = "0x1111111111111111111111111111111111111111";
+        let owner_b = "0x2222222222222222222222222222222222222222";
+        let sig = format!("0x{}", "11".repeat(65)); // a 65-byte signature
+        let raw = vec![
+            // Fully valid → kept.
+            RawConfirmation {
+                owner: Some(owner_a.into()),
+                signature: Some(sig.clone()),
+            },
+            // Valid owner but empty signature ("0x") → dropped; an empty blob
+            // would break `execTransaction` signature packing.
+            RawConfirmation {
+                owner: Some(owner_b.into()),
+                signature: Some("0x".into()),
+            },
+            // Valid owner, missing signature → dropped.
+            RawConfirmation {
+                owner: Some(owner_b.into()),
+                signature: None,
+            },
+            // Unparsable owner → dropped.
+            RawConfirmation {
+                owner: Some("not-an-address".into()),
+                signature: Some(sig.clone()),
+            },
+        ];
+        let parsed = parse_confirmations(&raw);
+        assert_eq!(
+            parsed.len(),
+            1,
+            "only the fully-valid confirmation survives"
+        );
+        assert_eq!(parsed[0].owner, owner_a.parse::<Address>().unwrap());
+        assert!(!parsed[0].signature.is_empty());
     }
 
     #[test]
