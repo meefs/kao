@@ -551,11 +551,33 @@ fn balance_of_calldata(owner: Address) -> Bytes {
     Bytes::from(data)
 }
 
+/// Hard cap on the `decimals` we'll honour when scaling a balance for
+/// display. Real ERC-20 tokens top out at 18; anything beyond this is
+/// garbled or hostile metadata. The cap also keeps the divisor finite:
+/// `10u64.pow(20)` already overflows u64 (panics in debug builds, silently
+/// wraps in release, where `overflow-checks` are off) — see
+/// [`decimals_or_default`](crate::indexer::decimals_or_default), which feeds
+/// this from untrusted indexer/contract metadata with no upper bound.
+const MAX_DISPLAY_DECIMALS: u8 = 36;
+
 pub(crate) fn format_token_balance(raw: U256, decimals: u8) -> (String, f64) {
     if raw.is_zero() {
         return ("0".into(), 0.0);
     }
-    let divisor = 10u64.pow(decimals as u32) as f64;
+    let decimals = if decimals > MAX_DISPLAY_DECIMALS {
+        warn!(
+            decimals,
+            max = MAX_DISPLAY_DECIMALS,
+            "token decimals exceed sane maximum; clamping for display"
+        );
+        MAX_DISPLAY_DECIMALS
+    } else {
+        decimals
+    };
+    // f64 exponentiation saturates to a finite value instead of wrapping the
+    // way integer `pow` would; combined with the clamp above the divisor is
+    // always a sane, non-zero scale factor.
+    let divisor = 10f64.powi(decimals as i32);
     let raw_f64 = raw.to_string().parse::<f64>().unwrap_or(0.0);
     let value = raw_f64 / divisor;
     let formatted = if value >= 1000.0 {
@@ -1441,6 +1463,34 @@ mod helper_tests {
         let usdc = address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
         let weth = address!("0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2");
         assert_eq!(eth_usd_from_sqrt_price(U256::ZERO, usdc, weth), 0.0);
+    }
+
+    #[test]
+    fn format_token_balance_huge_decimals_does_not_overflow() {
+        // `decimals` is untrusted indexer/contract metadata. 255 would make
+        // `10u64.pow(255)` overflow u64 (panic in debug, wrap in release).
+        // The clamp + f64 divisor must yield a finite, sane result instead.
+        let raw = U256::from(1_000_000u64);
+        let (s, f) = format_token_balance(raw, 255);
+        assert!(f.is_finite(), "value must be finite, got {f}");
+        assert!(f >= 0.0, "value must be non-negative, got {f}");
+        // 1e6 / 10^36 rounds to zero at 6 dp.
+        assert_eq!(s, "0.000000");
+    }
+
+    #[test]
+    fn format_token_balance_at_clamp_boundary_is_finite() {
+        // decimals == MAX_DISPLAY_DECIMALS and one above both stay finite and
+        // (after clamping) produce the same scale.
+        let raw = U256::from(5u64) * U256::from(10).pow(U256::from(36));
+        let (_, at_cap) = format_token_balance(raw, MAX_DISPLAY_DECIMALS);
+        let (_, over_cap) = format_token_balance(raw, 200);
+        assert!(at_cap.is_finite() && over_cap.is_finite());
+        assert!(
+            (at_cap - over_cap).abs() < 1e-9,
+            "over-cap clamps to the cap"
+        );
+        assert!((at_cap - 5.0).abs() < 1e-9, "5 * 10^36 / 10^36 == 5");
     }
 
     #[test]
