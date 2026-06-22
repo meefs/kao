@@ -145,10 +145,7 @@ pub fn looks_like_ens(input: &str) -> bool {
 /// the signed recipient, so an unverified answer is never returned as
 /// success (the caller surfaces it as a resolution error, and the user can
 /// still paste the address directly).
-pub async fn resolve_name(
-    net: &dyn BalanceFetcher,
-    name: &str,
-) -> Result<Option<Address>, String> {
+pub async fn resolve_name(net: &dyn BalanceFetcher, name: &str) -> Result<Option<Address>, String> {
     let normalized = normalize(name)?;
     let node = namehash(&normalized);
     let result = resolver_addr(net, node).await?;
@@ -256,10 +253,7 @@ async fn verified_call(
 
 /// Resolve the `addr` record for an already-namehashed node. Shared by
 /// `resolve_name` and the forward-verification step in `lookup_address`.
-async fn resolver_addr(
-    net: &dyn BalanceFetcher,
-    node: B256,
-) -> Result<Option<Address>, String> {
+async fn resolver_addr(net: &dyn BalanceFetcher, node: B256) -> Result<Option<Address>, String> {
     let resolver = registry_resolver(net, node).await?;
     if resolver == Address::ZERO {
         return Ok(None);
@@ -284,10 +278,7 @@ fn reverse_node_name(addr: Address) -> String {
 }
 
 /// Call `ENS.resolver(bytes32)` against the registry and decode the address.
-async fn registry_resolver(
-    net: &dyn BalanceFetcher,
-    node: B256,
-) -> Result<Address, String> {
+async fn registry_resolver(net: &dyn BalanceFetcher, node: B256) -> Result<Address, String> {
     let result = verified_call(net, ENS_REGISTRY, RESOLVER_SELECTOR, node).await?;
     if result.len() < 32 {
         debug!(
@@ -925,7 +916,12 @@ mod verified_resolution_tests {
             abi_address(RESOLVER),
             true,
         );
-        net.set_call(RESOLVER, calldata(ADDR_SELECTOR, node), abi_address(TARGET), true);
+        net.set_call(
+            RESOLVER,
+            calldata(ADDR_SELECTOR, node),
+            abi_address(TARGET),
+            true,
+        );
 
         let got = resolve_name(&net, "vitalik.eth").await.unwrap();
         assert_eq!(got, Some(TARGET));
@@ -965,7 +961,12 @@ mod verified_resolution_tests {
             abi_address(RESOLVER),
             true,
         );
-        net.set_call(RESOLVER, calldata(ADDR_SELECTOR, node), abi_address(TARGET), false);
+        net.set_call(
+            RESOLVER,
+            calldata(ADDR_SELECTOR, node),
+            abi_address(TARGET),
+            false,
+        );
 
         let res = resolve_name(&net, "vitalik.eth").await;
         assert!(

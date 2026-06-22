@@ -477,7 +477,13 @@ impl SendPane {
         self.resolution = if trimmed.is_empty() {
             Resolution::Empty
         } else if let Ok(addr) = Address::from_str(trimmed) {
-            Resolution::Address(addr)
+            // The zero address is a burn hole, never a real recipient —
+            // surface it as invalid rather than letting it ride into a plan.
+            if addr.is_zero() {
+                Resolution::Invalid
+            } else {
+                Resolution::Address(addr)
+            }
         } else if ens::looks_like_ens(trimmed) {
             Resolution::Resolving {
                 name: trimmed.to_string(),
@@ -498,6 +504,12 @@ impl SendPane {
     pub fn build_plan(&self, portfolio: &[LiveToken]) -> Option<SendPlan> {
         let eoa = self.eoa()?;
         let recipient = self.resolution.recipient()?;
+        // Defence in depth behind `set_to`/`recipient()`: never build a plan
+        // that sends to the zero address, regardless of how `recipient` was
+        // populated (typed, pasted, picked from a contact, or ENS-resolved).
+        if recipient.is_zero() {
+            return None;
+        }
         let token = portfolio.get(self.token_idx)?;
         let amount_units = parse_amount_units(&self.amount, token.decimals).ok()?;
         if amount_units.is_zero() || amount_units > token.balance_raw {
@@ -650,6 +662,13 @@ impl SendPane {
         if s.version_block.is_some() {
             return None;
         }
+        let recipient = self.resolution.recipient()?;
+        // Same zero-address guard as `build_plan`. Every Safe signing path
+        // (prepare / broadcast / propose) re-derives the request here, so one
+        // check keeps a zero-recipient SafeTx from ever being built or signed.
+        if recipient.is_zero() {
+            return None;
+        }
         let token = portfolio.get(self.token_idx)?;
         let amount_units = self.parsed_amount(token.decimals)?;
         let send_token = match token.contract {
@@ -661,7 +680,7 @@ impl SendPane {
             chain: s.safe_chain?,
             version: s.safe_version.clone(),
             service_base: s.service_base.clone(),
-            recipient: self.resolution.recipient()?,
+            recipient,
             amount_units,
             token: send_token,
             threshold: s.threshold,
@@ -3485,6 +3504,67 @@ mod tests {
         let pane = SendPane::new_safe(&desc, &[local_account_simple(1)]);
         assert!(pane.safe().unwrap().safe_chain.is_none());
         assert!(pane.outgoing_request(&test_portfolio()).is_none());
+    }
+
+    #[test]
+    fn set_to_rejects_zero_address() {
+        let mut pane = SendPane::new_safe(&safe_only(1, vec![0]), &[local_account_simple(1)]);
+        pane.set_to("0x0000000000000000000000000000000000000000".into());
+        assert!(
+            matches!(pane.resolution, Resolution::Invalid),
+            "zero address must resolve to Invalid, got {:?}",
+            pane.resolution,
+        );
+    }
+
+    #[test]
+    fn build_plan_rejects_zero_recipient() {
+        // A picked zero address bypasses `set_to`'s parse guard, so
+        // `build_plan` must independently refuse it before producing a
+        // signable plan.
+        let mut pane = SendPane::new_eoa(Address::repeat_byte(0xAB));
+        pane.amount = "0.1".into();
+        // Control: the identical setup with a real recipient builds a plan,
+        // so a `None` below can only be the zero-address guard firing.
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::repeat_byte(0xCD),
+            ens: None,
+        });
+        assert!(
+            pane.build_plan(&test_portfolio()).is_some(),
+            "control: a non-zero recipient should build a plan",
+        );
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::ZERO,
+            ens: None,
+        });
+        assert!(
+            pane.build_plan(&test_portfolio()).is_none(),
+            "build_plan must reject a zero recipient",
+        );
+    }
+
+    #[test]
+    fn outgoing_request_rejects_zero_recipient() {
+        let mut pane = SendPane::new_safe(&safe_only(1, vec![0]), &[local_account_simple(1)]);
+        pane.amount = "0.001".into();
+        // Control, mirroring `outgoing_request_uses_resolved_recipient`.
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::repeat_byte(0xCD),
+            ens: None,
+        });
+        assert!(
+            pane.outgoing_request(&test_portfolio()).is_some(),
+            "control: a non-zero recipient should build a request",
+        );
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::ZERO,
+            ens: None,
+        });
+        assert!(
+            pane.outgoing_request(&test_portfolio()).is_none(),
+            "outgoing_request must reject a zero recipient",
+        );
     }
 
     #[test]

@@ -255,6 +255,17 @@ pub async fn sign_and_send(
     plan: SendPlan,
     quote: TxQuote,
 ) -> Result<TxHash, String> {
+    // Never sign a transfer to the zero address. For a native send that
+    // burns the ETH irrecoverably; many ERC-20s also permit transfer-to-zero.
+    // `plan.recipient` is the *actual* destination in both cases — for an
+    // ERC-20 the tx `to` is the contract and the recipient lives in the
+    // transfer calldata — so this single check covers native and token sends.
+    // The Send UI rejects it earlier; this is the last-line guard for any
+    // path that reaches the signer.
+    if plan.recipient.is_zero() {
+        warn!(from = %plan.from, "sign+send: refusing zero-address recipient");
+        return Err("refusing to send to the zero address".to_string());
+    }
     let (to, value, input) = plan.tx_target();
     let token_kind = match &plan.token {
         SendToken::Native => "native",
@@ -456,5 +467,61 @@ mod tests {
         if let Ok(v) = parse_amount_units("1.2345678", 6) {
             assert!(v <= U256::from(1_234_568u64), "must not over-allocate");
         }
+    }
+
+    fn dummy_quote() -> TxQuote {
+        TxQuote {
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            nonce: 0,
+            eth_cost_wei: U256::ZERO,
+            sim: SimulationResult::unavailable(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_and_send_refuses_zero_recipient_native() {
+        use alloy::signers::local::PrivateKeySigner;
+        let signer = KaoSigner::Local(PrivateKeySigner::random());
+        // The guard returns before signing/broadcast, so the provider is
+        // never contacted — a non-routable URL is fine.
+        let provider = RootProvider::<Ethereum>::new_http("http://127.0.0.1:1".parse().unwrap());
+        let plan = SendPlan {
+            from: signer.address(),
+            recipient: Address::ZERO,
+            token: SendToken::Native,
+            amount_units: U256::from(1u64),
+            chain: Chain::Mainnet,
+        };
+        let res = sign_and_send(&provider, &signer, plan, dummy_quote()).await;
+        assert!(
+            res.is_err(),
+            "native send to the zero address must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_and_send_refuses_zero_recipient_erc20() {
+        use alloy::signers::local::PrivateKeySigner;
+        let signer = KaoSigner::Local(PrivateKeySigner::random());
+        let provider = RootProvider::<Ethereum>::new_http("http://127.0.0.1:1".parse().unwrap());
+        // ERC-20: the tx `to` is the (non-zero) contract, but the recipient
+        // buried in the transfer calldata is zero — exactly the case a
+        // `to`-only check would wave through. The guard inspects
+        // `plan.recipient`, so it catches it.
+        let usdc = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let plan = SendPlan {
+            from: signer.address(),
+            recipient: Address::ZERO,
+            token: SendToken::Erc20 { contract: usdc },
+            amount_units: U256::from(1_000_000u64),
+            chain: Chain::Base,
+        };
+        let res = sign_and_send(&provider, &signer, plan, dummy_quote()).await;
+        assert!(
+            res.is_err(),
+            "erc20 transfer to the zero address must be refused"
+        );
     }
 }
