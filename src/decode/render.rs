@@ -320,16 +320,15 @@ async fn humanize_arg(
 ) -> DecodedArg {
     let display = match value {
         DynSolValue::Address(addr) => {
-            // Reverse ENS only on Mainnet — reverse records live there.
-            // Cross-chain reverse would need a separate Mainnet provider
-            // (a future deliberate addition). The ENS resolver itself
-            // already forward-verifies the result; we don't need to add
-            // a second verification layer here.
+            // Reverse ENS only on Mainnet — reverse records live there, and
+            // gating here keeps an L2 decode from spinning up mainnet Helios
+            // for a cosmetic name. Cross-chain reverse would need a separate
+            // Mainnet read (a future deliberate addition). `lookup_address`
+            // both forward-verifies the record and routes every read through
+            // the light client, so an unverified answer fails closed (no
+            // name) rather than letting a hostile RPC fabricate one.
             let ens = if matches!(chain, Chain::Mainnet) {
-                match net.provider(chain).await {
-                    Some(provider) => ens::lookup_address(&provider, *addr).await.ok().flatten(),
-                    None => None,
-                }
+                ens::lookup_address(net, *addr).await.ok().flatten()
             } else {
                 None
             };

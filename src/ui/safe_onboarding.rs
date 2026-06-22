@@ -478,10 +478,10 @@ impl SafeOnboardingScreen {
         let network = self.network.clone();
         let task = Task::perform(
             async move {
-                let result = match network.provider(Chain::Mainnet).await {
-                    Some(provider) => ens::resolve_name(&provider, &name).await,
-                    None => Err("no execution RPCs configured".to_string()),
-                };
+                // ENS resolution rides the Helios-verified path (mainnet
+                // only); a hostile exec RPC can't substitute the resolved
+                // address that becomes a Safe owner.
+                let result = ens::resolve_name(network.as_ref(), &name).await;
                 (seq, name, result)
             },
             |(seq, name, result)| Message::EnsResolved { seq, name, result },

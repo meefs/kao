@@ -18,9 +18,22 @@
 //!
 //! No `sol!` macro: encoding is a 4-byte selector + a single 32-byte
 //! `bytes32` argument; decoding is either a left-padded 20-byte address or a
-//! single-string ABI head/tail. Mirrors the raw-call style used in
-//! `portfolio.rs` so the reader can compare both call sites without context
-//! switching.
+//! single-string ABI head/tail.
+//!
+//! Every registry/resolver read goes through the Helios-verified
+//! [`BalanceFetcher::call`] against Ethereum mainnet — **never** the raw
+//! exec-RPC provider. ENS lives on mainnet, and a resolved address feeds the
+//! signed recipient (Send) and imported Safe owners; routing the lookups
+//! through the light client means a hostile exec RPC can't substitute a
+//! resolver or an `addr` record, because Helios re-executes the call against
+//! proof-verified state. When a read can't be verified (light client
+//! unavailable, raw-RPC fallback) we **fail closed**: the lookup returns
+//! `Err` instead of an address. Forward resolution surfaces that error to the
+//! user (who can paste the address directly); the reverse-display call sites
+//! already map any error to "no name", so a hostile RPC can never fabricate a
+//! name on the review surface. Mainnet ships with a built-in checkpoint and a
+//! default consensus RPC, so the verified path is the normal case, not an
+//! opt-in.
 //!
 //! `alloy` 2.0.1 does not ship ENS resolution under the hood — there is no
 //! `Provider::resolve_name` or equivalent in the published crate — so we
@@ -28,12 +41,12 @@
 
 use std::sync::LazyLock;
 
-use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256};
-use alloy::providers::{Provider, RootProvider};
-use alloy::rpc::types::{TransactionInput, TransactionRequest};
 use ens_normalize_rs::EnsNameNormalizer;
 use tracing::{debug, trace};
+
+use crate::chain::Chain;
+use crate::net::BalanceFetcher;
 
 /// Process-wide normalizer. Constructing one parses an embedded JSON spec
 /// (~MB of code-point tables); we want that cost paid once at first use,
@@ -69,6 +82,13 @@ const RESOLVER_SELECTOR: [u8; 4] = [0x01, 0x78, 0xb8, 0xbf];
 const ADDR_SELECTOR: [u8; 4] = [0x3b, 0x3b, 0x57, 0xde];
 // keccak256("name(bytes32)")[..4]
 const NAME_SELECTOR: [u8; 4] = [0x69, 0x1f, 0x34, 0x31];
+
+/// Error returned when an ENS read completed but did not cross Helios's
+/// verified path — the light client was unavailable and the value came back
+/// over the raw-RPC fallback. ENS feeds signing decisions, so an unverified
+/// answer is a hard failure rather than something to silently trust.
+const UNVERIFIED: &str =
+    "ENS lookup could not be verified by the light client; enter the address directly";
 
 /// Compute the ENSIP-1 namehash of `name`.
 ///
@@ -120,14 +140,18 @@ pub fn looks_like_ens(input: &str) -> bool {
 ///
 /// `Ok(None)` when the name has no resolver, the resolver has no `addr`
 /// record, or the recorded address is the zero address. Network/RPC
-/// failures bubble up as `Err`.
+/// failures bubble up as `Err` — as does a resolution that completed but
+/// could not be verified by the light client: the resolved address becomes
+/// the signed recipient, so an unverified answer is never returned as
+/// success (the caller surfaces it as a resolution error, and the user can
+/// still paste the address directly).
 pub async fn resolve_name(
-    provider: &RootProvider<Ethereum>,
+    net: &dyn BalanceFetcher,
     name: &str,
 ) -> Result<Option<Address>, String> {
     let normalized = normalize(name)?;
     let node = namehash(&normalized);
-    let result = resolver_addr(provider, node).await?;
+    let result = resolver_addr(net, node).await?;
     if result.is_none() {
         trace!(name = %normalized, "ens forward: no resolver / no record");
     }
@@ -155,27 +179,22 @@ pub async fn resolve_name(
 /// suitable for direct rendering. Forward verification used the
 /// normalized form so an on-chain record that round-trips with non-canonical
 /// bytes still resolves correctly.
+///
+/// A read that could not be verified by the light client returns `Err`
+/// (every registry/resolver call goes through Helios); the display call
+/// sites map that to "no name", so a hostile RPC can't fabricate one.
 pub async fn lookup_address(
-    provider: &RootProvider<Ethereum>,
+    net: &dyn BalanceFetcher,
     addr: Address,
 ) -> Result<Option<String>, String> {
     let reverse_label = reverse_node_name(addr);
     let node = namehash(&reverse_label);
-    let resolver = registry_resolver(provider, node).await?;
+    let resolver = registry_resolver(net, node).await?;
     if resolver == Address::ZERO {
         trace!(addr = %addr, "ens reverse: no resolver");
         return Ok(None);
     }
-    let mut data = Vec::with_capacity(36);
-    data.extend_from_slice(&NAME_SELECTOR);
-    data.extend_from_slice(node.as_slice());
-    let tx = TransactionRequest::default()
-        .to(resolver)
-        .input(TransactionInput::new(Bytes::from(data)));
-    let result = provider
-        .call(tx)
-        .await
-        .map_err(|e| format!("name({addr}): {e}"))?;
+    let result = verified_call(net, resolver, NAME_SELECTOR, node).await?;
     let claimed = match decode_string(&result) {
         Some(s) if !s.is_empty() => s,
         _ => return Ok(None),
@@ -197,7 +216,7 @@ pub async fn lookup_address(
     // namehash inputs we want, and re-running the normalizer obscures the
     // round-trip in tracing.
     let forward_node = namehash(&normalized);
-    let forward_addr = match resolver_addr(provider, forward_node).await? {
+    let forward_addr = match resolver_addr(net, forward_node).await? {
         Some(a) => a,
         None => {
             debug!(addr = %addr, name = %normalized, "ens reverse rejected: no forward record");
@@ -212,26 +231,40 @@ pub async fn lookup_address(
     Ok(Some(beautify(&normalized)))
 }
 
+/// Issue one ENS `eth_call` (`selector` followed by the 32-byte `node`)
+/// against `to` through the light-client-verified path on Ethereum mainnet.
+///
+/// Returns the raw return bytes on a verified read, or `Err` ([`UNVERIFIED`])
+/// when the value came back over the raw-RPC fallback. ENS is mainnet-only,
+/// so the chain is pinned to [`Chain::Mainnet`] regardless of which chain the
+/// caller is viewing — see the module docs for why every read fails closed.
+async fn verified_call(
+    net: &dyn BalanceFetcher,
+    to: Address,
+    selector: [u8; 4],
+    node: B256,
+) -> Result<Bytes, String> {
+    let mut data = Vec::with_capacity(36);
+    data.extend_from_slice(&selector);
+    data.extend_from_slice(node.as_slice());
+    let read = net.call(to, Bytes::from(data), Chain::Mainnet).await?;
+    if !read.verified {
+        return Err(UNVERIFIED.to_string());
+    }
+    Ok(read.value)
+}
+
 /// Resolve the `addr` record for an already-namehashed node. Shared by
 /// `resolve_name` and the forward-verification step in `lookup_address`.
 async fn resolver_addr(
-    provider: &RootProvider<Ethereum>,
+    net: &dyn BalanceFetcher,
     node: B256,
 ) -> Result<Option<Address>, String> {
-    let resolver = registry_resolver(provider, node).await?;
+    let resolver = registry_resolver(net, node).await?;
     if resolver == Address::ZERO {
         return Ok(None);
     }
-    let mut data = Vec::with_capacity(36);
-    data.extend_from_slice(&ADDR_SELECTOR);
-    data.extend_from_slice(node.as_slice());
-    let tx = TransactionRequest::default()
-        .to(resolver)
-        .input(TransactionInput::new(Bytes::from(data)));
-    let result = provider
-        .call(tx)
-        .await
-        .map_err(|e| format!("addr(node): {e}"))?;
+    let result = verified_call(net, resolver, ADDR_SELECTOR, node).await?;
     if result.len() < 32 {
         return Ok(None);
     }
@@ -252,19 +285,10 @@ fn reverse_node_name(addr: Address) -> String {
 
 /// Call `ENS.resolver(bytes32)` against the registry and decode the address.
 async fn registry_resolver(
-    provider: &RootProvider<Ethereum>,
+    net: &dyn BalanceFetcher,
     node: B256,
 ) -> Result<Address, String> {
-    let mut data = Vec::with_capacity(36);
-    data.extend_from_slice(&RESOLVER_SELECTOR);
-    data.extend_from_slice(node.as_slice());
-    let tx = TransactionRequest::default()
-        .to(ENS_REGISTRY)
-        .input(TransactionInput::new(Bytes::from(data)));
-    let result = provider
-        .call(tx)
-        .await
-        .map_err(|e| format!("registry.resolver: {e}"))?;
+    let result = verified_call(net, ENS_REGISTRY, RESOLVER_SELECTOR, node).await?;
     if result.len() < 32 {
         debug!(
             len = result.len(),
@@ -856,6 +880,118 @@ mod phishing_tests {
         assert!(
             !looks_like_ens(s),
             "looks_like_ens matched a Unicode-dot input — would route a homograph to ENS resolution silently",
+        );
+    }
+}
+
+/// Trust-boundary tests for the verified-call routing: every ENS read must
+/// go through Helios's verified `eth_call`, and an unverified answer (raw-RPC
+/// fallback) must never be returned as a resolved address. Drives the
+/// `CallMock` double — keyed on exact `(target, calldata)` with a per-call
+/// `verified` flag — so the registry/resolver round-trip runs without a live
+/// light client.
+#[cfg(test)]
+mod verified_resolution_tests {
+    use super::*;
+    use crate::net::CallMock;
+
+    /// `selector` + 32-byte `node`, exactly as `verified_call` encodes it —
+    /// the key the mock matches against.
+    fn calldata(selector: [u8; 4], node: B256) -> Bytes {
+        let mut d = Vec::with_capacity(36);
+        d.extend_from_slice(&selector);
+        d.extend_from_slice(node.as_slice());
+        Bytes::from(d)
+    }
+
+    /// Left-pad a 20-byte address into a 32-byte ABI word, the shape
+    /// `decode_address` expects from `resolver()` / `addr()`.
+    fn abi_address(a: Address) -> Bytes {
+        let mut b = [0u8; 32];
+        b[12..].copy_from_slice(a.as_slice());
+        Bytes::from(b.to_vec())
+    }
+
+    const RESOLVER: Address = address!("0x1111111111111111111111111111111111111111");
+    const TARGET: Address = address!("0x2222222222222222222222222222222222222222");
+
+    #[tokio::test]
+    async fn resolve_name_returns_address_when_fully_verified() {
+        let net = CallMock::new();
+        let node = namehash(&normalize("vitalik.eth").unwrap());
+        net.set_call(
+            ENS_REGISTRY,
+            calldata(RESOLVER_SELECTOR, node),
+            abi_address(RESOLVER),
+            true,
+        );
+        net.set_call(RESOLVER, calldata(ADDR_SELECTOR, node), abi_address(TARGET), true);
+
+        let got = resolve_name(&net, "vitalik.eth").await.unwrap();
+        assert_eq!(got, Some(TARGET));
+    }
+
+    #[tokio::test]
+    async fn resolve_name_fails_closed_when_registry_read_unverified() {
+        // A hostile exec RPC answers `resolver(node)` with an attacker-chosen
+        // resolver but cannot produce a Helios proof → verified=false. The
+        // resolved address feeds the signed recipient, so this must error
+        // rather than return Some(addr).
+        let net = CallMock::new();
+        let node = namehash(&normalize("vitalik.eth").unwrap());
+        net.set_call(
+            ENS_REGISTRY,
+            calldata(RESOLVER_SELECTOR, node),
+            abi_address(RESOLVER),
+            false,
+        );
+
+        let res = resolve_name(&net, "vitalik.eth").await;
+        assert!(
+            res.is_err(),
+            "unverified registry read must fail closed, got {res:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_name_fails_closed_when_addr_read_unverified() {
+        // The registry read is verified, but the `addr(node)` record itself
+        // comes back unverified — the spoofable value. Still must fail closed.
+        let net = CallMock::new();
+        let node = namehash(&normalize("vitalik.eth").unwrap());
+        net.set_call(
+            ENS_REGISTRY,
+            calldata(RESOLVER_SELECTOR, node),
+            abi_address(RESOLVER),
+            true,
+        );
+        net.set_call(RESOLVER, calldata(ADDR_SELECTOR, node), abi_address(TARGET), false);
+
+        let res = resolve_name(&net, "vitalik.eth").await;
+        assert!(
+            res.is_err(),
+            "unverified addr read must fail closed, got {res:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_address_fails_closed_when_unverified() {
+        // Reverse display: an unverified reverse-resolver read must surface as
+        // an error (the call sites render no name) rather than a fabricated one.
+        let net = CallMock::new();
+        let addr: Address = address!("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
+        let reverse_node = namehash(&reverse_node_name(addr));
+        net.set_call(
+            ENS_REGISTRY,
+            calldata(RESOLVER_SELECTOR, reverse_node),
+            abi_address(RESOLVER),
+            false,
+        );
+
+        let res = lookup_address(&net, addr).await;
+        assert!(
+            res.is_err(),
+            "unverified reverse read must fail closed, got {res:?}",
         );
     }
 }

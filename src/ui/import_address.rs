@@ -142,10 +142,10 @@ impl ImportAddressScreen {
             let name = trimmed;
             let task = Task::perform(
                 async move {
-                    let result = match network.provider(crate::chain::Chain::Mainnet).await {
-                        Some(provider) => ens::resolve_name(&provider, &name).await,
-                        None => Err("no execution RPCs configured".to_string()),
-                    };
+                    // Verified (Helios, mainnet-only) ENS resolution — the
+                    // resolved address is what gets imported as a watched
+                    // account, so an unverified RPC answer must not be trusted.
+                    let result = ens::resolve_name(network.as_ref(), &name).await;
                     (seq, name, result)
                 },
                 |(seq, name, result)| Message::EnsResolved { seq, name, result },

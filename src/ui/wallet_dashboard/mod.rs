@@ -1056,10 +1056,11 @@ impl WalletScreen {
             async move {
                 debug!(addr = %short_address(address), "ens reverse lookup");
                 let started = std::time::Instant::now();
-                let result = match network.provider(crate::chain::Chain::Mainnet).await {
-                    Some(provider) => crate::ens::lookup_address(&provider, address).await,
-                    None => Err("no execution RPCs configured".to_string()),
-                };
+                // Verified (Helios, mainnet-only) reverse lookup. An
+                // unverified read fails closed inside `lookup_address`, so
+                // the address simply shows without an ENS name rather than
+                // a name a hostile RPC could fabricate.
+                let result = crate::ens::lookup_address(network.as_ref(), address).await;
                 debug!(
                     elapsed = ?started.elapsed(),
                     found = matches!(&result, Ok(Some(_))),
@@ -2772,10 +2773,10 @@ fn spawn_ens_resolve_task(
 ) -> Task<Message> {
     Task::perform(
         async move {
-            let result = match network.provider(crate::chain::Chain::Mainnet).await {
-                Some(provider) => crate::ens::resolve_name(&provider, &name).await,
-                None => Err("no execution RPCs configured".to_string()),
-            };
+            // Verified (Helios, mainnet-only) forward resolution: the
+            // resolved address becomes the signed send recipient, so an
+            // unverified RPC answer fails closed rather than being trusted.
+            let result = crate::ens::resolve_name(network.as_ref(), &name).await;
             (seq, name, result)
         },
         |(seq, name, result)| Message::Send(send::Message::EnsResolved { seq, name, result }),
@@ -2792,10 +2793,10 @@ fn spawn_contacts_ens_resolve_task(
 ) -> Task<Message> {
     Task::perform(
         async move {
-            let result = match network.provider(crate::chain::Chain::Mainnet).await {
-                Some(provider) => crate::ens::resolve_name(&provider, &name).await,
-                None => Err("no execution RPCs configured".to_string()),
-            };
+            // Verified (Helios, mainnet-only) forward resolution; the
+            // resolved address is saved as a contact and later reused as a
+            // send recipient, so unverified answers fail closed.
+            let result = crate::ens::resolve_name(network.as_ref(), &name).await;
             (seq, name, result)
         },
         |(seq, name, result)| {
