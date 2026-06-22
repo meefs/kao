@@ -43,6 +43,15 @@ pub fn parse_amount_units(amount: &str, decimals: u8) -> Result<U256, String> {
     if trimmed.is_empty() {
         return Err("empty amount".into());
     }
+    // alloy's `parse_units` accepts a leading '-' and `<ParseUnits as
+    // Into<U256>>` reinterprets the signed value's two's-complement bytes as a
+    // huge U256 (e.g. "-1" → 2^256 - 1e18). The Send screen's digit-only field
+    // guards against this, but reject it here too so the public API matches its
+    // "rejects negative inputs" contract and a non-UI caller can't sign an
+    // astronomically large transfer. (See the rejects-negative test.)
+    if trimmed.starts_with('-') {
+        return Err("amount must not be negative".into());
+    }
     let parsed = parse_units(trimmed, decimals).map_err(|e| format!("invalid amount: {e}"))?;
     let value: U256 = parsed.into();
     Ok(value)
@@ -411,22 +420,16 @@ mod tests {
         assert_eq!(&bytes[36..68], &[0xFFu8; 32]);
     }
 
-    /// Pins a known sharp edge: alloy's `parse_units` accepts `"-N"`
-    /// and `<ParseUnits as Into<U256>>` calls `get_absolute()`, which
-    /// despite its name does NOT take the absolute value — it
-    /// reinterprets the signed I256's raw two's-complement bytes as a
-    /// U256. So `-1` (18 decimals) round-trips to `2^256 - 1e18`, an
-    /// astronomically large amount that would always exceed the
-    /// sender's balance and bounce upstream. The Send screen guards
-    /// against this *additionally* (its amount field only accepts
-    /// digits + one decimal point), but if a future caller bypasses
-    /// the UI it must not assume `parse_amount_units` rejects negatives.
+    /// Guards a known sharp edge: alloy's `parse_units` accepts `"-N"` and
+    /// `<ParseUnits as Into<U256>>` reinterprets the signed I256's raw
+    /// two's-complement bytes as a U256 (so `-1` would become `2^256 - 1e18`,
+    /// an astronomically large amount). `parse_amount_units` must reject
+    /// negatives itself so a non-UI caller can't bypass the Send screen's
+    /// digit-only field and sign a huge transfer.
     #[test]
-    fn parse_amount_units_negative_reinterprets_as_huge_u256() {
-        let neg = parse_amount_units("-1", 18).expect("alloy accepts negative");
-        let one_eth = U256::from(10).pow(U256::from(18));
-        // -1e18 as I256, raw bytes reinterpreted as U256, is 2^256 - 1e18.
-        assert_eq!(neg, U256::MAX - one_eth + U256::from(1u8));
+    fn parse_amount_units_rejects_negative() {
+        assert!(parse_amount_units("-1", 18).is_err());
+        assert!(parse_amount_units("  -0.5  ", 18).is_err());
     }
 
     #[test]

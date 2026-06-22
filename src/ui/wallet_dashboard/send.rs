@@ -780,7 +780,11 @@ impl SendPane {
                         1 if self.can_continue_recipient() => {
                             self.step = 1;
                         }
-                        2 => {
+                        // Same guard as step 1: never advance to the review/
+                        // sign screen without a valid recipient + signer, or
+                        // the review would render (and prepare) a transaction
+                        // with no real destination.
+                        2 if self.can_continue_recipient() => {
                             self.step = 2;
                             self.begin_prepare();
                         }
@@ -2357,7 +2361,15 @@ impl SendPane {
         portfolio: &'a [LiveToken],
     ) -> Element<'a, Message> {
         let s = self.safe().unwrap();
-        let recipient = self.resolution.recipient().unwrap_or(Address::ZERO);
+        // Never render/sign a transfer to a defaulted zero address: if there's
+        // no resolved recipient we shouldn't be on this screen (the step-2
+        // transition is guarded), so fail closed with a visible error.
+        let Some(recipient) = self.resolution.recipient() else {
+            return text("No valid recipient — go back and re-enter the address.")
+                .size(13)
+                .color(t.down)
+                .into();
+        };
         let token = portfolio.get(self.token_idx);
         let decimals = token.map(|tk| tk.decimals).unwrap_or(18);
         let symbol = token.map(|tk| tk.symbol.as_str()).unwrap_or("ETH");
@@ -2737,10 +2749,15 @@ impl SendPane {
         let amount_str = format_units(amount_wei, decimals)
             .map(|v| sim_view::trim_trailing_decimal_zeros(&v))
             .unwrap_or_else(|_| "?".into());
-        let recipient = self.resolution.recipient().unwrap_or(Address::ZERO);
+        // Post-success display only — but still avoid inventing a zero
+        // address for the label if the recipient is somehow absent.
         let recipient_label = recipient_name.unwrap_or_else(|| match &self.resolution {
             Resolution::Resolved { name, .. } => name.clone(),
-            _ => short_address(recipient),
+            _ => self
+                .resolution
+                .recipient()
+                .map(short_address)
+                .unwrap_or_else(|| "unknown recipient".into()),
         });
         let hash_display = match self.last_tx_hash {
             Some(h) => {
