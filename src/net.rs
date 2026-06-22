@@ -1833,10 +1833,14 @@ async fn fetch_checkpoint_via(proxy: Option<&str>) -> Result<B256, String> {
         "checkpoint refresh: querying services"
     );
 
-    // 2. Query providers one at a time, in order, stopping as soon as `ENOUGH`
-    //    have answered. Sequential (rather than a concurrent fan-out) so we
-    //    don't hit every provider at once; per-request timeouts bound how long
-    //    a dead one stalls us before moving to the next.
+    // 2. Query providers one at a time, in order, stopping once we have a
+    //    comfortable sample (`ENOUGH`) *and* that sample actually corroborates a
+    //    checkpoint. Requiring the corroboration check too means a cluster of
+    //    providers split across an epoch boundary doesn't make us stop short
+    //    with `ENOUGH` mutually-disagreeing slots — we keep going (up to the
+    //    whole list) until two of them agree. Sequential (rather than a
+    //    concurrent fan-out) so we don't hit every provider at once;
+    //    per-request timeouts bound how long a dead one stalls us.
     const ENOUGH: usize = 5;
     let mut queried = 0usize;
     let mut slots = Vec::with_capacity(ENOUGH);
@@ -1844,7 +1848,7 @@ async fn fetch_checkpoint_via(proxy: Option<&str>) -> Result<B256, String> {
         queried += 1;
         if let Some(slot) = query_checkpoint_slot(&client, endpoint).await {
             slots.push(slot);
-            if slots.len() >= ENOUGH {
+            if slots.len() >= ENOUGH && resolve_checkpoint(&slots).is_ok() {
                 break;
             }
         }
@@ -1942,32 +1946,59 @@ fn checkpoint_endpoints() -> Vec<url::Url> {
         .collect()
 }
 
-/// From the latest slots gathered across checkpoint services, pick the block
-/// root the most services agree on at the **newest** epoch. Returns the
-/// chosen root with that epoch and the agreement count (how many services
-/// reported it) for logging.
+/// Minimum number of independent services that must report the *same* block
+/// root before we'll trust it as a checkpoint.
 ///
-/// Slots without a block root are ignored entirely — including when deciding
-/// the newest epoch, so a service that reports a higher epoch but no root
-/// can't blank out the result.
+/// A checkpoint is the weak-subjectivity root Helios bootstraps its light
+/// client from, so it must not be dictated by a single source: a lone
+/// compromised or buggy provider in [`CHECKPOINT_ENDPOINTS`] could otherwise
+/// report a fabricated (and conveniently newest) root and, at agreement = 1,
+/// win outright — breaking sync for anyone who refreshes. Requiring
+/// corroboration means we fall back to the newest epoch the honest majority
+/// actually agrees on. Failure here is benign: the refresh surfaces an error
+/// and the user keeps the bundled checkpoint.
+const MIN_CHECKPOINT_AGREEMENT: usize = 2;
+
+/// From the latest slots gathered across checkpoint services, pick the block
+/// root for the **newest epoch that at least [`MIN_CHECKPOINT_AGREEMENT`]
+/// services agree on**. Returns the chosen root with that epoch and the
+/// agreement count (how many services reported it) for logging.
+///
+/// Walking *down* from the newest epoch — rather than only ever considering
+/// the single highest one — tolerates the normal ~1-epoch skew between
+/// providers (their polls don't line up to the same slot) while still refusing
+/// any root that no two services corroborate. Slots without a block root are
+/// ignored entirely, so a service reporting a higher epoch but no root can
+/// neither hijack the result nor blank it out.
 fn resolve_checkpoint(slots: &[Slot]) -> Result<(B256, u64, usize), String> {
-    let max_epoch = slots
-        .iter()
-        .filter(|s| s.block_root.is_some())
-        .map(|s| s.epoch)
-        .max()
-        .ok_or_else(|| "no healthy checkpoint service responded".to_string())?;
-    let mut tally: std::collections::HashMap<B256, usize> = std::collections::HashMap::new();
-    for slot in slots.iter().filter(|s| s.epoch == max_epoch) {
+    // epoch -> (root -> how many services reported it)
+    let mut by_epoch: std::collections::BTreeMap<u64, std::collections::HashMap<B256, usize>> =
+        std::collections::BTreeMap::new();
+    for slot in slots {
         if let Some(root) = slot.block_root {
-            *tally.entry(root).or_default() += 1;
+            *by_epoch
+                .entry(slot.epoch)
+                .or_default()
+                .entry(root)
+                .or_default() += 1;
         }
     }
-    tally
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(root, n)| (root, max_epoch, n))
-        .ok_or_else(|| "no checkpoint agreed on".to_string())
+
+    // Newest epoch first; take the first whose top root clears the floor. The
+    // `(count, root)` tiebreak keeps the choice deterministic when two roots
+    // are equally backed at the same epoch (a genuine split — pick one stably
+    // rather than relying on HashMap order).
+    for (epoch, tally) in by_epoch.into_iter().rev() {
+        if let Some((root, n)) = tally.into_iter().max_by_key(|(root, n)| (*n, *root))
+            && n >= MIN_CHECKPOINT_AGREEMENT
+        {
+            return Ok((root, epoch, n));
+        }
+    }
+
+    Err(format!(
+        "no checkpoint corroborated by at least {MIN_CHECKPOINT_AGREEMENT} services"
+    ))
 }
 
 #[cfg(test)]
@@ -2268,9 +2299,27 @@ mod checkpoint_tests {
     }
 
     #[test]
-    fn newest_epoch_wins_over_a_more_popular_older_one() {
-        // Epoch 10 has three votes, epoch 11 only one — the newer epoch still
-        // wins. (Checkpoints only ever move forward.)
+    fn newest_corroborated_epoch_wins_over_an_older_one() {
+        // Epoch 11 is newer and corroborated by two services, so it wins over
+        // the (also corroborated) older epoch 10. Checkpoints move forward.
+        let slots = [
+            slot(10, Some(0xaa)),
+            slot(10, Some(0xaa)),
+            slot(11, Some(0xbb)),
+            slot(11, Some(0xbb)),
+        ];
+        let (root, epoch, agreement) = resolve_checkpoint(&slots).unwrap();
+        assert_eq!(epoch, 11);
+        assert_eq!(root, B256::repeat_byte(0xbb));
+        assert_eq!(agreement, 2);
+    }
+
+    #[test]
+    fn a_lone_newest_epoch_root_falls_back_to_a_corroborated_older_one() {
+        // A single service reports a fabricated root one epoch ahead of the
+        // pack. With no corroboration it must be skipped in favour of the
+        // newest epoch the majority actually agrees on — a lone provider can't
+        // dictate the checkpoint.
         let slots = [
             slot(10, Some(0xaa)),
             slot(10, Some(0xaa)),
@@ -2278,9 +2327,41 @@ mod checkpoint_tests {
             slot(11, Some(0xbb)),
         ];
         let (root, epoch, agreement) = resolve_checkpoint(&slots).unwrap();
-        assert_eq!(epoch, 11);
-        assert_eq!(root, B256::repeat_byte(0xbb));
-        assert_eq!(agreement, 1);
+        assert_eq!(epoch, 10);
+        assert_eq!(root, B256::repeat_byte(0xaa));
+        assert_eq!(agreement, 3);
+    }
+
+    #[test]
+    fn an_uncorroborated_checkpoint_is_an_error() {
+        // Only one service responds with a root at all — nothing corroborates
+        // it, so we refuse rather than trust a single source.
+        let slots = [slot(11, Some(0xaa)), slot(12, None)];
+        assert!(resolve_checkpoint(&slots).is_err());
+    }
+
+    #[test]
+    fn an_even_split_at_the_newest_epoch_resolves_deterministically() {
+        // Two roots equally backed (2 vs 2) at the same epoch — a genuine
+        // split. The `(count, root)` tiebreak must pick the same one regardless
+        // of input order, never depending on HashMap iteration.
+        let a = [
+            slot(11, Some(0xaa)),
+            slot(11, Some(0xaa)),
+            slot(11, Some(0xbb)),
+            slot(11, Some(0xbb)),
+        ];
+        let b = [
+            slot(11, Some(0xbb)),
+            slot(11, Some(0xaa)),
+            slot(11, Some(0xbb)),
+            slot(11, Some(0xaa)),
+        ];
+        let (root_a, _, _) = resolve_checkpoint(&a).unwrap();
+        let (root_b, _, _) = resolve_checkpoint(&b).unwrap();
+        assert_eq!(root_a, root_b, "tiebreak must be order-independent");
+        // Higher byte value wins the (count, root) tiebreak.
+        assert_eq!(root_a, B256::repeat_byte(0xbb));
     }
 
     #[test]
@@ -2299,8 +2380,9 @@ mod checkpoint_tests {
     #[test]
     fn a_rootless_slot_at_a_higher_epoch_is_ignored() {
         // A service reporting a newer epoch but no block root must not hijack
-        // `max_epoch` and blank out the result.
-        let slots = [slot(11, Some(0xaa)), slot(12, None)];
+        // the newest-epoch search and blank out the result; the corroborated
+        // root one epoch down still resolves.
+        let slots = [slot(11, Some(0xaa)), slot(11, Some(0xaa)), slot(12, None)];
         let (root, epoch, _) = resolve_checkpoint(&slots).unwrap();
         assert_eq!(epoch, 11);
         assert_eq!(root, B256::repeat_byte(0xaa));

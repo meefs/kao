@@ -1339,8 +1339,73 @@ fn write_all() {
         let _ = restrict_to_owner(parent, 0o700);
     }
     let snapshot = ensure().lock().expect("settings mutex poisoned").clone();
-    let _ = std::fs::write(&path, serialize(&snapshot));
-    let _ = restrict_to_owner(&path, 0o600);
+    let body = serialize(&snapshot);
+    // Best-effort, but deliberately no world-readable fallback: if the atomic
+    // write fails we leave the previous settings.toml intact rather than risk a
+    // create+chmod that briefly exposes the plaintext API keys. The sibling
+    // temp shares the target's filesystem, so the realistic failure modes are
+    // genuine I/O errors a second insecure attempt wouldn't fix anyway.
+    let _ = atomic_write_owner_only(&path, body.as_bytes());
+}
+
+/// Write `bytes` to `path` atomically with owner-only (0o600) permissions.
+///
+/// `settings.toml` holds API keys in plaintext, so three hazards matter on the
+/// write path:
+/// - a torn write (a crash mid-`write` leaving a truncated, garbage file),
+/// - a permissions race (`fs::write` creates the file at the umask-default mode
+///   — typically world-readable 0o644 — and only a *follow-up* chmod tightens
+///   it, leaving a window where another local user can read the keys), and
+/// - a pre-image at a predictable temp path (a symlink planted as the temp file
+///   would be followed, redirecting the secret write and the chmod).
+///
+/// All three are closed by creating a sibling temp file with `create_new`
+/// (never following an existing path/symlink) at mode 0o600 up front, writing
+/// and `fsync`ing it, then renaming it over `path` — atomic on the same
+/// filesystem, so the secret is never briefly world-readable and `path` is
+/// either fully old or fully new.
+fn atomic_write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("settings.toml");
+    let tmp = dir.join(format!(".{file_name}.tmp"));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    // `create_new` refuses to open an existing path, so a hostile or stale temp
+    // (a symlink pre-image, or a leftover from a crash) is never followed or
+    // written through. A genuine leftover is unlinked and retried once so a past
+    // crash can't wedge every future save; unlinking a symlink drops the link,
+    // not its target.
+    let mut f = match opts.open(&tmp) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&tmp)?;
+            opts.open(&tmp)?
+        }
+        Err(e) => return Err(e),
+    };
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Restrict a path to owner-only access on Unix; no-op elsewhere.
@@ -1768,6 +1833,50 @@ mod tests {
         restrict_to_owner(f.path(), 0o600).unwrap();
         let meta = std::fs::metadata(f.path()).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_owner_only_file_with_contents() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+
+        atomic_write_owner_only(&path, b"key = \"secret\"\n").unwrap();
+
+        // The secret landed...
+        assert_eq!(std::fs::read(&path).unwrap(), b"key = \"secret\"\n");
+        // ...with owner-only perms from the moment it existed (no 0o644 window),
+        // and the temp file was renamed away, not left behind.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+        assert!(!dir.path().join(".settings.toml.tmp").exists());
+
+        // A second write atomically replaces the file and keeps the perms.
+        atomic_write_owner_only(&path, b"key = \"rotated\"\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"key = \"rotated\"\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_recovers_from_a_leftover_temp_file() {
+        // A crash between create and rename can strand the temp file. `create_new`
+        // would otherwise refuse to reopen it; the unlink-and-retry path must
+        // recover so a single past crash doesn't wedge every future save.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let tmp = dir.path().join(".settings.toml.tmp");
+        std::fs::write(&tmp, b"stale garbage").unwrap();
+
+        atomic_write_owner_only(&path, b"key = \"fresh\"\n").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"key = \"fresh\"\n");
+        assert!(
+            !tmp.exists(),
+            "leftover temp should be cleared, not left behind"
+        );
     }
 
     #[test]
