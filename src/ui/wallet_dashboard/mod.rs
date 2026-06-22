@@ -1111,6 +1111,13 @@ impl WalletScreen {
                 if let SettingsPane::Safes(p) = &mut self.settings_pane {
                     p.set_safes(self.safes.clone());
                 }
+                // The pending queue's lifecycle states were derived against the
+                // *old* descriptors (threshold/owners). Rebuild it against the
+                // refreshed ones so a changed threshold can't leave a stale
+                // have/required badge on a queued tx.
+                let pending = self.fetch_safe_pending_task();
+                self.safe_pending_loading = pending.is_some();
+                return (pending.unwrap_or_else(Task::none), None);
             }
             Message::PortfolioFetched {
                 address,
@@ -1126,7 +1133,16 @@ impl WalletScreen {
                 if let Ok(tokens) = &result
                     && let Ok(mut cache) = self.portfolio_cache.lock()
                 {
-                    cache.insert((address, chain), tokens.clone());
+                    // Only cache rows that belong to the chain we fetched — a
+                    // buggy/malicious provider could tag a token with another
+                    // chain, which would pollute this slot (and, via the merge
+                    // below, the live portfolio).
+                    let scoped: Vec<LiveToken> = tokens
+                        .iter()
+                        .filter(|t| t.chain == chain)
+                        .cloned()
+                        .collect();
+                    cache.insert((address, chain), scoped);
                 }
                 if address != self.display_address() {
                     return (Task::none(), None);
@@ -1155,7 +1171,11 @@ impl WalletScreen {
                         // doesn't shuffle a stable row order — the
                         // original portfolio sort already maintained this.
                         self.portfolio.retain(|t| t.chain != chain);
-                        self.portfolio.extend(tokens);
+                        // Same chain-scoping as the cache write: never merge a
+                        // token whose `chain` differs from the one we fetched,
+                        // or a stale-chain row would survive the retain above.
+                        self.portfolio
+                            .extend(tokens.into_iter().filter(|t| t.chain == chain));
                         self.portfolio.sort_by(|a, b| {
                             // Native ETH bubbles up first per chain.
                             let a_native = a.contract.is_none();
