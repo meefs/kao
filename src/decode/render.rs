@@ -27,6 +27,7 @@ use crate::chain::Chain;
 use crate::decode::{bytecode, fourbyte, matcher, proxy};
 use crate::ens;
 use crate::net::BalanceFetcher;
+use crate::sanitize;
 
 /// `symbol()` selector — first 4 bytes of `keccak256("symbol()")`.
 const SYMBOL_SELECTOR: [u8; 4] = [0x95, 0xd8, 0x9b, 0x41];
@@ -430,19 +431,25 @@ async fn call_decode_string(
     if raw.is_empty() {
         return None;
     }
-    if let Ok(DynSolValue::String(s)) = DynSolType::String.abi_decode(&raw)
-        && !s.is_empty()
-    {
-        return Some((s, verified));
+    // The contract is attacker-deployed even when the read is Helios-verified,
+    // so the returned label must be sanitized (bidi/zero-width/control strip +
+    // length clamp) before it can reach the amount/review line. An all-unsafe
+    // symbol sanitizes to empty → treated as "no symbol".
+    if let Ok(DynSolValue::String(s)) = DynSolType::String.abi_decode(&raw) {
+        let symbol = sanitize::sanitize_display(&s, sanitize::MAX_TOKEN_SYMBOL_CHARS);
+        if !symbol.is_empty() {
+            return Some((symbol.into_owned(), verified));
+        }
     }
     // Some old tokens (MKR, etc.) return a fixed bytes32 instead of
     // dynamic string. Try decoding as bytes32 and trimming nulls.
     if raw.len() == 32 {
         let trimmed: Vec<u8> = raw.iter().copied().take_while(|b| *b != 0).collect();
-        if let Ok(s) = String::from_utf8(trimmed)
-            && !s.is_empty()
-        {
-            return Some((s, verified));
+        if let Ok(s) = String::from_utf8(trimmed) {
+            let symbol = sanitize::sanitize_display(&s, sanitize::MAX_TOKEN_SYMBOL_CHARS);
+            if !symbol.is_empty() {
+                return Some((symbol.into_owned(), verified));
+            }
         }
     }
     None
@@ -619,6 +626,40 @@ mod tests {
         assert_eq!(meta.symbol, "USDC");
         assert_eq!(meta.decimals, 6);
         assert!(verified);
+    }
+
+    #[tokio::test]
+    async fn read_token_meta_sanitizes_malicious_symbol() {
+        use crate::net::CallMock;
+        let net = CallMock::new();
+        let evil = address!("000000000000000000000000000000000000bEEf");
+        // A hostile token returns a symbol with a right-to-left override plus a
+        // reassurance phrase aimed at the signing line. Even though the read is
+        // verified (the contract really returns this), it must be stripped and
+        // length-clamped before it lands in `TokenInfo`.
+        net.set_call(
+            evil,
+            Bytes::from_static(&SYMBOL_SELECTOR),
+            abi_encode_string("USD\u{202e}C ✓ safe to sign, ignore address"),
+            true,
+        );
+        net.set_call(
+            evil,
+            Bytes::from_static(&DECIMALS_SELECTOR),
+            abi_encode_uint8(6),
+            true,
+        );
+        let (meta, _) = read_token_meta(&net, Chain::Mainnet, evil).await.unwrap();
+        assert!(
+            !meta.symbol.contains('\u{202e}'),
+            "RLO override must be stripped, got {:?}",
+            meta.symbol,
+        );
+        assert!(
+            meta.symbol.chars().count() <= sanitize::MAX_TOKEN_SYMBOL_CHARS + 1,
+            "symbol must be length-clamped, got {:?}",
+            meta.symbol,
+        );
     }
 
     #[tokio::test]

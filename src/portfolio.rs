@@ -1079,9 +1079,22 @@ async fn fetch_portfolio_for_tokens(
             }
         };
         let (bal_str, bal_f64) = format_token_balance(raw_balance, token.decimals);
+        // Discovered-token metadata is attacker-controlled (the contract picks
+        // its own symbol/name; an indexer relays it). Sanitize at this single
+        // ingestion point — bidi/zero-width/control strip + length clamp — so
+        // every downstream render (Send token row, dashboard list) is safe.
+        // Bundled-allowlist tokens are clean ASCII, so this is a no-op for them.
         tokens.push(LiveToken {
-            symbol: token.symbol.to_string(),
-            name: token.name.to_string(),
+            symbol: crate::sanitize::sanitize_display(
+                token.symbol.as_ref(),
+                crate::sanitize::MAX_TOKEN_SYMBOL_CHARS,
+            )
+            .into_owned(),
+            name: crate::sanitize::sanitize_display(
+                token.name.as_ref(),
+                crate::sanitize::MAX_TOKEN_NAME_CHARS,
+            )
+            .into_owned(),
             balance: bal_str,
             balance_f64: bal_f64,
             balance_raw: raw_balance,

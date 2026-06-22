@@ -10,6 +10,7 @@ mod net;
 mod paths;
 mod portfolio;
 mod safe;
+mod sanitize;
 mod settings;
 mod ui;
 mod wallet;

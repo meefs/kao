@@ -545,19 +545,27 @@ fn decode_symbol(data: &Bytes) -> String {
                 && end <= data.len()
                 && let Ok(s) = std::str::from_utf8(&data[64..end])
             {
-                let s = s.trim_end_matches('\0').trim();
+                // Attacker-deployed contract → strip bidi/zero-width/control
+                // and clamp length before this reaches the activity feed.
+                let s = crate::sanitize::sanitize_display(
+                    s.trim_end_matches('\0').trim(),
+                    crate::sanitize::MAX_TOKEN_SYMBOL_CHARS,
+                );
                 if !s.is_empty() {
-                    return s.to_string();
+                    return s.into_owned();
                 }
             }
         }
     }
-    // bytes32 fallback (MKR et al.): trim trailing nulls.
+    // bytes32 fallback (MKR et al.): trim trailing nulls. Same sanitization as
+    // the dynamic-string path — the bytes32 branch previously only rejected
+    // C0 controls, letting bidi/zero-width code points through.
     let end = data[..32].iter().position(|&b| b == 0).unwrap_or(32);
     if let Ok(s) = std::str::from_utf8(&data[..end]) {
-        let s = s.trim();
-        if s.chars().all(|c| !c.is_control()) && !s.is_empty() {
-            return s.to_string();
+        let s =
+            crate::sanitize::sanitize_display(s.trim(), crate::sanitize::MAX_TOKEN_SYMBOL_CHARS);
+        if !s.is_empty() {
+            return s.into_owned();
         }
     }
     String::new()

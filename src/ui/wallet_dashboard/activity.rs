@@ -219,7 +219,10 @@ fn format_token_amount(tok: &TokenTransfer, recv: bool) -> String {
             "tokens".to_string()
         }
     } else {
-        tok.symbol.clone()
+        // Indexer-supplied (attacker-controlled) symbol — strip bidi/
+        // zero-width/control and clamp before it reaches the activity row.
+        crate::sanitize::sanitize_display(&tok.symbol, crate::sanitize::MAX_TOKEN_SYMBOL_CHARS)
+            .into_owned()
     };
     if tok.is_nft {
         // ERC-721: render as `SYMBOL #N` (or just `#N` for unknowns).

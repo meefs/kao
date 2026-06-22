@@ -456,12 +456,14 @@ fn short(addr: Address) -> String {
     format!("{}…{}", &s[..6], &s[len - 4..])
 }
 
+/// Clamp `s` to `max` characters (appending `…`) **and** strip unsafe display
+/// code points — bidi controls, zero-width / invisible characters, control
+/// chars. Arg values and clear-signed labels can carry attacker-controlled
+/// strings (decoded calldata, contract-supplied text); stripping here keeps a
+/// hostile contract from reordering or hiding the review surface. See
+/// [`crate::sanitize`].
 fn truncate(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
-    if s.chars().count() <= max {
-        return std::borrow::Cow::Borrowed(s);
-    }
-    let head: String = s.chars().take(max).collect();
-    std::borrow::Cow::Owned(format!("{head}…"))
+    crate::sanitize::sanitize_display(s, max)
 }
 
 /// Compact canonical-string label for an alloy `DynSolType` — used on
