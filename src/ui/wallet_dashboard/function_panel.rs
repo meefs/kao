@@ -57,6 +57,7 @@ pub fn view<'a, M: 'a>(
             diagnostics,
             proxy_hops,
             *all_verified,
+            &[],
         )),
         DecodeResult::Fallback {
             model,
@@ -69,6 +70,10 @@ pub fn view<'a, M: 'a>(
             diagnostics,
             &heuristic.proxy_hops,
             heuristic.all_verified,
+            // The heuristic ran alongside the partial descriptor; don't drop
+            // its spoof/ambiguity signals just because we're showing the
+            // descriptor's intent.
+            &heuristic.warnings,
         )),
         DecodeResult::Heuristic(decoded) => {
             if matches!(decoded.state, ResolutionState::Empty) {
@@ -120,17 +125,35 @@ fn clear_signed_panel<'a, M: 'a>(
     diagnostics: &'a [FormatDiagnostic],
     proxy_hops: &'a [Address],
     all_verified: bool,
+    heuristic_warnings: &'a [Warning],
 ) -> Element<'a, M> {
     let mut col = column![].spacing(6);
+
+    // Spoof / ambiguity signals from the cross-referenced heuristic decode
+    // (Fallback path) ride above the intent — they cast doubt on the title
+    // itself, so the user must see them before reading the name.
+    for w in heuristic_warnings {
+        if matches!(
+            w,
+            Warning::BytecodeMismatch { .. } | Warning::AmbiguousSignature { .. }
+        ) {
+            col = col.push(warning_strip(t, w));
+        }
+    }
 
     // Intent header.
     let intent = model
         .interpolated_intent
         .as_deref()
         .unwrap_or(&model.intent);
+    // When some on-chain read fell back to unverified RPC, the intent text,
+    // contract name and amounts below are no longer fully trustworthy — mute
+    // the header so it doesn't read as authoritative, and raise a prominent
+    // caution band rather than the easy-to-miss one-line note it used to be.
+    let intent_color = if all_verified { t.text } else { t.sub };
     col = col.push(text("Intent").size(11).color(t.sub).font(bold()));
     col = col.push(Space::new().height(2));
-    col = col.push(text(intent).size(13).color(t.text).font(bold()));
+    col = col.push(text(intent).size(13).color(intent_color).font(bold()));
 
     if let Some(name) = &model.contract_name {
         col = col.push(text(name).size(11).color(t.sub).font(mono()));
@@ -139,12 +162,11 @@ fn clear_signed_panel<'a, M: 'a>(
         col = col.push(text("(via proxy)").size(10).color(t.sub).font(mono()));
     }
     if !all_verified {
-        col = col.push(
-            text("⚠ some reads fell back to unverified RPC")
-                .size(10)
-                .color(t.down)
-                .font(mono()),
-        );
+        col = col.push(Space::new().height(3));
+        col = col.push(caution_strip(
+            t,
+            "⚠ Some on-chain reads fell back to unverified RPC — the intent, names and amounts below may be spoofed.".into(),
+        ));
     }
 
     col = col.push(Space::new().height(4));
@@ -237,8 +259,9 @@ fn display_item_row<'a, M: 'a>(t: KaoTheme, item: &'a DisplayItem, indent: f32) 
     .into()
 }
 
-fn diagnostic_strip<'a, M: 'a>(t: KaoTheme, diag: &'a FormatDiagnostic) -> Element<'a, M> {
-    let line = format!("⚠ {}", diag.message);
+/// A tinted caution band — the shared styling for diagnostics, heuristic
+/// warnings, and the unverified-reads notice.
+fn caution_strip<'a, M: 'a>(t: KaoTheme, line: String) -> Element<'a, M> {
     container(text(line).size(11).color(t.down).font(bold()))
         .padding(Padding::from([6, 8]))
         .width(Length::Fill)
@@ -255,6 +278,10 @@ fn diagnostic_strip<'a, M: 'a>(t: KaoTheme, diag: &'a FormatDiagnostic) -> Eleme
         .into()
 }
 
+fn diagnostic_strip<'a, M: 'a>(t: KaoTheme, diag: &'a FormatDiagnostic) -> Element<'a, M> {
+    caution_strip(t, format!("⚠ {}", diag.message))
+}
+
 // ---------------------------------------------------------------------------
 // Heuristic panel (existing renderer, extracted from the old `panel`)
 
@@ -265,7 +292,10 @@ fn heuristic_panel<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M>
     // ride below the arg rows in the foot strip.
     let mut col = column![].spacing(6);
     for w in &d.warnings {
-        if matches!(w, Warning::AmbiguousSignature { .. }) {
+        if matches!(
+            w,
+            Warning::AmbiguousSignature { .. } | Warning::BytecodeMismatch { .. }
+        ) {
             col = col.push(warning_strip(t, w));
         }
     }
@@ -284,7 +314,12 @@ fn heuristic_panel<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M>
     let mut foot_warnings = d
         .warnings
         .iter()
-        .filter(|w| !matches!(w, Warning::AmbiguousSignature { .. }))
+        .filter(|w| {
+            !matches!(
+                w,
+                Warning::AmbiguousSignature { .. } | Warning::BytecodeMismatch { .. }
+            )
+        })
         .peekable();
     if foot_warnings.peek().is_some() {
         col = col.push(Space::new().height(4));
@@ -396,21 +431,15 @@ fn warning_strip<'a, M: 'a>(t: KaoTheme, w: &'a Warning) -> Element<'a, M> {
             let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
             format!("⚠ ambiguous: {}", truncate(&names.join(", "), 60))
         }
+        Warning::BytecodeMismatch { candidates } => {
+            let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
+            format!(
+                "⚠ possible spoof — on-chain code matches no known signature (claimed: {})",
+                truncate(&names.join(", "), 48)
+            )
+        }
     };
-    container(text(line).size(11).color(t.down).font(bold()))
-        .padding(Padding::from([6, 8]))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(with_alpha(t.down, 0.12))),
-            border: Border {
-                color: with_alpha(t.down, 0.4),
-                width: 1.0,
-                radius: Radius::from(8),
-            },
-            text_color: Some(t.down),
-            ..container::Style::default()
-        })
-        .into()
+    caution_strip(t, line)
 }
 
 // ---------------------------------------------------------------------------

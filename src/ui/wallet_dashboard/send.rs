@@ -2002,12 +2002,43 @@ impl SendPane {
                 })
                 .into()
         };
-        let badges_row = row![
-            good_badge("✓ Simulated locally · revm"),
-            Space::new().width(7),
-            good_badge("✓ Verified by Helios")
-        ]
-        .align_y(Alignment::Center);
+        let warn_badge = |label: &'a str| -> Element<'a, Message> {
+            container(text(label).size(10).color(t.down).font(mono_bold()))
+                .padding(Padding::from([3, 7]))
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(with_alpha(t.down, 0.08))),
+                    border: Border {
+                        color: with_alpha(t.down, 0.30),
+                        width: 1.0,
+                        radius: Radius::from(6),
+                    },
+                    ..container::Style::default()
+                })
+                .into()
+        };
+        // Only claim "simulated/verified" when the sim actually succeeded, and
+        // gate the Helios badge on whether the reads were verified — a sim that
+        // ran on fallback state must not display as Helios-verified.
+        let sim_ok = !sim_reverted && !sim_unavailable;
+        let sim_verified = eoa.quote.as_ref().map(|q| q.sim.verified).unwrap_or(false);
+        let badges_row: Element<'_, Message> = if sim_ok {
+            let helios = if sim_verified {
+                good_badge("✓ Verified by Helios")
+            } else {
+                warn_badge("⚠ Unverified · fallback RPC")
+            };
+            row![
+                good_badge("✓ Simulated locally · revm"),
+                Space::new().width(7),
+                helios
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            // Reverted/unavailable: the balance-changes card already explains
+            // the state; don't show badges that would overclaim.
+            Space::new().height(0).into()
+        };
 
         // Gas warning
         let gas_warning: Element<'_, Message> = if has_insufficient_eth {
@@ -2051,9 +2082,20 @@ impl SendPane {
 
         let back_btn = secondary_button(t, "← Back").on_press(Message::Step(1));
         let confirm_enabled = !self.busy && eoa.quote.is_some() && !has_insufficient_eth;
+        // Soften the primary action whenever any read is unverified — either
+        // the calldata decode fell back to unverified RPC, or the local sim
+        // wasn't Helios-verified — matching the reverting-sim treatment so
+        // every unverified sign is a deliberate, acknowledged choice.
+        let decode_unverified = match eoa.decoded.as_deref() {
+            Some(DecodeResult::ClearSigned { all_verified, .. }) => !all_verified,
+            Some(DecodeResult::Fallback { heuristic, .. }) => !heuristic.all_verified,
+            Some(DecodeResult::Heuristic(c)) => !c.all_verified,
+            Some(DecodeResult::Empty) | None => false,
+        };
+        let reads_unverified = decode_unverified || (sim_ok && !sim_verified);
         let confirm_label = if has_insufficient_eth {
             "Need ETH for gas"
-        } else if sim_reverted {
+        } else if sim_reverted || reads_unverified {
             "Sign anyway ⚠"
         } else {
             "Sign & Send"

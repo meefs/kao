@@ -5,9 +5,16 @@
 //! - **Unique** — exactly one signature is consistent with both
 //!   sources. The clear-signing UI shows the function name and decodes
 //!   arguments by name.
-//! - **Ambiguous** — multiple signatures collide on this selector and
-//!   we couldn't narrow further. The UI lists candidates and falls back
-//!   to raw calldata.
+//! - **Ambiguous** — multiple signatures collide on this selector and,
+//!   even with the bytecode's arg types, more than one stays consistent.
+//!   The UI lists candidates and falls back to raw calldata.
+//! - **BytecodeMismatch** — 4byte has candidates, the bytecode's arg
+//!   types are known, but *none* of the candidates match them. This is a
+//!   stronger signal than plain ambiguity: the name the 4byte database
+//!   suggests is contradicted by what the contract actually implements,
+//!   which is exactly what a phishing fixture (a contract registered
+//!   under a friendly selector that does something else) looks like. The
+//!   UI must flag this louder than a normal ambiguity.
 //! - **TypesOnly** — 4byte has no entry, but the bytecode tells us the
 //!   shape. The UI shows `unknown(address, uint256)` so the user at
 //!   least sees structured arguments.
@@ -27,6 +34,10 @@ pub enum Resolved {
         arg_types: Vec<DynSolType>,
     },
     Ambiguous(Vec<(String, Vec<DynSolType>)>),
+    /// 4byte offered candidates but the bytecode's arg types match none of
+    /// them — a possible spoof. Carries the rejected candidate list so the
+    /// UI can show what was *claimed* versus warn that the code disagrees.
+    BytecodeMismatch(Vec<(String, Vec<DynSolType>)>),
     TypesOnly(Vec<DynSolType>),
     Unknown,
 }
@@ -52,7 +63,13 @@ pub fn resolve(
             let (name, arg_types) = parsed.into_iter().next().unwrap();
             Resolved::Unique { name, arg_types }
         }
-        (_, Some(bytecode_types)) => {
+        // ≥2 candidates AND evmole recovered *concrete* arg types we can
+        // compare against. Empty bytecode types are handled by the catch-all
+        // below: evmole frequently returns the selector with `Some(vec![])`
+        // when it couldn't recover the arguments at all, which is NOT the
+        // same as "the function takes zero args" — treating empty as a
+        // contradiction would raise false spoof alarms on ordinary calls.
+        (_, Some(bytecode_types)) if !bytecode_types.is_empty() => {
             let matches: Vec<_> = parsed
                 .iter()
                 .filter(|(_, types)| types == bytecode_types)
@@ -63,14 +80,21 @@ pub fn resolve(
                     let (name, arg_types) = matches.into_iter().next().unwrap();
                     Resolved::Unique { name, arg_types }
                 }
-                // Either no candidate matches the bytecode (suspicious —
-                // could indicate a phishing fixture or a stale 4byte
-                // entry), or several do. Either way, hand the user the
-                // full candidate list so they can decide.
-                _ => Resolved::Ambiguous(if matches.is_empty() { parsed } else { matches }),
+                // No candidate's arg types match the on-chain bytecode: the
+                // 4byte name(s) are contradicted by what the contract
+                // actually implements. Surface this as a distinct, louder
+                // signal than ordinary ambiguity (possible phishing).
+                0 => Resolved::BytecodeMismatch(parsed),
+                // Several candidates remain consistent with the bytecode —
+                // genuinely ambiguous; hand the user the narrowed list.
+                _ => Resolved::Ambiguous(matches),
             }
         }
-        (_, None) => Resolved::Ambiguous(parsed),
+        // ≥2 candidates but no usable bytecode shape — either no bytecode at
+        // all, or evmole found the selector but not its arg types. We can
+        // neither confirm nor contradict, so hand back the full candidate
+        // list as ordinary ambiguity (never a spoof accusation).
+        _ => Resolved::Ambiguous(parsed),
     }
 }
 
@@ -219,20 +243,40 @@ mod tests {
     }
 
     #[test]
-    fn no_bytecode_match_falls_back_to_all_parsed() {
-        // Bytecode says (bool, bool) but no candidate has that shape.
-        // The fallback hands back ALL parsed candidates — see the
-        // "suspicious — could indicate phishing" branch in resolve().
+    fn no_bytecode_match_is_flagged_as_bytecode_mismatch() {
+        // Bytecode says (bool, bool) but no candidate has that shape: the
+        // on-chain code contradicts every 4byte name. This is the spoof
+        // signal — distinct from plain ambiguity — and carries the rejected
+        // candidate list so the UI can show what was claimed.
         let candidates = &["transfer(address,uint256)", "approve(address,uint256)"];
         let bytecode = vec![DynSolType::Bool, DynSolType::Bool];
         match resolve(candidates, Some(&bytecode)) {
+            Resolved::BytecodeMismatch(list) => {
+                assert_eq!(list.len(), 2);
+                let names: Vec<_> = list.iter().map(|(n, _)| n.as_str()).collect();
+                assert!(names.contains(&"transfer"));
+                assert!(names.contains(&"approve"));
+            }
+            other => panic!("expected BytecodeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_bytecode_types_is_ambiguous_not_spoof() {
+        // evmole often recovers the selector but returns NO arg types
+        // (`Some(vec![])`). That is "unknown shape", not "contradicts the
+        // candidates" — it must stay ordinary Ambiguous, never the louder
+        // BytecodeMismatch spoof signal, or every such legit call would
+        // raise a false phishing alarm.
+        let candidates = &["transfer(address,uint256)", "approve(address,uint256)"];
+        match resolve(candidates, Some(&[])) {
             Resolved::Ambiguous(list) => {
                 assert_eq!(list.len(), 2);
                 let names: Vec<_> = list.iter().map(|(n, _)| n.as_str()).collect();
                 assert!(names.contains(&"transfer"));
                 assert!(names.contains(&"approve"));
             }
-            other => panic!("expected Ambiguous fallback, got {other:?}"),
+            other => panic!("expected Ambiguous for empty bytecode types, got {other:?}"),
         }
     }
 

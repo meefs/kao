@@ -59,6 +59,10 @@ pub struct DecodedCall {
     /// Symbol/decimals of `to`, if it answers the standard probes.
     /// Drives "1.234 USDC" amount formatting.
     pub target_token: Option<TokenInfo>,
+    /// Whether `target_token` came from a *verified* read. False when the
+    /// symbol/decimals probe fell back to unverified RPC — the label is
+    /// then attacker-influenceable, so amount formatting marks it.
+    pub target_token_verified: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +138,11 @@ pub enum Warning {
     /// 4byte returned multiple candidates and bytecode types couldn't
     /// narrow. UI lists candidates; signing this is "trust me bro".
     AmbiguousSignature { candidates: Vec<String> },
+    /// 4byte offered candidate name(s) but the on-chain bytecode's arg
+    /// types match none of them — the suggested name is contradicted by
+    /// what the contract actually implements. A possible spoof; the UI
+    /// flags it louder than plain ambiguity. Carries the rejected names.
+    BytecodeMismatch { candidates: Vec<String> },
 }
 
 // ---------------------------------------------------------------------------
@@ -156,6 +165,7 @@ pub async fn decode_call(
         proxy_hops: Vec::new(),
         all_verified: true,
         target_token: None,
+        target_token_verified: true,
     };
 
     if calldata.is_empty() {
@@ -219,6 +229,16 @@ pub async fn decode_call(
                 None => (None, Vec::new(), ResolutionState::Unknown),
             }
         }
+        matcher::Resolved::BytecodeMismatch(list) => {
+            // The on-chain code contradicts every name 4byte suggested.
+            // Don't show any of those names as authoritative — fall back to
+            // the raw selector (muted, via Ambiguous) and raise a distinct
+            // spoof warning that rides above the header.
+            let names: Vec<String> = list.into_iter().map(|(n, _)| n).collect();
+            out.warnings
+                .push(Warning::BytecodeMismatch { candidates: names });
+            (None, Vec::new(), ResolutionState::Ambiguous)
+        }
         matcher::Resolved::Unknown => (None, Vec::new(), ResolutionState::Unknown),
     };
     out.function_name = function_name;
@@ -237,6 +257,7 @@ pub async fn decode_call(
     // alongside the existing bytecode/storage warnings.
     if let Some((meta, verified)) = read_token_meta(net, chain, to).await {
         out.target_token = Some(meta);
+        out.target_token_verified = verified;
         if !verified {
             out.all_verified = false;
         }
@@ -316,9 +337,19 @@ async fn humanize_arg(
         }
         DynSolValue::Uint(raw, _) => {
             let formatted = match &parent.target_token {
-                Some(tok) => format_units(*raw, tok.decimals)
-                    .map(|s| format!("{s} {}", tok.symbol))
-                    .unwrap_or_else(|_| raw.to_string()),
+                // When the symbol/decimals probe was unverified the label
+                // (and the scaling) are attacker-influenceable, so tag the
+                // amount rather than letting "1.234 USDC" read as fact.
+                Some(tok) => {
+                    let symbol = if parent.target_token_verified {
+                        tok.symbol.clone()
+                    } else {
+                        format!("{} (unverified)", tok.symbol)
+                    };
+                    format_units(*raw, tok.decimals)
+                        .map(|s| format!("{s} {symbol}"))
+                        .unwrap_or_else(|_| raw.to_string())
+                }
                 None => raw.to_string(),
             };
             ArgDisplay::Uint {
