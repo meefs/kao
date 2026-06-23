@@ -519,7 +519,9 @@ impl NetworkSetupScreen {
     fn step_valid(&self, step: WizardStep) -> bool {
         match step {
             WizardStep::Rpc => match self.draft.rpc_provider {
-                RpcProvider::Kao => settings::is_https_url(self.draft.kao_server_url.trim()),
+                RpcProvider::Kao => {
+                    settings::parse_kao_server_input(self.draft.kao_server_url.trim()).is_some()
+                }
                 RpcProvider::Alchemy => !self.draft.rpc_key.as_str().trim().is_empty(),
                 RpcProvider::Drpc => !self.draft.rpc_key.as_str().trim().is_empty(),
                 RpcProvider::Custom => {
@@ -1116,6 +1118,10 @@ impl NetworkSetupScreen {
                     text("Server URL").size(11).color(t.sub).font(mono()),
                     vspace(4),
                     input,
+                    vspace(4),
+                    text("HTTPS, or http:// for a localhost server.")
+                        .size(10)
+                        .color(t.sub),
                 ]
                 .width(Length::Fill)
                 .into(),

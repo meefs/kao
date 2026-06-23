@@ -491,10 +491,9 @@ fn parse(text: &str) -> State {
 
     // ── Wizard-level network config ──────────────────────────────────
     if let Some(url) = on_disk.kao_server_url.as_deref()
-        && !url.is_empty()
-        && is_https_url(url)
+        && let Some(normalized) = parse_kao_server_input(url)
     {
-        state.kao_server_url = url.to_string();
+        state.kao_server_url = normalized;
     }
     if let Some(p) = on_disk.rpc_provider.as_deref()
         && let Some(parsed) = RpcProvider::from_key(p)
@@ -855,12 +854,7 @@ pub fn kao_server_url() -> String {
 }
 
 pub fn set_kao_server_url(value: String) {
-    let url = value.trim().to_string();
-    let url = if url.is_empty() || !is_https_url(&url) {
-        DEFAULT_KAO_SERVER_URL.to_string()
-    } else {
-        url
-    };
+    let url = parse_kao_server_input(&value).unwrap_or_else(|| DEFAULT_KAO_SERVER_URL.to_string());
     ensure()
         .lock()
         .expect("settings mutex poisoned")
@@ -1263,6 +1257,69 @@ pub fn parse_rpc_input(s: &str) -> Option<String> {
         return None;
     }
     Some(format!("https://{s}"))
+}
+
+/// Validate and normalize a user-supplied Kao privacy-proxy base URL.
+///
+/// Like [`parse_rpc_input`] but tailored to the Kao server field: it accepts
+/// an explicit `https://` URL (any host) or — for the common self-hosted dev
+/// setup — a plain `http://` URL pointed at loopback (`localhost`,
+/// `127.0.0.1`, `[::1]`, …). A bare `host[:port][/path]` is wrapped: loopback
+/// and IP hosts get `http://`, public hostnames get `https://`. Plain http to
+/// a *public* host is rejected so Kao traffic can't be silently downgraded
+/// onto a MITM-able transport. Returns the normalized URL, or `None` when the
+/// input can't be made safe.
+///
+/// Unlike [`parse_rpc_input`], an explicit `http://localhost` is kept rather
+/// than rejected — that's what we store after wrapping bare loopback input, so
+/// the stored value must survive a re-parse on the next load.
+pub fn parse_kao_server_input(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.contains("://") {
+        let url = url::Url::parse(s).ok()?;
+        let host = url.host_str()?;
+        let host_ok = is_loopback_host(host) || is_plausible_host(host);
+        let scheme_ok = match url.scheme() {
+            "https" => true,
+            "http" => is_loopback_host(host),
+            _ => false,
+        };
+        return (host_ok && scheme_ok).then(|| s.to_string());
+    }
+    let (host_port, _) = s.find('/').map_or((s, ""), |i| (&s[..i], &s[i..]));
+    let host = match host_port.rsplit_once(':') {
+        Some((host, port)) => {
+            if port.parse::<u16>().is_err() {
+                return None;
+            }
+            host
+        }
+        None => host_port,
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() || host.eq_ignore_ascii_case("localhost") {
+        return Some(format!("http://{s}"));
+    }
+    if !is_plausible_host(host) {
+        return None;
+    }
+    Some(format!("https://{s}"))
+}
+
+/// True for hosts where plain http is safe because the traffic never leaves
+/// the machine: `localhost` and any loopback IP (`127.0.0.0/8`, `::1`).
+/// Accepts the bracketed IPv6 form (`[::1]`) that `Url::host_str` returns.
+fn is_loopback_host(host: &str) -> bool {
+    let h = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    h.eq_ignore_ascii_case("localhost")
+        || h.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 /// A host is plausible if it's an IP, `localhost`, or a multi-label hostname.
@@ -2086,6 +2143,56 @@ mod tests {
     #[test]
     fn parse_rpc_input_rejects_http_url() {
         assert_eq!(parse_rpc_input("http://my-node.example"), None);
+    }
+
+    #[test]
+    fn parse_kao_server_input_wraps_bare_localhost_as_http() {
+        // The reported case: a self-hosted server typed without a scheme.
+        assert_eq!(
+            parse_kao_server_input("localhost:8080"),
+            Some("http://localhost:8080".into())
+        );
+        assert_eq!(
+            parse_kao_server_input("127.0.0.1:8080"),
+            Some("http://127.0.0.1:8080".into())
+        );
+    }
+
+    #[test]
+    fn parse_kao_server_input_keeps_explicit_loopback_http() {
+        // Must round-trip: this is what we store after wrapping bare input, so
+        // it has to survive re-parsing on the next load.
+        for url in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert_eq!(parse_kao_server_input(url), Some(url.into()), "{url}");
+        }
+    }
+
+    #[test]
+    fn parse_kao_server_input_keeps_https_anywhere() {
+        assert_eq!(
+            parse_kao_server_input(DEFAULT_KAO_SERVER_URL),
+            Some(DEFAULT_KAO_SERVER_URL.into())
+        );
+        assert_eq!(
+            parse_kao_server_input("my-node.example"),
+            Some("https://my-node.example".into())
+        );
+    }
+
+    #[test]
+    fn parse_kao_server_input_rejects_public_http_and_junk() {
+        // Plain http to a public host would let traffic be MITM'd.
+        assert_eq!(parse_kao_server_input("http://my-node.example"), None);
+        assert_eq!(parse_kao_server_input("http://1.2.3.4:8080"), None);
+        // Single-label / malformed hosts and non-web schemes.
+        assert_eq!(parse_kao_server_input("ws://localhost:8080"), None);
+        assert_eq!(parse_kao_server_input("asdf"), None);
+        assert_eq!(parse_kao_server_input(""), None);
+        assert_eq!(parse_kao_server_input("   "), None);
     }
 
     #[test]
