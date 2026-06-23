@@ -670,8 +670,7 @@ pub async fn refresh_one(
 /// Spawned by the App after unlock so the dashboard renders against
 /// freshly-verified owner sets / modules / guards. Wallet is saved
 /// once at the App layer after the batch completes (if any diff was
-/// non-empty), which keeps the rollback-protection epoch from
-/// bumping per-Safe.
+/// non-empty), which keeps the save path off the per-Safe hot loop.
 #[allow(dead_code)]
 pub async fn refresh_all_safes(
     net: Arc<dyn BalanceFetcher>,

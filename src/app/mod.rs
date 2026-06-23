@@ -541,8 +541,7 @@ impl App {
     /// Process the post-unlock Safe-refresh batch. For each successful
     /// refresh: replace `wallet.safes[idx]` with the new descriptor;
     /// collect any user-facing change summaries. After the batch:
-    /// - if any diff was non-empty, save the wallet once (single
-    ///   epoch bump for the whole batch)
+    /// - if any diff was non-empty, save the wallet once for the whole batch
     /// - if any user-facing alerts collected, surface them as a toast
     /// - push the updated safes vec into the WalletScreen so its
     ///   dropdown stops rendering stale labels
