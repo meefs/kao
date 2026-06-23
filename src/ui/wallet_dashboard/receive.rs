@@ -28,14 +28,16 @@ pub enum Outcome {
 #[derive(Debug)]
 pub struct ReceivePane {
     address: Address,
-    qr: qr_code::Data,
+    qr: Option<qr_code::Data>,
     copied: bool,
 }
 
 impl ReceivePane {
     pub fn new(address: Address) -> Self {
-        let qr = qr_code::Data::new(format!("{:#x}", address))
-            .expect("an Ethereum address always fits in a QR code");
+        // An Ethereum address always fits in a QR code, so this realistically
+        // never fails — but fall back to `None` (the view shows a placeholder)
+        // rather than panicking the whole GUI if encoding ever errors.
+        let qr = qr_code::Data::new(format!("{:#x}", address)).ok();
         Self {
             address,
             qr,
@@ -100,15 +102,23 @@ impl ReceivePane {
             Color::from_rgb8(30, 30, 30)
         };
         let light_cell = if t.dark { t.card_alt } else { Color::WHITE };
-        let qr = qr_code(&self.qr)
-            .total_size(180.0)
-            .style(move |_| qr_code::Style {
-                cell: dark_cell,
-                background: light_cell,
-            });
-        let qr_box = container(qr)
-            .width(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Center);
+        let qr_box: Element<'_, Message> = if let Some(qr_data) = &self.qr {
+            let qr = qr_code(qr_data)
+                .total_size(180.0)
+                .style(move |_| qr_code::Style {
+                    cell: dark_cell,
+                    background: light_cell,
+                });
+            container(qr)
+                .width(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .into()
+        } else {
+            container(text("QR code unavailable").size(13).color(t.sub))
+                .width(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .into()
+        };
 
         let addr_box = container(
             text(addr)

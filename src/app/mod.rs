@@ -30,6 +30,9 @@ use crate::ui::import_seed_phrase::{
 };
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::bold;
+use crate::ui::network_setup::{
+    Message as NetworkSetupMessage, NetworkSetupScreen, Outcome as NetworkSetupOutcome, WizardMode,
+};
 use crate::ui::safe_onboarding::{
     Message as SafeOnboardingMessage, Outcome as SafeOnboardingOutcome, SafeOnboardingScreen,
 };
@@ -39,12 +42,6 @@ use crate::ui::select_hardware_wallet::{
 };
 use crate::ui::select_hd_account::{
     Message as SelectHdAccountMessage, Outcome as SelectHdAccountOutcome, SelectHdAccountScreen,
-};
-use crate::ui::select_indexer::{
-    Message as SelectIndexerMessage, Outcome as SelectIndexerOutcome, SelectIndexerScreen,
-};
-use crate::ui::select_rpc::{
-    Message as SelectRpcMessage, Outcome as SelectRpcOutcome, SelectRpcScreen,
 };
 use crate::ui::setup_method::{
     Message as SetupMethodMessage, Outcome as SetupMethodOutcome, SetupMethod, SetupMethodScreen,
@@ -76,8 +73,7 @@ pub enum Message {
     SafeOnboarding(SafeOnboardingMessage),
     SelectHardwareWallet(SelectHardwareWalletMessage),
     SelectHdAccount(SelectHdAccountMessage),
-    SelectIndexer(SelectIndexerMessage),
-    SelectRpc(SelectRpcMessage),
+    NetworkSetup(NetworkSetupMessage),
     SetupMethod(SetupMethodMessage),
     ShowSeed(ShowSeedMessage),
     Unlock(UnlockMessage),
@@ -118,12 +114,9 @@ pub enum Screen {
     CreatePassword(CreatePasswordScreen),
     /// Ask the user for the existing passphrase to decrypt wallet.enc.
     Unlock(UnlockScreen),
-    /// Pick the RPC source to use for on-chain reads (defaults or custom).
-    /// Shown once, after the user creates their initial passphrase.
-    SelectRpc(SelectRpcScreen),
-    /// Pick the third-party indexer (transaction history + unverified
-    /// balances). Shown once, right after `SelectRpc`.
-    SelectIndexer(SelectIndexerScreen),
+    /// 4-step network setup wizard (RPC, API, Safe TX, Proxy). Shown once
+    /// after the user creates their initial passphrase.
+    NetworkSetup(NetworkSetupScreen),
     /// Choose how to set up the wallet (create new, import seed, import key,
     /// or open the hardware-wallet sub-screen).
     SetupMethod(SetupMethodScreen),
@@ -239,7 +232,6 @@ const TOAST_LIFETIME_SECS: u64 = 5;
 impl App {
     pub fn new() -> (Self, iced::Task<Message>) {
         crate::settings::load();
-        crate::net::refresh_auto_checkpoint();
         let network: Arc<dyn BalanceFetcher> = Arc::new(NetworkClient::new());
         let portfolio_cache = portfolio::new_cache();
 
@@ -406,7 +398,7 @@ impl App {
         };
         match wallet.active().clone() {
             AccountDescriptor::Local { key_bytes, .. } => {
-                let b = alloy::primitives::B256::from_slice(&key_bytes);
+                let b = key_bytes.to_b256();
                 match wallet::signer_from_bytes(&b) {
                     Ok(s) => self.enter_dashboard(KaoSigner::Local(s), initial_nav),
                     Err(e) => {
@@ -1021,7 +1013,8 @@ impl App {
                 if let Some(CreatePasswordOutcome::Created(passphrase)) = outcome {
                     self.passphrase = Some(passphrase);
                     self.setup_context = Some(SetupContext::FreshWallet);
-                    self.screen = Screen::SelectRpc(SelectRpcScreen::default());
+                    self.screen =
+                        Screen::NetworkSetup(NetworkSetupScreen::new(WizardMode::Onboarding));
                     return iced::Task::none();
                 }
                 cmd.map(Message::CreatePassword)
@@ -1040,14 +1033,13 @@ impl App {
                 {
                     // Hold the passphrase for the unlocked session so we
                     // can re-save the wallet file on add/switch account.
-                    self.passphrase = Some(passphrase);
+                    // Clone the passphrase into the session slot and move the
+                    // original into the contacts task — avoids re-fetching from
+                    // `self.passphrase` with an `.expect()` that would panic the
+                    // whole app if the invariant ever changed under refactoring.
+                    self.passphrase = Some(passphrase.clone());
                     self.wallet = Some(descriptor);
-                    let load_contacts = load_contacts_task(
-                        self.passphrase
-                            .as_ref()
-                            .expect("passphrase just set")
-                            .clone(),
-                    );
+                    let load_contacts = load_contacts_task(passphrase);
                     // Refresh-on-app-open: kick off a parallel
                     // re-inspect for every Safe so the dashboard
                     // renders against verified-fresh owner sets and
@@ -1075,95 +1067,29 @@ impl App {
                 cmd.map(Message::Unlock)
             }
 
-            // ── SelectRpc ───────────────────────────────────────────
-            Message::SelectRpc(msg) => {
-                let Screen::SelectRpc(screen) = &mut self.screen else {
+            // ── NetworkSetup ───────────────────────────────────────
+            Message::NetworkSetup(msg) => {
+                let Screen::NetworkSetup(screen) = &mut self.screen else {
                     return iced::Task::none();
                 };
                 let (cmd, outcome) = screen.update(msg);
                 match outcome {
-                    Some(SelectRpcOutcome::UseDefaults) => {
-                        let exec: Vec<String> = crate::settings::default_rpcs()
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect();
-                        let consensus: Vec<String> = crate::settings::default_consensus_rpcs()
-                            .iter()
-                            .map(|s| s.to_string())
-                            .collect();
-                        crate::settings::set_rpcs(crate::chain::Chain::Mainnet, exec);
-                        crate::settings::set_consensus_rpcs(
-                            crate::chain::Chain::Mainnet,
-                            consensus,
-                        );
-                        // Seed L2 chains with their per-chain defaults from
-                        // `chain.rs` so the dashboard's per-chain portfolio
-                        // fan-out actually runs for Base/Optimism — the loop
-                        // skips chains whose RPC list is empty.
-                        for chain in [crate::chain::Chain::Base, crate::chain::Chain::Optimism] {
-                            crate::settings::set_rpcs(
-                                chain,
-                                vec![chain.default_exec_url().to_string()],
-                            );
-                            crate::settings::set_consensus_rpcs(
-                                chain,
-                                vec![chain.default_consensus_url().to_string()],
-                            );
-                        }
-                        self.screen = Screen::SelectIndexer(SelectIndexerScreen::new(None));
+                    Some(NetworkSetupOutcome::Completed) => {
+                        self.screen = Screen::SetupMethod(SetupMethodScreen::default());
                         iced::Task::none()
                     }
-                    Some(SelectRpcOutcome::Custom { exec, consensus }) => {
-                        // Persist every chain whose slot the screen
-                        // populated. Empty slots (typical for L2 in the
-                        // Custom path when the user wiped the row) leave
-                        // those chains unconfigured — the dashboard's
-                        // per-chain fan-out skips chains with no RPC.
-                        for chain in crate::chain::Chain::ALL {
-                            let e = exec.get(chain).trim();
-                            if !e.is_empty() {
-                                crate::settings::set_rpcs(chain, vec![e.to_string()]);
-                            }
-                            let c = consensus.get(chain).trim();
-                            if !c.is_empty() {
-                                crate::settings::set_consensus_rpcs(chain, vec![c.to_string()]);
-                            }
-                        }
-                        // SelectIndexer's auto-detect keys off the
-                        // Mainnet RPC URL (Alchemy / Etherscan reuse).
-                        let mainnet_url = exec.get(crate::chain::Chain::Mainnet).clone();
-                        self.screen =
-                            Screen::SelectIndexer(SelectIndexerScreen::new(Some(&mainnet_url)));
-                        iced::Task::none()
-                    }
-                    Some(SelectRpcOutcome::Back) => {
+                    Some(NetworkSetupOutcome::Back) => {
                         self.passphrase = None;
                         self.setup_context = None;
                         self.screen = Screen::CreatePassword(CreatePasswordScreen::default());
                         focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
                             .map(Message::CreatePassword)
                     }
-                    None => cmd.map(Message::SelectRpc),
-                }
-            }
-
-            // ── SelectIndexer ───────────────────────────────────────
-            Message::SelectIndexer(msg) => {
-                let Screen::SelectIndexer(screen) = &mut self.screen else {
-                    return iced::Task::none();
-                };
-                let (cmd, outcome) = screen.update(msg);
-                match outcome {
-                    Some(SelectIndexerOutcome::Back) => {
-                        self.screen = Screen::SelectRpc(SelectRpcScreen::default());
+                    Some(NetworkSetupOutcome::Closed) => {
+                        // Settings mode — shouldn't happen at this level.
                         iced::Task::none()
                     }
-                    Some(out) => {
-                        apply_indexer_outcome(out);
-                        self.screen = Screen::SetupMethod(SetupMethodScreen::default());
-                        iced::Task::none()
-                    }
-                    None => cmd.map(Message::SelectIndexer),
+                    None => cmd.map(Message::NetworkSetup),
                 }
             }
 
@@ -1227,14 +1153,11 @@ impl App {
                         if matches!(self.setup_context, Some(SetupContext::AddAccount)) {
                             self.cancel_add_account()
                         } else {
-                            // Fresh setup: step back one — to the indexer
-                            // picker — so users can flip from e.g. Etherscan
-                            // to None without re-picking RPC.
-                            let rpc = crate::settings::rpcs(crate::chain::Chain::Mainnet)
-                                .into_iter()
-                                .next();
-                            self.screen =
-                                Screen::SelectIndexer(SelectIndexerScreen::new(rpc.as_deref()));
+                            // Fresh setup: step back to the network wizard so
+                            // users can revise RPC/API/proxy choices.
+                            self.screen = Screen::NetworkSetup(NetworkSetupScreen::new(
+                                WizardMode::Onboarding,
+                            ));
                             iced::Task::none()
                         }
                     }
@@ -1646,8 +1569,7 @@ impl App {
         let screen: Element<'_, Message> = match &self.screen {
             Screen::CreatePassword(screen) => screen.view().map(Message::CreatePassword),
             Screen::Unlock(screen) => screen.view().map(Message::Unlock),
-            Screen::SelectRpc(screen) => screen.view().map(Message::SelectRpc),
-            Screen::SelectIndexer(screen) => screen.view().map(Message::SelectIndexer),
+            Screen::NetworkSetup(screen) => screen.view().map(Message::NetworkSetup),
             Screen::SetupMethod(screen) => screen.view().map(Message::SetupMethod),
             Screen::SelectHardwareWallet(screen) => {
                 screen.view().map(Message::SelectHardwareWallet)
@@ -1677,8 +1599,7 @@ impl App {
         match &self.screen {
             Screen::CreatePassword(screen) => screen.subscription().map(Message::CreatePassword),
             Screen::Unlock(_) => Subscription::none(),
-            Screen::SelectRpc(screen) => screen.subscription().map(Message::SelectRpc),
-            Screen::SelectIndexer(screen) => screen.subscription().map(Message::SelectIndexer),
+            Screen::NetworkSetup(screen) => screen.subscription().map(Message::NetworkSetup),
             Screen::SetupMethod(screen) => screen.subscription().map(Message::SetupMethod),
             Screen::SelectHardwareWallet(screen) => {
                 screen.subscription().map(Message::SelectHardwareWallet)
@@ -1834,38 +1755,6 @@ fn save_contacts_task(contacts: Vec<Contact>, passphrase: SecretString) -> iced:
         },
         Message::ContactsSaved,
     )
-}
-
-/// Persist the user's indexer choice. Each branch sets the provider plus
-/// any provider-specific config; fields the outcome doesn't carry are left
-/// untouched so a re-run of setup doesn't wipe an unrelated existing key.
-fn apply_indexer_outcome(outcome: SelectIndexerOutcome) {
-    use crate::settings::{self, IndexerProvider};
-    match outcome {
-        SelectIndexerOutcome::Alchemy { api_key } => {
-            settings::set_alchemy_api_key(Some(api_key));
-            settings::set_indexer_provider(IndexerProvider::Alchemy);
-        }
-        SelectIndexerOutcome::Drpc { api_key } => {
-            settings::set_drpc_api_key(Some(api_key));
-            settings::set_indexer_provider(IndexerProvider::Drpc);
-        }
-        SelectIndexerOutcome::Blockscout { base_url, api_key } => {
-            settings::set_blockscout_base_url(base_url);
-            settings::set_blockscout_api_key(api_key);
-            settings::set_indexer_provider(IndexerProvider::Blockscout);
-        }
-        SelectIndexerOutcome::Etherscan { api_key } => {
-            settings::set_etherscan_api_key(Some(api_key));
-            settings::set_indexer_provider(IndexerProvider::Etherscan);
-        }
-        SelectIndexerOutcome::NoIndexer => {
-            settings::set_indexer_provider(IndexerProvider::None);
-        }
-        SelectIndexerOutcome::Back => {
-            // Handled by the caller — back navigation doesn't touch settings.
-        }
-    }
 }
 
 #[cfg(test)]

@@ -22,8 +22,8 @@ use crate::portfolio::{format_eth_balance, format_token_balance};
 use crate::chain::Chain;
 
 use super::{
-    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
-    parse_iso8601, redact_url_in_err,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, amount_or_zero_logged,
+    classify_direction, decimals_or_default, http_client_or_err, parse_iso8601, redact_url_in_err,
 };
 
 const DEFAULT_BASE: &str = "https://eth.blockscout.com";
@@ -195,7 +195,7 @@ impl Indexer for BlockscoutClient {
             "type=ERC-20",
         );
 
-        let client = http_client();
+        let client = http_client_or_err()?;
         let (txs_res, tokens_res): (
             Result<TxListResponse, String>,
             Result<TokenTransfersResponse, String>,
@@ -257,7 +257,7 @@ impl Indexer for BlockscoutClient {
             "type=ERC-20",
         );
 
-        let client = http_client();
+        let client = http_client_or_err()?;
         let (detail, tokens) = futures::future::join(
             async {
                 client
@@ -352,17 +352,18 @@ fn convert_token_transfer(r: RawTokenTransfer, owner: Address) -> Option<Indexed
     let from = parse_address(&r.from.hash)?;
     let to = r.to.as_ref().and_then(|a| parse_address(&a.hash));
     let contract = parse_address(&r.token.address_hash)?;
-    let amount_raw = U256::from_str(&r.total.value).unwrap_or(U256::ZERO);
+    let amount_raw = amount_or_zero_logged(U256::from_str(&r.total.value), contract);
     // `total.decimals` is authoritative for the actual transferred amount;
     // fall back to the token-level decimals if the per-row field is
     // missing on a quirky deployment.
-    let decimals = r
-        .total
-        .decimals
-        .as_deref()
-        .or(r.token.decimals.as_deref())
-        .and_then(|s| s.parse::<u8>().ok())
-        .unwrap_or(18);
+    let decimals = decimals_or_default(
+        r.total
+            .decimals
+            .as_deref()
+            .or(r.token.decimals.as_deref())
+            .and_then(|s| s.parse::<u8>().ok()),
+        contract,
+    );
     Some(IndexedTx {
         hash,
         block_number: r.block_number.unwrap_or(0),
@@ -462,13 +463,14 @@ fn parse_balances(detail: AddressDetail, rows: Vec<TokenBalanceRow>) -> Vec<Inde
         let Some(contract) = parse_address(&row.token.address_hash) else {
             continue;
         };
-        let decimals = row
-            .token
-            .decimals
-            .as_deref()
-            .and_then(|s| s.parse::<u8>().ok())
-            .unwrap_or(18);
-        let raw = U256::from_str(&row.value).unwrap_or(U256::ZERO);
+        let decimals = decimals_or_default(
+            row.token
+                .decimals
+                .as_deref()
+                .and_then(|s| s.parse::<u8>().ok()),
+            contract,
+        );
+        let raw = amount_or_zero_logged(U256::from_str(&row.value), contract);
         if raw.is_zero() {
             continue;
         }

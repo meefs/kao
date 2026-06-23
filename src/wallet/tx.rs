@@ -43,6 +43,16 @@ pub fn parse_amount_units(amount: &str, decimals: u8) -> Result<U256, String> {
     if trimmed.is_empty() {
         return Err("empty amount".into());
     }
+    // alloy's `parse_units` accepts a leading '-' and `<ParseUnits as
+    // Into<U256>>` reinterprets the signed value's two's-complement bytes as a
+    // huge U256 (e.g. "-1" → 2^256 - 1e18). The Send screen's `parsed_amount`
+    // also rejects negatives, but enforce it in this public helper too so the
+    // API matches its "rejects negative inputs" contract and a non-UI caller
+    // can't sign an astronomically large transfer. (See the rejects-negative
+    // test.)
+    if trimmed.starts_with('-') {
+        return Err("amount must not be negative".into());
+    }
     let parsed = parse_units(trimmed, decimals).map_err(|e| format!("invalid amount: {e}"))?;
     let value: U256 = parsed.into();
     Ok(value)
@@ -245,6 +255,17 @@ pub async fn sign_and_send(
     plan: SendPlan,
     quote: TxQuote,
 ) -> Result<TxHash, String> {
+    // Never sign a transfer to the zero address. For a native send that
+    // burns the ETH irrecoverably; many ERC-20s also permit transfer-to-zero.
+    // `plan.recipient` is the *actual* destination in both cases — for an
+    // ERC-20 the tx `to` is the contract and the recipient lives in the
+    // transfer calldata — so this single check covers native and token sends.
+    // The Send UI rejects it earlier; this is the last-line guard for any
+    // path that reaches the signer.
+    if plan.recipient.is_zero() {
+        warn!(from = %plan.from, "sign+send: refusing zero-address recipient");
+        return Err("refusing to send to the zero address".to_string());
+    }
     let (to, value, input) = plan.tx_target();
     let token_kind = match &plan.token {
         SendToken::Native => "native",
@@ -411,22 +432,16 @@ mod tests {
         assert_eq!(&bytes[36..68], &[0xFFu8; 32]);
     }
 
-    /// Pins a known sharp edge: alloy's `parse_units` accepts `"-N"`
-    /// and `<ParseUnits as Into<U256>>` calls `get_absolute()`, which
-    /// despite its name does NOT take the absolute value — it
-    /// reinterprets the signed I256's raw two's-complement bytes as a
-    /// U256. So `-1` (18 decimals) round-trips to `2^256 - 1e18`, an
-    /// astronomically large amount that would always exceed the
-    /// sender's balance and bounce upstream. The Send screen guards
-    /// against this *additionally* (its amount field only accepts
-    /// digits + one decimal point), but if a future caller bypasses
-    /// the UI it must not assume `parse_amount_units` rejects negatives.
+    /// Guards a known sharp edge: alloy's `parse_units` accepts `"-N"` and
+    /// `<ParseUnits as Into<U256>>` reinterprets the signed I256's raw
+    /// two's-complement bytes as a U256 (so `-1` would become `2^256 - 1e18`,
+    /// an astronomically large amount). `parse_amount_units` must reject
+    /// negatives itself so a non-UI caller can't bypass the Send screen's
+    /// digit-only field and sign a huge transfer.
     #[test]
-    fn parse_amount_units_negative_reinterprets_as_huge_u256() {
-        let neg = parse_amount_units("-1", 18).expect("alloy accepts negative");
-        let one_eth = U256::from(10).pow(U256::from(18));
-        // -1e18 as I256, raw bytes reinterpreted as U256, is 2^256 - 1e18.
-        assert_eq!(neg, U256::MAX - one_eth + U256::from(1u8));
+    fn parse_amount_units_rejects_negative() {
+        assert!(parse_amount_units("-1", 18).is_err());
+        assert!(parse_amount_units("  -0.5  ", 18).is_err());
     }
 
     #[test]
@@ -452,5 +467,61 @@ mod tests {
         if let Ok(v) = parse_amount_units("1.2345678", 6) {
             assert!(v <= U256::from(1_234_568u64), "must not over-allocate");
         }
+    }
+
+    fn dummy_quote() -> TxQuote {
+        TxQuote {
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            nonce: 0,
+            eth_cost_wei: U256::ZERO,
+            sim: SimulationResult::unavailable(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sign_and_send_refuses_zero_recipient_native() {
+        use alloy::signers::local::PrivateKeySigner;
+        let signer = KaoSigner::Local(PrivateKeySigner::random());
+        // The guard returns before signing/broadcast, so the provider is
+        // never contacted — a non-routable URL is fine.
+        let provider = RootProvider::<Ethereum>::new_http("http://127.0.0.1:1".parse().unwrap());
+        let plan = SendPlan {
+            from: signer.address(),
+            recipient: Address::ZERO,
+            token: SendToken::Native,
+            amount_units: U256::from(1u64),
+            chain: Chain::Mainnet,
+        };
+        let res = sign_and_send(&provider, &signer, plan, dummy_quote()).await;
+        assert!(
+            res.is_err(),
+            "native send to the zero address must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_and_send_refuses_zero_recipient_erc20() {
+        use alloy::signers::local::PrivateKeySigner;
+        let signer = KaoSigner::Local(PrivateKeySigner::random());
+        let provider = RootProvider::<Ethereum>::new_http("http://127.0.0.1:1".parse().unwrap());
+        // ERC-20: the tx `to` is the (non-zero) contract, but the recipient
+        // buried in the transfer calldata is zero — exactly the case a
+        // `to`-only check would wave through. The guard inspects
+        // `plan.recipient`, so it catches it.
+        let usdc = address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
+        let plan = SendPlan {
+            from: signer.address(),
+            recipient: Address::ZERO,
+            token: SendToken::Erc20 { contract: usdc },
+            amount_units: U256::from(1_000_000u64),
+            chain: Chain::Base,
+        };
+        let res = sign_and_send(&provider, &signer, plan, dummy_quote()).await;
+        assert!(
+            res.is_err(),
+            "erc20 transfer to the zero address must be refused"
+        );
     }
 }

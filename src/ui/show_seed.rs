@@ -18,7 +18,10 @@ use crate::wallet;
 #[derive(Debug, Clone)]
 pub enum Message {
     CopySeed,
-    SeedCopied,
+    /// A clipboard write finished (the seed copy, or the clear-on-exit). We
+    /// don't act on it: `did_copy` is set eagerly at copy time, so the exit
+    /// clear can't race this async confirmation.
+    ClipboardWritten,
     Continue,
     BackPressed,
     KeyboardEvent(keyboard::Event),
@@ -36,9 +39,12 @@ pub struct ShowSeedScreen {
     seed_phrase: SecretString,
     key_bytes: Zeroizing<[u8; 32]>,
     address: Address,
-    /// True once the user has clicked Copy on the current visit. Drives the
-    /// auto-clear-clipboard-on-Continue behavior so we don't clobber unrelated
-    /// clipboard contents when the user never copied. Reset per-instance.
+    /// True once the user has clicked Copy on the current visit. Set **eagerly**
+    /// the instant Copy is pressed — not when the async clipboard write confirms
+    /// — so a fast Copy→Continue (or Copy→Enter) can't leave the screen before
+    /// the flag flips and silently skip the clipboard clear. Drives the
+    /// auto-clear-on-exit behavior so we don't clobber unrelated clipboard
+    /// contents when the user never copied. Reset per-instance.
     did_copy: bool,
 }
 
@@ -75,16 +81,29 @@ impl ShowSeedScreen {
         (self.seed_phrase, self.key_bytes, self.address)
     }
 
-    /// Build the (Task, Outcome) pair that moves the user past this screen,
-    /// overwriting the clipboard if we put the seed there. Best-effort: this
-    /// only clears the current clipboard slot, not clipboard-manager history.
-    fn continue_outcome(&self) -> (Task<Message>, Option<Outcome>) {
-        let clear = if self.did_copy {
-            clipboard::write(String::new()).map(|_: ()| Message::SeedCopied)
+    /// Best-effort wipe of the clipboard slot we wrote the seed into. Returns
+    /// an empty task when we never copied, so we don't clobber unrelated
+    /// clipboard contents. Only clears the current slot, not clipboard-manager
+    /// history.
+    fn clear_clipboard_task(&self) -> Task<Message> {
+        if self.did_copy {
+            clipboard::write(String::new()).map(|_: ()| Message::ClipboardWritten)
         } else {
             Task::none()
-        };
-        (clear, Some(Outcome::Continue))
+        }
+    }
+
+    /// Build the (Task, Outcome) pair that moves the user *past* this screen,
+    /// overwriting the clipboard if we put the seed there.
+    fn continue_outcome(&self) -> (Task<Message>, Option<Outcome>) {
+        (self.clear_clipboard_task(), Some(Outcome::Continue))
+    }
+
+    /// Build the (Task, Outcome) pair that takes the user *back* off this
+    /// screen. Clears the clipboard on the way out too — leaving Back/Escape
+    /// would otherwise strand a copied seed in the clipboard.
+    fn back_outcome(&self) -> (Task<Message>, Option<Outcome>) {
+        (self.clear_clipboard_task(), Some(Outcome::Back))
     }
 
     pub fn update(&mut self, message: Message) -> (Task<Message>, Option<Outcome>) {
@@ -92,23 +111,28 @@ impl ShowSeedScreen {
             Message::CopySeed => {
                 // Clipboard write requires an owned String — the one
                 // unavoidable plaintext copy on the path to the OS clipboard.
-                // We auto-clear on Continue (see `continue_outcome`).
+                // We auto-clear on exit (see `continue_outcome` / `back_outcome`).
+                //
+                // Mark `did_copy` NOW, synchronously — not when the async write
+                // confirms. The confirmation and the user's next action
+                // (Continue / Enter) arrive as unordered messages; waiting for
+                // the confirmation would let a fast Copy→Enter run the exit
+                // clear while `did_copy` was still false, stranding the seed in
+                // the clipboard.
+                self.did_copy = true;
                 let phrase = self.seed_phrase.expose_secret().to_string();
                 (
-                    clipboard::write(phrase).map(|_: ()| Message::SeedCopied),
+                    clipboard::write(phrase).map(|_: ()| Message::ClipboardWritten),
                     None,
                 )
             }
-            Message::SeedCopied => {
-                self.did_copy = true;
-                (Task::none(), None)
-            }
+            // Both the seed copy and the clear-on-exit map their completion
+            // here; nothing to do — `did_copy` was already set at copy time.
+            Message::ClipboardWritten => (Task::none(), None),
             Message::Continue => self.continue_outcome(),
-            Message::BackPressed => (Task::none(), Some(Outcome::Back)),
+            Message::BackPressed => self.back_outcome(),
             Message::KeyboardEvent(keyboard::Event::KeyPressed { key, .. }) => match key {
-                keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                    (Task::none(), Some(Outcome::Back))
-                }
+                keyboard::Key::Named(keyboard::key::Named::Escape) => self.back_outcome(),
                 keyboard::Key::Named(keyboard::key::Named::Enter) => self.continue_outcome(),
                 _ => (Task::none(), None),
             },
@@ -239,4 +263,63 @@ fn word_cell<'a>(t: KaoTheme, num: usize, word: Option<&'a str>) -> Element<'a, 
             ..container::Style::default()
         })
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen() -> ShowSeedScreen {
+        ShowSeedScreen::generate().expect("mnemonic generation should succeed")
+    }
+
+    #[test]
+    fn copy_sets_did_copy_synchronously() {
+        let mut s = screen();
+        assert!(!s.did_copy);
+        let _ = s.update(Message::CopySeed);
+        // Must flip immediately, without processing the async ClipboardWritten
+        // confirmation — that ordering is exactly what the race exploited.
+        assert!(
+            s.did_copy,
+            "did_copy must be set synchronously on CopySeed so the exit clear is never skipped",
+        );
+    }
+
+    #[test]
+    fn fast_copy_then_continue_still_arms_clear() {
+        // The race: Copy, then Continue *before* ClipboardWritten is delivered.
+        // `did_copy` must already be true so `clear_clipboard_task` writes the
+        // empty string instead of returning `Task::none()`.
+        let mut s = screen();
+        let _ = s.update(Message::CopySeed);
+        let (_task, outcome) = s.update(Message::Continue);
+        assert!(matches!(outcome, Some(Outcome::Continue)));
+        assert!(
+            s.did_copy,
+            "fast Copy→Continue must still arm the clipboard clear",
+        );
+    }
+
+    #[test]
+    fn never_copied_does_not_arm_clear() {
+        // Without a copy we must not clobber unrelated clipboard contents.
+        let mut s = screen();
+        let (_task, outcome) = s.update(Message::Continue);
+        assert!(matches!(outcome, Some(Outcome::Continue)));
+        assert!(!s.did_copy, "no copy → no clipboard clear");
+    }
+
+    #[test]
+    fn clipboard_written_ack_is_noop() {
+        let mut s = screen();
+        let _ = s.update(Message::CopySeed);
+        let before = s.did_copy;
+        let (_task, outcome) = s.update(Message::ClipboardWritten);
+        assert!(outcome.is_none());
+        assert_eq!(
+            s.did_copy, before,
+            "the write-completed ack must not change state"
+        );
+    }
 }

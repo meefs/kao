@@ -20,8 +20,8 @@ use crate::chain::Chain;
 use crate::portfolio::{format_eth_balance, format_token_balance};
 
 use super::{
-    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction, http_client,
-    redact_url_in_err,
+    IndexedToken, IndexedTx, Indexer, TokenTransfer, TxStatus, classify_direction,
+    decimals_or_default, http_client_or_err, redact_url_in_err,
 };
 
 const BASE: &str = "https://lb.drpc.live";
@@ -194,6 +194,75 @@ impl Indexer for DrpcClient {
     }
 }
 
+// ── Kao proxy client ─────────────────────────────────────────────────────────
+
+/// Indexer backed by the Kao privacy proxy.
+///
+/// The proxy is a thin per-chain front for dRPC's Wallet API: it injects the
+/// shared dRPC key, forwards our query string verbatim, and returns dRPC's
+/// response body unchanged. So the wire types ([`BalancesResponse`],
+/// [`HistoryResponse`]) and the parsing ([`parse_balances`], [`convert_tx`])
+/// are shared with [`DrpcClient`] — only the URL differs. Two privacy wins
+/// over talking to dRPC directly: the API key lives on the proxy (never in a
+/// URL the wallet builds, so there's nothing to redact), and the proxy
+/// originates the upstream request, so no client IP reaches dRPC.
+#[derive(Debug)]
+pub struct KaoClient {
+    /// Base URL of the user's Kao proxy, e.g. `https://api.kaowallet.com`.
+    base: String,
+    chain: Chain,
+}
+
+impl KaoClient {
+    pub fn new(base: String, chain: Chain) -> Self {
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            chain,
+        }
+    }
+
+    fn balances_url(&self, addr: Address) -> String {
+        // Same query knobs the direct dRPC client uses; the proxy forwards
+        // them verbatim to the Wallet API.
+        format!(
+            "{}/v1/{}/balances/{:#x}?asset_type=TOKEN&include_zero_price_tokens=false",
+            self.base,
+            drpc_chain(self.chain),
+            addr,
+        )
+    }
+
+    fn history_url(&self, addr: Address, limit: usize) -> String {
+        format!(
+            "{}/v1/{}/history/{:#x}?limit={}",
+            self.base,
+            drpc_chain(self.chain),
+            addr,
+            limit.max(1),
+        )
+    }
+}
+
+#[async_trait]
+impl Indexer for KaoClient {
+    async fn transactions(&self, addr: Address, limit: usize) -> Result<Vec<IndexedTx>, String> {
+        let url = self.history_url(addr, limit);
+        let resp: HistoryResponse = fetch_json(&url, "kao history").await?;
+        Ok(resp
+            .data
+            .into_iter()
+            .filter_map(|t| convert_tx(t, addr))
+            .take(limit)
+            .collect())
+    }
+
+    async fn balances(&self, addr: Address) -> Result<Vec<IndexedToken>, String> {
+        let url = self.balances_url(addr);
+        let resp: BalancesResponse = fetch_json(&url, "kao balances").await?;
+        Ok(parse_balances(resp.data.assets))
+    }
+}
+
 /// GET `url`, log the raw response body at `debug!`, then deserialize.
 ///
 /// dRPC's Wallet API surfaces a lot of fields the wallet doesn't render
@@ -211,7 +280,7 @@ async fn fetch_json<T>(url: &str, label: &'static str) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let resp = http_client()
+    let resp = http_client_or_err()?
         .get(url)
         .header("accept", "application/json")
         .send()
@@ -309,7 +378,7 @@ fn parse_balances(assets: Vec<Asset>) -> Vec<IndexedToken> {
             let Ok(contract) = Address::from_str(addr_str) else {
                 continue;
             };
-            let decimals = attrs.decimals.unwrap_or(18);
+            let decimals = decimals_or_default(attrs.decimals, contract);
             let (bal_str, bal_f64) = format_token_balance(raw, decimals);
             erc20.push(IndexedToken {
                 symbol: attrs.token_symbol.unwrap_or_default(),
@@ -434,7 +503,7 @@ fn decode_transfer(tr: &RawTransfer) -> (U256, Option<TokenTransfer>) {
         // Native ETH transfer — amount is wei.
         (raw_amount, None)
     } else if let Ok(contract) = Address::from_str(address) {
-        let decimals = tr.decimals.unwrap_or(18);
+        let decimals = decimals_or_default(tr.decimals, contract);
         let symbol = token.and_then(|t| t.symbol.clone()).unwrap_or_default();
         (
             U256::ZERO,
@@ -659,6 +728,36 @@ mod tests {
         assert!(url.starts_with(
             "https://lb.drpc.live/base/MYKEY/lambda/v2/wallets/0xd8da6bf26964af9d7eed9e03e53415d37aa96045/balances"
         ));
+    }
+
+    #[test]
+    fn kao_balances_url_targets_proxy_v1_route() {
+        let client = KaoClient::new("https://api.kaowallet.com/".into(), Chain::Optimism);
+        let url = client.balances_url(
+            "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+                .parse()
+                .unwrap(),
+        );
+        // Trailing slash on the base is trimmed; key never appears in the URL.
+        assert_eq!(
+            url,
+            "https://api.kaowallet.com/v1/optimism/balances/0xd8da6bf26964af9d7eed9e03e53415d37aa96045?asset_type=TOKEN&include_zero_price_tokens=false",
+        );
+    }
+
+    #[test]
+    fn kao_history_url_targets_proxy_v1_route() {
+        let client = KaoClient::new("https://api.kaowallet.com".into(), Chain::Mainnet);
+        let url = client.history_url(
+            "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
+                .parse()
+                .unwrap(),
+            25,
+        );
+        assert_eq!(
+            url,
+            "https://api.kaowallet.com/v1/ethereum/history/0xd8da6bf26964af9d7eed9e03e53415d37aa96045?limit=25",
+        );
     }
 
     #[test]

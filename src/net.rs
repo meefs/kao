@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use rand::seq::SliceRandom;
 use tokio::sync::Mutex;
 
-use helios_ethereum::config::checkpoints::CheckpointFallback;
+use helios_ethereum::config::checkpoints::{CheckpointFallback, Slot};
 use helios_ethereum::config::networks::Network as EthNetwork;
 use helios_ethereum::{EthereumClient, EthereumClientBuilder};
 use helios_opstack::OpStackClientBuilder;
@@ -110,6 +110,7 @@ pub trait BalanceFetcher: Send + Sync + std::fmt::Debug {
     async fn balance(&self, addr: Address, chain: Chain) -> Result<String, String>;
     /// Drop every cached client across all chains. The next per-chain
     /// `balance` call rebuilds from settings.
+    #[allow(dead_code)]
     async fn invalidate(&self);
     /// Verification state of the most recent `balance` call on `chain`.
     /// Sync getter so the UI thread can read it without awaiting.
@@ -475,13 +476,10 @@ impl NetworkClient {
         let mut s = self.state_for(chain).lock().await;
 
         // Reuse the existing client when the *endpoints* match. The
-        // checkpoint is deliberately excluded from the comparison: it's
-        // only a bootstrap hint, and `refresh_auto_checkpoint` updates it
-        // asynchronously shortly after startup — tearing down an
-        // already-synced client over checkpoint drift would force a
-        // pointless re-sync. A user-entered checkpoint override flows
-        // through `invalidate()` (networks-pane save), which clears
-        // `built_with` and forces the rebuild explicitly.
+        // checkpoint is deliberately excluded from the comparison: it's only
+        // a bootstrap hint for Mainnet sync. A user-entered checkpoint
+        // override flows through `invalidate()` (networks-pane save), which
+        // clears `built_with` and forces the rebuild explicitly.
         if let (Some(client), Some(prev)) = (&s.client, &s.built_with)
             && prev.rpcs == snapshot.rpcs
             && prev.consensus_rpcs == snapshot.consensus_rpcs
@@ -1747,30 +1745,239 @@ impl BalanceFetcher for CallMock {
     }
 }
 
-/// Spawn a background task that fetches the latest community-fallback
-/// checkpoint and, if our built-in is older than the freshness threshold,
-/// updates `settings::auto_checkpoint`. No-ops when the built-in is
-/// fresh. Mainnet only — L2 chains have no checkpoint concept.
-pub fn refresh_auto_checkpoint() {
-    if settings::builtin_is_fresh() {
-        return;
-    }
-    tokio::spawn(async move {
-        let cf = match CheckpointFallback::new().build().await {
-            Ok(cf) => cf,
-            Err(e) => {
-                warn!(error = %e, "checkpoint fallback build failed");
-                return;
-            }
-        };
-        match cf.fetch_latest_checkpoint(&EthNetwork::Mainnet).await {
-            Ok(latest) => {
-                info!(checkpoint = %latest, "refreshed auto checkpoint");
-                settings::set_auto_checkpoint(latest);
-            }
-            Err(e) => warn!(error = %e, "checkpoint fetch failed"),
+/// Build a reqwest client that routes through `proxy` (a SOCKS5 `host:port`)
+/// when `Some`, or connects directly when `None`. `socks5h://` keeps DNS
+/// resolution on the proxy side so the destination hostname never leaks to
+/// the local resolver.
+///
+/// Timeouts are deliberately tight: the checkpoint refresh queries providers
+/// one at a time, and the bundled set routinely contains dead-but-still-listed
+/// endpoints. A short `connect_timeout` makes an unreachable host fail fast
+/// instead of hanging until the read timeout, and a short overall `timeout`
+/// caps how long one slow service can stall the refresh before we move to the
+/// next. Tor needs more room to build a circuit, so the proxied path gets a
+/// longer budget.
+fn proxy_http_client(proxy: Option<&str>) -> Result<reqwest::Client, String> {
+    let proxied = proxy.map(str::trim).filter(|a| !a.is_empty());
+    let (req_timeout, connect_timeout) = if proxied.is_some() {
+        (Duration::from_secs(20), Duration::from_secs(10))
+    } else {
+        (Duration::from_secs(5), Duration::from_secs(3))
+    };
+    debug!(
+        proxied = proxied.is_some(),
+        req_timeout_s = req_timeout.as_secs(),
+        connect_timeout_s = connect_timeout.as_secs(),
+        "checkpoint refresh: building http client"
+    );
+    let mut builder = reqwest::Client::builder()
+        .timeout(req_timeout)
+        .connect_timeout(connect_timeout)
+        .user_agent(concat!("kao/", env!("CARGO_PKG_VERSION")));
+    match proxied {
+        Some(addr) => {
+            // An explicit proxy also disables reqwest's env-proxy detection,
+            // so the draft address is the only thing this client honours.
+            let p = reqwest::Proxy::all(format!("socks5h://{addr}"))
+                .map_err(|e| format!("invalid proxy address: {e}"))?;
+            builder = builder.proxy(p);
         }
-    });
+        None => {
+            // The manual refresh tests the *draft* proxy choice in isolation.
+            // With no draft proxy we want a genuinely direct client — force it,
+            // so it doesn't silently inherit a persisted `ALL_PROXY` installed
+            // process-wide at startup.
+            builder = builder.no_proxy();
+        }
+    }
+    builder
+        .build()
+        .map_err(|e| format!("HTTP client build failed: {e}"))
+}
+
+/// Fetch the latest **mainnet** checkpoint, routing every request through
+/// `proxy` (a SOCKS5 `host:port`) when set.
+///
+/// Helios's own [`CheckpointFallback`] builds a fixed reqwest client with no
+/// proxy support and pulls its service list from GitHub (often blocked), so we
+/// reimplement the discovery against a bundled set of well-known checkpoint
+/// providers ([`CHECKPOINT_ENDPOINTS`]): query them one at a time until enough
+/// have answered (some are dead at any time), then return the block root those
+/// services agree on at the newest epoch. L2 chains have no checkpoint concept,
+/// so this is mainnet only.
+pub async fn fetch_latest_checkpoint(proxy: Option<String>) -> Result<B256, String> {
+    let start = Instant::now();
+    info!(
+        via_proxy = proxy.is_some(),
+        proxy = proxy.as_deref().unwrap_or("(direct)"),
+        "checkpoint refresh: starting"
+    );
+    let result = fetch_checkpoint_via(proxy.as_deref()).await;
+    let elapsed_ms = start.elapsed().as_millis();
+    match &result {
+        Ok(cp) => info!(checkpoint = %cp, elapsed_ms, "checkpoint refresh: resolved"),
+        Err(e) => warn!(error = %e, elapsed_ms, "checkpoint refresh: failed"),
+    }
+    result
+}
+
+async fn fetch_checkpoint_via(proxy: Option<&str>) -> Result<B256, String> {
+    let client = proxy_http_client(proxy)?;
+
+    // 1. Use the bundled provider set directly. (Helios discovers these from a
+    //    GitHub-hosted list, but that host is frequently blocked, so we skip it
+    //    and query the providers straight away.)
+    let endpoints = checkpoint_endpoints();
+    info!(
+        endpoints = endpoints.len(),
+        "checkpoint refresh: querying services"
+    );
+
+    // 2. Query providers one at a time, in order, stopping as soon as `ENOUGH`
+    //    have answered. Sequential (rather than a concurrent fan-out) so we
+    //    don't hit every provider at once; per-request timeouts bound how long
+    //    a dead one stalls us before moving to the next.
+    const ENOUGH: usize = 5;
+    let mut queried = 0usize;
+    let mut slots = Vec::with_capacity(ENOUGH);
+    for endpoint in &endpoints {
+        queried += 1;
+        if let Some(slot) = query_checkpoint_slot(&client, endpoint).await {
+            slots.push(slot);
+            if slots.len() >= ENOUGH {
+                break;
+            }
+        }
+    }
+    info!(
+        responded = slots.len(),
+        queried, "checkpoint refresh: collected slots"
+    );
+
+    // 3. Take the block root the most services agree on at the newest epoch.
+    let (root, epoch, agreement) = resolve_checkpoint(&slots)?;
+    info!(
+        epoch,
+        agreement,
+        of = slots.len(),
+        "checkpoint refresh: tallied agreement"
+    );
+    Ok(root)
+}
+
+/// Query one checkpoint provider for its latest rooted slot. Returns `None`
+/// (and logs why at debug) on request error, decode error, or a response with
+/// no rooted slot, so the caller can simply move on to the next provider.
+async fn query_checkpoint_slot(client: &reqwest::Client, endpoint: &url::Url) -> Option<Slot> {
+    use helios_ethereum::config::checkpoints::RawSlotResponse;
+
+    let name = endpoint.host_str().unwrap_or("?");
+    let url = CheckpointFallback::construct_url(endpoint);
+    let resp = match client.get(url.as_str()).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            debug!(
+                service = %name,
+                error = %crate::indexer::redact_url_in_err(e),
+                "checkpoint refresh: service request failed"
+            );
+            return None;
+        }
+    };
+    let raw: RawSlotResponse = match resp.json().await {
+        Ok(raw) => raw,
+        Err(e) => {
+            debug!(
+                service = %name,
+                error = %crate::indexer::redact_url_in_err(e),
+                "checkpoint refresh: service decode failed"
+            );
+            return None;
+        }
+    };
+    let slot = raw
+        .data
+        .slots
+        .into_iter()
+        .find(|slot| slot.block_root.is_some());
+    match &slot {
+        Some(s) => debug!(
+            service = %name,
+            epoch = s.epoch,
+            "checkpoint refresh: service responded"
+        ),
+        None => debug!(
+            service = %name,
+            "checkpoint refresh: service returned no rooted slot"
+        ),
+    }
+    slot
+}
+
+/// Well-known mainnet checkpoint-sync providers we query directly.
+///
+/// Helios discovers these from a GitHub-hosted community list, but that host
+/// is frequently blocked, so we bundle the providers instead. Any that are
+/// dead simply drop out of the consensus tally, and the checkpoint is only a
+/// bootstrap hint that Helios re-verifies on sync.
+///
+/// Mirrors the full mainnet set from the community list as of 2026-06; all
+/// nine were verified live (HTTP 200 on `…/checkpointz/v1/beacon/slots`).
+const CHECKPOINT_ENDPOINTS: &[&str] = &[
+    "https://sync-mainnet.beaconcha.in",
+    "https://beaconstate.info",
+    "https://sync.invis.tools",
+    "https://beaconstate.ethstaker.cc",
+    "https://checkpointz.pietjepuk.net",
+    "https://mainnet-checkpoint-sync.stakely.io",
+    "https://mainnet.checkpoint.sigp.io",
+    "https://mainnet-checkpoint-sync.attestant.io",
+    "https://beaconstate-mainnet.chainsafe.io",
+];
+
+fn checkpoint_endpoints() -> Vec<url::Url> {
+    CHECKPOINT_ENDPOINTS
+        .iter()
+        .filter_map(|u| url::Url::parse(u).ok())
+        .collect()
+}
+
+/// From the latest slots gathered across checkpoint services, pick the block
+/// root the most services agree on at the **newest** epoch. Returns the
+/// chosen root with that epoch and the agreement count (how many services
+/// reported it) for logging.
+///
+/// This deliberately mirrors Helios's own `fetch_latest_checkpoint_from_services`
+/// (max epoch, then most-common root at that epoch) — agreement of 1 is normal
+/// and expected, *not* a failure: each service reports its own latest head slot
+/// via `find(block_root.is_some())`, and because they poll at slightly different
+/// times they routinely land on different epochs, so the newest one is usually a
+/// lone reporter. Requiring corroboration here would reject nearly every real
+/// refresh. The checkpoint is only a weak-subjectivity bootstrap hint that
+/// Helios re-verifies on sync — a forged root can't fabricate state, it just
+/// fails to bootstrap — so trusting the newest single source is acceptable.
+///
+/// Slots without a block root are ignored entirely — including when deciding
+/// the newest epoch, so a service that reports a higher epoch but no root
+/// can't blank out the result.
+fn resolve_checkpoint(slots: &[Slot]) -> Result<(B256, u64, usize), String> {
+    let max_epoch = slots
+        .iter()
+        .filter(|s| s.block_root.is_some())
+        .map(|s| s.epoch)
+        .max()
+        .ok_or_else(|| "no healthy checkpoint service responded".to_string())?;
+    let mut tally: std::collections::HashMap<B256, usize> = std::collections::HashMap::new();
+    for slot in slots.iter().filter(|s| s.epoch == max_epoch) {
+        if let Some(root) = slot.block_root {
+            *tally.entry(root).or_default() += 1;
+        }
+    }
+    tally
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(root, n)| (root, max_epoch, n))
+        .ok_or_else(|| "no checkpoint agreed on".to_string())
 }
 
 #[cfg(test)]
@@ -2053,5 +2260,107 @@ mod pure_tests {
         let err = out.unwrap_err();
         assert_eq!(err, "boom; retry: boom");
         assert_eq!(calls.load(Ordering::SeqCst), 2, "no third attempt");
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    use super::*;
+
+    /// A `Slot` with just the two fields `resolve_checkpoint` reads. The rest
+    /// come from `Slot`'s `Default`.
+    fn slot(epoch: u64, root: Option<u8>) -> Slot {
+        Slot {
+            epoch,
+            block_root: root.map(B256::repeat_byte),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn newest_epoch_wins_over_a_more_popular_older_one() {
+        // Epoch 10 has three votes, epoch 11 only one — the newer epoch still
+        // wins. (Checkpoints only ever move forward, and a single service at
+        // the newest epoch is the normal case, not an error.)
+        let slots = [
+            slot(10, Some(0xaa)),
+            slot(10, Some(0xaa)),
+            slot(10, Some(0xaa)),
+            slot(11, Some(0xbb)),
+        ];
+        let (root, epoch, agreement) = resolve_checkpoint(&slots).unwrap();
+        assert_eq!(epoch, 11);
+        assert_eq!(root, B256::repeat_byte(0xbb));
+        assert_eq!(agreement, 1);
+    }
+
+    #[test]
+    fn within_the_newest_epoch_the_majority_root_wins() {
+        // Two services say 0xbb, one says 0xaa, all at the same epoch.
+        let slots = [
+            slot(11, Some(0xaa)),
+            slot(11, Some(0xbb)),
+            slot(11, Some(0xbb)),
+        ];
+        let (root, _, agreement) = resolve_checkpoint(&slots).unwrap();
+        assert_eq!(root, B256::repeat_byte(0xbb));
+        assert_eq!(agreement, 2);
+    }
+
+    #[test]
+    fn a_rootless_slot_at_a_higher_epoch_is_ignored() {
+        // A service reporting a newer epoch but no block root must not hijack
+        // `max_epoch` and blank out the result.
+        let slots = [slot(11, Some(0xaa)), slot(12, None)];
+        let (root, epoch, _) = resolve_checkpoint(&slots).unwrap();
+        assert_eq!(epoch, 11);
+        assert_eq!(root, B256::repeat_byte(0xaa));
+    }
+
+    #[test]
+    fn no_slots_is_an_error() {
+        assert!(resolve_checkpoint(&[]).is_err());
+    }
+
+    #[test]
+    fn slots_without_any_root_is_an_error() {
+        let slots = [slot(11, None), slot(12, None)];
+        assert!(resolve_checkpoint(&slots).is_err());
+    }
+
+    #[test]
+    fn proxy_client_builds_direct_proxied_and_treats_blank_as_direct() {
+        assert!(proxy_http_client(None).is_ok(), "direct");
+        assert!(proxy_http_client(Some("127.0.0.1:9050")).is_ok(), "socks5");
+        // Whitespace-only is "no proxy" (direct), not an error.
+        assert!(proxy_http_client(Some("   ")).is_ok(), "blank → direct");
+    }
+
+    #[test]
+    fn proxy_client_rejects_an_unparseable_address() {
+        // A space inside the authority makes the `socks5h://` URL invalid.
+        assert!(proxy_http_client(Some("bad addr")).is_err());
+    }
+
+    #[test]
+    fn checkpoint_endpoints_all_parse_and_build_slot_urls() {
+        use helios_ethereum::config::checkpoints::CheckpointFallback;
+        let eps = checkpoint_endpoints();
+        // Every bundled entry must parse — `filter_map` would silently drop a
+        // typo'd URL, so guard the count.
+        assert_eq!(
+            eps.len(),
+            CHECKPOINT_ENDPOINTS.len(),
+            "a checkpoint endpoint failed to parse"
+        );
+        assert!(!eps.is_empty());
+        // And each must produce the canonical slots query URL.
+        for ep in &eps {
+            let slots = CheckpointFallback::construct_url(ep);
+            assert!(
+                slots.as_str().ends_with("/checkpointz/v1/beacon/slots"),
+                "unexpected slot URL: {slots}"
+            );
+        }
     }
 }

@@ -96,13 +96,27 @@ pub fn lookup(selector: [u8; 4]) -> Vec<&'static str> {
 
 fn read_sigs(start: usize) -> Vec<&'static str> {
     let mut p = start;
-    let count = u16::from_le_bytes(BLOB[p..p + 2].try_into().unwrap()) as usize;
+    // The 4byte.bin blob is a trusted build artifact, but read it defensively:
+    // a corrupt or truncated embedding should degrade to "no signatures" rather
+    // than panic the decode path (which runs while rendering a tx for signing).
+    // `.get()` bounds-checks every read; the `try_into().unwrap()`s below are
+    // infallible because each slice is exactly the 2 bytes we asked for.
+    let Some(count_bytes) = BLOB.get(p..p + 2) else {
+        return Vec::new();
+    };
+    let count = u16::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
     p += 2;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        let len = u16::from_le_bytes(BLOB[p..p + 2].try_into().unwrap()) as usize;
+        let Some(len_bytes) = BLOB.get(p..p + 2) else {
+            break;
+        };
+        let len = u16::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
         p += 2;
-        if let Ok(s) = std::str::from_utf8(&BLOB[p..p + len]) {
+        let Some(bytes) = BLOB.get(p..p + len) else {
+            break;
+        };
+        if let Ok(s) = std::str::from_utf8(bytes) {
             out.push(s);
         }
         p += len;

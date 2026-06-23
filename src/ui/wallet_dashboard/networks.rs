@@ -1,6 +1,10 @@
 //! Networks settings sub-screen — per-chain execution RPC, per-chain
-//! consensus RPC, and the checkpoint override. Owned by the dashboard's
-//! Settings nav slot, not the modal stack.
+//! consensus RPC, and the checkpoint override. Retained for potential future
+//! "advanced overrides" access; the primary network config is now handled by
+//! `network_setup::NetworkSetupScreen`.
+//!
+#![allow(dead_code)]
+//! Owned by the dashboard's Settings nav slot, not the modal stack.
 //!
 //! Save invalidates the shared `BalanceFetcher` so the next balance/portfolio
 //! fetch rebuilds Helios against the new endpoints.
@@ -29,6 +33,7 @@ use crate::ui::kao_widgets::{
     black, bold, ghost_button, kao_scrollable_style, primary_button, section, text_input_style,
 };
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Message {
     Back,
@@ -39,6 +44,7 @@ pub enum Message {
     Saved,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum Outcome {
     /// User backed out (or save completed) — coordinator should return to the
@@ -54,6 +60,7 @@ struct Draft {
     checkpoint_override: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct NetworksPane {
     draft: Draft,

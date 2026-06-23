@@ -478,10 +478,10 @@ impl SafeOnboardingScreen {
         let network = self.network.clone();
         let task = Task::perform(
             async move {
-                let result = match network.provider(Chain::Mainnet).await {
-                    Some(provider) => ens::resolve_name(&provider, &name).await,
-                    None => Err("no execution RPCs configured".to_string()),
-                };
+                // ENS resolution rides the Helios-verified path (mainnet
+                // only); a hostile exec RPC can't substitute the resolved
+                // address that becomes a Safe owner.
+                let result = ens::resolve_name(network.as_ref(), &name).await;
                 (seq, name, result)
             },
             |(seq, name, result)| Message::EnsResolved { seq, name, result },
@@ -584,15 +584,20 @@ impl SafeOnboardingScreen {
     }
 
     fn enter_inspect_from_results(&mut self, chain: Chain, results: Vec<(Chain, ScanResult)>) {
-        let (metadata, trust) = results
+        let found = results
             .iter()
             .find(|(c, _)| *c == chain)
             .and_then(|(_, r)| match r {
                 ScanResult::Canonical(md) => Some((md.clone(), SafeTrust::Canonical)),
                 ScanResult::UnrecognizedImpl(md) => Some((md.clone(), SafeTrust::UnrecognizedImpl)),
                 _ => None,
-            })
-            .expect("caller pre-filtered for Canonical/UnrecognizedImpl");
+            });
+        // Callers pre-filter so `chain` always has a Canonical/UnrecognizedImpl
+        // result, but don't panic the whole GUI if that ever stops holding —
+        // just decline the transition into Inspect.
+        let Some((metadata, trust)) = found else {
+            return;
+        };
         self.step = Step::Inspect {
             chain,
             metadata,

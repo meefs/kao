@@ -1,5 +1,5 @@
 [workspace]
-members = ["xtask"]
+members = ["xtask", "proxy-env"]
 exclude = ["vendor/op-alloy-network"]
 
 [package]
@@ -70,6 +70,11 @@ alloy-rpc-types-eth = "1"
 op-alloy-rpc-types = "0.20"
 argon2 = "0.5.3"
 postcard = { version = "1.1", default-features = false, features = ["use-std"] }
+# Isolated helper crate whose sole job is the one `unsafe std::env::set_var`
+# call that installs a process-wide proxy (`ALL_PROXY`) at startup. Lives in
+# its own crate so this crate can keep `#![forbid(unsafe_code)]`. See
+# `src/main.rs` for the call site and `proxy-env/src/lib.rs` for the rationale.
+proxy-env = { path = "proxy-env" }
 chacha20poly1305 = "0.10.1"
 dirs = "6"
 # UTS-46 / ENSIP-15 normalization for ENS names. Rejects bidi controls,
@@ -115,7 +120,13 @@ revm = { version = "29.0.1", default-features = false, features = [
     "optional_eip3607",
     "optional_no_base_fee",
 ] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks"] }
+# `http::Uri` is the exact parser reqwest/hyper-util use for the `ALL_PROXY`
+# value, so we reuse it to validate a user's proxy address before storing it —
+# rejecting anything that would make reqwest silently ignore the proxy and
+# connect directly (see `settings::valid_proxy_address`). The same http 1.x
+# reqwest already depends on, so nothing new enters the tree.
+http = "1"
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -149,10 +160,9 @@ keyring = { version = "3.6.3", features = ["sync-secret-service", "crypto-rust",
 
 [dev-dependencies]
 tempfile = "3"
-# Only for synthesizing `reqwest::Response`s in `safe::service` tests
-# (via reqwest's `From<http::Response<T>>`) — the same http 1.x that
-# reqwest already depends on, so nothing new enters the tree.
-http = "1"
+# `http` (used in `safe::service` tests to synthesize `reqwest::Response`s via
+# reqwest's `From<http::Response<T>>`) is a regular dependency now — see the
+# `[dependencies]` entry.
 
 # Workarounds for two upstream-broken transitive deps pulled in by
 # helios-opstack. Drop both entries the moment the upstreams ship fixes

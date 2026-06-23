@@ -137,14 +137,10 @@ impl DataProvider for KaoDataProvider<'_> {
                     return None;
                 }
             };
-            let provider = match self.net.provider(self.chain).await {
-                Some(p) => p,
-                None => {
-                    debug!(%addr, "clear-sign: no provider for ENS lookup");
-                    return None;
-                }
-            };
-            match ens::lookup_address(&provider, addr).await {
+            // Verified (Helios, mainnet-only) reverse lookup — an unverified
+            // read fails closed inside `lookup_address`, so a hostile RPC
+            // can't fabricate a name on the clear-signing review surface.
+            match ens::lookup_address(self.net, addr).await {
                 Ok(Some(name)) => {
                     debug!(%addr, %name, "clear-sign: resolved ENS name");
                     Some(name)

@@ -10,6 +10,7 @@ use alloy::signers::trezor::{HDPath as AlloyTrezorHDPath, TrezorSigner};
 use alloy::sol_types::{Eip712Domain, SolStruct};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 pub mod contacts;
 mod keyring;
@@ -107,6 +108,74 @@ impl From<std::io::Error> for WalletError {
 
 // ── Descriptor ─────────────────────────────────────────────────────────────
 
+/// A 32-byte secp256k1 private key, stored so it never lingers as bare,
+/// long-lived key material inside an `AccountDescriptor`.
+///
+/// Unlike the plain `[u8; 32]` it replaces:
+///   * the buffer is zeroized on drop — and because the inner type is not
+///     `Copy`, every `clone()` is a deliberate, independently-zeroized copy
+///     rather than a silent bitwise duplication that outlives its use;
+///   * `Debug` is redacted, so an accidental `{:?}` on an `AccountDescriptor`
+///     (or a panic backtrace that formats one) can never print the key.
+///
+/// It (de)serializes byte-for-byte identically to the `[u8; 32]` it replaced,
+/// so the on-disk wallet format is unchanged and existing wallets load as-is.
+#[derive(Clone)]
+pub struct SecretKeyBytes(Zeroizing<[u8; 32]>);
+
+impl SecretKeyBytes {
+    /// Wrap raw private-key bytes.
+    pub fn new(bytes: [u8; 32]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    /// Borrow the raw bytes. Keep the borrow short-lived and never copy it
+    /// into an un-zeroized owner.
+    pub fn as_array(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// The key as a `B256` — the form alloy's signer constructors expect.
+    /// The returned value is a plain (non-zeroizing) copy, so build the signer
+    /// from it immediately and let it drop.
+    pub fn to_b256(&self) -> B256 {
+        B256::from_slice(self.as_array())
+    }
+}
+
+impl From<[u8; 32]> for SecretKeyBytes {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self::new(bytes)
+    }
+}
+
+impl From<Zeroizing<[u8; 32]>> for SecretKeyBytes {
+    fn from(bytes: Zeroizing<[u8; 32]>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for SecretKeyBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretKeyBytes(redacted)")
+    }
+}
+
+impl Serialize for SecretKeyBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize as the bare `[u8; 32]` so the on-disk format is identical
+        // to the field this type replaced — existing wallets load unchanged.
+        let bytes: &[u8; 32] = &self.0;
+        bytes.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretKeyBytes {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::new(<[u8; 32]>::deserialize(deserializer)?))
+    }
+}
+
 /// What kind of signer one account uses, plus enough metadata to reconstruct
 /// it on the next launch. Multiple of these live inside a `WalletDescriptor`.
 ///
@@ -116,7 +185,7 @@ impl From<std::io::Error> for WalletError {
 pub enum AccountDescriptor {
     Local {
         name: Option<String>,
-        key_bytes: [u8; 32],
+        key_bytes: SecretKeyBytes,
     },
     Ledger {
         name: Option<String>,
@@ -387,7 +456,7 @@ pub fn account_is_safe_signer(account_idx: u32, safes: &[SafeDescriptor]) -> boo
 pub fn account_address(account: &AccountDescriptor) -> Option<Address> {
     match account {
         AccountDescriptor::Local { key_bytes, .. } => {
-            let b = B256::from_slice(key_bytes);
+            let b = key_bytes.to_b256();
             signer_from_bytes(&b).ok().map(|s| s.address())
         }
         AccountDescriptor::Ledger { address, .. }
@@ -586,7 +655,7 @@ impl KaoSigner {
 pub async fn build_owner_signer(desc: &AccountDescriptor) -> Result<KaoSigner, String> {
     match desc {
         AccountDescriptor::Local { key_bytes, .. } => {
-            let s = signer_from_bytes(&B256::from(*key_bytes)).map_err(|e| e.to_string())?;
+            let s = signer_from_bytes(&key_bytes.to_b256()).map_err(|e| e.to_string())?;
             Ok(KaoSigner::Local(s))
         }
         AccountDescriptor::Ledger { path, address, .. } => {
@@ -713,7 +782,7 @@ pub fn local_account(signer: &PrivateKeySigner) -> AccountDescriptor {
     let bytes: [u8; 32] = signer.to_bytes().0;
     AccountDescriptor::Local {
         name: None,
-        key_bytes: bytes,
+        key_bytes: SecretKeyBytes::new(bytes),
     }
 }
 
@@ -758,17 +827,81 @@ mod tests {
     fn account_postcard_roundtrip_local() {
         let acc = AccountDescriptor::Local {
             name: Some("Treasury".into()),
-            key_bytes: [0xab; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0xab; 32]),
         };
         let encoded = postcard::to_stdvec(&acc).unwrap();
         let decoded: AccountDescriptor = postcard::from_bytes(&encoded).unwrap();
         match decoded {
             AccountDescriptor::Local { name, key_bytes } => {
                 assert_eq!(name.as_deref(), Some("Treasury"));
-                assert_eq!(key_bytes, [0xab; 32]);
+                assert_eq!(key_bytes.as_array(), &[0xab; 32]);
             }
             _ => panic!("expected Local"),
         }
+    }
+
+    /// On-disk format guard: a wallet file written by the *old* code, where
+    /// `Local::key_bytes` was a bare `[u8; 32]`, must still load now that the
+    /// field is `SecretKeyBytes`. We reproduce the exact old wire shape with a
+    /// mirror enum (same variant order, bare array) and confirm it decodes
+    /// into the real type byte-for-byte. If this ever breaks, existing wallets
+    /// would fail to open — treat a failure here as a hard backwards-compat
+    /// regression, not a test to "fix".
+    #[test]
+    fn account_local_decodes_legacy_bare_key_bytes_layout() {
+        #[derive(Serialize)]
+        enum LegacyAccountDescriptor {
+            Local {
+                name: Option<String>,
+                key_bytes: [u8; 32],
+            },
+            #[allow(dead_code)]
+            Ledger {
+                name: Option<String>,
+                path: LedgerHdPath,
+                address: [u8; 20],
+            },
+        }
+
+        let legacy = LegacyAccountDescriptor::Local {
+            name: Some("Treasury".into()),
+            key_bytes: [0xab; 32],
+        };
+        let legacy_bytes = postcard::to_stdvec(&legacy).unwrap();
+
+        // Same bytes the current type produces — proves the wire format is
+        // unchanged in both directions.
+        let current = AccountDescriptor::Local {
+            name: Some("Treasury".into()),
+            key_bytes: SecretKeyBytes::new([0xab; 32]),
+        };
+        assert_eq!(legacy_bytes, postcard::to_stdvec(&current).unwrap());
+
+        let decoded: AccountDescriptor = postcard::from_bytes(&legacy_bytes).unwrap();
+        match decoded {
+            AccountDescriptor::Local { name, key_bytes } => {
+                assert_eq!(name.as_deref(), Some("Treasury"));
+                assert_eq!(key_bytes.as_array(), &[0xab; 32]);
+            }
+            _ => panic!("expected Local"),
+        }
+    }
+
+    /// `SecretKeyBytes` must never leak its contents through `Debug` — an
+    /// accidental `{:?}` on an `AccountDescriptor` (or a panic backtrace
+    /// formatting one) must not print the private key.
+    #[test]
+    fn secret_key_bytes_debug_is_redacted() {
+        let acc = AccountDescriptor::Local {
+            name: Some("Treasury".into()),
+            key_bytes: SecretKeyBytes::new([0xab; 32]),
+        };
+        let rendered = format!("{acc:?}");
+        assert!(rendered.contains("redacted"), "got: {rendered}");
+        assert!(
+            !rendered.contains("ab"),
+            "key bytes leaked into Debug: {rendered}"
+        );
     }
 
     #[test]
@@ -823,7 +956,7 @@ mod tests {
             accounts: vec![
                 AccountDescriptor::Local {
                     name: None,
-                    key_bytes: [0x11; 32],
+                    key_bytes: crate::wallet::SecretKeyBytes::new([0x11; 32]),
                 },
                 AccountDescriptor::Ledger {
                     name: None,
@@ -941,7 +1074,7 @@ mod tests {
     fn account_address_local_matches_signer_address() {
         let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
         let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
-        let key_bytes: [u8; 32] = signer.to_bytes().0;
+        let key_bytes = SecretKeyBytes::new(signer.to_bytes().0);
         let acc = AccountDescriptor::Local {
             name: None,
             key_bytes,
@@ -954,14 +1087,16 @@ mod tests {
         let desc = WalletDescriptor {
             accounts: vec![AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0xab; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0xab; 32]),
             }],
             safes: Vec::new(),
             // Bogus index larger than accounts.len(); active() must clamp.
             active_index: 99,
         };
         match desc.active() {
-            AccountDescriptor::Local { key_bytes, .. } => assert_eq!(*key_bytes, [0xab; 32]),
+            AccountDescriptor::Local { key_bytes, .. } => {
+                assert_eq!(key_bytes.as_array(), &[0xab; 32])
+            }
             _ => panic!("expected Local"),
         }
     }
@@ -970,14 +1105,14 @@ mod tests {
     fn display_name_falls_back_to_indexed_default() {
         let unnamed = AccountDescriptor::Local {
             name: None,
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         };
         assert_eq!(unnamed.display_name(0), "Account 1");
         assert_eq!(unnamed.display_name(4), "Account 5");
 
         let named = AccountDescriptor::Local {
             name: Some("Cold Storage".into()),
-            key_bytes: [0x42; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
         };
         assert_eq!(named.display_name(0), "Cold Storage");
     }
@@ -1283,7 +1418,7 @@ mod tests {
         // account_address returns None and the fallback string is used.
         let acc = AccountDescriptor::Local {
             name: None,
-            key_bytes: [0u8; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([0u8; 32]),
         };
         assert_eq!(account_short_address(&acc), "0x????…????");
     }

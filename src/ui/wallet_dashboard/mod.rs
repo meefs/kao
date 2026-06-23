@@ -38,7 +38,6 @@ mod tx_details;
 
 use account_dropdown::AccountDropdown;
 use contacts_settings::ContactsPane;
-use networks::NetworksPane;
 use receive::ReceivePane;
 use safe_tx_detail::SafeTxDetailPane;
 use safes_settings::SafesPane;
@@ -72,6 +71,7 @@ use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
 use crate::ui::kao_widgets::{fill_style, mono};
+use crate::ui::network_setup::{self, NetworkSetupScreen, WizardMode};
 use crate::wallet::sim::SimulationResult;
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
@@ -146,7 +146,9 @@ pub enum Message {
     TxDetails(tx_details::Message),
     Tick,
     OpenNetworksSettings,
+    #[allow(dead_code)]
     Networks(networks::Message),
+    NetworkWizard(network_setup::Message),
     OpenSafesSettings,
     SafesSettings(safes_settings::Message),
     OpenAppearanceSettings,
@@ -287,7 +289,7 @@ enum Modal {
 #[derive(Debug)]
 enum SettingsPane {
     Root,
-    Networks(NetworksPane),
+    NetworkWizard(NetworkSetupScreen),
     Safes(SafesPane),
     Appearance,
     Contacts(ContactsPane),
@@ -1054,10 +1056,11 @@ impl WalletScreen {
             async move {
                 debug!(addr = %short_address(address), "ens reverse lookup");
                 let started = std::time::Instant::now();
-                let result = match network.provider(crate::chain::Chain::Mainnet).await {
-                    Some(provider) => crate::ens::lookup_address(&provider, address).await,
-                    None => Err("no execution RPCs configured".to_string()),
-                };
+                // Verified (Helios, mainnet-only) reverse lookup. An
+                // unverified read fails closed inside `lookup_address`, so
+                // the address simply shows without an ENS name rather than
+                // a name a hostile RPC could fabricate.
+                let result = crate::ens::lookup_address(network.as_ref(), address).await;
                 debug!(
                     elapsed = ?started.elapsed(),
                     found = matches!(&result, Ok(Some(_))),
@@ -1109,6 +1112,13 @@ impl WalletScreen {
                 if let SettingsPane::Safes(p) = &mut self.settings_pane {
                     p.set_safes(self.safes.clone());
                 }
+                // The pending queue's lifecycle states were derived against the
+                // *old* descriptors (threshold/owners). Rebuild it against the
+                // refreshed ones so a changed threshold can't leave a stale
+                // have/required badge on a queued tx.
+                let pending = self.fetch_safe_pending_task();
+                self.safe_pending_loading = pending.is_some();
+                return (pending.unwrap_or_else(Task::none), None);
             }
             Message::PortfolioFetched {
                 address,
@@ -1124,7 +1134,16 @@ impl WalletScreen {
                 if let Ok(tokens) = &result
                     && let Ok(mut cache) = self.portfolio_cache.lock()
                 {
-                    cache.insert((address, chain), tokens.clone());
+                    // Only cache rows that belong to the chain we fetched — a
+                    // buggy/malicious provider could tag a token with another
+                    // chain, which would pollute this slot (and, via the merge
+                    // below, the live portfolio).
+                    let scoped: Vec<LiveToken> = tokens
+                        .iter()
+                        .filter(|t| t.chain == chain)
+                        .cloned()
+                        .collect();
+                    cache.insert((address, chain), scoped);
                 }
                 if address != self.display_address() {
                     return (Task::none(), None);
@@ -1153,7 +1172,11 @@ impl WalletScreen {
                         // doesn't shuffle a stable row order — the
                         // original portfolio sort already maintained this.
                         self.portfolio.retain(|t| t.chain != chain);
-                        self.portfolio.extend(tokens);
+                        // Same chain-scoping as the cache write: never merge a
+                        // token whose `chain` differs from the one we fetched,
+                        // or a stale-chain row would survive the retain above.
+                        self.portfolio
+                            .extend(tokens.into_iter().filter(|t| t.chain == chain));
                         self.portfolio.sort_by(|a, b| {
                             // Native ETH bubbles up first per chain.
                             let a_native = a.contract.is_none();
@@ -2205,7 +2228,7 @@ impl WalletScreen {
             }
             Message::OpenNetworksSettings => {
                 self.settings_pane =
-                    SettingsPane::Networks(NetworksPane::new(self.network.clone()));
+                    SettingsPane::NetworkWizard(NetworkSetupScreen::new(WizardMode::Settings));
             }
             Message::OpenSafesSettings => {
                 self.settings_pane = SettingsPane::Safes(SafesPane::new(self.safes.clone()));
@@ -2324,14 +2347,24 @@ impl WalletScreen {
             Message::CancelRename => {
                 self.rename_draft = None;
             }
-            Message::Networks(child_msg) => {
-                let SettingsPane::Networks(p) = &mut self.settings_pane else {
+            Message::Networks(_child_msg) => {
+                // Legacy Networks pane — routing removed; wizard handles
+                // network configuration now.
+            }
+            Message::NetworkWizard(child_msg) => {
+                let SettingsPane::NetworkWizard(p) = &mut self.settings_pane else {
                     return (Task::none(), None);
                 };
                 let (task, outcome) = p.update(child_msg);
-                let task = task.map(Message::Networks);
+                let task = task.map(Message::NetworkWizard);
                 match outcome {
-                    Some(networks::Outcome::Closed) => {
+                    Some(network_setup::Outcome::Completed)
+                    | Some(network_setup::Outcome::Closed) => {
+                        self.settings_pane = SettingsPane::Root;
+                        return (task, None);
+                    }
+                    Some(network_setup::Outcome::Back) => {
+                        // In settings mode, Back returns to root.
                         self.settings_pane = SettingsPane::Root;
                         return (task, None);
                     }
@@ -2366,7 +2399,9 @@ impl WalletScreen {
             Modal::None => {}
         }
         match &self.settings_pane {
-            SettingsPane::Networks(p) => subs.push(p.subscription().map(Message::Networks)),
+            SettingsPane::NetworkWizard(p) => {
+                subs.push(p.subscription().map(Message::NetworkWizard))
+            }
             SettingsPane::Contacts(p) => subs.push(p.subscription().map(Message::Contacts)),
             _ => {}
         }
@@ -2543,7 +2578,7 @@ impl WalletScreen {
             }
             Nav::Settings => match &self.settings_pane {
                 SettingsPane::Root => settings_root::view(t),
-                SettingsPane::Networks(p) => p.view(t).map(Message::Networks),
+                SettingsPane::NetworkWizard(p) => p.view().map(Message::NetworkWizard),
                 SettingsPane::Safes(p) => p.view(t).map(Message::SafesSettings),
                 SettingsPane::Appearance => appearance::view(t, self.theme_kind),
                 SettingsPane::Contacts(p) => p.view(t).map(Message::Contacts),
@@ -2738,10 +2773,10 @@ fn spawn_ens_resolve_task(
 ) -> Task<Message> {
     Task::perform(
         async move {
-            let result = match network.provider(crate::chain::Chain::Mainnet).await {
-                Some(provider) => crate::ens::resolve_name(&provider, &name).await,
-                None => Err("no execution RPCs configured".to_string()),
-            };
+            // Verified (Helios, mainnet-only) forward resolution: the
+            // resolved address becomes the signed send recipient, so an
+            // unverified RPC answer fails closed rather than being trusted.
+            let result = crate::ens::resolve_name(network.as_ref(), &name).await;
             (seq, name, result)
         },
         |(seq, name, result)| Message::Send(send::Message::EnsResolved { seq, name, result }),
@@ -2758,10 +2793,10 @@ fn spawn_contacts_ens_resolve_task(
 ) -> Task<Message> {
     Task::perform(
         async move {
-            let result = match network.provider(crate::chain::Chain::Mainnet).await {
-                Some(provider) => crate::ens::resolve_name(&provider, &name).await,
-                None => Err("no execution RPCs configured".to_string()),
-            };
+            // Verified (Helios, mainnet-only) forward resolution; the
+            // resolved address is saved as a contact and later reused as a
+            // send recipient, so unverified answers fail closed.
+            let result = crate::ens::resolve_name(network.as_ref(), &name).await;
             (seq, name, result)
         },
         |(seq, name, result)| {
@@ -2879,7 +2914,7 @@ fn collect_owner_keys(
     for &idx in indices {
         match accounts.get(idx as usize) {
             Some(AccountDescriptor::Local { key_bytes, .. }) => {
-                out.push(alloy::primitives::B256::from_slice(key_bytes));
+                out.push(key_bytes.to_b256());
             }
             Some(_) => {
                 return Err(format!(
@@ -2927,7 +2962,7 @@ fn owner_desc_by_address(
 /// execute-from-queue. `None` if the wallet is hardware/view-only only.
 fn first_local_key_of(accounts: &[AccountDescriptor]) -> Option<B256> {
     accounts.iter().find_map(|a| match a {
-        AccountDescriptor::Local { key_bytes, .. } => Some(B256::from_slice(key_bytes)),
+        AccountDescriptor::Local { key_bytes, .. } => Some(key_bytes.to_b256()),
         _ => None,
     })
 }
@@ -3686,7 +3721,7 @@ mod tests {
             view_only_account(addr(1)),
             crate::wallet::AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0x7e; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0x7e; 32]),
             },
         ];
         let mut safe = safe_descriptor(0x99, 1);
@@ -3836,7 +3871,7 @@ mod tests {
         let accounts = vec![
             crate::wallet::AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0xaa; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0xaa; 32]),
             },
             crate::wallet::AccountDescriptor::ViewOnly {
                 name: None,
@@ -3844,7 +3879,7 @@ mod tests {
             },
             crate::wallet::AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0xbb; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0xbb; 32]),
             },
         ];
         let got = collect_owner_keys(&[2, 0], &accounts).unwrap();
@@ -3858,7 +3893,7 @@ mod tests {
         let accounts = vec![
             crate::wallet::AccountDescriptor::Local {
                 name: None,
-                key_bytes: [0xaa; 32],
+                key_bytes: crate::wallet::SecretKeyBytes::new([0xaa; 32]),
             },
             crate::wallet::AccountDescriptor::ViewOnly {
                 name: None,
@@ -3879,7 +3914,7 @@ mod tests {
     fn local_with_key(seed: u8) -> AccountDescriptor {
         AccountDescriptor::Local {
             name: None,
-            key_bytes: [seed; 32],
+            key_bytes: crate::wallet::SecretKeyBytes::new([seed; 32]),
         }
     }
 

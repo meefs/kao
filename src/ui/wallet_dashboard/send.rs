@@ -477,7 +477,13 @@ impl SendPane {
         self.resolution = if trimmed.is_empty() {
             Resolution::Empty
         } else if let Ok(addr) = Address::from_str(trimmed) {
-            Resolution::Address(addr)
+            // The zero address is a burn hole, never a real recipient —
+            // surface it as invalid rather than letting it ride into a plan.
+            if addr.is_zero() {
+                Resolution::Invalid
+            } else {
+                Resolution::Address(addr)
+            }
         } else if ens::looks_like_ens(trimmed) {
             Resolution::Resolving {
                 name: trimmed.to_string(),
@@ -498,6 +504,12 @@ impl SendPane {
     pub fn build_plan(&self, portfolio: &[LiveToken]) -> Option<SendPlan> {
         let eoa = self.eoa()?;
         let recipient = self.resolution.recipient()?;
+        // Defence in depth behind `set_to`/`recipient()`: never build a plan
+        // that sends to the zero address, regardless of how `recipient` was
+        // populated (typed, pasted, picked from a contact, or ENS-resolved).
+        if recipient.is_zero() {
+            return None;
+        }
         let token = portfolio.get(self.token_idx)?;
         let amount_units = parse_amount_units(&self.amount, token.decimals).ok()?;
         if amount_units.is_zero() || amount_units > token.balance_raw {
@@ -650,6 +662,13 @@ impl SendPane {
         if s.version_block.is_some() {
             return None;
         }
+        let recipient = self.resolution.recipient()?;
+        // Same zero-address guard as `build_plan`. Every Safe signing path
+        // (prepare / broadcast / propose) re-derives the request here, so one
+        // check keeps a zero-recipient SafeTx from ever being built or signed.
+        if recipient.is_zero() {
+            return None;
+        }
         let token = portfolio.get(self.token_idx)?;
         let amount_units = self.parsed_amount(token.decimals)?;
         let send_token = match token.contract {
@@ -661,7 +680,7 @@ impl SendPane {
             chain: s.safe_chain?,
             version: s.safe_version.clone(),
             service_base: s.service_base.clone(),
-            recipient: self.resolution.recipient()?,
+            recipient,
             amount_units,
             token: send_token,
             threshold: s.threshold,
@@ -780,7 +799,11 @@ impl SendPane {
                         1 if self.can_continue_recipient() => {
                             self.step = 1;
                         }
-                        2 => {
+                        // Same guard as step 1: never advance to the review/
+                        // sign screen without a valid recipient + signer, or
+                        // the review would render (and prepare) a transaction
+                        // with no real destination.
+                        2 if self.can_continue_recipient() => {
                             self.step = 2;
                             self.begin_prepare();
                         }
@@ -1605,7 +1628,12 @@ impl SendPane {
         recipient_kao: Option<String>,
         recipient_chip: Option<&'static str>,
     ) -> Element<'a, Message> {
-        let eoa = self.eoa().unwrap();
+        let Some(eoa) = self.eoa() else {
+            return text("Account state unavailable.")
+                .size(13)
+                .color(t.down)
+                .into();
+        };
         let token = portfolio.get(self.token_idx);
         let token_sym = token.map(|t| t.symbol.as_str()).unwrap_or("ETH");
         let recipient = self.resolution.recipient();
@@ -1997,12 +2025,43 @@ impl SendPane {
                 })
                 .into()
         };
-        let badges_row = row![
-            good_badge("✓ Simulated locally · revm"),
-            Space::new().width(7),
-            good_badge("✓ Verified by Helios")
-        ]
-        .align_y(Alignment::Center);
+        let warn_badge = |label: &'a str| -> Element<'a, Message> {
+            container(text(label).size(10).color(t.down).font(mono_bold()))
+                .padding(Padding::from([3, 7]))
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(with_alpha(t.down, 0.08))),
+                    border: Border {
+                        color: with_alpha(t.down, 0.30),
+                        width: 1.0,
+                        radius: Radius::from(6),
+                    },
+                    ..container::Style::default()
+                })
+                .into()
+        };
+        // Only claim "simulated/verified" when the sim actually succeeded, and
+        // gate the Helios badge on whether the reads were verified — a sim that
+        // ran on fallback state must not display as Helios-verified.
+        let sim_ok = !sim_reverted && !sim_unavailable;
+        let sim_verified = eoa.quote.as_ref().map(|q| q.sim.verified).unwrap_or(false);
+        let badges_row: Element<'_, Message> = if sim_ok {
+            let helios = if sim_verified {
+                good_badge("✓ Verified by Helios")
+            } else {
+                warn_badge("⚠ Unverified · fallback RPC")
+            };
+            row![
+                good_badge("✓ Simulated locally · revm"),
+                Space::new().width(7),
+                helios
+            ]
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            // Reverted/unavailable: the balance-changes card already explains
+            // the state; don't show badges that would overclaim.
+            Space::new().height(0).into()
+        };
 
         // Gas warning
         let gas_warning: Element<'_, Message> = if has_insufficient_eth {
@@ -2046,9 +2105,20 @@ impl SendPane {
 
         let back_btn = secondary_button(t, "← Back").on_press(Message::Step(1));
         let confirm_enabled = !self.busy && eoa.quote.is_some() && !has_insufficient_eth;
+        // Soften the primary action whenever any read is unverified — either
+        // the calldata decode fell back to unverified RPC, or the local sim
+        // wasn't Helios-verified — matching the reverting-sim treatment so
+        // every unverified sign is a deliberate, acknowledged choice.
+        let decode_unverified = match eoa.decoded.as_deref() {
+            Some(DecodeResult::ClearSigned { all_verified, .. }) => !all_verified,
+            Some(DecodeResult::Fallback { heuristic, .. }) => !heuristic.all_verified,
+            Some(DecodeResult::Heuristic(c)) => !c.all_verified,
+            Some(DecodeResult::Empty) | None => false,
+        };
+        let reads_unverified = decode_unverified || (sim_ok && !sim_verified);
         let confirm_label = if has_insufficient_eth {
             "Need ETH for gas"
-        } else if sim_reverted {
+        } else if sim_reverted || reads_unverified {
             "Sign anyway ⚠"
         } else {
             "Sign & Send"
@@ -2097,7 +2167,12 @@ impl SendPane {
         portfolio: &'a [LiveToken],
         recipient_name: Option<String>,
     ) -> Element<'a, Message> {
-        let eoa = self.eoa().unwrap();
+        let Some(eoa) = self.eoa() else {
+            return text("Account state unavailable.")
+                .size(13)
+                .color(t.down)
+                .into();
+        };
         let token_sym = portfolio
             .get(self.token_idx)
             .map(|t| t.symbol.as_str())
@@ -2305,7 +2380,15 @@ impl SendPane {
         portfolio: &'a [LiveToken],
     ) -> Element<'a, Message> {
         let s = self.safe().unwrap();
-        let recipient = self.resolution.recipient().unwrap_or(Address::ZERO);
+        // Never render/sign a transfer to a defaulted zero address: if there's
+        // no resolved recipient we shouldn't be on this screen (the step-2
+        // transition is guarded), so fail closed with a visible error.
+        let Some(recipient) = self.resolution.recipient() else {
+            return text("No valid recipient — go back and re-enter the address.")
+                .size(13)
+                .color(t.down)
+                .into();
+        };
         let token = portfolio.get(self.token_idx);
         let decimals = token.map(|tk| tk.decimals).unwrap_or(18);
         let symbol = token.map(|tk| tk.symbol.as_str()).unwrap_or("ETH");
@@ -2685,10 +2768,15 @@ impl SendPane {
         let amount_str = format_units(amount_wei, decimals)
             .map(|v| sim_view::trim_trailing_decimal_zeros(&v))
             .unwrap_or_else(|_| "?".into());
-        let recipient = self.resolution.recipient().unwrap_or(Address::ZERO);
+        // Post-success display only — but still avoid inventing a zero
+        // address for the label if the recipient is somehow absent.
         let recipient_label = recipient_name.unwrap_or_else(|| match &self.resolution {
             Resolution::Resolved { name, .. } => name.clone(),
-            _ => short_address(recipient),
+            _ => self
+                .resolution
+                .recipient()
+                .map(short_address)
+                .unwrap_or_else(|| "unknown recipient".into()),
         });
         let hash_display = match self.last_tx_hash {
             Some(h) => {
@@ -3214,7 +3302,7 @@ mod tests {
         }
         AccountDescriptor::Local {
             name: name.map(str::to_string),
-            key_bytes: bytes,
+            key_bytes: bytes.into(),
         }
     }
 
@@ -3381,7 +3469,7 @@ mod tests {
         }
         AccountDescriptor::Local {
             name: None,
-            key_bytes: bytes,
+            key_bytes: bytes.into(),
         }
     }
 
@@ -3416,6 +3504,67 @@ mod tests {
         let pane = SendPane::new_safe(&desc, &[local_account_simple(1)]);
         assert!(pane.safe().unwrap().safe_chain.is_none());
         assert!(pane.outgoing_request(&test_portfolio()).is_none());
+    }
+
+    #[test]
+    fn set_to_rejects_zero_address() {
+        let mut pane = SendPane::new_safe(&safe_only(1, vec![0]), &[local_account_simple(1)]);
+        pane.set_to("0x0000000000000000000000000000000000000000".into());
+        assert!(
+            matches!(pane.resolution, Resolution::Invalid),
+            "zero address must resolve to Invalid, got {:?}",
+            pane.resolution,
+        );
+    }
+
+    #[test]
+    fn build_plan_rejects_zero_recipient() {
+        // A picked zero address bypasses `set_to`'s parse guard, so
+        // `build_plan` must independently refuse it before producing a
+        // signable plan.
+        let mut pane = SendPane::new_eoa(Address::repeat_byte(0xAB));
+        pane.amount = "0.1".into();
+        // Control: the identical setup with a real recipient builds a plan,
+        // so a `None` below can only be the zero-address guard firing.
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::repeat_byte(0xCD),
+            ens: None,
+        });
+        assert!(
+            pane.build_plan(&test_portfolio()).is_some(),
+            "control: a non-zero recipient should build a plan",
+        );
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::ZERO,
+            ens: None,
+        });
+        assert!(
+            pane.build_plan(&test_portfolio()).is_none(),
+            "build_plan must reject a zero recipient",
+        );
+    }
+
+    #[test]
+    fn outgoing_request_rejects_zero_recipient() {
+        let mut pane = SendPane::new_safe(&safe_only(1, vec![0]), &[local_account_simple(1)]);
+        pane.amount = "0.001".into();
+        // Control, mirroring `outgoing_request_uses_resolved_recipient`.
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::repeat_byte(0xCD),
+            ens: None,
+        });
+        assert!(
+            pane.outgoing_request(&test_portfolio()).is_some(),
+            "control: a non-zero recipient should build a request",
+        );
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::ZERO,
+            ens: None,
+        });
+        assert!(
+            pane.outgoing_request(&test_portfolio()).is_none(),
+            "outgoing_request must reject a zero recipient",
+        );
     }
 
     #[test]

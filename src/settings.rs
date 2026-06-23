@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::B256;
 use serde::{Deserialize, Serialize};
@@ -24,19 +23,21 @@ const DEFAULT_RPCS: &[&str] = &["https://eth.llamarpc.com"];
 /// the light-client bootstrap before any consensus signatures get verified.
 const DEFAULT_CONSENSUS_RPCS: &[&str] = &["https://ethereum-beacon-api.publicnode.com"];
 
-/// Hex hash of the built-in mainnet checkpoint shipped with the binary.
-/// Update at release time together with `BUILTIN_CHECKPOINT_PUBLISHED`.
-/// If older than `BUILTIN_FRESHNESS_DAYS`, the auto-resolver prefers a
-/// freshly fetched community fallback (see `crate::net::refresh_auto_checkpoint`).
+/// Default Kao privacy-proxy server. All Kao-proxied RPC and indexer
+/// queries are relayed through this endpoint.
+pub const DEFAULT_KAO_SERVER_URL: &str = "https://api.kaowallet.com";
+
+/// Hex hash of the built-in mainnet checkpoint shipped with the binary, used
+/// to bootstrap Mainnet helios sync when the user has set no override.
 ///
 /// IMPORTANT: this must be a finalized beacon block root from a sync-committee
 /// period that public LC servers still index — they prune older periods (~27h
 /// rotation), so a checkpoint that's more than a day or two stale will fail
-/// every bootstrap call.
+/// every bootstrap call. There is no automatic refresh: if it goes stale the
+/// user resolves a fresh one via the network setup wizard's manual refresh
+/// button (stored as `checkpoint_override`). Bump this at release time.
 pub const BUILTIN_CHECKPOINT: &str =
     "0x56d275d9bdf4afb040ecbbba7da0dff9ed384b062c321d5f2b9a4a4f0eb83b4d";
-pub const BUILTIN_CHECKPOINT_PUBLISHED: u64 = 1777188238;
-pub const BUILTIN_FRESHNESS_DAYS: u64 = 14;
 
 /// Third-party indexer used for transaction history and unverified balance
 /// fan-outs. Helios verification of native ETH stays in `crate::net`; this
@@ -50,6 +51,9 @@ pub enum IndexerProvider {
     Etherscan,
     Alchemy,
     Drpc,
+    /// Kao privacy proxy — fronts dRPC's Wallet API and holds the key, so
+    /// the wallet sends no API key and no client identity upstream.
+    Kao,
     None,
 }
 
@@ -60,6 +64,7 @@ impl IndexerProvider {
             Self::Etherscan => "etherscan",
             Self::Alchemy => "alchemy",
             Self::Drpc => "drpc",
+            Self::Kao => "kao",
             Self::None => "none",
         }
     }
@@ -70,13 +75,145 @@ impl IndexerProvider {
             "etherscan" => Some(Self::Etherscan),
             "alchemy" => Some(Self::Alchemy),
             "drpc" => Some(Self::Drpc),
+            "kao" => Some(Self::Kao),
             "none" => Some(Self::None),
             _ => None,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+/// Wizard-level RPC provider choice. Maps to per-chain URL generation
+/// and drives the privacy posture score. Persisted in `settings.toml`
+/// as a simple string key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RpcProvider {
+    /// Kao privacy proxy (placeholder until the proxy backend ships).
+    #[default]
+    Kao,
+    /// 1RPC relay — strips metadata before forwarding to the upstream.
+    OneRpc,
+    /// dRPC decentralized load-balancer — requires an API key.
+    Drpc,
+    /// Alchemy — fast, requires an API key.
+    Alchemy,
+    /// User-supplied URL(s).
+    Custom,
+}
+
+impl RpcProvider {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Kao => "kao",
+            Self::OneRpc => "1rpc",
+            Self::Drpc => "drpc",
+            Self::Alchemy => "alchemy",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "kao" => Some(Self::Kao),
+            "1rpc" => Some(Self::OneRpc),
+            "drpc" => Some(Self::Drpc),
+            "alchemy" => Some(Self::Alchemy),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+/// Wizard-level API/indexer provider choice (simplified from
+/// `IndexerProvider` — the wizard exposes fewer options).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApiProvider {
+    /// Kao privacy proxy for indexer queries.
+    #[default]
+    Kao,
+    /// Blockscout open-source explorer — optional custom URL + API key.
+    Blockscout,
+    /// dRPC Wallet API — requires a (paid) API key.
+    Drpc,
+    /// No indexer — slower, history limited to txs sent from Kao.
+    None,
+}
+
+impl ApiProvider {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Kao => "kao",
+            Self::Blockscout => "blockscout",
+            Self::Drpc => "drpc",
+            Self::None => "none",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "kao" => Some(Self::Kao),
+            "blockscout" => Some(Self::Blockscout),
+            "drpc" => Some(Self::Drpc),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+}
+
+/// Safe Transaction Service endpoint choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SafeTxService {
+    /// Use the default Safe Transaction Service endpoints.
+    #[default]
+    Default,
+    /// User-supplied custom URL.
+    Custom,
+}
+
+impl SafeTxService {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "default" => Some(Self::Default),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
+/// SOCKS proxy type for network tunneling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProxyType {
+    /// Tor/Whonix SOCKS5 proxy (typically 127.0.0.1:9050).
+    #[default]
+    Tor,
+    /// Custom SOCKS5 proxy address.
+    Socks,
+}
+
+impl ProxyType {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Tor => "tor",
+            Self::Socks => "socks",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        match s {
+            "tor" => Some(Self::Tor),
+            "socks" => Some(Self::Socks),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
 struct State {
     theme: ThemeKind,
     /// Per-chain execution RPC lists. Mainnet seeds from `DEFAULT_RPCS`; L2
@@ -103,6 +240,53 @@ struct State {
     /// to the public mainnet endpoint baked into the indexer.
     blockscout_base_url: Option<String>,
     blockscout_api_key: Option<String>,
+    // ── Wizard-level network config ──────────────────────────────────
+    /// Kao privacy-proxy base URL. Defaults to `DEFAULT_KAO_SERVER_URL`.
+    kao_server_url: String,
+    rpc_provider: RpcProvider,
+    rpc_key: Option<String>,
+    custom_rpc_url: Option<String>,
+    api_provider: ApiProvider,
+    api_key: Option<String>,
+    safe_tx_service: SafeTxService,
+    safe_tx_service_url: Option<String>,
+    proxy_enabled: bool,
+    proxy_type: ProxyType,
+    proxy_address: String,
+}
+
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // API keys are deliberately redacted: they live behind owner-only file
+        // perms on disk, but a stray `{:?}` / log line / panic backtrace
+        // shouldn't spill them. Presence (`Some`/`None`) is preserved so the
+        // dump still tells you whether a key is configured.
+        let redact = |o: &Option<String>| o.as_ref().map(|_| "<redacted>");
+        f.debug_struct("State")
+            .field("theme", &self.theme)
+            .field("rpcs", &self.rpcs)
+            .field("consensus_rpcs", &self.consensus_rpcs)
+            .field("checkpoint_override", &self.checkpoint_override)
+            .field("auto_checkpoint", &self.auto_checkpoint)
+            .field("indexer_provider", &self.indexer_provider)
+            .field("etherscan_api_key", &redact(&self.etherscan_api_key))
+            .field("alchemy_api_key", &redact(&self.alchemy_api_key))
+            .field("drpc_api_key", &redact(&self.drpc_api_key))
+            .field("blockscout_base_url", &self.blockscout_base_url)
+            .field("blockscout_api_key", &redact(&self.blockscout_api_key))
+            .field("kao_server_url", &self.kao_server_url)
+            .field("rpc_provider", &self.rpc_provider)
+            .field("rpc_key", &redact(&self.rpc_key))
+            .field("custom_rpc_url", &self.custom_rpc_url)
+            .field("api_provider", &self.api_provider)
+            .field("api_key", &redact(&self.api_key))
+            .field("safe_tx_service", &self.safe_tx_service)
+            .field("safe_tx_service_url", &self.safe_tx_service_url)
+            .field("proxy_enabled", &self.proxy_enabled)
+            .field("proxy_type", &self.proxy_type)
+            .field("proxy_address", &self.proxy_address)
+            .finish()
+    }
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -138,6 +322,17 @@ fn default_state() -> State {
         drpc_api_key: None,
         blockscout_base_url: None,
         blockscout_api_key: None,
+        kao_server_url: DEFAULT_KAO_SERVER_URL.to_string(),
+        rpc_provider: RpcProvider::default(),
+        rpc_key: None,
+        custom_rpc_url: None,
+        api_provider: ApiProvider::default(),
+        api_key: None,
+        safe_tx_service: SafeTxService::default(),
+        safe_tx_service_url: None,
+        proxy_enabled: false,
+        proxy_type: ProxyType::default(),
+        proxy_address: "127.0.0.1:9050".to_string(),
     }
 }
 
@@ -160,8 +355,9 @@ pub fn load() {
 
 /// On-disk TOML schema. All fields are optional so a partial or older config
 /// file falls back to defaults per-key rather than failing the whole load.
-/// `auto_checkpoint` is intentionally absent — it's rederived on each app
-/// start from the network and never persisted.
+/// `auto_checkpoint` is intentionally absent — it's the binary's built-in
+/// `BUILTIN_CHECKPOINT` and never persisted; a user-resolved checkpoint is
+/// stored under `checkpoint_override` instead.
 ///
 /// Per-chain RPC keys: `rpcs` / `consensus_rpcs` carry Mainnet (kept under
 /// these names so an upgrade from the pre-L2 schema is a no-op). L2 lists
@@ -197,12 +393,35 @@ struct OnDisk {
     blockscout_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blockscout_api_key: Option<String>,
+    // ── Wizard-level network config ──────────────────────────────────
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kao_server_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rpc_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rpc_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_rpc_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    safe_tx_service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    safe_tx_service_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy_address: Option<String>,
 }
 
 /// True iff `s` parses as an HTTPS URL. Non-HTTPS endpoints are dropped on
 /// load so a hand-edited `settings.toml` can't bypass the UI's HTTPS check
 /// and steer the wallet onto a MITM-able transport.
-fn is_https_url(s: &str) -> bool {
+pub fn is_https_url(s: &str) -> bool {
     url::Url::parse(s)
         .map(|u| u.scheme() == "https")
         .unwrap_or(false)
@@ -269,6 +488,82 @@ fn parse(text: &str) -> State {
         .blockscout_base_url
         .filter(|s| !s.is_empty() && is_https_url(s));
     state.blockscout_api_key = on_disk.blockscout_api_key.filter(|s| !s.is_empty());
+
+    // ── Wizard-level network config ──────────────────────────────────
+    if let Some(url) = on_disk.kao_server_url.as_deref()
+        && let Some(normalized) = parse_kao_server_input(url)
+    {
+        state.kao_server_url = normalized;
+    }
+    if let Some(p) = on_disk.rpc_provider.as_deref()
+        && let Some(parsed) = RpcProvider::from_key(p)
+    {
+        state.rpc_provider = parsed;
+    } else {
+        // Backwards compat: infer provider from existing config.
+        if state.alchemy_api_key.is_some() {
+            state.rpc_provider = RpcProvider::Alchemy;
+        } else if state.drpc_api_key.is_some() {
+            state.rpc_provider = RpcProvider::Drpc;
+        }
+    }
+    state.rpc_key = on_disk.rpc_key.filter(|s| !s.is_empty());
+    // Backwards compat: if rpc_key is unset, populate from the legacy
+    // provider-specific key so the wizard shows the key the user already
+    // entered.
+    if state.rpc_key.is_none() {
+        match state.rpc_provider {
+            RpcProvider::Drpc => state.rpc_key = state.drpc_api_key.clone(),
+            RpcProvider::Alchemy => state.rpc_key = state.alchemy_api_key.clone(),
+            _ => {}
+        }
+    }
+    state.custom_rpc_url = on_disk.custom_rpc_url.filter(|s| !s.is_empty());
+
+    if let Some(p) = on_disk.api_provider.as_deref()
+        && let Some(parsed) = ApiProvider::from_key(p)
+    {
+        state.api_provider = parsed;
+    } else {
+        // Backwards compat: infer API provider from existing indexer config.
+        match state.indexer_provider {
+            IndexerProvider::Blockscout => state.api_provider = ApiProvider::Blockscout,
+            IndexerProvider::Drpc => state.api_provider = ApiProvider::Drpc,
+            IndexerProvider::Kao => state.api_provider = ApiProvider::Kao,
+            IndexerProvider::None => state.api_provider = ApiProvider::None,
+            _ => {}
+        }
+    }
+    state.api_key = on_disk.api_key.filter(|s| !s.is_empty());
+    // Backwards compat: if api_key is unset, populate from the legacy
+    // drpc_api_key so the wizard shows the key the user already entered.
+    if state.api_key.is_none() && state.api_provider == ApiProvider::Drpc {
+        state.api_key = state.drpc_api_key.clone();
+    }
+
+    if let Some(p) = on_disk.safe_tx_service.as_deref()
+        && let Some(parsed) = SafeTxService::from_key(p)
+    {
+        state.safe_tx_service = parsed;
+    }
+    state.safe_tx_service_url = on_disk
+        .safe_tx_service_url
+        .filter(|s| !s.is_empty() && is_https_url(s));
+
+    if let Some(enabled) = on_disk.proxy_enabled {
+        state.proxy_enabled = enabled;
+    }
+    if let Some(p) = on_disk.proxy_type.as_deref()
+        && let Some(parsed) = ProxyType::from_key(p)
+    {
+        state.proxy_type = parsed;
+    }
+    if let Some(addr) = on_disk.proxy_address.as_deref()
+        && !addr.is_empty()
+    {
+        state.proxy_address = addr.to_string();
+    }
+
     state
 }
 
@@ -300,6 +595,33 @@ fn serialize(state: &State) -> String {
         drpc_api_key: state.drpc_api_key.clone(),
         blockscout_base_url: state.blockscout_base_url.clone(),
         blockscout_api_key: state.blockscout_api_key.clone(),
+        kao_server_url: if state.kao_server_url != DEFAULT_KAO_SERVER_URL {
+            Some(state.kao_server_url.clone())
+        } else {
+            None
+        },
+        rpc_provider: Some(state.rpc_provider.key().to_string()),
+        rpc_key: state.rpc_key.clone(),
+        custom_rpc_url: state.custom_rpc_url.clone(),
+        api_provider: Some(state.api_provider.key().to_string()),
+        api_key: state.api_key.clone(),
+        safe_tx_service: Some(state.safe_tx_service.key().to_string()),
+        safe_tx_service_url: state.safe_tx_service_url.clone(),
+        proxy_enabled: if state.proxy_enabled {
+            Some(true)
+        } else {
+            None
+        },
+        proxy_type: if state.proxy_enabled {
+            Some(state.proxy_type.key().to_string())
+        } else {
+            None
+        },
+        proxy_address: if state.proxy_enabled && state.proxy_address != "127.0.0.1:9050" {
+            Some(state.proxy_address.clone())
+        } else {
+            None
+        },
     };
     toml::to_string(&on_disk).expect("serializing settings cannot fail")
 }
@@ -313,15 +635,15 @@ pub fn set_theme(kind: ThemeKind) {
     write_all();
 }
 
-/// The built-in execution-RPC list for Mainnet. Exposed so the setup UI can
-/// show the user exactly which endpoints "use defaults" enrolls them in.
-pub fn default_rpcs() -> &'static [&'static str] {
+/// The built-in execution-RPC list for Mainnet.
+#[cfg(test)]
+fn default_rpcs() -> &'static [&'static str] {
     DEFAULT_RPCS
 }
 
-/// The built-in consensus (beacon-chain LC) RPC list for Mainnet. Mirrors
-/// `default_rpcs` so the setup flow can reset both lists in one go.
-pub fn default_consensus_rpcs() -> &'static [&'static str] {
+/// The built-in consensus (beacon-chain LC) RPC list for Mainnet.
+#[cfg(test)]
+fn default_consensus_rpcs() -> &'static [&'static str] {
     DEFAULT_CONSENSUS_RPCS
 }
 
@@ -449,6 +771,7 @@ pub fn etherscan_api_key() -> Option<String> {
         .clone()
 }
 
+#[allow(dead_code)]
 pub fn set_etherscan_api_key(value: Option<String>) {
     ensure()
         .lock()
@@ -522,8 +845,27 @@ pub fn set_blockscout_api_key(value: Option<String>) {
     write_all();
 }
 
-/// Resolved checkpoint (built-in or freshly fetched fallback) used when no
-/// user override is set. Mutated by `crate::net` on startup.
+pub fn kao_server_url() -> String {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .kao_server_url
+        .clone()
+}
+
+pub fn set_kao_server_url(value: String) {
+    let url = parse_kao_server_input(&value).unwrap_or_else(|| DEFAULT_KAO_SERVER_URL.to_string());
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .kao_server_url = url;
+    write_all();
+}
+
+/// Built-in checkpoint used to bootstrap Mainnet sync when no user override is
+/// set. Always the binary's `BUILTIN_CHECKPOINT`; a fresh value is obtained
+/// only through the network setup wizard's manual refresh, which is stored as
+/// `checkpoint_override` rather than mutating this.
 pub fn auto_checkpoint() -> B256 {
     ensure()
         .lock()
@@ -531,23 +873,520 @@ pub fn auto_checkpoint() -> B256 {
         .auto_checkpoint
 }
 
-pub fn set_auto_checkpoint(value: B256) {
+// ── Wizard-level getters/setters ─────────────────────────────────────────
+
+pub fn rpc_provider() -> RpcProvider {
     ensure()
         .lock()
         .expect("settings mutex poisoned")
-        .auto_checkpoint = value;
-    // Not persisted to disk: this value is rederived on each app start.
+        .rpc_provider
 }
 
-/// True when the binary's built-in checkpoint is recent enough that we don't
-/// need to fetch a community fallback before the first sync.
-pub fn builtin_is_fresh() -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let age_secs = now.saturating_sub(BUILTIN_CHECKPOINT_PUBLISHED);
-    age_secs < BUILTIN_FRESHNESS_DAYS * 86400
+pub fn set_rpc_provider(value: RpcProvider) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .rpc_provider = value;
+    write_all();
+}
+
+pub fn rpc_key() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .rpc_key
+        .clone()
+}
+
+pub fn set_rpc_key(value: Option<String>) {
+    ensure().lock().expect("settings mutex poisoned").rpc_key = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+pub fn custom_rpc_url() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .custom_rpc_url
+        .clone()
+}
+
+pub fn set_custom_rpc_url(value: Option<String>) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .custom_rpc_url = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+pub fn api_provider() -> ApiProvider {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .api_provider
+}
+
+pub fn set_api_provider(value: ApiProvider) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .api_provider = value;
+    write_all();
+}
+
+pub fn api_key() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .api_key
+        .clone()
+}
+
+pub fn set_api_key(value: Option<String>) {
+    ensure().lock().expect("settings mutex poisoned").api_key = value.filter(|s| !s.is_empty());
+    write_all();
+}
+
+pub fn safe_tx_service() -> SafeTxService {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .safe_tx_service
+}
+
+pub fn set_safe_tx_service(value: SafeTxService) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .safe_tx_service = value;
+    write_all();
+}
+
+pub fn safe_tx_service_url() -> Option<String> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .safe_tx_service_url
+        .clone()
+}
+
+pub fn set_safe_tx_service_url(value: Option<String>) {
+    let cleaned = value.filter(|s| !s.is_empty() && is_https_url(s));
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .safe_tx_service_url = cleaned;
+    write_all();
+}
+
+pub fn proxy_enabled() -> bool {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .proxy_enabled
+}
+
+pub fn set_proxy_enabled(value: bool) {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .proxy_enabled = value;
+    write_all();
+}
+
+pub fn proxy_type() -> ProxyType {
+    ensure().lock().expect("settings mutex poisoned").proxy_type
+}
+
+pub fn set_proxy_type(value: ProxyType) {
+    ensure().lock().expect("settings mutex poisoned").proxy_type = value;
+    write_all();
+}
+
+pub fn proxy_address() -> String {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .proxy_address
+        .clone()
+}
+
+pub fn set_proxy_address(value: String) {
+    // Fall back to the Tor default for an empty or malformed address. The
+    // wallet installs the proxy as `socks5h://{addr}` in `ALL_PROXY`, and
+    // reqwest *silently ignores* a value it can't parse — connecting directly
+    // and leaking the user's real IP. So a value that wouldn't yield a valid
+    // proxy URI must never be persisted; the Tor default fails closed if Tor
+    // isn't running, rather than fail open.
+    let trimmed = value.trim();
+    let v = if valid_proxy_address(trimmed) {
+        trimmed.to_string()
+    } else {
+        "127.0.0.1:9050".to_string()
+    };
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .proxy_address = v;
+    write_all();
+}
+
+/// True when `addr` is a well-formed `host:port` that reqwest will accept as a
+/// proxy. The wallet installs the proxy as `socks5h://{addr}`, and reqwest /
+/// hyper-util parse that value via [`http::Uri`], silently ignoring it (and
+/// connecting *directly*) if it doesn't parse. We mirror that exact parser so
+/// an authority-illegal value (spaces, non-ASCII, missing host, missing or
+/// out-of-range port, trailing path) is rejected at input time instead of
+/// turning into a silent direct connection that deanonymizes the user.
+pub fn valid_proxy_address(addr: &str) -> bool {
+    let addr = addr.trim();
+    let Ok(uri) = format!("socks5h://{addr}").parse::<http::Uri>() else {
+        return false;
+    };
+    match uri.authority() {
+        // The whole input must be exactly the authority — `host:port` with an
+        // explicit, in-range port and no path/query/trailing junk.
+        Some(auth) => auth.as_str() == addr && auth.port_u16().is_some(),
+        None => false,
+    }
+}
+
+// ── URL generation helpers ──────────────────────────────────────────────
+
+/// Build a per-chain map of Alchemy exec URLs from a single API key.
+pub fn alchemy_exec_urls(key: &str) -> PerChain<String> {
+    let mut out = PerChain::<String>::default();
+    out.set(
+        Chain::Mainnet,
+        format!("https://eth-mainnet.g.alchemy.com/v2/{key}"),
+    );
+    out.set(
+        Chain::Base,
+        format!("https://base-mainnet.g.alchemy.com/v2/{key}"),
+    );
+    out.set(
+        Chain::Optimism,
+        format!("https://opt-mainnet.g.alchemy.com/v2/{key}"),
+    );
+    out
+}
+
+/// Build a per-chain map of dRPC exec URLs from a single API key.
+pub fn drpc_exec_urls(key: &str) -> PerChain<String> {
+    let mut out = PerChain::<String>::default();
+    for chain in Chain::ALL {
+        let slug = match chain {
+            Chain::Mainnet => "ethereum",
+            Chain::Base => "base",
+            Chain::Optimism => "optimism",
+        };
+        out.set(chain, format!("https://lb.drpc.live/{slug}/{key}"));
+    }
+    out
+}
+
+/// Build per-chain Kao proxy RPC URLs from the server base URL.
+pub fn kao_exec_urls(base: &str) -> PerChain<String> {
+    let base = base.trim_end_matches('/');
+    let mut out = PerChain::<String>::default();
+    for chain in Chain::ALL {
+        let slug = match chain {
+            Chain::Mainnet => "ethereum",
+            Chain::Base => "base",
+            Chain::Optimism => "optimism",
+        };
+        out.set(chain, format!("{base}/rpc/{slug}"));
+    }
+    out
+}
+
+/// Per-chain consensus URL defaults.
+pub fn default_consensus_url_map() -> PerChain<String> {
+    let mut out = PerChain::<String>::default();
+    for chain in Chain::ALL {
+        out.set(chain, chain.default_consensus_url().to_string());
+    }
+    out
+}
+
+/// 1RPC relay endpoints — privacy-preserving relay that strips metadata
+/// before forwarding to an upstream provider. No API key required.
+fn one_rpc_exec_urls() -> PerChain<String> {
+    let mut out = PerChain::<String>::default();
+    out.set(Chain::Mainnet, "https://1rpc.io/eth".to_string());
+    out.set(Chain::Base, "https://1rpc.io/base".to_string());
+    out.set(Chain::Optimism, "https://1rpc.io/op".to_string());
+    out
+}
+
+/// Expand the wizard's RPC provider + key + custom URL into the low-level
+/// per-chain settings. Called at wizard finish to persist the provider
+/// choice into the existing `rpcs` / `consensus_rpcs` / API-key slots.
+pub fn apply_rpc_provider(provider: RpcProvider, key: &str, custom_url: &str) {
+    // Persist the wizard-level choice.
+    set_rpc_provider(provider);
+    set_rpc_key(if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    });
+    set_custom_rpc_url(if custom_url.is_empty() {
+        None
+    } else {
+        Some(custom_url.to_string())
+    });
+
+    // Generate per-chain URL lists.
+    let consensus = default_consensus_url_map();
+    match provider {
+        RpcProvider::Kao => {
+            let exec = kao_exec_urls(&kao_server_url());
+            for chain in Chain::ALL {
+                set_rpcs(chain, vec![exec.get(chain).clone()]);
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+        }
+        RpcProvider::OneRpc => {
+            let exec = one_rpc_exec_urls();
+            for chain in Chain::ALL {
+                set_rpcs(chain, vec![exec.get(chain).clone()]);
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+        }
+        RpcProvider::Drpc => {
+            let exec = drpc_exec_urls(key);
+            set_drpc_api_key(Some(key.to_string()));
+            for chain in Chain::ALL {
+                set_rpcs(chain, vec![exec.get(chain).clone()]);
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+        }
+        RpcProvider::Alchemy => {
+            let exec = alchemy_exec_urls(key);
+            set_alchemy_api_key(Some(key.to_string()));
+            for chain in Chain::ALL {
+                set_rpcs(chain, vec![exec.get(chain).clone()]);
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+        }
+        RpcProvider::Custom => {
+            if !custom_url.is_empty() {
+                set_rpcs(Chain::Mainnet, vec![custom_url.to_string()]);
+            }
+            // Seed L2 with defaults for consensus.
+            for chain in Chain::ALL {
+                set_consensus_rpcs(chain, vec![consensus.get(chain).clone()]);
+            }
+            // L2 exec URLs default to each chain's built-in.
+            for chain in [Chain::Base, Chain::Optimism] {
+                set_rpcs(chain, vec![chain.default_exec_url().to_string()]);
+            }
+        }
+    }
+}
+
+/// Expand the wizard's API provider + key into the low-level indexer
+/// settings.
+pub fn apply_api_provider(provider: ApiProvider, key: &str) {
+    set_api_provider(provider);
+    set_api_key(if key.is_empty() {
+        None
+    } else {
+        Some(key.to_string())
+    });
+
+    match provider {
+        ApiProvider::Kao => {
+            // Route indexer queries through the Kao proxy. The proxy holds the
+            // dRPC key, so — unlike `ApiProvider::Drpc` — no key is stored here
+            // and none is sent upstream from the wallet.
+            set_indexer_provider(IndexerProvider::Kao);
+        }
+        ApiProvider::Blockscout => {
+            set_indexer_provider(IndexerProvider::Blockscout);
+        }
+        ApiProvider::Drpc => {
+            set_drpc_api_key(Some(key.to_string()));
+            set_indexer_provider(IndexerProvider::Drpc);
+        }
+        ApiProvider::None => {
+            set_indexer_provider(IndexerProvider::None);
+        }
+    }
+}
+
+/// Validate and normalize a custom RPC input. Accepts:
+/// - an explicit `https://` URL (kept as-is),
+/// - a bare hostname with optional `:port` and `/path` (wrapped as `https://`),
+/// - a bare IP address with optional `:port` and `/path` (wrapped as `http://`,
+///   since local nodes typically do not have TLS).
+///
+/// Explicit non-https schemes (`http://`, `ws://`, …) are rejected so users
+/// cannot downgrade themselves; if they want plain http they must type the
+/// host without a scheme and we will pick the right scheme automatically.
+pub fn parse_rpc_input(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.contains("://") {
+        let url = url::Url::parse(s).ok()?;
+        if url.scheme() != "https" {
+            return None;
+        }
+        let host = url.host_str()?;
+        if !is_plausible_host(host) {
+            return None;
+        }
+        return Some(s.to_string());
+    }
+    let (host_port, _) = s.find('/').map_or((s, ""), |i| (&s[..i], &s[i..]));
+    let host = match host_port.rsplit_once(':') {
+        Some((host, port)) => {
+            if port.parse::<u16>().is_err() {
+                return None;
+            }
+            host
+        }
+        None => host_port,
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() || host.eq_ignore_ascii_case("localhost") {
+        return Some(format!("http://{s}"));
+    }
+    if !is_plausible_host(host) {
+        return None;
+    }
+    Some(format!("https://{s}"))
+}
+
+/// Validate and normalize a user-supplied Kao privacy-proxy base URL.
+///
+/// Like [`parse_rpc_input`] but tailored to the Kao server field: it accepts
+/// an explicit `https://` URL (any host) or — for the common self-hosted dev
+/// setup — a plain `http://` URL pointed at loopback (`localhost`,
+/// `127.0.0.1`, `[::1]`, …). A bare `host[:port][/path]` is wrapped: loopback
+/// and IP hosts get `http://`, public hostnames get `https://`. Plain http to
+/// a *public* host is rejected so Kao traffic can't be silently downgraded
+/// onto a MITM-able transport. Returns the normalized URL, or `None` when the
+/// input can't be made safe.
+///
+/// Unlike [`parse_rpc_input`], an explicit `http://localhost` is kept rather
+/// than rejected — that's what we store after wrapping bare loopback input, so
+/// the stored value must survive a re-parse on the next load.
+pub fn parse_kao_server_input(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.contains("://") {
+        let url = url::Url::parse(s).ok()?;
+        let host = url.host_str()?;
+        let host_ok = is_loopback_host(host) || is_plausible_host(host);
+        let scheme_ok = match url.scheme() {
+            "https" => true,
+            "http" => is_loopback_host(host),
+            _ => false,
+        };
+        return (host_ok && scheme_ok).then(|| s.to_string());
+    }
+    let (host_port, _) = s.find('/').map_or((s, ""), |i| (&s[..i], &s[i..]));
+    let host = match host_port.rsplit_once(':') {
+        Some((host, port)) => {
+            if port.parse::<u16>().is_err() {
+                return None;
+            }
+            host
+        }
+        None => host_port,
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() || host.eq_ignore_ascii_case("localhost") {
+        return Some(format!("http://{s}"));
+    }
+    if !is_plausible_host(host) {
+        return None;
+    }
+    Some(format!("https://{s}"))
+}
+
+/// True for hosts where plain http is safe because the traffic never leaves
+/// the machine: `localhost` and any loopback IP (`127.0.0.0/8`, `::1`).
+/// Accepts the bracketed IPv6 form (`[::1]`) that `Url::host_str` returns.
+fn is_loopback_host(host: &str) -> bool {
+    let h = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    h.eq_ignore_ascii_case("localhost")
+        || h.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// A host is plausible if it's an IP, `localhost`, or a multi-label hostname.
+fn is_plausible_host(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    if s.eq_ignore_ascii_case("localhost") || s.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if !s.contains('.') {
+        return false;
+    }
+    is_valid_hostname(s)
+}
+
+fn is_valid_hostname(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
+/// Pull an Alchemy API key out of an RPC URL like
+/// `https://eth-mainnet.g.alchemy.com/v2/{key}`.
+#[cfg(test)]
+fn extract_alchemy_key(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if !host.ends_with(".g.alchemy.com") {
+        return None;
+    }
+    let mut segs = parsed.path_segments()?;
+    if segs.next()? != "v2" {
+        return None;
+    }
+    let key = segs.next()?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.to_string())
+}
+
+/// Pull a dRPC API key out of an RPC URL like
+/// `https://lb.drpc.live/{chain}/{key}`.
+#[cfg(test)]
+fn extract_drpc_key(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    if host != "lb.drpc.live" {
+        return None;
+    }
+    let mut segs = parsed.path_segments()?;
+    let _chain = segs.next()?;
+    let key = segs.next()?;
+    if key.is_empty() {
+        return None;
+    }
+    Some(key.to_string())
 }
 
 fn write_all() {
@@ -557,8 +1396,73 @@ fn write_all() {
         let _ = restrict_to_owner(parent, 0o700);
     }
     let snapshot = ensure().lock().expect("settings mutex poisoned").clone();
-    let _ = std::fs::write(&path, serialize(&snapshot));
-    let _ = restrict_to_owner(&path, 0o600);
+    let body = serialize(&snapshot);
+    // Best-effort, but deliberately no world-readable fallback: if the atomic
+    // write fails we leave the previous settings.toml intact rather than risk a
+    // create+chmod that briefly exposes the plaintext API keys. The sibling
+    // temp shares the target's filesystem, so the realistic failure modes are
+    // genuine I/O errors a second insecure attempt wouldn't fix anyway.
+    let _ = atomic_write_owner_only(&path, body.as_bytes());
+}
+
+/// Write `bytes` to `path` atomically with owner-only (0o600) permissions.
+///
+/// `settings.toml` holds API keys in plaintext, so three hazards matter on the
+/// write path:
+/// - a torn write (a crash mid-`write` leaving a truncated, garbage file),
+/// - a permissions race (`fs::write` creates the file at the umask-default mode
+///   — typically world-readable 0o644 — and only a *follow-up* chmod tightens
+///   it, leaving a window where another local user can read the keys), and
+/// - a pre-image at a predictable temp path (a symlink planted as the temp file
+///   would be followed, redirecting the secret write and the chmod).
+///
+/// All three are closed by creating a sibling temp file with `create_new`
+/// (never following an existing path/symlink) at mode 0o600 up front, writing
+/// and `fsync`ing it, then renaming it over `path` — atomic on the same
+/// filesystem, so the secret is never briefly world-readable and `path` is
+/// either fully old or fully new.
+fn atomic_write_owner_only(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("settings.toml");
+    let tmp = dir.join(format!(".{file_name}.tmp"));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    // `create_new` refuses to open an existing path, so a hostile or stale temp
+    // (a symlink pre-image, or a leftover from a crash) is never followed or
+    // written through. A genuine leftover is unlinked and retried once so a past
+    // crash can't wedge every future save; unlinking a symlink drops the link,
+    // not its target.
+    let mut f = match opts.open(&tmp) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&tmp)?;
+            opts.open(&tmp)?
+        }
+        Err(e) => return Err(e),
+    };
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Restrict a path to owner-only access on Unix; no-op elsewhere.
@@ -757,6 +1661,7 @@ mod tests {
             drpc_api_key: Some("DRPC_TEST_KEY".into()),
             blockscout_base_url: Some("https://base.blockscout.com".into()),
             blockscout_api_key: Some("BLOCKSCOUT_TEST_KEY".into()),
+            ..default_state()
         };
         let serialized = serialize(&original);
         let parsed = parse(&serialized);
@@ -803,6 +1708,36 @@ mod tests {
     }
 
     #[test]
+    fn valid_proxy_address_accepts_host_port_forms() {
+        assert!(valid_proxy_address("127.0.0.1:9050")); // Tor default
+        assert!(valid_proxy_address("127.0.0.1:1080"));
+        assert!(valid_proxy_address("proxy.example.com:1080")); // hostname
+        assert!(valid_proxy_address("[::1]:9050")); // bracketed IPv6
+        assert!(valid_proxy_address("  127.0.0.1:9050  ")); // trimmed
+    }
+
+    #[test]
+    fn valid_proxy_address_rejects_fail_open_inputs() {
+        // The security-critical cases: authority-illegal values that reqwest
+        // would silently ignore (→ direct connection / IP leak) rather than
+        // proxy. These MUST be rejected at input time.
+        assert!(!valid_proxy_address("127.0.0.1:90 50")); // inner space
+        assert!(!valid_proxy_address("тор:9050")); // non-ASCII host
+        assert!(!valid_proxy_address("proxy host:1080")); // inner space in host
+    }
+
+    #[test]
+    fn valid_proxy_address_rejects_malformed_host_port() {
+        assert!(!valid_proxy_address("")); // empty
+        assert!(!valid_proxy_address("127.0.0.1")); // no port
+        assert!(!valid_proxy_address("127.0.0.1:")); // empty port
+        assert!(!valid_proxy_address("127.0.0.1:abc")); // non-numeric port
+        assert!(!valid_proxy_address("127.0.0.1:99999")); // out-of-range port
+        assert!(!valid_proxy_address("127.0.0.1:9050/path")); // trailing path
+        assert!(!valid_proxy_address("socks5://127.0.0.1:9050")); // includes scheme
+    }
+
+    #[test]
     fn nonempty_passes_through_or_returns_none() {
         assert!(nonempty(&[]).is_none());
         assert_eq!(nonempty(&["a".to_string()]), Some(vec!["a".to_string()]));
@@ -815,6 +1750,7 @@ mod tests {
             IndexerProvider::Etherscan,
             IndexerProvider::Alchemy,
             IndexerProvider::Drpc,
+            IndexerProvider::Kao,
             IndexerProvider::None,
         ] {
             assert_eq!(IndexerProvider::from_key(p.key()), Some(p));
@@ -830,6 +1766,7 @@ mod tests {
             IndexerProvider::Etherscan,
             IndexerProvider::Alchemy,
             IndexerProvider::Drpc,
+            IndexerProvider::Kao,
             IndexerProvider::None,
         ] {
             let mut s = default_state();
@@ -955,12 +1892,48 @@ mod tests {
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn builtin_is_fresh_returns_bool() {
-        // `builtin_is_fresh` is a pure (now − published) < freshness window
-        // check. The output depends on wall clock, but the function must
-        // always return without panicking — assert it produces a result.
-        let _ = builtin_is_fresh();
+    fn atomic_write_creates_owner_only_file_with_contents() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+
+        atomic_write_owner_only(&path, b"key = \"secret\"\n").unwrap();
+
+        // The secret landed...
+        assert_eq!(std::fs::read(&path).unwrap(), b"key = \"secret\"\n");
+        // ...with owner-only perms from the moment it existed (no 0o644 window),
+        // and the temp file was renamed away, not left behind.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "expected 0o600, got 0o{mode:o}");
+        assert!(!dir.path().join(".settings.toml.tmp").exists());
+
+        // A second write atomically replaces the file and keeps the perms.
+        atomic_write_owner_only(&path, b"key = \"rotated\"\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"key = \"rotated\"\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_recovers_from_a_leftover_temp_file() {
+        // A crash between create and rename can strand the temp file. `create_new`
+        // would otherwise refuse to reopen it; the unlink-and-retry path must
+        // recover so a single past crash doesn't wedge every future save.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let tmp = dir.path().join(".settings.toml.tmp");
+        std::fs::write(&tmp, b"stale garbage").unwrap();
+
+        atomic_write_owner_only(&path, b"key = \"fresh\"\n").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"key = \"fresh\"\n");
+        assert!(
+            !tmp.exists(),
+            "leftover temp should be cleared, not left behind"
+        );
     }
 
     #[test]
@@ -1044,17 +2017,11 @@ mod tests {
             vec!["https://c".into(), "https://d".into(), "https://e".into()],
         );
         let state = State {
-            theme: default_state().theme,
             rpcs,
             consensus_rpcs,
             checkpoint_override: None,
-            auto_checkpoint: default_state().auto_checkpoint,
             indexer_provider: IndexerProvider::Blockscout,
-            etherscan_api_key: None,
-            alchemy_api_key: None,
-            drpc_api_key: None,
-            blockscout_base_url: None,
-            blockscout_api_key: None,
+            ..default_state()
         };
         let text = serialize(&state);
         let reparsed: OnDisk = toml::from_str(&text).expect("output must be valid toml");
@@ -1075,5 +2042,237 @@ mod tests {
         );
         // Unset overrides are dropped from the output rather than emitted as "".
         assert!(reparsed.checkpoint_override.is_none());
+    }
+
+    // ── New wizard-level enum round-trip tests ──────────────────────
+
+    #[test]
+    fn rpc_provider_key_round_trip() {
+        for p in [
+            RpcProvider::Kao,
+            RpcProvider::OneRpc,
+            RpcProvider::Drpc,
+            RpcProvider::Alchemy,
+            RpcProvider::Custom,
+        ] {
+            assert_eq!(RpcProvider::from_key(p.key()), Some(p));
+        }
+        assert!(RpcProvider::from_key("bogus").is_none());
+    }
+
+    #[test]
+    fn api_provider_key_round_trip() {
+        for p in [
+            ApiProvider::Kao,
+            ApiProvider::Blockscout,
+            ApiProvider::Drpc,
+            ApiProvider::None,
+        ] {
+            assert_eq!(ApiProvider::from_key(p.key()), Some(p));
+        }
+        assert!(ApiProvider::from_key("bogus").is_none());
+    }
+
+    #[test]
+    fn safe_tx_service_key_round_trip() {
+        for p in [SafeTxService::Default, SafeTxService::Custom] {
+            assert_eq!(SafeTxService::from_key(p.key()), Some(p));
+        }
+        assert!(SafeTxService::from_key("bogus").is_none());
+    }
+
+    #[test]
+    fn proxy_type_key_round_trip() {
+        for p in [ProxyType::Tor, ProxyType::Socks] {
+            assert_eq!(ProxyType::from_key(p.key()), Some(p));
+        }
+        assert!(ProxyType::from_key("bogus").is_none());
+    }
+
+    #[test]
+    fn parse_rpc_input_accepts_bare_ip() {
+        assert_eq!(
+            parse_rpc_input("192.168.1.5"),
+            Some("http://192.168.1.5".into())
+        );
+    }
+
+    #[test]
+    fn parse_rpc_input_accepts_ip_with_port_and_path() {
+        assert_eq!(
+            parse_rpc_input("192.168.1.5:8545/rpc"),
+            Some("http://192.168.1.5:8545/rpc".into())
+        );
+    }
+
+    #[test]
+    fn parse_rpc_input_accepts_bare_hostname() {
+        assert_eq!(
+            parse_rpc_input("my-node.example"),
+            Some("https://my-node.example".into())
+        );
+    }
+
+    #[test]
+    fn parse_rpc_input_rejects_empty_and_invalid() {
+        assert_eq!(parse_rpc_input(""), None);
+        assert_eq!(parse_rpc_input("   "), None);
+        assert_eq!(parse_rpc_input("my-node.example:abc"), None);
+        assert_eq!(parse_rpc_input("--bad-label.example"), None);
+    }
+
+    #[test]
+    fn parse_rpc_input_rejects_single_label_hosts() {
+        assert_eq!(parse_rpc_input("https://d"), None);
+        assert_eq!(parse_rpc_input("d"), None);
+        assert_eq!(parse_rpc_input("asdf"), None);
+    }
+
+    #[test]
+    fn parse_rpc_input_accepts_localhost_as_http() {
+        assert_eq!(
+            parse_rpc_input("localhost"),
+            Some("http://localhost".into())
+        );
+        assert_eq!(
+            parse_rpc_input("localhost:8545"),
+            Some("http://localhost:8545".into())
+        );
+    }
+
+    #[test]
+    fn parse_rpc_input_rejects_http_url() {
+        assert_eq!(parse_rpc_input("http://my-node.example"), None);
+    }
+
+    #[test]
+    fn parse_kao_server_input_wraps_bare_localhost_as_http() {
+        // The reported case: a self-hosted server typed without a scheme.
+        assert_eq!(
+            parse_kao_server_input("localhost:8080"),
+            Some("http://localhost:8080".into())
+        );
+        assert_eq!(
+            parse_kao_server_input("127.0.0.1:8080"),
+            Some("http://127.0.0.1:8080".into())
+        );
+    }
+
+    #[test]
+    fn parse_kao_server_input_keeps_explicit_loopback_http() {
+        // Must round-trip: this is what we store after wrapping bare input, so
+        // it has to survive re-parsing on the next load.
+        for url in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://[::1]:8080",
+        ] {
+            assert_eq!(parse_kao_server_input(url), Some(url.into()), "{url}");
+        }
+    }
+
+    #[test]
+    fn parse_kao_server_input_keeps_https_anywhere() {
+        assert_eq!(
+            parse_kao_server_input(DEFAULT_KAO_SERVER_URL),
+            Some(DEFAULT_KAO_SERVER_URL.into())
+        );
+        assert_eq!(
+            parse_kao_server_input("my-node.example"),
+            Some("https://my-node.example".into())
+        );
+    }
+
+    #[test]
+    fn parse_kao_server_input_rejects_public_http_and_junk() {
+        // Plain http to a public host would let traffic be MITM'd.
+        assert_eq!(parse_kao_server_input("http://my-node.example"), None);
+        assert_eq!(parse_kao_server_input("http://1.2.3.4:8080"), None);
+        // Single-label / malformed hosts and non-web schemes.
+        assert_eq!(parse_kao_server_input("ws://localhost:8080"), None);
+        assert_eq!(parse_kao_server_input("asdf"), None);
+        assert_eq!(parse_kao_server_input(""), None);
+        assert_eq!(parse_kao_server_input("   "), None);
+    }
+
+    #[test]
+    fn extract_alchemy_key_from_v2_url() {
+        assert_eq!(
+            extract_alchemy_key("https://eth-mainnet.g.alchemy.com/v2/abc123"),
+            Some("abc123".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_alchemy_key_rejects_other_hosts() {
+        assert_eq!(extract_alchemy_key("https://eth.llamarpc.com"), None);
+        assert_eq!(extract_alchemy_key("not-a-url"), None);
+    }
+
+    #[test]
+    fn extract_drpc_key_from_rpc_url() {
+        assert_eq!(
+            extract_drpc_key("https://lb.drpc.live/ethereum/abc123"),
+            Some("abc123".to_string()),
+        );
+    }
+
+    #[test]
+    fn extract_drpc_key_rejects_other_hosts() {
+        assert_eq!(extract_drpc_key("https://eth.drpc.org/"), None);
+        assert_eq!(extract_drpc_key("not-a-url"), None);
+    }
+
+    #[test]
+    fn alchemy_exec_urls_generates_all_chains() {
+        let urls = alchemy_exec_urls("testkey");
+        assert!(urls.get(Chain::Mainnet).contains("eth-mainnet"));
+        assert!(urls.get(Chain::Base).contains("base-mainnet"));
+        assert!(urls.get(Chain::Optimism).contains("opt-mainnet"));
+    }
+
+    #[test]
+    fn drpc_exec_urls_generates_all_chains() {
+        let urls = drpc_exec_urls("testkey");
+        assert!(urls.get(Chain::Mainnet).contains("ethereum"));
+        assert!(urls.get(Chain::Base).contains("base"));
+        assert!(urls.get(Chain::Optimism).contains("optimism"));
+    }
+
+    #[test]
+    fn backwards_compat_infers_alchemy_provider() {
+        let s = parse("alchemy_api_key = \"testkey\"\n");
+        assert_eq!(s.rpc_provider, RpcProvider::Alchemy);
+    }
+
+    #[test]
+    fn backwards_compat_infers_drpc_provider() {
+        let s = parse("drpc_api_key = \"testkey\"\n");
+        assert_eq!(s.rpc_provider, RpcProvider::Drpc);
+    }
+
+    #[test]
+    fn backwards_compat_defaults_to_kao_provider() {
+        let s = parse("");
+        assert_eq!(s.rpc_provider, RpcProvider::Kao);
+    }
+
+    #[test]
+    fn explicit_rpc_provider_overrides_inference() {
+        let s = parse("rpc_provider = \"1rpc\"\nalchemy_api_key = \"testkey\"\n");
+        assert_eq!(s.rpc_provider, RpcProvider::OneRpc);
+    }
+
+    #[test]
+    fn backwards_compat_infers_blockscout_api_provider() {
+        let s = parse("indexer_provider = \"blockscout\"\n");
+        assert_eq!(s.api_provider, ApiProvider::Blockscout);
+    }
+
+    #[test]
+    fn backwards_compat_infers_drpc_api_provider() {
+        let s = parse("indexer_provider = \"drpc\"\ndrpc_api_key = \"testkey\"\n");
+        assert_eq!(s.api_provider, ApiProvider::Drpc);
+        assert_eq!(s.api_key.as_deref(), Some("testkey"));
     }
 }

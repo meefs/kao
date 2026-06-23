@@ -10,6 +10,7 @@ mod net;
 mod paths;
 mod portfolio;
 mod safe;
+mod sanitize;
 mod settings;
 mod ui;
 mod wallet;
@@ -28,6 +29,37 @@ pub fn main() -> iced::Result {
         .with_env_filter(filter)
         .with_target(true)
         .init();
+
+    // Load persisted settings and, if the user enabled a proxy, install it
+    // process-wide *before* iced spawns any thread or builds any HTTP client.
+    // reqwest's `ALL_PROXY` is the only proxy hook helios's internally-built
+    // clients honour, so this is what routes ALL outbound traffic (helios
+    // consensus/execution, the alloy fallback provider, indexers, the Safe
+    // service, ENS) through the proxy. It must run here, single-threaded, at
+    // startup: installing it mutates the environment, which is only sound
+    // before other threads exist. A proxy change therefore applies on the
+    // next launch, not mid-session.
+    settings::load();
+    if settings::proxy_enabled() {
+        let stored = settings::proxy_address();
+        let stored = stored.trim();
+        // Defence in depth: `load()` reads the address straight from disk
+        // without going through `set_proxy_address`, so a hand-edited config
+        // could carry a malformed value. Never install an invalid proxy URL —
+        // reqwest would silently ignore it and connect directly, leaking the
+        // real IP. Fall back to the Tor default, which fails closed if Tor
+        // isn't running.
+        let addr = if settings::valid_proxy_address(stored) {
+            stored.to_string()
+        } else {
+            tracing::warn!(
+                "configured proxy address is invalid; falling back to the default to avoid a direct connection"
+            );
+            "127.0.0.1:9050".to_string()
+        };
+        proxy_env::set_all_proxy(&format!("socks5h://{addr}"));
+        tracing::info!("routing all outbound traffic through the configured SOCKS5 proxy");
+    }
 
     iced::application(App::new, App::update, App::view)
         .title("Kao Wallet")

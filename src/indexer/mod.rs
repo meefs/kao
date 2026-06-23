@@ -35,7 +35,7 @@ pub mod onchain;
 
 pub use alchemy::AlchemyClient;
 pub use blockscout::BlockscoutClient;
-pub use drpc::DrpcClient;
+pub use drpc::{DrpcClient, KaoClient};
 pub use etherscan::EtherscanClient;
 
 /// Outcome of a single transaction relative to the queried address.
@@ -177,14 +177,53 @@ pub(crate) fn redact_url_in_err(e: reqwest::Error) -> String {
 
 /// Shared `reqwest::Client` for every indexer impl. One TLS pool per process,
 /// reused across account switches and provider changes.
-pub(crate) fn http_client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(20))
-            .user_agent(concat!("kao/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("reqwest client must build")
+pub(crate) fn http_client() -> Option<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            // Build failure means the TLS backend couldn't initialize — an
+            // unrecoverable environment fault. Cache `None` and let callers
+            // surface a network error rather than panicking a UI task (which
+            // would take down the whole window). The failure is deterministic,
+            // so caching it is correct: a retry would fail identically.
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .user_agent(concat!("kao/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|e| tracing::error!("failed to build shared HTTP client: {e}"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// `http_client()` or a uniform error string for the indexer / Safe-service
+/// call sites.
+pub(crate) fn http_client_or_err() -> Result<&'static reqwest::Client, String> {
+    http_client().ok_or_else(|| "HTTP client unavailable (TLS init failed)".to_string())
+}
+
+/// Token `decimals` from an indexer's metadata, or a **logged** fallback to 18.
+/// Indexer JSON is untrusted and can omit or garble `decimals`; defaulting
+/// silently would rescale a balance/amount by up to 10^12 (a 6-decimal USDC
+/// rendered as 18), so surface the gap. Live balances are re-read on-chain;
+/// this keeps the indexer/activity-feed fallback visible (`RUST_LOG=kao=warn`).
+pub(crate) fn decimals_or_default(parsed: Option<u8>, token: impl std::fmt::Display) -> u8 {
+    parsed.unwrap_or_else(|| {
+        tracing::warn!(%token, "token decimals missing/unparseable from indexer; defaulting to 18 — displayed scale may be wrong");
+        18
+    })
+}
+
+/// A parsed token amount, or a **logged** fallback to zero. A silent
+/// `unwrap_or(U256::ZERO)` on untrusted indexer data would hide a real balance
+/// or transfer behind a plausible "0"; this records the parse failure instead.
+pub(crate) fn amount_or_zero_logged<E: std::fmt::Display>(
+    parsed: Result<U256, E>,
+    token: impl std::fmt::Display,
+) -> U256 {
+    parsed.unwrap_or_else(|e| {
+        tracing::warn!(%token, error = %e, "unparseable amount from indexer; showing 0");
+        U256::ZERO
     })
 }
 
@@ -245,6 +284,9 @@ pub fn build_indexer_for(chain: Chain) -> Arc<dyn Indexer> {
             Some(key) => Arc::new(DrpcClient::new(key, chain)),
             None => blockscout(chain),
         },
+        // The Kao proxy holds the dRPC key and supports every chain we do,
+        // so there's no per-chain fallback — it answers for all of them.
+        (_, IndexerProvider::Kao) => Arc::new(KaoClient::new(settings::kao_server_url(), chain)),
         (_, IndexerProvider::None) => noop(),
         // L2 + Etherscan: Etherscan v2 supports multi-chain via
         // `chainid` but our `EtherscanClient` doesn't carry that yet.
@@ -613,8 +655,8 @@ mod tests {
 
     #[test]
     fn http_client_singleton() {
-        let a = http_client();
-        let b = http_client();
+        let a = http_client().unwrap();
+        let b = http_client().unwrap();
         assert!(std::ptr::eq(a, b));
     }
 
@@ -624,7 +666,7 @@ mod tests {
         // its `source()`. The helper must surface that cause instead of
         // collapsing to reqwest's terse top-level message — that's the
         // whole point of the verbose-logging change.
-        let err = http_client().get("not a url").build().unwrap_err();
+        let err = http_client().unwrap().get("not a url").build().unwrap_err();
         let redacted = redact_url_in_err(err);
         assert!(
             redacted.contains(": "),
