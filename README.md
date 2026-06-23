@@ -23,7 +23,7 @@ For too long we've been relying on slow and vulnerable JavaScript for building u
 # ‧₊˚♪ 𝄞₊˚⊹ Roadmap ▶︎ •၊၊||၊|။||||| 0:10
 
 - [ ] WalletConnect
-- [ ] ERC-7730 clear signing support
+- [x] ERC-7730 clear signing support
 - Kohaku-aligned integrations:
     - [ ] Stealth Addresses
     - [ ] Privacy Pools
@@ -31,7 +31,7 @@ For too long we've been relying on slow and vulnerable JavaScript for building u
     - [ ] Railgun
 - [ ] optional Revoke Cash integration
 - [ ] CoW Swap integration
-- [ ] Tor support
+- [x] Tor support
 
 # ⊹ ࣪ ˖ macOS: "Kao Wallet is damaged and can't be opened" ૮₍ ˶•⤙•˶ ₎ა
 
