@@ -36,8 +36,10 @@ pub const DEFAULT_KAO_SERVER_URL: &str = "https://api.kaowallet.com";
 /// every bootstrap call. There is no automatic refresh: if it goes stale the
 /// user resolves a fresh one via the network setup wizard's manual refresh
 /// button (stored as `checkpoint_override`). Bump this at release time.
+///
+/// Last updated: 2026-06-23.
 pub const BUILTIN_CHECKPOINT: &str =
-    "0x56d275d9bdf4afb040ecbbba7da0dff9ed384b062c321d5f2b9a4a4f0eb83b4d";
+    "0xb932756e3e27c272b4a39f90355e6ba829f485be230cf5b39abf325619fd92f0";
 
 /// Third-party indexer used for transaction history and unverified balance
 /// fan-outs. Helios verification of native ETH stays in `crate::net`; this
