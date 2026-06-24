@@ -252,6 +252,40 @@ pub const DEFAULT_CUSTOM_SYMBOL: &str = "ETH";
 /// verified path, and a "custom mainnet" would be a confusing footgun.
 pub const BUILTIN_CHAIN_IDS: [u64; 3] = [1, 10, 8453];
 
+/// EIP-155 chain id of the Sepolia testnet.
+pub const SEPOLIA_CHAIN_ID: u64 = 11_155_111;
+/// EIP-155 chain id Anvil/Hardhat use for their default local devnet.
+pub const ANVIL_CHAIN_ID: u64 = 31_337;
+
+/// Networks Kao ships pre-configured but **off by default**: the Sepolia
+/// testnet and a local Anvil node. Seeding these saves the user from typing a
+/// chain id and RPC by hand to reach the two most common non-mainnet targets —
+/// they just flip the toggle in the Networks wizard. Once seeded they are
+/// ordinary [`CustomNetwork`]s: editable and removable like any the user adds.
+///
+/// Both stay unverified (no Helios light client) and carry only the native
+/// coin, exactly like a hand-added custom network.
+fn seeded_custom_networks() -> Vec<CustomNetwork> {
+    vec![
+        CustomNetwork {
+            chain_id: SEPOLIA_CHAIN_ID,
+            name: "Sepolia".to_string(),
+            rpc_url: "https://ethereum-sepolia-rpc.publicnode.com".to_string(),
+            currency_symbol: DEFAULT_CUSTOM_SYMBOL.to_string(),
+            enabled: false,
+        },
+        CustomNetwork {
+            // Anvil binds to localhost; the NO_PROXY rule keeps this request off
+            // the privacy proxy so a local devnet stays reachable.
+            chain_id: ANVIL_CHAIN_ID,
+            name: "Anvil".to_string(),
+            rpc_url: "http://127.0.0.1:8545".to_string(),
+            currency_symbol: DEFAULT_CUSTOM_SYMBOL.to_string(),
+            enabled: false,
+        },
+    ]
+}
+
 /// True iff `s` parses as an `http`/`https` URL. Looser than [`is_https_url`]
 /// because custom networks legitimately point at plain-HTTP local nodes
 /// (Anvil, Hardhat). Used to filter custom-network RPCs on load.
@@ -301,8 +335,10 @@ struct State {
     proxy_enabled: bool,
     proxy_type: ProxyType,
     proxy_address: String,
-    /// User-defined custom networks (Sepolia, Anvil, …). Empty by default.
-    /// Persisted as a TOML array of tables; remembered across restarts.
+    /// Custom networks. Seeded with Sepolia and Anvil (both disabled) on a
+    /// fresh config via [`seeded_custom_networks`]; the user can toggle, edit,
+    /// or remove them and add their own. Persisted as a TOML array of tables;
+    /// remembered across restarts.
     custom_networks: Vec<CustomNetwork>,
 }
 
@@ -385,7 +421,7 @@ fn default_state() -> State {
         proxy_enabled: false,
         proxy_type: ProxyType::default(),
         proxy_address: "127.0.0.1:9050".to_string(),
-        custom_networks: Vec::new(),
+        custom_networks: seeded_custom_networks(),
     }
 }
 
@@ -1832,10 +1868,62 @@ rpc_url = \"http://127.0.0.1:8545\"
     }
 
     #[test]
-    fn no_custom_networks_omits_section_from_output() {
-        // A stock config must not litter the file with an empty section.
-        let out = serialize(&default_state());
+    fn empty_custom_networks_omits_section_from_output() {
+        // An empty list must not litter the file with a `[[custom_networks]]`
+        // section. (A stock config is seeded with Sepolia/Anvil, so clear them
+        // first to exercise the empty case.)
+        let mut s = default_state();
+        s.custom_networks.clear();
+        let out = serialize(&s);
         assert!(!out.contains("custom_networks"));
+    }
+
+    #[test]
+    fn default_state_seeds_sepolia_and_anvil_disabled() {
+        let s = default_state();
+        let sepolia = s
+            .custom_networks
+            .iter()
+            .find(|n| n.chain_id == SEPOLIA_CHAIN_ID)
+            .expect("Sepolia seeded");
+        let anvil = s
+            .custom_networks
+            .iter()
+            .find(|n| n.chain_id == ANVIL_CHAIN_ID)
+            .expect("Anvil seeded");
+        // Off by default — they must not widen the portfolio fan-out unasked.
+        assert!(!sepolia.enabled);
+        assert!(!anvil.enabled);
+        // Seeds are valid rows that survive normalization (Anvil's http:// is
+        // intentionally allowed for the local node).
+        assert_eq!(
+            s.custom_networks,
+            normalize_custom_networks(s.custom_networks.clone())
+        );
+        assert!(is_http_or_https_url(&anvil.rpc_url));
+        assert!(anvil.rpc_url.starts_with("http://"));
+    }
+
+    #[test]
+    fn fresh_config_keeps_seeds_section_present_is_authoritative() {
+        // A config with no `[[custom_networks]]` section keeps the seeds…
+        let fresh = parse("");
+        assert_eq!(fresh.custom_networks, seeded_custom_networks());
+
+        // …but once a section is present it fully replaces them, so a user who
+        // deletes Anvil and keeps only Sepolia doesn't get Anvil re-added.
+        let only_sepolia = parse(
+            "\
+[[custom_networks]]
+chain_id = 11155111
+name = \"Sepolia\"
+rpc_url = \"https://sepolia.example\"
+enabled = true
+",
+        );
+        assert_eq!(only_sepolia.custom_networks.len(), 1);
+        assert_eq!(only_sepolia.custom_networks[0].chain_id, SEPOLIA_CHAIN_ID);
+        assert!(only_sepolia.custom_networks[0].enabled);
     }
 
     #[test]

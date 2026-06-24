@@ -529,10 +529,12 @@ mod tests {
     fn custom_network_symbol_carries_name_or_chain_id() {
         // No settings entry for this id in the test process → falls back to
         // "chain {id}". (The happy path, resolving the user's name, is
-        // exercised via the live settings store in integration use.)
+        // exercised via the live settings store in integration use.) Uses an
+        // arbitrary id that isn't one of the seeded networks (Sepolia/Anvil),
+        // whose names the live default settings would otherwise resolve.
         assert_eq!(
-            format_symbol("ETH", NetworkId::Custom(11155111)),
-            "ETH (chain 11155111)"
+            format_symbol("ETH", NetworkId::Custom(987654321)),
+            "ETH (chain 987654321)"
         );
     }
 
