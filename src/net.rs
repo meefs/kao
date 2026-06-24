@@ -2288,7 +2288,14 @@ mod pure_tests {
     fn is_loopback_host_matches_every_loopback_spelling() {
         // The three forms a local-node RPC URL realistically uses, plus the
         // rest of the 127/8 block and a bracketed IPv6 literal.
-        for h in ["localhost", "LOCALHOST", "127.0.0.1", "127.0.0.2", "::1", "[::1]"] {
+        for h in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            "[::1]",
+        ] {
             assert!(is_loopback_host(Some(h)), "{h} should be loopback");
         }
     }
