@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{Provider, RootProvider};
+use alloy::rpc::client::RpcClient;
 use alloy_eips::BlockId;
 use async_trait::async_trait;
 use rand::seq::SliceRandom;
@@ -124,6 +125,27 @@ pub trait BalanceFetcher: Send + Sync + std::fmt::Debug {
     /// dashboard rebuild. `None` only when no RPCs are configured for
     /// the chain or the chosen URL won't parse.
     async fn provider(&self, chain: Chain) -> Option<RootProvider<Ethereum>>;
+    /// Raw `RootProvider` for a user-defined custom network at `rpc_url`.
+    ///
+    /// Custom networks are never Helios-verified, so this is a plain HTTP
+    /// provider built straight from the URL the user typed — the same
+    /// transport `balance`'s raw fallback uses for built-ins. `chain_id` is
+    /// accepted for symmetry/logging and so an impl may key a cache on it;
+    /// the default builds fresh each call, which keeps the provider in lock-
+    /// step with edits to the network's RPC URL. `None` when the URL won't
+    /// parse. Process-wide `ALL_PROXY` still applies to remote custom RPCs, so
+    /// a configured proxy covers their traffic too — but a *loopback* RPC (a
+    /// local Anvil/Hardhat node) bypasses the proxy, since a remote proxy can't
+    /// reach the user's own machine and loopback never leaves it anyway. See
+    /// `provider_for_url` / `is_loopback_host`.
+    async fn custom_provider(
+        &self,
+        chain_id: u64,
+        rpc_url: &str,
+    ) -> Option<RootProvider<Ethereum>> {
+        let _ = chain_id;
+        build_fallback(rpc_url)
+    }
     /// Verified contract bytecode at `addr`. Tries Helios first; on error,
     /// falls back to a raw `eth_getCode` and starts the same cooldown
     /// `balance` uses. The returned `verified` flag tells the caller
@@ -1292,13 +1314,68 @@ fn redact_urls(s: &str) -> String {
 
 fn build_fallback(url: &str) -> Option<RootProvider<Ethereum>> {
     match url::Url::parse(url) {
-        Ok(u) => Some(RootProvider::<Ethereum>::new_http(u)),
+        Ok(u) => Some(provider_for_url(u)),
         Err(e) => {
             // The unparsable input may still contain a key fragment —
             // scrub what we can rather than echoing it verbatim.
             error!(url = %redact_urls(url), error = %e, "cannot build raw provider");
             None
         }
+    }
+}
+
+/// Build a raw `RootProvider` for `u`, bypassing the process-wide SOCKS proxy
+/// when (and only when) the destination is loopback.
+///
+/// A custom network may point at a local node (`http://127.0.0.1:8545`). When
+/// the user has a proxy enabled (`ALL_PROXY`, e.g. Tor), a *remote* proxy can't
+/// reach the user's own loopback, so a default client — which inherits
+/// `ALL_PROXY` — would send the request to the proxy and never reach the node.
+/// Loopback traffic also never leaves the machine, so there is nothing to
+/// anonymize by proxying it. We therefore give loopback providers a reqwest
+/// client with `.no_proxy()` (direct), while every non-loopback destination
+/// keeps the proxied default client unchanged — so no public/remote RPC can
+/// ever slip past the proxy.
+fn provider_for_url(u: url::Url) -> RootProvider<Ethereum> {
+    if is_loopback_host(u.host_str()) {
+        // `.no_proxy()` opts this client out of `ALL_PROXY`/`NO_PROXY` env
+        // detection entirely — a genuinely direct connection to loopback.
+        //
+        // Built from alloy's *re-exported* reqwest, not the crate's direct
+        // `reqwest` dependency: alloy 2.0.1 resolves its own (newer) reqwest,
+        // and `new_http_with_client` wants a `Client` of that version. Using
+        // the bare `reqwest::Client` here would be a different type.
+        let client = alloy::transports::http::reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("reqwest client with no_proxy cannot fail to build");
+        // `new_http_with_client` is `new_http` with a caller-supplied client:
+        // same transport/`is_local` wiring, just not the default proxied one.
+        RootProvider::<Ethereum>::new(RpcClient::new_http_with_client(client, u))
+    } else {
+        RootProvider::<Ethereum>::new_http(u)
+    }
+}
+
+/// True for the hosts that must never be proxied: `localhost`, the whole IPv4
+/// loopback block (`127.0.0.0/8`, via [`IpAddr::is_loopback`]), and IPv6 `::1`.
+/// Matching is on the host as written in the URL (`url` strips the `[]` from an
+/// IPv6 literal in `host_str`, but we strip defensively in case a caller passes
+/// a bracketed form). Deliberately loopback-only: LAN/RFC1918 hosts stay
+/// proxied so a wallet never reveals itself to the local network unprompted.
+fn is_loopback_host(host: Option<&str>) -> bool {
+    match host {
+        Some(h) => {
+            let h = h
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+                .unwrap_or(h);
+            h.eq_ignore_ascii_case("localhost")
+                || h.parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false)
+        }
+        None => false,
     }
 }
 
@@ -2205,6 +2282,51 @@ mod pure_tests {
     fn redact_urls_no_url_is_identity() {
         assert_eq!(redact_urls("plain error, no urls"), "plain error, no urls");
         assert_eq!(redact_urls(""), "");
+    }
+
+    #[test]
+    fn is_loopback_host_matches_every_loopback_spelling() {
+        // The three forms a local-node RPC URL realistically uses, plus the
+        // rest of the 127/8 block and a bracketed IPv6 literal.
+        for h in [
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "127.0.0.2",
+            "::1",
+            "[::1]",
+        ] {
+            assert!(is_loopback_host(Some(h)), "{h} should be loopback");
+        }
+    }
+
+    #[test]
+    fn is_loopback_host_rejects_remote_and_lan_hosts() {
+        // Public hosts, LAN/RFC1918, and a missing host must stay proxied —
+        // the bypass is deliberately loopback-only.
+        for h in [
+            "eth.example.com",
+            "1.2.3.4",
+            "192.168.1.10",
+            "10.0.0.1",
+            "0.0.0.0",
+            "localhost.evil.com",
+        ] {
+            assert!(!is_loopback_host(Some(h)), "{h} must not be loopback");
+        }
+        assert!(!is_loopback_host(None));
+    }
+
+    #[test]
+    fn is_loopback_host_resolves_from_url_host_str() {
+        // Confirm the host extracted from a parsed URL feeds the check as
+        // expected — including the IPv6 form `url` serializes with brackets.
+        let local = url::Url::parse("http://127.0.0.1:8545").unwrap();
+        assert!(is_loopback_host(local.host_str()));
+        let local6 = url::Url::parse("http://[::1]:8545").unwrap();
+        assert!(is_loopback_host(local6.host_str()));
+        let remote = url::Url::parse("https://mainnet.example.com/v2/key").unwrap();
+        assert!(!is_loopback_host(remote.host_str()));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use alloy::primitives::{Address, Bytes, TxHash, TxKind, U256};
 use alloy::providers::{Provider, RootProvider};
 use tracing::{debug, info, warn};
 
-use crate::chain::Chain;
+use crate::chain::NetworkId;
 use crate::net::BalanceFetcher;
 use crate::wallet::KaoSigner;
 use crate::wallet::sim::{self, SimulationResult};
@@ -72,14 +72,17 @@ pub enum SendToken {
 ///
 /// `chain` is the network the tx will be broadcast on; its EIP-155 id is
 /// baked into the signing hash, so changing the chain after a quote is
-/// fetched would invalidate the review screen's numbers.
+/// fetched would invalidate the review screen's numbers. It's a
+/// [`NetworkId`] so the send flow works on a user-defined custom network
+/// (which carries `NetworkId::Custom(chain_id)`) exactly as it does on a
+/// built-in — only the provider the caller hands in differs.
 #[derive(Debug, Clone)]
 pub struct SendPlan {
     pub from: Address,
     pub recipient: Address,
     pub token: SendToken,
     pub amount_units: U256,
-    pub chain: Chain,
+    pub chain: NetworkId,
 }
 
 impl SendPlan {
@@ -150,8 +153,8 @@ pub async fn build_quote(
         SendToken::Erc20 { .. } => "erc20",
     };
     info!(
-        chain = %plan.chain.label(),
         chain_id = plan.chain.chain_id(),
+        custom = plan.chain.is_custom(),
         token = token_kind,
         from = %plan.from,
         to = %target,
@@ -219,7 +222,10 @@ pub async fn build_quote(
             }
         }
     } else {
-        debug!(chain = %plan.chain.label(), "quote: chain doesn't support simulation");
+        debug!(
+            chain_id = plan.chain.chain_id(),
+            "quote: chain doesn't support simulation"
+        );
         SimulationResult::unavailable()
     };
 
@@ -272,8 +278,8 @@ pub async fn sign_and_send(
         SendToken::Erc20 { .. } => "erc20",
     };
     info!(
-        chain = %plan.chain.label(),
         chain_id = plan.chain.chain_id(),
+        custom = plan.chain.is_custom(),
         token = token_kind,
         from = %plan.from,
         to = %to,
@@ -327,6 +333,7 @@ pub async fn sign_and_send(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::Chain;
     use alloy::primitives::address;
 
     #[test]
@@ -385,7 +392,7 @@ mod tests {
             recipient: to,
             token: SendToken::Native,
             amount_units: U256::from(123u64),
-            chain: Chain::Mainnet,
+            chain: NetworkId::Builtin(Chain::Mainnet),
         };
         let (target, value, input) = plan.tx_target();
         assert_eq!(target, to);
@@ -403,7 +410,7 @@ mod tests {
             recipient: to,
             token: SendToken::Erc20 { contract: usdc },
             amount_units: U256::from(1_000_000u64),
-            chain: Chain::Base,
+            chain: NetworkId::Builtin(Chain::Base),
         };
         let (target, value, input) = plan.tx_target();
         assert_eq!(target, usdc, "contract is the call target for ERC-20");
@@ -492,7 +499,7 @@ mod tests {
             recipient: Address::ZERO,
             token: SendToken::Native,
             amount_units: U256::from(1u64),
-            chain: Chain::Mainnet,
+            chain: NetworkId::Builtin(Chain::Mainnet),
         };
         let res = sign_and_send(&provider, &signer, plan, dummy_quote()).await;
         assert!(
@@ -516,7 +523,7 @@ mod tests {
             recipient: Address::ZERO,
             token: SendToken::Erc20 { contract: usdc },
             amount_units: U256::from(1_000_000u64),
-            chain: Chain::Base,
+            chain: NetworkId::Builtin(Chain::Base),
         };
         let res = sign_and_send(&provider, &signer, plan, dummy_quote()).await;
         assert!(

@@ -19,7 +19,7 @@ use iced::keyboard;
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
-use super::home::format_symbol;
+use super::home::{format_symbol, network_display_name, network_label};
 use crate::chain::Chain;
 use crate::decode::clear_sign::DecodeResult;
 use crate::ens;
@@ -1592,7 +1592,10 @@ impl SendPane {
             kao_text(t, kaomoji_for_index(i), 11.0),
             Space::new().height(1),
             text(&tk.symbol).size(12).color(t.text).font(bold()),
-            text(tk.chain.label()).size(9).color(t.sub).font(mono()),
+            text(network_label(tk.chain))
+                .size(9)
+                .color(t.sub)
+                .font(mono()),
         ]
         .align_x(Alignment::Center)
         .spacing(0);
@@ -1693,9 +1696,9 @@ impl SendPane {
         .clip(true)
         .width(Length::Fill);
         let usd_sub = if usd_price > 0.0 {
-            format!("on {} · ≈ ${usd_value:.2}", chain.display_name())
+            format!("on {} · ≈ ${usd_value:.2}", network_display_name(chain))
         } else {
-            format!("on {}", chain.display_name())
+            format!("on {}", network_display_name(chain))
         };
 
         let intent_banner = container(
@@ -2078,7 +2081,7 @@ impl SendPane {
                     column![
                         text("Can't sign yet — not enough ETH for gas").size(13).color(t.down).font(bold()),
                         Space::new().height(3),
-                        text(format!("This network fee is paid in ETH. You need ≈ {} ETH on {}, but your ETH balance on this chain is 0.", gas_eth_str, chain.display_name())).size(12).color(t.sub),
+                        text(format!("This network fee is paid in ETH. You need ≈ {} ETH on {}, but your ETH balance on this chain is 0.", gas_eth_str, network_display_name(chain))).size(12).color(t.sub),
                     ].width(Length::Fill),
                 ].align_y(Alignment::Center).width(Length::Fill),
             ).padding(Padding::from([13, 15])).width(Length::Fill)
@@ -2447,7 +2450,7 @@ impl SendPane {
                     .width(Length::Fill);
                 col = col.push(sim_row(
                     t,
-                    chain,
+                    chain.into(),
                     contract,
                     symbol.to_string(),
                     None,
@@ -2459,7 +2462,7 @@ impl SendPane {
                     .unwrap_or_else(|| "?".into());
                 col = col.push(sim_row(
                     t,
-                    chain,
+                    chain.into(),
                     None,
                     "Gas".to_string(),
                     None,
@@ -2472,7 +2475,7 @@ impl SendPane {
                     .unwrap_or_else(|| short_address(recipient));
                 col = col.push(sim_row(
                     t,
-                    chain,
+                    chain.into(),
                     contract,
                     recip_label,
                     None,
@@ -2490,9 +2493,12 @@ impl SendPane {
                     );
                 }
                 if sim.is_revert() {
-                    col = col
-                        .push(vspace(6))
-                        .push(sim_view::simulation_block(t, sim, chain, portfolio));
+                    col = col.push(vspace(6)).push(sim_view::simulation_block(
+                        t,
+                        sim,
+                        chain.into(),
+                        portfolio,
+                    ));
                 }
                 review_card(t, col.into())
             }
@@ -2871,7 +2877,7 @@ pub(crate) fn colored_address_compact<'a, M: 'a>(t: KaoTheme, addr: Address) -> 
 
 pub(crate) fn sim_row<'a, M: 'a>(
     t: KaoTheme,
-    chain: crate::chain::Chain,
+    chain: crate::chain::NetworkId,
     contract: Option<Address>,
     name: String,
     after: Option<String>,
@@ -2882,9 +2888,15 @@ pub(crate) fn sim_row<'a, M: 'a>(
     if let Some(after_text) = after {
         name_col = name_col.push(text(after_text).size(10).color(t.sub).font(mono()));
     }
+    // Built-in networks can show a chain/token logo; a custom network has no
+    // bundled logo, so it falls back to the kaomoji avatar.
+    let avatar_el = match chain.builtin() {
+        Some(c) => token_avatar(t, c, contract, "(•◡•)", 30.0, t.ab2),
+        None => avatar(t, "(•◡•)", 30.0, t.ab2),
+    };
     container(
         row![
-            token_avatar(t, chain, contract, "(•◡•)", 30.0, t.ab2),
+            avatar_el,
             Space::new().width(11),
             name_col,
             Space::new().width(Length::Fill),
@@ -3477,7 +3489,7 @@ mod tests {
         vec![LiveToken {
             symbol: "ETH".into(),
             name: "Ether".into(),
-            chain: Chain::Mainnet,
+            chain: Chain::Mainnet.into(),
             contract: None,
             decimals: 18,
             balance: "1.0".into(),

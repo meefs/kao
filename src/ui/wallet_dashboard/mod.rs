@@ -101,7 +101,10 @@ pub enum Message {
     /// can't pollute the wrong account's portfolio (or its cache slot).
     PortfolioFetched {
         address: Address,
-        chain: crate::chain::Chain,
+        /// The network the rows were fetched from — a built-in chain or a
+        /// user-defined custom network. Keys the cache slot and gates the
+        /// merge so a custom network's rows land in their own slot.
+        network: crate::chain::NetworkId,
         result: Result<Vec<LiveToken>, String>,
     },
     /// Result of a per-chain history fetch. `address` is the address it
@@ -454,7 +457,7 @@ impl WalletScreen {
         let cached: Option<Vec<LiveToken>> = portfolio_cache.lock().ok().map(|c| {
             crate::chain::Chain::ALL
                 .iter()
-                .filter_map(|chain| c.get(&(address, *chain)).cloned())
+                .filter_map(|chain| c.get(&(address, (*chain).into())).cloned())
                 .flatten()
                 .collect()
         });
@@ -548,6 +551,31 @@ impl WalletScreen {
         }
     }
 
+    /// Networks whose balances are valid for the current display identity,
+    /// spanning both built-in chains and user-defined custom networks.
+    ///
+    /// In EOA mode: every built-in chain plus every *enabled* custom network
+    /// — a self-custodial EOA holds an independent balance on each. In Safe
+    /// mode: just the Safe's own built-in chain. A Safe is a contract pinned
+    /// to one deployment, and custom networks have no Safe support, so a Safe
+    /// never spans custom networks.
+    fn allowed_networks(&self) -> Vec<crate::chain::NetworkId> {
+        use crate::chain::NetworkId;
+        let mut out: Vec<NetworkId> = self
+            .allowed_chains()
+            .into_iter()
+            .map(NetworkId::from)
+            .collect();
+        if self.active_safe_descriptor().is_none() {
+            out.extend(
+                settings::enabled_custom_networks()
+                    .into_iter()
+                    .map(|n| NetworkId::Custom(n.chain_id)),
+            );
+        }
+        out
+    }
+
     /// Reset `history_pending` to the set of chains the dashboard
     /// will actually fetch — `allowed_chains()` intersected with
     /// "has at least one configured RPC". Single source of truth
@@ -567,11 +595,11 @@ impl WalletScreen {
     /// the cache misses entirely on this address.
     fn seed_portfolio_from_cache(&mut self) {
         let addr = self.display_address();
-        let allowed = self.allowed_chains();
+        let allowed = self.allowed_networks();
         let cached: Vec<LiveToken> = match self.portfolio_cache.lock() {
             Ok(c) => allowed
                 .iter()
-                .filter_map(|chain| c.get(&(addr, *chain)).cloned())
+                .filter_map(|network| c.get(&(addr, *network)).cloned())
                 .flatten()
                 .collect(),
             Err(_) => Vec::new(),
@@ -972,10 +1000,45 @@ impl WalletScreen {
                 },
                 |(address, chain, result)| Message::PortfolioFetched {
                     address,
-                    chain,
+                    network: crate::chain::NetworkId::Builtin(chain),
                     result,
                 },
             ));
+        }
+        // Custom networks: native-coin-only, unverified, served by a raw
+        // provider built straight from the user's RPC URL. Skipped entirely
+        // in Safe mode (custom networks have no Safe support), matching
+        // `allowed_networks`. Each emits its own `PortfolioFetched` so a slow
+        // or dead custom RPC never stalls the built-in rows.
+        if self.active_safe_descriptor().is_none() {
+            for net in settings::enabled_custom_networks() {
+                let network = self.network.clone();
+                tasks.push(Task::perform(
+                    async move {
+                        let started = std::time::Instant::now();
+                        let result = match network.custom_provider(net.chain_id, &net.rpc_url).await
+                        {
+                            Some(p) => {
+                                crate::portfolio::fetch_native_balance(address, &net, &p).await
+                            }
+                            None => Err(format!("invalid RPC URL for {}", net.name)),
+                        };
+                        debug!(
+                            elapsed = ?started.elapsed(),
+                            chain_id = net.chain_id,
+                            custom = true,
+                            ok = result.is_ok(),
+                            "custom network portfolio fetch completed",
+                        );
+                        (address, net.chain_id, result)
+                    },
+                    |(address, chain_id, result)| Message::PortfolioFetched {
+                        address,
+                        network: crate::chain::NetworkId::Custom(chain_id),
+                        result,
+                    },
+                ));
+            }
         }
         Task::batch(tasks)
     }
@@ -1078,6 +1141,12 @@ impl WalletScreen {
                 self.verification = self.network.last_status(crate::chain::Chain::Mainnet);
             }
             Message::RefreshPortfolio => {
+                // Drop rows for networks no longer in scope — e.g. a custom
+                // network the user just disabled or deleted. Those won't get a
+                // fresh `PortfolioFetched`, so without this their stale rows
+                // would linger until the next account switch.
+                let allowed = self.allowed_networks();
+                self.portfolio.retain(|t| allowed.contains(&t.chain));
                 // Don't reset `portfolio_loading` if the portfolio is
                 // already populated — the rendered tokens stay
                 // visible during refresh, and the home view's
@@ -1122,10 +1191,10 @@ impl WalletScreen {
             }
             Message::PortfolioFetched {
                 address,
-                chain,
+                network,
                 result,
             } => {
-                // Always write the (address, chain) we issued the fetch
+                // Always write the (address, network) we issued the fetch
                 // for into the cache — it's still the correct slot for
                 // that address's data even if the user has since
                 // switched away. Only the live portfolio merge is
@@ -1134,26 +1203,26 @@ impl WalletScreen {
                 if let Ok(tokens) = &result
                     && let Ok(mut cache) = self.portfolio_cache.lock()
                 {
-                    // Only cache rows that belong to the chain we fetched — a
+                    // Only cache rows that belong to the network we fetched — a
                     // buggy/malicious provider could tag a token with another
-                    // chain, which would pollute this slot (and, via the merge
-                    // below, the live portfolio).
+                    // network, which would pollute this slot (and, via the
+                    // merge below, the live portfolio).
                     let scoped: Vec<LiveToken> = tokens
                         .iter()
-                        .filter(|t| t.chain == chain)
+                        .filter(|t| t.chain == network)
                         .cloned()
                         .collect();
-                    cache.insert((address, chain), scoped);
+                    cache.insert((address, network), scoped);
                 }
                 if address != self.display_address() {
                     return (Task::none(), None);
                 }
-                // Cross-chain Safe rows: a stale fetch that was
-                // issued before SelectSafe but landed after can carry
-                // a chain that's no longer in scope for the active
-                // Safe. Drop it before merging so the user never
-                // sees Optimism balances on a Mainnet Safe.
-                if !self.allowed_chains().contains(&chain) {
+                // Cross-network rows that are no longer in scope: a stale
+                // fetch issued before a Safe switch (or before a custom
+                // network was disabled) can land afterwards carrying a
+                // network that's no longer allowed. Drop it before merging
+                // so the user never sees out-of-scope balances.
+                if !self.allowed_networks().contains(&network) {
                     return (Task::none(), None);
                 }
                 // Loading flag clears once *any* chain lands; the user
@@ -1165,18 +1234,18 @@ impl WalletScreen {
                 self.portfolio_refreshing = false;
                 match result {
                     Ok(tokens) => {
-                        // Merge by chain: replace the rows belonging to
-                        // `chain` with the new ones, leave other chains'
+                        // Merge by network: replace the rows belonging to
+                        // `network` with the new ones, leave other networks'
                         // rows untouched. Re-sort ETH-first then by USD
-                        // value descending so a late-landing chain
+                        // value descending so a late-landing network
                         // doesn't shuffle a stable row order — the
                         // original portfolio sort already maintained this.
-                        self.portfolio.retain(|t| t.chain != chain);
-                        // Same chain-scoping as the cache write: never merge a
-                        // token whose `chain` differs from the one we fetched,
-                        // or a stale-chain row would survive the retain above.
+                        self.portfolio.retain(|t| t.chain != network);
+                        // Same network-scoping as the cache write: never merge
+                        // a token whose `chain` differs from the one we
+                        // fetched, or a stale row would survive the retain.
                         self.portfolio
-                            .extend(tokens.into_iter().filter(|t| t.chain == chain));
+                            .extend(tokens.into_iter().filter(|t| t.chain == network));
                         self.portfolio.sort_by(|a, b| {
                             // Native ETH bubbles up first per chain.
                             let a_native = a.contract.is_none();
@@ -1191,7 +1260,7 @@ impl WalletScreen {
                         });
                     }
                     Err(e) => warn!(
-                        chain = %chain.label(),
+                        chain_id = network.chain_id(),
                         error = %e,
                         "portfolio fetch failed",
                     ),
@@ -1420,8 +1489,8 @@ impl WalletScreen {
                         );
                         if let (Some(plan), Some(quote)) = (plan, quote) {
                             info!(
-                                chain = %plan.chain.label(),
                                 chain_id = plan.chain.chain_id(),
+                                custom = plan.chain.is_custom(),
                                 from = %plan.from,
                                 recipient = %plan.recipient,
                                 amount_units = %plan.amount_units,
@@ -2359,14 +2428,19 @@ impl WalletScreen {
                 let task = task.map(Message::NetworkWizard);
                 match outcome {
                     Some(network_setup::Outcome::Completed)
-                    | Some(network_setup::Outcome::Closed) => {
+                    | Some(network_setup::Outcome::Closed)
+                    | Some(network_setup::Outcome::Back) => {
                         self.settings_pane = SettingsPane::Root;
-                        return (task, None);
-                    }
-                    Some(network_setup::Outcome::Back) => {
-                        // In settings mode, Back returns to root.
-                        self.settings_pane = SettingsPane::Root;
-                        return (task, None);
+                        // The wizard may have changed RPC endpoints and/or
+                        // added, edited, toggled, or removed custom networks.
+                        // The network client rebuilds lazily from settings and
+                        // custom providers are built per-fetch, so a portfolio
+                        // refresh is all that's needed to reflect the new
+                        // config (e.g. a freshly-added custom network appears).
+                        return (
+                            Task::batch([task, Task::done(Message::RefreshPortfolio)]),
+                            None,
+                        );
                     }
                     None => return (task, None),
                 }
@@ -2850,20 +2924,29 @@ fn spawn_decode_task(
     local_names: std::collections::HashMap<Address, String>,
 ) -> Task<Message> {
     let (to, value, calldata) = plan.tx_target();
-    let chain = plan.chain;
+    let network_id = plan.chain;
     let from = plan.from;
     Task::perform(
         async move {
-            let decoded = crate::decode::clear_sign::decode_transaction(
-                network.as_ref(),
-                chain,
-                from,
-                to,
-                calldata,
-                value,
-                local_names,
-            )
-            .await;
+            // Custom networks have no clear-signing (ERC-7730) registry and
+            // only ever carry native, empty-calldata sends — nothing to
+            // decode, so short-circuit to the native-transfer result rather
+            // than routing an unverified chain through the decode pipeline.
+            let decoded = match network_id.builtin() {
+                Some(chain) => {
+                    crate::decode::clear_sign::decode_transaction(
+                        network.as_ref(),
+                        chain,
+                        from,
+                        to,
+                        calldata,
+                        value,
+                        local_names,
+                    )
+                    .await
+                }
+                None => crate::decode::clear_sign::DecodeResult::Empty,
+            };
             (seq, decoded)
         },
         |(seq, decoded)| {
@@ -2875,20 +2958,41 @@ fn spawn_decode_task(
     )
 }
 
-/// Spawn a quote task using the network's shared provider. Returns a
-/// `Task` that resolves to a `Send::QuoteFetched(...)` message. The
-/// provider is selected by `plan.chain` so an L2 send hits the L2 RPC,
-/// not mainnet.
+/// Resolve a raw provider for any [`NetworkId`](crate::chain::NetworkId): the
+/// shared verified-path provider for a built-in chain, or a freshly-built raw
+/// provider for a custom network (RPC URL looked up by chain id in settings).
+/// `None` when the network has no usable RPC — a built-in with nothing
+/// configured, or a custom network that was deleted / whose URL won't parse.
+async fn provider_for(
+    network: &Arc<dyn BalanceFetcher>,
+    id: crate::chain::NetworkId,
+) -> Option<alloy::providers::RootProvider<alloy::network::Ethereum>> {
+    use crate::chain::NetworkId;
+    match id {
+        NetworkId::Builtin(chain) => network.provider(chain).await,
+        NetworkId::Custom(chain_id) => {
+            let cfg = settings::custom_network(chain_id)?;
+            network.custom_provider(chain_id, &cfg.rpc_url).await
+        }
+    }
+}
+
+/// Spawn a quote task using a provider resolved from `plan.chain` — the L2 RPC
+/// for an L2 send, the user's raw RPC for a custom network. The same provider
+/// later serves the broadcast.
 fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, plan: SendPlan) -> Task<Message> {
     let chain = plan.chain;
     Task::perform(
         async move {
-            match network.provider(chain).await {
+            match provider_for(&network, chain).await {
                 Some(provider) => {
                     crate::wallet::tx::build_quote(&provider, network.clone(), &plan).await
                 }
                 None => {
-                    warn!(chain = %chain.label(), "quote: no execution RPC configured");
+                    warn!(
+                        chain_id = chain.chain_id(),
+                        "quote: no execution RPC configured"
+                    );
                     Err("no execution RPCs configured".into())
                 }
             }
@@ -3454,10 +3558,13 @@ fn spawn_broadcast_task(
     let chain = plan.chain;
     Task::perform(
         async move {
-            let provider = match network.provider(chain).await {
+            let provider = match provider_for(&network, chain).await {
                 Some(p) => p,
                 None => {
-                    warn!(chain = %chain.label(), "broadcast: no execution RPC configured");
+                    warn!(
+                        chain_id = chain.chain_id(),
+                        "broadcast: no execution RPC configured"
+                    );
                     return Err::<TxHash, String>("no execution RPCs configured".into());
                 }
             };
@@ -3534,7 +3641,7 @@ mod tests {
             contract: None,
             usd_price: 1.0,
             usd_value: 1.0,
-            chain,
+            chain: chain.into(),
         }
     }
 
@@ -3547,7 +3654,7 @@ mod tests {
         assert!(s.portfolio.is_empty());
         s.update(Message::PortfolioFetched {
             address: other,
-            chain: Chain::Mainnet,
+            network: Chain::Mainnet.into(),
             result: Ok(vec![token("USDC", Chain::Mainnet)]),
         });
         // Active account's live portfolio must stay empty — the
@@ -3563,7 +3670,7 @@ mod tests {
         let mut s = screen_for(active, cache.clone());
         s.update(Message::PortfolioFetched {
             address: other,
-            chain: Chain::Mainnet,
+            network: Chain::Mainnet.into(),
             result: Ok(vec![token("USDC", Chain::Mainnet)]),
         });
         // The data is correct for `other`'s slot — we only suppressed
@@ -3571,12 +3678,12 @@ mod tests {
         // slot must remain untouched.
         let g = cache.lock().expect("cache");
         assert_eq!(
-            g.get(&(other, Chain::Mainnet)).map(|v| v.len()),
+            g.get(&(other, Chain::Mainnet.into())).map(|v| v.len()),
             Some(1),
             "other's cache slot should be populated",
         );
         assert!(
-            g.get(&(active, Chain::Mainnet)).is_none(),
+            g.get(&(active, Chain::Mainnet.into())).is_none(),
             "active's cache slot must not be touched by another address's fetch",
         );
     }
@@ -3588,14 +3695,17 @@ mod tests {
         let mut s = screen_for(active, cache.clone());
         s.update(Message::PortfolioFetched {
             address: active,
-            chain: Chain::Mainnet,
+            network: Chain::Mainnet.into(),
             result: Ok(vec![token("USDC", Chain::Mainnet)]),
         });
         assert_eq!(s.portfolio.len(), 1);
         assert_eq!(s.portfolio[0].symbol, "USDC");
         assert!(!s.portfolio_loading);
         let g = cache.lock().expect("cache");
-        assert_eq!(g.get(&(active, Chain::Mainnet)).map(|v| v.len()), Some(1));
+        assert_eq!(
+            g.get(&(active, Chain::Mainnet.into())).map(|v| v.len()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -3789,7 +3899,7 @@ mod tests {
         let safe_addr = Address::from([0x55u8; 20]);
         // Stray Base fetch addressed to the Safe address.
         let stray = vec![LiveToken {
-            chain: Chain::Base,
+            chain: Chain::Base.into(),
             contract: None,
             name: "Ether".into(),
             symbol: "ETH".into(),
@@ -3802,7 +3912,7 @@ mod tests {
         }];
         let _ = screen.update(Message::PortfolioFetched {
             address: safe_addr,
-            chain: Chain::Base,
+            network: Chain::Base.into(),
             result: Ok(stray),
         });
         assert!(

@@ -130,6 +130,74 @@ impl std::fmt::Display for Chain {
     }
 }
 
+/// Identity of any network the wallet can show a balance for: one of the
+/// three Helios-verified built-ins, or a user-defined custom network keyed by
+/// its EIP-155 chain id.
+///
+/// This is an *additive* layer over [`Chain`] — `Chain` stays the closed,
+/// Helios/Safe/indexer-coupled set, and only the "horizontal" surfaces that
+/// must span both worlds (the portfolio rows, the send plan, balance/provider
+/// routing) speak `NetworkId`. A `Custom` is always unverified and only ever
+/// carries the native coin; the verified plumbing never receives one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NetworkId {
+    /// A Helios-verified built-in chain (Mainnet / Base / Optimism).
+    Builtin(Chain),
+    /// A user-defined custom network, identified by its EIP-155 chain id.
+    /// Metadata (name, RPC, symbol) lives in `settings::custom_network`.
+    Custom(u64),
+}
+
+impl NetworkId {
+    /// EIP-155 chain id. For a custom network this is the id itself; for a
+    /// built-in it delegates to [`Chain::chain_id`]. Baked into the signing
+    /// hash on the send path, so it must be exact.
+    pub fn chain_id(self) -> u64 {
+        match self {
+            NetworkId::Builtin(c) => c.chain_id(),
+            NetworkId::Custom(id) => id,
+        }
+    }
+
+    /// The built-in [`Chain`] this id refers to, or `None` for a custom
+    /// network. Used to route to the verified provider/indexer path only when
+    /// the network is one Helios actually supports.
+    pub fn builtin(self) -> Option<Chain> {
+        match self {
+            NetworkId::Builtin(c) => Some(c),
+            NetworkId::Custom(_) => None,
+        }
+    }
+
+    /// Whether this is a user-defined custom (unverified) network.
+    pub fn is_custom(self) -> bool {
+        matches!(self, NetworkId::Custom(_))
+    }
+
+    /// Whether the send flow runs local revm preflight on this network.
+    /// Custom networks skip it — preflight reads verified state through the
+    /// Helios-aware path, which a custom RPC can't provide, and sim is only
+    /// ever advisory.
+    pub fn supports_simulation(self) -> bool {
+        match self {
+            NetworkId::Builtin(c) => c.supports_simulation(),
+            NetworkId::Custom(_) => false,
+        }
+    }
+}
+
+impl From<Chain> for NetworkId {
+    fn from(c: Chain) -> Self {
+        NetworkId::Builtin(c)
+    }
+}
+
+impl Default for NetworkId {
+    fn default() -> Self {
+        NetworkId::Builtin(Chain::Mainnet)
+    }
+}
+
 /// Tiny owned per-chain map so screens can hold one value of `T` per chain
 /// without dragging in a hashmap dependency. Order matches `Chain::ALL`.
 #[derive(Debug, Default, Clone)]
@@ -277,5 +345,41 @@ mod tests {
         for (i, c) in Chain::ALL.iter().enumerate() {
             assert_eq!(*p.get(*c), i as u32);
         }
+    }
+
+    #[test]
+    fn network_id_chain_id_matches_source() {
+        for c in Chain::ALL {
+            assert_eq!(NetworkId::Builtin(c).chain_id(), c.chain_id());
+        }
+        assert_eq!(NetworkId::Custom(11155111).chain_id(), 11155111);
+    }
+
+    #[test]
+    fn network_id_builtin_and_is_custom() {
+        let b: NetworkId = Chain::Base.into();
+        assert_eq!(b.builtin(), Some(Chain::Base));
+        assert!(!b.is_custom());
+
+        let c = NetworkId::Custom(31337);
+        assert_eq!(c.builtin(), None);
+        assert!(c.is_custom());
+    }
+
+    #[test]
+    fn network_id_custom_never_simulates() {
+        // Built-ins follow their own rule; custom networks always skip sim.
+        assert!(!NetworkId::Custom(11155111).supports_simulation());
+        for c in Chain::ALL {
+            assert_eq!(
+                NetworkId::Builtin(c).supports_simulation(),
+                c.supports_simulation()
+            );
+        }
+    }
+
+    #[test]
+    fn network_id_default_is_mainnet() {
+        assert_eq!(NetworkId::default(), NetworkId::Builtin(Chain::Mainnet));
     }
 }

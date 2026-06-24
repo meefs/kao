@@ -397,7 +397,7 @@ pub fn into_live_tokens(chain: Chain, tokens: Vec<IndexedToken>) -> Vec<LiveToke
             contract: t.contract,
             usd_price: t.usd_price.unwrap_or(0.0),
             usd_value: t.usd_value.unwrap_or(0.0),
-            chain,
+            chain: chain.into(),
         })
         .collect()
 }
@@ -573,7 +573,7 @@ mod tests {
         );
         assert_eq!(live[1].usd_value, 0.0);
         for tk in &live {
-            assert_eq!(tk.chain, Chain::Mainnet);
+            assert_eq!(tk.chain, Chain::Mainnet.into());
         }
     }
 

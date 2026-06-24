@@ -330,9 +330,19 @@ pub async fn simulate_tx(
     plan: &SendPlan,
     nonce: u64,
 ) -> Result<SimulationResult, SimError> {
+    // Local preflight needs a Helios-verified state source, which only the
+    // built-in chains have. Custom (unverified) networks return an error the
+    // caller degrades to `SimulationResult::unavailable()`. In practice the
+    // send path gates this on `NetworkId::supports_simulation()` first, so a
+    // custom plan never reaches here — this is the type-level backstop.
+    let Some(chain) = plan.chain.builtin() else {
+        return Err(SimError::State(
+            "simulation unsupported on custom network".into(),
+        ));
+    };
     let (to, value, input) = plan.tx_target();
     let spec = CallSpec {
-        chain: plan.chain,
+        chain,
         from: plan.from,
         to,
         value,
@@ -856,7 +866,7 @@ mod tests {
             recipient: address!("000000000000000000000000000000000000dEaD"),
             token: SendToken::Native,
             amount_units: U256::ZERO,
-            chain,
+            chain: chain.into(),
         };
         let result = simulate_tx(network, &plan, /* nonce */ 0)
             .await
@@ -1181,7 +1191,7 @@ mod tests {
             recipient: address!("000000000000000000000000000000000000dEaD"),
             token: SendToken::Erc20 { contract: usdc },
             amount_units: U256::from(1_000_000u64),
-            chain: Chain::Mainnet,
+            chain: Chain::Mainnet.into(),
         };
         let result = simulate_tx(network, &plan, /* nonce */ 0)
             .await
