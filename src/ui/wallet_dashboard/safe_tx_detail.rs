@@ -525,7 +525,12 @@ impl SafeTxDetailPane {
                     );
                 }
                 Some(sim) => {
-                    col = col.push(sim_view::simulation_block(t, sim, self.chain, portfolio));
+                    col = col.push(sim_view::simulation_block(
+                        t,
+                        sim,
+                        self.chain.into(),
+                        portfolio,
+                    ));
                     if sim.gas_used > 0 {
                         // Denominate in ETH at the sim's pinned base fee
                         // when one is known; the raw count alone isn't a
@@ -562,7 +567,12 @@ impl SafeTxDetailPane {
                     );
                 }
                 Some(sim) => {
-                    col = col.push(sim_view::simulation_block(t, sim, self.chain, portfolio));
+                    col = col.push(sim_view::simulation_block(
+                        t,
+                        sim,
+                        self.chain.into(),
+                        portfolio,
+                    ));
                 }
             }
         }

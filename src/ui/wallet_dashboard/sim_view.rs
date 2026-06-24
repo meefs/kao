@@ -22,7 +22,7 @@ use crate::wallet::sim::{SimOutcome, SimulationResult, TokenTransfer};
 pub fn simulation_block<'a, M: 'a>(
     t: KaoTheme,
     sim: &'a SimulationResult,
-    chain: crate::chain::Chain,
+    chain: crate::chain::NetworkId,
     portfolio: &'a [LiveToken],
 ) -> Element<'a, M> {
     match &sim.outcome {
@@ -108,7 +108,7 @@ pub fn simulation_block<'a, M: 'a>(
 fn transfer_row<'a, M: 'a>(
     t: KaoTheme,
     transfer: &'a TokenTransfer,
-    chain: crate::chain::Chain,
+    chain: crate::chain::NetworkId,
     portfolio: &'a [LiveToken],
 ) -> Element<'a, M> {
     // Match by (chain, contract). The portfolio is multi-chain, so we

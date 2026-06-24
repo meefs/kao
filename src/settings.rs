@@ -215,6 +215,52 @@ impl ProxyType {
     }
 }
 
+/// A user-defined custom network (e.g. Sepolia, a local Anvil node).
+///
+/// Custom networks are NOT verified by Helios — Helios's light-client only
+/// ships configs for a fixed set of chains, so balances and broadcasts on a
+/// custom network trust the configured RPC directly. The wallet surfaces this
+/// with an "Unverified" treatment everywhere a custom network is shown.
+///
+/// Identity is the EIP-155 `chain_id`: it's baked into the signing hash, used
+/// as the map key for the portfolio/provider routing, and must be unique
+/// across both custom networks and the three built-in chains.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomNetwork {
+    /// EIP-155 chain id. Unique; never collides with a built-in (1/10/8453).
+    pub chain_id: u64,
+    /// Human label shown in the portfolio and send screens (e.g. "Sepolia").
+    pub name: String,
+    /// Execution JSON-RPC endpoint. `http://` is allowed (local Anvil nodes
+    /// live on `http://127.0.0.1:8545`); built-in chains require HTTPS, but a
+    /// custom network the user typed themselves is their own trust decision.
+    pub rpc_url: String,
+    /// Native-coin ticker shown next to balances (e.g. "ETH"). Defaults to
+    /// "ETH" when the user leaves it blank.
+    pub currency_symbol: String,
+    /// Whether the network is active. Disabled networks are remembered but
+    /// skipped by the portfolio fan-out and hidden from the send token list.
+    pub enabled: bool,
+}
+
+/// Default native-coin ticker for a custom network when the user leaves the
+/// symbol field blank.
+pub const DEFAULT_CUSTOM_SYMBOL: &str = "ETH";
+
+/// EIP-155 chain ids of the three Helios-verified built-in chains. A custom
+/// network may not reuse one of these — that id already routes to the
+/// verified path, and a "custom mainnet" would be a confusing footgun.
+pub const BUILTIN_CHAIN_IDS: [u64; 3] = [1, 10, 8453];
+
+/// True iff `s` parses as an `http`/`https` URL. Looser than [`is_https_url`]
+/// because custom networks legitimately point at plain-HTTP local nodes
+/// (Anvil, Hardhat). Used to filter custom-network RPCs on load.
+pub fn is_http_or_https_url(s: &str) -> bool {
+    url::Url::parse(s)
+        .map(|u| matches!(u.scheme(), "http" | "https"))
+        .unwrap_or(false)
+}
+
 #[derive(Clone)]
 struct State {
     theme: ThemeKind,
@@ -255,6 +301,9 @@ struct State {
     proxy_enabled: bool,
     proxy_type: ProxyType,
     proxy_address: String,
+    /// User-defined custom networks (Sepolia, Anvil, …). Empty by default.
+    /// Persisted as a TOML array of tables; remembered across restarts.
+    custom_networks: Vec<CustomNetwork>,
 }
 
 impl std::fmt::Debug for State {
@@ -287,6 +336,7 @@ impl std::fmt::Debug for State {
             .field("proxy_enabled", &self.proxy_enabled)
             .field("proxy_type", &self.proxy_type)
             .field("proxy_address", &self.proxy_address)
+            .field("custom_networks", &self.custom_networks)
             .finish()
     }
 }
@@ -335,6 +385,7 @@ fn default_state() -> State {
         proxy_enabled: false,
         proxy_type: ProxyType::default(),
         proxy_address: "127.0.0.1:9050".to_string(),
+        custom_networks: Vec::new(),
     }
 }
 
@@ -418,6 +469,31 @@ struct OnDisk {
     proxy_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proxy_address: Option<String>,
+    /// User-defined custom networks. Serialized as `[[custom_networks]]`
+    /// tables; absent in pre-custom-network configs so the load defaults to
+    /// an empty list (backward compatible).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    custom_networks: Option<Vec<CustomNetworkOnDisk>>,
+}
+
+/// On-disk form of a [`CustomNetwork`]. Separate from the runtime type so the
+/// loader can validate/normalize (drop bad URLs, default the symbol) before a
+/// row reaches `State`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CustomNetworkOnDisk {
+    chain_id: u64,
+    name: String,
+    rpc_url: String,
+    #[serde(default)]
+    currency_symbol: Option<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+/// serde default for `CustomNetworkOnDisk::enabled` — a row written without an
+/// explicit `enabled` is treated as on.
+fn default_true() -> bool {
+    true
 }
 
 /// True iff `s` parses as an HTTPS URL. Non-HTTPS endpoints are dropped on
@@ -566,7 +642,48 @@ fn parse(text: &str) -> State {
         state.proxy_address = addr.to_string();
     }
 
+    if let Some(rows) = on_disk.custom_networks {
+        let parsed = rows.into_iter().map(|r| CustomNetwork {
+            chain_id: r.chain_id,
+            name: r.name,
+            rpc_url: r.rpc_url,
+            currency_symbol: r
+                .currency_symbol
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_CUSTOM_SYMBOL.to_string()),
+            enabled: r.enabled,
+        });
+        state.custom_networks = normalize_custom_networks(parsed);
+    }
+
     state
+}
+
+/// Drop invalid/duplicate custom-network rows and trim fields. A row is kept
+/// only when it has a non-empty name, an `http(s)` RPC URL, a chain id that
+/// doesn't collide with a built-in chain, and a chain id not already seen
+/// (first occurrence wins). Centralizes the rules so both the loader and the
+/// setter enforce the same invariants.
+fn normalize_custom_networks(rows: impl IntoIterator<Item = CustomNetwork>) -> Vec<CustomNetwork> {
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for mut n in rows {
+        n.name = n.name.trim().to_string();
+        n.rpc_url = n.rpc_url.trim().to_string();
+        n.currency_symbol = n.currency_symbol.trim().to_string();
+        if n.currency_symbol.is_empty() {
+            n.currency_symbol = DEFAULT_CUSTOM_SYMBOL.to_string();
+        }
+        if n.name.is_empty()
+            || !is_http_or_https_url(&n.rpc_url)
+            || BUILTIN_CHAIN_IDS.contains(&n.chain_id)
+            || !seen.insert(n.chain_id)
+        {
+            continue;
+        }
+        out.push(n);
+    }
+    out
 }
 
 /// L2 lists go through `Some(...)` only when non-empty so a stock config
@@ -623,6 +740,23 @@ fn serialize(state: &State) -> String {
             Some(state.proxy_address.clone())
         } else {
             None
+        },
+        custom_networks: if state.custom_networks.is_empty() {
+            None
+        } else {
+            Some(
+                state
+                    .custom_networks
+                    .iter()
+                    .map(|n| CustomNetworkOnDisk {
+                        chain_id: n.chain_id,
+                        name: n.name.clone(),
+                        rpc_url: n.rpc_url.clone(),
+                        currency_symbol: Some(n.currency_symbol.clone()),
+                        enabled: n.enabled,
+                    })
+                    .collect(),
+            )
         },
     };
     toml::to_string(&on_disk).expect("serializing settings cannot fail")
@@ -732,6 +866,54 @@ pub fn set_consensus_rpcs(chain: Chain, list: Vec<String>) {
         .expect("settings mutex poisoned")
         .consensus_rpcs
         .set(chain, list);
+    write_all();
+}
+
+/// All remembered custom networks, enabled or not. Order is the order the
+/// user added them (preserved by the setter).
+pub fn custom_networks() -> Vec<CustomNetwork> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .custom_networks
+        .clone()
+}
+
+/// Custom networks the user has switched on — the set the portfolio fan-out
+/// and send token list consider.
+pub fn enabled_custom_networks() -> Vec<CustomNetwork> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .custom_networks
+        .iter()
+        .filter(|n| n.enabled)
+        .cloned()
+        .collect()
+}
+
+/// Look up a single custom network by chain id. `None` if no custom network
+/// with that id is configured (including when it's a built-in id).
+pub fn custom_network(chain_id: u64) -> Option<CustomNetwork> {
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .custom_networks
+        .iter()
+        .find(|n| n.chain_id == chain_id)
+        .cloned()
+}
+
+/// Replace the whole custom-network list (the wizard edits all rows together
+/// and commits once). Rows are normalized — invalid/duplicate/built-in-id
+/// entries are dropped — before persisting, so callers can pass partially-
+/// validated UI state without corrupting the file.
+pub fn set_custom_networks(networks: Vec<CustomNetwork>) {
+    let normalized = normalize_custom_networks(networks);
+    ensure()
+        .lock()
+        .expect("settings mutex poisoned")
+        .custom_networks = normalized;
     write_all();
 }
 
@@ -1565,6 +1747,95 @@ mod tests {
             s.consensus_rpcs.get(Chain::Mainnet),
             default_state().consensus_rpcs.get(Chain::Mainnet)
         );
+    }
+
+    #[test]
+    fn parse_custom_networks_round_trips_via_serialize() {
+        let toml = "\
+[[custom_networks]]
+chain_id = 11155111
+name = \"Sepolia\"
+rpc_url = \"https://sepolia.example\"
+currency_symbol = \"ETH\"
+enabled = true
+
+[[custom_networks]]
+chain_id = 31337
+name = \"Anvil\"
+rpc_url = \"http://127.0.0.1:8545\"
+enabled = false
+";
+        let s = parse(toml);
+        assert_eq!(s.custom_networks.len(), 2);
+        assert_eq!(s.custom_networks[0].chain_id, 11155111);
+        assert_eq!(s.custom_networks[0].name, "Sepolia");
+        assert!(s.custom_networks[0].enabled);
+        // `enabled` omitted on the second row defaults to true via serde, but
+        // here it's explicitly false.
+        assert_eq!(s.custom_networks[1].chain_id, 31337);
+        assert!(!s.custom_networks[1].enabled);
+        // http:// is allowed for custom networks (local Anvil).
+        assert_eq!(s.custom_networks[1].rpc_url, "http://127.0.0.1:8545");
+
+        // Serialize → parse must preserve the list.
+        let reparsed = parse(&serialize(&s));
+        assert_eq!(reparsed.custom_networks, s.custom_networks);
+    }
+
+    #[test]
+    fn parse_custom_networks_drops_invalid_and_collisions() {
+        let toml = "\
+[[custom_networks]]
+chain_id = 1
+name = \"Fake Mainnet\"
+rpc_url = \"https://evil.example\"
+
+[[custom_networks]]
+chain_id = 5
+name = \"\"
+rpc_url = \"https://no-name.example\"
+
+[[custom_networks]]
+chain_id = 6
+name = \"Bad URL\"
+rpc_url = \"not a url\"
+
+[[custom_networks]]
+chain_id = 11155111
+name = \"Sepolia\"
+rpc_url = \"https://sepolia.example\"
+
+[[custom_networks]]
+chain_id = 11155111
+name = \"Sepolia Dup\"
+rpc_url = \"https://dup.example\"
+";
+        let s = parse(toml);
+        // Built-in id (1), blank name (5), bad URL (6), and the duplicate
+        // 11155111 are all dropped — only the first valid Sepolia survives.
+        assert_eq!(s.custom_networks.len(), 1);
+        assert_eq!(s.custom_networks[0].chain_id, 11155111);
+        assert_eq!(s.custom_networks[0].name, "Sepolia");
+    }
+
+    #[test]
+    fn custom_networks_default_symbol_when_blank() {
+        let toml = "\
+[[custom_networks]]
+chain_id = 31337
+name = \"Anvil\"
+rpc_url = \"http://127.0.0.1:8545\"
+";
+        let s = parse(toml);
+        assert_eq!(s.custom_networks.len(), 1);
+        assert_eq!(s.custom_networks[0].currency_symbol, DEFAULT_CUSTOM_SYMBOL);
+    }
+
+    #[test]
+    fn no_custom_networks_omits_section_from_output() {
+        // A stock config must not litter the file with an empty section.
+        let out = serialize(&default_state());
+        assert!(!out.contains("custom_networks"));
     }
 
     #[test]

@@ -49,16 +49,18 @@ pub enum WizardStep {
     SafeTx,
     Proxy,
     Consensus,
+    CustomNetworks,
     Review,
 }
 
 impl WizardStep {
-    const ALL: [WizardStep; 5] = [
+    const ALL: [WizardStep; 6] = [
         WizardStep::Rpc,
         WizardStep::Api,
         WizardStep::SafeTx,
         WizardStep::Proxy,
         WizardStep::Consensus,
+        WizardStep::CustomNetworks,
     ];
 
     fn index(self) -> usize {
@@ -68,7 +70,8 @@ impl WizardStep {
             Self::SafeTx => 2,
             Self::Proxy => 3,
             Self::Consensus => 4,
-            Self::Review => 5,
+            Self::CustomNetworks => 5,
+            Self::Review => 6,
         }
     }
 
@@ -79,6 +82,7 @@ impl WizardStep {
             Self::SafeTx => "Safe TX Service",
             Self::Proxy => "Proxy",
             Self::Consensus => "Consensus",
+            Self::CustomNetworks => "Custom Networks",
             Self::Review => "Review",
         }
     }
@@ -100,6 +104,9 @@ impl WizardStep {
             Self::Consensus => {
                 "Helios verifies every RPC response against the beacon chain consensus layer. Override the endpoints per chain or paste a checkpoint hash."
             }
+            Self::CustomNetworks => {
+                "Add your own EVM networks (Sepolia, a local Anvil node, …). These are optional and can be added or changed later from Settings."
+            }
             Self::Review => "Review your network configuration before connecting.",
         }
     }
@@ -111,6 +118,7 @@ impl WizardStep {
             Self::SafeTx => "(ᵔᴥᵔ)",
             Self::Proxy => "(⌐■_■)",
             Self::Consensus => "( ˘▽˘)っ",
+            Self::CustomNetworks => "ﾍ(⌐■_■)ﾉ♪",
             Self::Review => "ヽ(・∀・)ﾉ",
         }
     }
@@ -121,7 +129,8 @@ impl WizardStep {
             Self::Api => Self::SafeTx,
             Self::SafeTx => Self::Proxy,
             Self::Proxy => Self::Consensus,
-            Self::Consensus => Self::Review,
+            Self::Consensus => Self::CustomNetworks,
+            Self::CustomNetworks => Self::Review,
             Self::Review => Self::Review,
         }
     }
@@ -133,7 +142,8 @@ impl WizardStep {
             Self::SafeTx => Some(Self::Api),
             Self::Proxy => Some(Self::SafeTx),
             Self::Consensus => Some(Self::Proxy),
-            Self::Review => Some(Self::Consensus),
+            Self::CustomNetworks => Some(Self::Consensus),
+            Self::Review => Some(Self::CustomNetworks),
         }
     }
 }
@@ -176,6 +186,40 @@ impl From<String> for SecretInput {
     }
 }
 
+/// One editable custom-network row in the wizard. All fields are strings so
+/// the form can hold partially-typed input (e.g. a chain id mid-edit); they're
+/// parsed/validated on `Continue` and converted to [`settings::CustomNetwork`]
+/// on Finish.
+#[derive(Debug, Clone, Default)]
+struct CustomNetworkDraft {
+    name: String,
+    chain_id: String,
+    rpc_url: String,
+    symbol: String,
+    enabled: bool,
+}
+
+impl CustomNetworkDraft {
+    /// A row the user hasn't started filling in — ignored on validate/commit
+    /// so a stray empty card never blocks the wizard or persists junk.
+    fn is_blank(&self) -> bool {
+        self.name.trim().is_empty()
+            && self.chain_id.trim().is_empty()
+            && self.rpc_url.trim().is_empty()
+            && self.symbol.trim().is_empty()
+    }
+
+    /// Parse the chain id field as a positive EIP-155 id that isn't one of the
+    /// built-in chains (those already route to the verified path).
+    fn parsed_chain_id(&self) -> Option<u64> {
+        let id = self.chain_id.trim().parse::<u64>().ok()?;
+        if id == 0 || settings::BUILTIN_CHAIN_IDS.contains(&id) {
+            return None;
+        }
+        Some(id)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WizardDraft {
     rpc_provider: RpcProvider,
@@ -193,6 +237,7 @@ struct WizardDraft {
     proxy_address: String,
     consensus_rpcs: PerChain<String>,
     checkpoint_override: String,
+    custom_networks: Vec<CustomNetworkDraft>,
 }
 
 impl Default for WizardDraft {
@@ -219,8 +264,22 @@ impl Default for WizardDraft {
             proxy_address: "127.0.0.1:9050".to_string(),
             consensus_rpcs,
             checkpoint_override: String::new(),
+            custom_networks: Vec::new(),
         }
     }
+}
+
+/// Map persisted custom networks into editable wizard rows.
+fn custom_networks_to_drafts(nets: Vec<settings::CustomNetwork>) -> Vec<CustomNetworkDraft> {
+    nets.into_iter()
+        .map(|n| CustomNetworkDraft {
+            name: n.name,
+            chain_id: n.chain_id.to_string(),
+            rpc_url: n.rpc_url,
+            symbol: n.currency_symbol,
+            enabled: n.enabled,
+        })
+        .collect()
 }
 
 // ── Message / Outcome ───────────────────────────────────────────────────────
@@ -243,6 +302,17 @@ pub enum Message {
     ProxyAddressInput(String),
     ConsensusRpcInput(Chain, String),
     CheckpointInput(String),
+    // ── Custom networks (step 6) ─────────────────────────────────────────
+    /// Append a fresh blank custom-network row.
+    CustomNetAdd,
+    /// Remove the row at the given index.
+    CustomNetRemove(usize),
+    CustomNetNameInput(usize, String),
+    CustomNetChainIdInput(usize, String),
+    CustomNetRpcInput(usize, String),
+    CustomNetSymbolInput(usize, String),
+    /// Toggle the enabled flag on the row at the given index.
+    CustomNetToggle(usize),
     /// Fetch a fresh mainnet checkpoint through the draft's proxy.
     RefreshCheckpoint,
     /// Result of an in-flight checkpoint refresh.
@@ -306,6 +376,7 @@ impl NetworkSetupScreen {
                     checkpoint_override: settings::checkpoint_override()
                         .map(|b| format!("0x{}", alloy::hex::encode(b.as_slice())))
                         .unwrap_or_default(),
+                    custom_networks: custom_networks_to_drafts(settings::custom_networks()),
                 }
             }
         };
@@ -392,6 +463,54 @@ impl NetworkSetupScreen {
             }
             Message::CheckpointInput(s) => {
                 self.draft.checkpoint_override = s;
+                (Task::none(), None)
+            }
+            Message::CustomNetAdd => {
+                self.draft.custom_networks.push(CustomNetworkDraft {
+                    enabled: true,
+                    symbol: settings::DEFAULT_CUSTOM_SYMBOL.to_string(),
+                    ..CustomNetworkDraft::default()
+                });
+                self.error = None;
+                (Task::none(), None)
+            }
+            Message::CustomNetRemove(i) => {
+                if i < self.draft.custom_networks.len() {
+                    self.draft.custom_networks.remove(i);
+                }
+                self.error = None;
+                (Task::none(), None)
+            }
+            Message::CustomNetNameInput(i, s) => {
+                if let Some(n) = self.draft.custom_networks.get_mut(i) {
+                    n.name = s;
+                }
+                (Task::none(), None)
+            }
+            Message::CustomNetChainIdInput(i, s) => {
+                // Digits only — chain ids are decimal u64. Silently drop other
+                // characters so the field can't hold an unparseable value.
+                if let Some(n) = self.draft.custom_networks.get_mut(i) {
+                    n.chain_id = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                }
+                (Task::none(), None)
+            }
+            Message::CustomNetRpcInput(i, s) => {
+                if let Some(n) = self.draft.custom_networks.get_mut(i) {
+                    n.rpc_url = s;
+                }
+                (Task::none(), None)
+            }
+            Message::CustomNetSymbolInput(i, s) => {
+                if let Some(n) = self.draft.custom_networks.get_mut(i) {
+                    n.symbol = s;
+                }
+                (Task::none(), None)
+            }
+            Message::CustomNetToggle(i) => {
+                if let Some(n) = self.draft.custom_networks.get_mut(i) {
+                    n.enabled = !n.enabled;
+                }
                 (Task::none(), None)
             }
             Message::RefreshCheckpoint => {
@@ -568,6 +687,27 @@ impl NetworkSetupScreen {
                 let cp = self.draft.checkpoint_override.trim();
                 cp.is_empty() || B256::from_str(cp).is_ok()
             }
+            WizardStep::CustomNetworks => {
+                // Blank rows are ignored. Every filled row must have a name, a
+                // valid non-built-in chain id, and an http(s) RPC URL, and the
+                // chain ids across rows must be unique.
+                let mut seen = std::collections::HashSet::new();
+                for n in &self.draft.custom_networks {
+                    if n.is_blank() {
+                        continue;
+                    }
+                    let Some(id) = n.parsed_chain_id() else {
+                        return false;
+                    };
+                    if n.name.trim().is_empty()
+                        || !settings::is_http_or_https_url(n.rpc_url.trim())
+                        || !seen.insert(id)
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
             WizardStep::Review => WizardStep::ALL.iter().all(|s| self.step_valid(*s)),
         }
     }
@@ -674,6 +814,36 @@ impl NetworkSetupScreen {
         } else {
             B256::from_str(cp).ok()
         });
+
+        // Custom networks: convert the filled rows into persisted networks.
+        // `set_custom_networks` re-normalizes (drops blanks/invalid/duplicate
+        // /built-in ids), so passing parsed rows is safe even if a row slipped
+        // past the step's validity gate.
+        let custom: Vec<settings::CustomNetwork> = self
+            .draft
+            .custom_networks
+            .iter()
+            .filter(|n| !n.is_blank())
+            .filter_map(|n| {
+                let chain_id = n.parsed_chain_id()?;
+                let symbol = {
+                    let s = n.symbol.trim();
+                    if s.is_empty() {
+                        settings::DEFAULT_CUSTOM_SYMBOL.to_string()
+                    } else {
+                        s.to_string()
+                    }
+                };
+                Some(settings::CustomNetwork {
+                    chain_id,
+                    name: n.name.trim().to_string(),
+                    rpc_url: n.rpc_url.trim().to_string(),
+                    currency_symbol: symbol,
+                    enabled: n.enabled,
+                })
+            })
+            .collect();
+        settings::set_custom_networks(custom);
     }
 
     // ── View ────────────────────────────────────────────────────────────
@@ -752,7 +922,7 @@ impl NetworkSetupScreen {
 
         let mut steps_col: Column<'_, Message> = column![].spacing(4);
         for (i, step) in WizardStep::ALL.iter().enumerate() {
-            let is_active = self.step == *step || self.step == WizardStep::Review && i < 4;
+            let is_active = self.step == *step || self.step == WizardStep::Review;
             let is_current = self.step == *step;
             let num = format!("{:02}", i + 1);
             let summary = self.step_summary(*step);
@@ -981,6 +1151,19 @@ impl NetworkSetupScreen {
                     "Custom checkpoint".to_string()
                 }
             }
+            WizardStep::CustomNetworks => {
+                let n = self
+                    .draft
+                    .custom_networks
+                    .iter()
+                    .filter(|c| !c.is_blank())
+                    .count();
+                match n {
+                    0 => "None".to_string(),
+                    1 => "1 network".to_string(),
+                    n => format!("{n} networks"),
+                }
+            }
             WizardStep::Review => String::new(),
         }
     }
@@ -990,9 +1173,9 @@ impl NetworkSetupScreen {
     fn view_main(&self, t: KaoTheme) -> Element<'_, Message> {
         let step_num = self.step.index() + 1;
         let total = if self.step == WizardStep::Review {
-            6
+            7
         } else {
-            5
+            6
         };
         let step_counter = text(format!("Step {step_num} of {total}"))
             .size(11)
@@ -1024,6 +1207,7 @@ impl NetworkSetupScreen {
             WizardStep::SafeTx => self.view_safe_tx(t),
             WizardStep::Proxy => self.view_proxy(t),
             WizardStep::Consensus => self.view_consensus(t),
+            WizardStep::CustomNetworks => self.view_custom_networks(t),
             WizardStep::Review => self.view_review(t),
         };
 
@@ -1679,6 +1863,173 @@ impl NetworkSetupScreen {
             .into()
     }
 
+    // ── Step 6: Custom networks ─────────────────────────────────────────
+
+    fn view_custom_networks(&self, t: KaoTheme) -> Element<'_, Message> {
+        // Unverified-trust warning — restated here (not just in the step
+        // description) because this is the one screen where the user commits
+        // to trusting an RPC directly.
+        let warning = container(
+            column![
+                text("\u{26a0} Not verified by Helios")
+                    .size(13)
+                    .color(t.down)
+                    .font(bold()),
+                vspace(4),
+                text(
+                    "Helios can't verify custom networks. Balances and transactions on them trust the RPC you enter directly — only add networks you trust. http:// is allowed for local nodes (e.g. Anvil)."
+                )
+                .size(12)
+                .color(t.sub),
+            ]
+            .width(Length::Fill),
+        )
+        .padding(Padding::from([12, 14]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(Color { a: 0.10, ..t.down })),
+            border: Border {
+                color: with_alpha(t.down, 0.4),
+                width: 1.0,
+                radius: Radius::from(12),
+            },
+            ..container::Style::default()
+        });
+
+        let mut cards = column![].spacing(12).width(Length::Fill);
+        for (i, n) in self.draft.custom_networks.iter().enumerate() {
+            let name_input = text_input("Sepolia", &n.name)
+                .on_input(move |s| Message::CustomNetNameInput(i, s))
+                .padding(Padding::from([10, 12]))
+                .size(13)
+                .style(move |_theme, status| text_input_style(t, status));
+            let chain_input = text_input("11155111", &n.chain_id)
+                .on_input(move |s| Message::CustomNetChainIdInput(i, s))
+                .padding(Padding::from([10, 12]))
+                .size(13)
+                .font(mono())
+                .style(move |_theme, status| text_input_style(t, status));
+            let symbol_input = text_input("ETH", &n.symbol)
+                .on_input(move |s| Message::CustomNetSymbolInput(i, s))
+                .padding(Padding::from([10, 12]))
+                .size(13)
+                .font(mono())
+                .style(move |_theme, status| text_input_style(t, status));
+            let rpc_input = text_input("https://… or http://127.0.0.1:8545", &n.rpc_url)
+                .on_input(move |s| Message::CustomNetRpcInput(i, s))
+                .padding(Padding::from([10, 12]))
+                .size(13)
+                .font(mono())
+                .style(move |_theme, status| text_input_style(t, status));
+
+            let on_off = if n.enabled { "On" } else { "Off" };
+            let header = row![
+                text(format!("Network {}", i + 1))
+                    .size(12)
+                    .color(t.text)
+                    .font(bold()),
+                Space::new().width(Length::Fill),
+                text(on_off).size(11).color(t.sub).font(mono()),
+                Space::new().width(8),
+                kao_toggle(t, n.enabled, Message::CustomNetToggle(i)),
+                Space::new().width(12),
+                link_button(t, "Delete").on_press(Message::CustomNetRemove(i)),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
+
+            let id_symbol_row = row![
+                column![
+                    text("Chain ID").size(11).color(t.sub).font(mono()),
+                    vspace(4),
+                    chain_input,
+                ]
+                .width(Length::FillPortion(1)),
+                Space::new().width(10),
+                column![
+                    text("Coin symbol").size(11).color(t.sub).font(mono()),
+                    vspace(4),
+                    symbol_input,
+                ]
+                .width(Length::FillPortion(1)),
+            ]
+            .width(Length::Fill);
+
+            // Per-row hint when a started-but-invalid row would block Continue.
+            let invalid = !n.is_blank()
+                && (n.parsed_chain_id().is_none()
+                    || n.name.trim().is_empty()
+                    || !settings::is_http_or_https_url(n.rpc_url.trim()));
+            let hint: Element<'_, Message> = if invalid {
+                column![
+                    vspace(6),
+                    text("Needs a name, a unique chain id (not 1, 10 or 8453), and a valid http(s) RPC URL.")
+                        .size(11)
+                        .color(t.down),
+                ]
+                .into()
+            } else {
+                Space::new().height(0).into()
+            };
+
+            let card = container(
+                column![
+                    header,
+                    vspace(10),
+                    text("Name").size(11).color(t.sub).font(mono()),
+                    vspace(4),
+                    name_input,
+                    vspace(8),
+                    id_symbol_row,
+                    vspace(8),
+                    text("RPC URL").size(11).color(t.sub).font(mono()),
+                    vspace(4),
+                    rpc_input,
+                    hint,
+                ]
+                .width(Length::Fill),
+            )
+            .padding(Padding::from([14, 16]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(Background::Color(t.card_alt)),
+                border: Border {
+                    color: t.border,
+                    width: 1.0,
+                    radius: Radius::from(14),
+                },
+                ..container::Style::default()
+            });
+            cards = cards.push(card);
+        }
+
+        if self.draft.custom_networks.is_empty() {
+            cards = cards.push(
+                container(
+                    text("No custom networks yet. Add one to track its balance in your portfolio.")
+                        .size(12)
+                        .color(t.sub),
+                )
+                .padding(Padding::from([16, 4]))
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            );
+        }
+
+        let add_btn = small_secondary_button(t, "\u{ff0b} Add custom network")
+            .on_press(Message::CustomNetAdd);
+
+        column![
+            warning,
+            vspace(14),
+            cards,
+            vspace(12),
+            row![Space::new().width(Length::Fill), add_btn].width(Length::Fill),
+        ]
+        .width(Length::Fill)
+        .into()
+    }
+
     // ── Review step ─────────────────────────────────────────────────────
 
     fn view_review(&self, t: KaoTheme) -> Element<'_, Message> {
@@ -1765,6 +2116,21 @@ impl NetworkSetupScreen {
             row_style,
         );
 
+        let custom_label = self.step_summary(WizardStep::CustomNetworks);
+        let has_custom = self.draft.custom_networks.iter().any(|c| !c.is_blank());
+        let custom_badges: Vec<(BadgeKind, &str)> = if has_custom {
+            vec![(BadgeKind::Caution, "Unverified")]
+        } else {
+            Vec::new()
+        };
+        let custom_row = self.review_row(
+            t,
+            "Custom Networks",
+            &custom_label,
+            &custom_badges,
+            row_style,
+        );
+
         column![
             rpc_row,
             vspace(6),
@@ -1775,6 +2141,8 @@ impl NetworkSetupScreen {
             proxy_row,
             vspace(6),
             consensus_row,
+            vspace(6),
+            custom_row,
         ]
         .width(Length::Fill)
         .into()

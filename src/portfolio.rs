@@ -21,7 +21,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
-use crate::chain::Chain;
+use crate::chain::{Chain, NetworkId};
 use crate::wallet::short_address;
 
 // ── Retry on RPC rate-limit ─────────────────────────────────────────────────
@@ -518,21 +518,23 @@ pub struct LiveToken {
     pub contract: Option<Address>,
     pub usd_price: f64,
     pub usd_value: f64,
-    /// Which chain this entry was fetched from. The asset-row UI reads
-    /// this to suffix L2 entries with their chain (e.g. "USDC (Base)")
-    /// while leaving Mainnet entries bare ("USDC").
-    pub chain: Chain,
+    /// Which network this entry was fetched from. The asset-row UI reads
+    /// this to suffix L2 / custom entries with their network (e.g.
+    /// "USDC (Base)", "ETH (Sepolia)") while leaving Mainnet entries bare.
+    /// Custom networks carry `NetworkId::Custom(chain_id)`.
+    pub chain: NetworkId,
 }
 
 // ── Cache ────────────────────────────────────────────────────────────────────
 
-/// In-memory portfolio cache keyed by `(owner, chain)`. Shared across
+/// In-memory portfolio cache keyed by `(owner, network)`. Shared across
 /// the `App` and each `WalletScreen` rebuild so account switches can
 /// render the previously-fetched token list immediately while a fresh
-/// fetch refreshes it in the background. Each chain has its own slot so
-/// a Base portfolio refresh doesn't clobber the cached Mainnet rows.
+/// fetch refreshes it in the background. Each network has its own slot so
+/// a Base portfolio refresh doesn't clobber the cached Mainnet rows, and a
+/// custom network gets its own slot keyed by `NetworkId::Custom(chain_id)`.
 /// Process-lifetime only — cleared on app restart.
-pub type PortfolioCache = Arc<Mutex<HashMap<(Address, Chain), Vec<LiveToken>>>>;
+pub type PortfolioCache = Arc<Mutex<HashMap<(Address, NetworkId), Vec<LiveToken>>>>;
 
 pub fn new_cache() -> PortfolioCache {
     Arc::new(Mutex::new(HashMap::new()))
@@ -922,6 +924,52 @@ pub async fn fetch_portfolio_with_discovery(
     fetch_portfolio_for_tokens(owner, chain, provider, &merged).await
 }
 
+/// Native-coin balance for a user-defined custom network.
+///
+/// Custom networks are unverified and carry only their native coin — there is
+/// no curated token list, Uniswap pool, or indexer for an arbitrary chain — so
+/// this issues a single `eth_getBalance` (latest block) against the user's RPC
+/// and returns one `LiveToken`. The row is kept even at a zero balance so the
+/// network stays visible in the portfolio (the user opted into seeing it).
+///
+/// No USD price: there's no trustworthy on-chain oracle for an arbitrary coin,
+/// so `usd_price` / `usd_value` are 0 and the asset row renders a dash. The
+/// network name and symbol are sanitized at this ingestion point — they're
+/// user-typed and flow straight into the Send token row and dashboard list.
+pub async fn fetch_native_balance(
+    owner: Address,
+    network: &crate::settings::CustomNetwork,
+    provider: &RootProvider<Ethereum>,
+) -> Result<Vec<LiveToken>, String> {
+    let raw = provider
+        .get_balance(owner)
+        .await
+        .map_err(|e| format!("eth_getBalance: {e}"))?;
+    let (balance, balance_f64) = format_eth_balance(raw);
+    let symbol = crate::sanitize::sanitize_display(
+        network.currency_symbol.as_str(),
+        crate::sanitize::MAX_TOKEN_SYMBOL_CHARS,
+    )
+    .into_owned();
+    let name = crate::sanitize::sanitize_display(
+        network.name.as_str(),
+        crate::sanitize::MAX_TOKEN_NAME_CHARS,
+    )
+    .into_owned();
+    Ok(vec![LiveToken {
+        symbol,
+        name,
+        balance,
+        balance_f64,
+        balance_raw: raw,
+        decimals: 18,
+        contract: None,
+        usd_price: 0.0,
+        usd_value: 0.0,
+        chain: NetworkId::Custom(network.chain_id),
+    }])
+}
+
 async fn fetch_portfolio_for_tokens(
     owner: Address,
     chain: Chain,
@@ -1072,7 +1120,7 @@ async fn fetch_portfolio_for_tokens(
             contract: None,
             usd_price: eth_usd,
             usd_value: eth_bal_f64 * eth_usd,
-            chain,
+            chain: chain.into(),
         });
     }
 
@@ -1124,7 +1172,7 @@ async fn fetch_portfolio_for_tokens(
             contract: Some(token.address),
             usd_price: price,
             usd_value: bal_f64 * price,
-            chain,
+            chain: chain.into(),
         });
     }
 
@@ -1515,7 +1563,7 @@ mod helper_tests {
         let c1 = new_cache();
         let c2 = c1.clone();
         assert!(c1.lock().unwrap().is_empty());
-        let key = (Address::ZERO, Chain::Mainnet);
+        let key = (Address::ZERO, NetworkId::Builtin(Chain::Mainnet));
         c1.lock().unwrap().insert(key, Vec::new());
         // The clone shares the same lock; the insertion is visible.
         assert!(c2.lock().unwrap().contains_key(&key));

@@ -124,6 +124,24 @@ pub trait BalanceFetcher: Send + Sync + std::fmt::Debug {
     /// dashboard rebuild. `None` only when no RPCs are configured for
     /// the chain or the chosen URL won't parse.
     async fn provider(&self, chain: Chain) -> Option<RootProvider<Ethereum>>;
+    /// Raw `RootProvider` for a user-defined custom network at `rpc_url`.
+    ///
+    /// Custom networks are never Helios-verified, so this is a plain HTTP
+    /// provider built straight from the URL the user typed — the same
+    /// transport `balance`'s raw fallback uses for built-ins. `chain_id` is
+    /// accepted for symmetry/logging and so an impl may key a cache on it;
+    /// the default builds fresh each call, which keeps the provider in lock-
+    /// step with edits to the network's RPC URL. `None` when the URL won't
+    /// parse. Process-wide `ALL_PROXY` still applies, so a configured proxy
+    /// covers custom-network traffic too.
+    async fn custom_provider(
+        &self,
+        chain_id: u64,
+        rpc_url: &str,
+    ) -> Option<RootProvider<Ethereum>> {
+        let _ = chain_id;
+        build_fallback(rpc_url)
+    }
     /// Verified contract bytecode at `addr`. Tries Helios first; on error,
     /// falls back to a raw `eth_getCode` and starts the same cooldown
     /// `balance` uses. The returned `verified` flag tells the caller

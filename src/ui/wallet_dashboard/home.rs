@@ -8,7 +8,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::activity::format_relative;
 use super::{MOOD, Message};
-use crate::chain::Chain;
+use crate::chain::NetworkId;
 use crate::portfolio::LiveToken;
 use crate::safe::service::{PendingSafeTx, SafeTxState};
 use crate::ui::kao_theme::{KaoTheme, mix, with_alpha};
@@ -396,7 +396,12 @@ fn token_row<'a>(t: KaoTheme, tk: &'a LiveToken, idx: usize) -> Element<'a, Mess
         _ => t.ab3,
     };
     let kao = kaomoji_for_index(idx);
-    let avatar = token_avatar(t, tk.chain, tk.contract, kao, 40.0, ab);
+    // Built-in networks can show a chain/token logo; a custom network has no
+    // bundled logo, so it falls back to the kaomoji avatar.
+    let avatar = match tk.chain.builtin() {
+        Some(chain) => token_avatar(t, chain, tk.contract, kao, 40.0, ab),
+        None => avatar(t, kao, 40.0, ab),
+    };
     let info = column![
         text(&tk.name).size(14).color(t.text).font(bold()),
         text(format!(
@@ -456,30 +461,89 @@ pub(super) fn format_usd(n: f64) -> String {
     s
 }
 
-/// Render a token symbol with its chain in parens when the token lives
-/// on an L2. Mainnet entries stay bare ("USDC"); L2 entries get a
-/// suffix ("USDC (Base)", "ETH (Optimism)") so a portfolio that spans
-/// chains is unambiguous at a glance without a separate chain column.
-pub(super) fn format_symbol(symbol: &str, chain: Chain) -> String {
-    match chain {
-        Chain::Mainnet => symbol.to_string(),
-        Chain::Base | Chain::Optimism => format!("{symbol} ({})", chain.label()),
+/// Render a token symbol with its network in parens when the token lives
+/// somewhere other than Mainnet. Mainnet entries stay bare ("USDC"); L2 and
+/// custom entries get a suffix ("USDC (Base)", "ETH (Sepolia)") so a portfolio
+/// that spans networks is unambiguous at a glance without a separate column.
+pub(super) fn format_symbol(symbol: &str, network: NetworkId) -> String {
+    use crate::chain::Chain;
+    match network {
+        NetworkId::Builtin(Chain::Mainnet) => symbol.to_string(),
+        NetworkId::Builtin(c) => format!("{symbol} ({})", c.label()),
+        NetworkId::Custom(_) => format!("{symbol} ({})", network_label(network)),
+    }
+}
+
+/// Sanitize a custom network's user-typed name for display, mirroring the
+/// ingestion-point sanitization in `portfolio::fetch_native_balance` so the
+/// name renders identically (bidi/zero-width/control chars stripped, length
+/// clamped) wherever it appears. Built-in labels are static and trusted, so
+/// they skip this.
+fn sanitize_network_name(name: &str) -> String {
+    crate::sanitize::sanitize_display(name, crate::sanitize::MAX_TOKEN_NAME_CHARS).into_owned()
+}
+
+/// Short network name for a token tab / row suffix. Built-ins use their static
+/// label; a custom network resolves its user-given name from settings, falling
+/// back to the chain id if the row was deleted out from under a stale render.
+pub(super) fn network_label(network: NetworkId) -> String {
+    match network {
+        NetworkId::Builtin(c) => c.label().to_string(),
+        NetworkId::Custom(id) => crate::settings::custom_network(id)
+            .map(|n| sanitize_network_name(&n.name))
+            .unwrap_or_else(|| format!("chain {id}")),
+    }
+}
+
+/// Long network name for the review screen ("Ethereum Mainnet", "OP Mainnet").
+/// Built-ins use their `display_name`; a custom network uses the user's name
+/// (there's no separate long form), falling back to the chain id.
+pub(super) fn network_display_name(network: NetworkId) -> String {
+    match network {
+        NetworkId::Builtin(c) => c.display_name().to_string(),
+        NetworkId::Custom(_) => network_label(network),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chain::Chain;
 
     #[test]
     fn mainnet_symbol_has_no_suffix() {
-        assert_eq!(format_symbol("USDC", Chain::Mainnet), "USDC");
-        assert_eq!(format_symbol("ETH", Chain::Mainnet), "ETH");
+        assert_eq!(format_symbol("USDC", Chain::Mainnet.into()), "USDC");
+        assert_eq!(format_symbol("ETH", Chain::Mainnet.into()), "ETH");
     }
 
     #[test]
     fn l2_symbol_carries_chain_in_parens() {
-        assert_eq!(format_symbol("USDC", Chain::Base), "USDC (Base)");
-        assert_eq!(format_symbol("ETH", Chain::Optimism), "ETH (Optimism)");
+        assert_eq!(format_symbol("USDC", Chain::Base.into()), "USDC (Base)");
+        assert_eq!(
+            format_symbol("ETH", Chain::Optimism.into()),
+            "ETH (Optimism)"
+        );
+    }
+
+    #[test]
+    fn custom_network_symbol_carries_name_or_chain_id() {
+        // No settings entry for this id in the test process → falls back to
+        // "chain {id}". (The happy path, resolving the user's name, is
+        // exercised via the live settings store in integration use.)
+        assert_eq!(
+            format_symbol("ETH", NetworkId::Custom(11155111)),
+            "ETH (chain 11155111)"
+        );
+    }
+
+    #[test]
+    fn custom_network_name_is_sanitized_for_display() {
+        // A user-typed name carrying a bidi override (U+202E) and a zero-width
+        // space (U+200B) must have those stripped before it reaches a text
+        // widget, matching the ingestion-point sanitization in portfolio.rs.
+        assert_eq!(
+            sanitize_network_name("My\u{202E}Net\u{200B}work"),
+            "MyNetwork"
+        );
     }
 }
