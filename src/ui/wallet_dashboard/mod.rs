@@ -1,9 +1,9 @@
 //! Kao Wallet dashboard — the main screen shown after unlock.
 //!
-//! Layout mirrors the HTML mock in `kao/project/Kao Wallet.html`:
-//! a thin sidebar (wordmark · Home/Activity/Settings · theme dots), a header
-//! with a mood kaomoji, and one of three content panes. Send and Receive are
-//! modal overlays rendered via `stack`.
+//! Layout: a wide sidebar (brand mark · account card · Portfolio/Apps/
+//! Activity/Settings nav rows · network-privacy footer), a slim header
+//! (account title · Helios badge · mood kaomoji), and one of the content
+//! panes. Send and Receive are modal overlays rendered via `stack`.
 
 use std::mem;
 use std::sync::{Arc, RwLock};
@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 mod account_dropdown;
 mod activity;
 mod appearance;
+mod apps;
 mod contacts_settings;
 mod function_panel;
 mod header;
@@ -527,6 +528,40 @@ impl WalletScreen {
     /// shouldn't happen but cheaper than panicking).
     fn active_safe_descriptor(&self) -> Option<&SafeDescriptor> {
         self.active_safe.and_then(|i| self.safes.get(i))
+    }
+
+    /// Display name for the active identity — the Safe's name with its
+    /// threshold badge in Safe mode, otherwise the active account's name
+    /// (falling back to a positional default). Shown both in the sidebar
+    /// account card and as the header title.
+    fn display_name(&self) -> String {
+        match self.active_safe_descriptor() {
+            Some(safe) => {
+                let idx = self.active_safe.unwrap_or(0);
+                let base = safe.display_name(idx);
+                let total_owners = safe.owners.len().max(safe.linked_signer_indices.len());
+                format!("{base} — Safe {} of {}", safe.threshold, total_owners)
+            }
+            None => self
+                .accounts
+                .get(self.active_index)
+                .map(|a| a.display_name(self.active_index))
+                .unwrap_or_else(|| format!("Account {}", self.active_index + 1)),
+        }
+    }
+
+    /// Short network label for the sidebar footer — the Safe's chain in
+    /// Safe mode, otherwise "Ethereum" (the EOA's primary network; the
+    /// portfolio itself may span several chains).
+    fn network_short_name(&self) -> &'static str {
+        match self.active_safe_descriptor() {
+            Some(safe) => crate::chain::Chain::ALL
+                .iter()
+                .find(|c| c.chain_id() == safe.chain_id)
+                .map(|c| c.label())
+                .unwrap_or("Unknown chain"),
+            None => "Ethereum",
+        }
     }
 
     /// Chains whose balances/history are valid for the current
@@ -2502,7 +2537,17 @@ impl WalletScreen {
     pub fn view(&self) -> Element<'_, Message> {
         let t = self.theme();
 
-        let app = row![sidebar::view(t, self.nav), self.main_pane(t)]
+        let sidebar = sidebar::view(
+            t,
+            self.nav,
+            self.active_index,
+            self.display_name(),
+            self.display_address(),
+            self.active_safe.is_some(),
+            self.network_short_name(),
+            self.verification,
+        );
+        let app = row![sidebar, self.main_pane(t)]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -2627,6 +2672,7 @@ impl WalletScreen {
                 self.safe_pending_loading,
                 self.safe_pending_error.as_deref(),
             ),
+            Nav::Apps => apps::view(t),
             Nav::Activity => {
                 // Show the error placeholder only when every configured
                 // chain failed *and* nothing rendered. Otherwise partial
@@ -2659,39 +2705,13 @@ impl WalletScreen {
             },
         };
 
-        let display_addr = self.display_address();
-        let display_name: String = match self.active_safe_descriptor() {
-            Some(safe) => {
-                let idx = self.active_safe.unwrap_or(0);
-                let base = safe.display_name(idx);
-                let total_owners = safe.owners.len().max(safe.linked_signer_indices.len());
-                format!("{base} — Safe {} of {}", safe.threshold, total_owners)
-            }
-            None => self
-                .accounts
-                .get(self.active_index)
-                .map(|a| a.display_name(self.active_index))
-                .unwrap_or_else(|| format!("Account {}", self.active_index + 1)),
-        };
-        let network_label: &str = match self.active_safe_descriptor() {
-            Some(safe) => crate::chain::Chain::ALL
-                .iter()
-                .find(|c| c.chain_id() == safe.chain_id)
-                .map(|c| c.display_name())
-                .unwrap_or("Unknown chain"),
-            None => "Ethereum Mainnet",
-        };
-        let is_safe = self.active_safe.is_some();
-
         column![
             header::view(
                 t,
-                display_addr,
                 self.verification,
-                display_name,
+                self.display_name(),
                 self.rename_draft.as_deref(),
-                network_label,
-                is_safe,
+                self.active_safe.is_some(),
             ),
             body
         ]
