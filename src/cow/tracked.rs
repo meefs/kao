@@ -64,6 +64,11 @@ pub struct TrackedOrder {
     /// Order side — always `Sell` in v1; kept for wire/display fidelity.
     #[allow(dead_code)]
     pub kind: OrderKind,
+    /// The ERC-20 sold (WETH for a native sell — see `is_ethflow`). Carried so
+    /// the post-fill targeted balance refresh knows which contract to refetch.
+    pub sell_token: Address,
+    /// The ERC-20 bought. Same purpose as `sell_token` for the buy leg.
+    pub buy_token: Address,
     pub sell_symbol: String,
     pub buy_symbol: String,
     /// Amount sold (atoms).
@@ -103,6 +108,8 @@ mod tests {
             chain: Chain::Base,
             owner: address!("0x1111111111111111111111111111111111111111"),
             kind: OrderKind::Sell,
+            sell_token: address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
+            buy_token: address!("0x4200000000000000000000000000000000000006"),
             sell_symbol: "USDC".into(),
             buy_symbol: "WETH".into(),
             sell_amount: U256::from(1_000_000u64),

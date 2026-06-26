@@ -73,7 +73,7 @@ use crate::cow::{
 };
 use crate::indexer::IndexedTx;
 use crate::net::{BalanceFetcher, VerificationStatus};
-use crate::portfolio::{LiveToken, PortfolioCache};
+use crate::portfolio::{DiscoveredToken, LiveToken, PortfolioCache};
 use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
@@ -284,6 +284,18 @@ pub enum Message {
     /// Poll tick: refresh every non-terminal tracked order. Only fires while at
     /// least one such order exists (see `subscription`).
     CowPollTick,
+    /// Targeted balance refresh after a swap filled. Carries the two assets
+    /// the order touched (the "slots": native ETH as `None`, each ERC-20 leg
+    /// as `Some(addr)`) so the handler replaces *only* those rows instead of
+    /// the whole network — a drained sell token disappears, a freshly-bought
+    /// token appears, every other row is left alone. `address`/`network` gate
+    /// the merge the same way `PortfolioFetched` does.
+    SwapTokensRefetched {
+        address: Address,
+        network: crate::chain::NetworkId,
+        slots: Vec<Option<Address>>,
+        result: Result<Vec<LiveToken>, String>,
+    },
 }
 
 /// Outcomes bubbled up to the parent app.
@@ -1344,18 +1356,7 @@ impl WalletScreen {
                         // fetched, or a stale row would survive the retain.
                         self.portfolio
                             .extend(tokens.into_iter().filter(|t| t.chain == network));
-                        self.portfolio.sort_by(|a, b| {
-                            // Native ETH bubbles up first per chain.
-                            let a_native = a.contract.is_none();
-                            let b_native = b.contract.is_none();
-                            match b_native.cmp(&a_native) {
-                                std::cmp::Ordering::Equal => b
-                                    .usd_value
-                                    .partial_cmp(&a.usd_value)
-                                    .unwrap_or(std::cmp::Ordering::Equal),
-                                other => other,
-                            }
-                        });
+                        sort_portfolio_rows(&mut self.portfolio);
                     }
                     Err(e) => warn!(
                         chain_id = network.chain_id(),
@@ -2056,10 +2057,63 @@ impl WalletScreen {
                 }
             }
             Message::CowStatus { uid, result } => {
+                // A just-filled order's legs, captured so the borrow on
+                // `tracked_orders` is dropped before we touch `self` again.
+                let mut filled: Option<SwapFillRefresh> = None;
                 if let Ok(resp) = result
                     && let Some(o) = self.tracked_orders.iter_mut().find(|o| o.uid == uid)
                 {
+                    let was_terminal = o.status.is_terminal();
                     o.apply_status(resp.status, resp.executed());
+                    // A non-terminal → Fulfilled edge is the only point where the
+                    // swapped balances become stale; once terminal the poll stops,
+                    // so this fires at most once per order.
+                    if !was_terminal && o.status == OrderStatus::Fulfilled {
+                        // Sell leg: native ETH (None) for an EthFlow order — the
+                        // user spent ETH, not an ERC-20 — else the token sold.
+                        let sell_slot = if o.is_ethflow {
+                            None
+                        } else {
+                            Some(o.sell_token)
+                        };
+                        let slots = vec![Some(o.buy_token), sell_slot];
+                        let mut fetch = vec![DiscoveredToken {
+                            symbol: o.buy_symbol.clone(),
+                            name: o.buy_symbol.clone(),
+                            address: o.buy_token,
+                            decimals: o.buy_decimals,
+                        }];
+                        if let Some(addr) = sell_slot {
+                            fetch.push(DiscoveredToken {
+                                symbol: o.sell_symbol.clone(),
+                                name: o.sell_symbol.clone(),
+                                address: addr,
+                                decimals: o.sell_decimals,
+                            });
+                        }
+                        filled = Some(SwapFillRefresh {
+                            chain: o.chain,
+                            owner: o.owner,
+                            slots,
+                            fetch,
+                        });
+                    }
+                }
+                if let Some(r) = filled
+                    && r.owner == self.display_address()
+                {
+                    // Refetch just the two assets the order touched rather than
+                    // the whole portfolio — see `spawn_swap_token_refresh`.
+                    return (
+                        spawn_swap_token_refresh(
+                            self.network.clone(),
+                            r.owner,
+                            r.chain,
+                            r.slots,
+                            r.fetch,
+                        ),
+                        None,
+                    );
                 }
             }
             Message::CowPollTick => {
@@ -2072,6 +2126,57 @@ impl WalletScreen {
                 if !tasks.is_empty() {
                     return (Task::batch(tasks), None);
                 }
+            }
+            Message::SwapTokensRefetched {
+                address,
+                network,
+                slots,
+                result,
+            } => {
+                let tokens = match result {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(
+                            chain_id = network.chain_id(),
+                            error = %e,
+                            "post-swap token refresh failed",
+                        );
+                        return (Task::none(), None);
+                    }
+                };
+                // Keep this address's cache slot consistent so a later
+                // switch-away-and-back reflects the post-swap balances. The
+                // slot holds only `network`'s rows, so a slot match on
+                // `contract` is enough. Done regardless of the live guards
+                // below — it's still the right slot for that address.
+                if let Ok(mut cache) = self.portfolio_cache.lock()
+                    && let Some(slot) = cache.get_mut(&(address, network))
+                {
+                    slot.retain(|t| !slots.contains(&t.contract));
+                    slot.extend(
+                        tokens
+                            .iter()
+                            .filter(|t| t.chain == network && slots.contains(&t.contract))
+                            .cloned(),
+                    );
+                    sort_portfolio_rows(slot);
+                }
+                // Same staleness/scope guards as `PortfolioFetched`: a fill that
+                // lands after the user switched identity (or off this network)
+                // must not pollute what's now on screen.
+                if address != self.display_address() || !self.allowed_networks().contains(&network)
+                {
+                    return (Task::none(), None);
+                }
+                // Replace only the refreshed slots; every other row stays put.
+                self.portfolio
+                    .retain(|t| !(t.chain == network && slots.contains(&t.contract)));
+                self.portfolio.extend(
+                    tokens
+                        .into_iter()
+                        .filter(|t| t.chain == network && slots.contains(&t.contract)),
+                );
+                sort_portfolio_rows(&mut self.portfolio);
             }
             Message::OpenAccountDropdown => {
                 self.modal = Modal::AccountDropdown(AccountDropdown::new());
@@ -4059,6 +4164,8 @@ async fn cow_place_order(
             chain,
             owner: user,
             kind: cow::order::OrderKind::Sell,
+            sell_token: draft.sell_token,
+            buy_token: draft.buy_token,
             sell_symbol: draft.sell_symbol.clone(),
             buy_symbol: draft.buy_symbol.clone(),
             sell_amount: draft.sell_amount,
@@ -4169,6 +4276,8 @@ async fn cow_place_order(
             chain,
             owner: user,
             kind: cow::order::OrderKind::Sell,
+            sell_token: draft.sell_token,
+            buy_token: draft.buy_token,
             sell_symbol: draft.sell_symbol.clone(),
             buy_symbol: draft.buy_symbol.clone(),
             sell_amount: draft.sell_amount,
@@ -4247,6 +4356,66 @@ fn spawn_cow_status(chain: crate::chain::Chain, uid: String) -> Task<Message> {
     )
 }
 
+/// The two legs of a just-filled swap order, captured for the targeted
+/// post-swap balance refresh. `slots` are the portfolio rows to replace
+/// (native ETH as `None`); `fetch` are the ERC-20 contracts to re-read
+/// on-chain (native ETH rides the walk's always-included native read).
+struct SwapFillRefresh {
+    chain: crate::chain::Chain,
+    owner: Address,
+    slots: Vec<Option<Address>>,
+    fetch: Vec<DiscoveredToken>,
+}
+
+/// Targeted balance refresh after a swap fills: re-read just the sell + buy
+/// assets (the "actives" the order touched) on `chain` instead of walking the
+/// whole multi-chain portfolio. `fetch` is the ERC-20 legs to read on-chain;
+/// `slots` (carried through to the handler) are the portfolio rows to replace
+/// — native ETH included as `None` for an EthFlow sell. CoW only runs on
+/// built-in chains, so the provider resolves through `NetworkId::Builtin`.
+fn spawn_swap_token_refresh(
+    network: Arc<dyn BalanceFetcher>,
+    address: Address,
+    chain: crate::chain::Chain,
+    slots: Vec<Option<Address>>,
+    fetch: Vec<DiscoveredToken>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = match provider_for(&network, crate::chain::NetworkId::Builtin(chain)).await
+            {
+                Some(p) => crate::portfolio::fetch_token_balances(address, chain, &p, &fetch).await,
+                None => Err(format!("no execution RPC configured for {}", chain.label())),
+            };
+            (address, chain, slots, result)
+        },
+        |(address, chain, slots, result)| Message::SwapTokensRefetched {
+            address,
+            network: crate::chain::NetworkId::Builtin(chain),
+            slots,
+            result,
+        },
+    )
+}
+
+/// ETH-first, then by USD value descending — the stable portfolio row order
+/// both the full fetch and the targeted post-swap refresh re-apply after
+/// merging fresh rows in.
+fn sort_portfolio_rows(rows: &mut [LiveToken]) {
+    rows.sort_by(|a, b| {
+        // Native ETH bubbles up first per chain.
+        let a_native = a.contract.is_none();
+        let b_native = b.contract.is_none();
+        match b_native.cmp(&a_native) {
+            std::cmp::Ordering::Equal => b
+                .usd_value
+                .partial_cmp(&a.usd_value)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            other => other,
+        }
+    });
+}
+
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests {
@@ -4291,6 +4460,124 @@ mod tests {
             usd_value: 1.0,
             chain: chain.into(),
         }
+    }
+
+    /// An ERC-20 row with a specific contract + USD value, so the targeted
+    /// post-swap refresh tests can tell rows apart by slot and assert the
+    /// merge replaced the right one.
+    fn erc20(symbol: &str, chain: Chain, contract: Address, usd: f64) -> LiveToken {
+        LiveToken {
+            symbol: symbol.into(),
+            name: symbol.into(),
+            balance: "1".into(),
+            balance_f64: 1.0,
+            balance_raw: U256::from(1u64),
+            decimals: 18,
+            contract: Some(contract),
+            usd_price: usd,
+            usd_value: usd,
+            chain: chain.into(),
+        }
+    }
+
+    #[test]
+    fn swap_refetch_replaces_targeted_slots_and_leaves_the_rest() {
+        let active = addr(0xAA);
+        let usdc = addr(0x01);
+        let weth = addr(0x02);
+        let mut s = screen_for(active, new_cache());
+        // ETH (untouched), USDC (about to be fully sold), WETH (bought into).
+        s.portfolio = vec![
+            token("ETH", Chain::Mainnet),
+            erc20("USDC", Chain::Mainnet, usdc, 100.0),
+            erc20("WETH", Chain::Mainnet, weth, 5.0),
+        ];
+        // Sold all USDC for more WETH: the drained sell token isn't in the
+        // result (zero balances drop out of the walk); the buy token grows.
+        s.update(Message::SwapTokensRefetched {
+            address: active,
+            network: Chain::Mainnet.into(),
+            slots: vec![Some(weth), Some(usdc)],
+            result: Ok(vec![erc20("WETH", Chain::Mainnet, weth, 105.0)]),
+        });
+        assert!(
+            s.portfolio.iter().all(|t| t.contract != Some(usdc)),
+            "drained sell token must disappear",
+        );
+        let w = s
+            .portfolio
+            .iter()
+            .find(|t| t.contract == Some(weth))
+            .expect("buy token present");
+        assert_eq!(w.usd_value, 105.0, "buy token must be refreshed");
+        assert!(
+            s.portfolio.iter().any(|t| t.contract.is_none()),
+            "the untouched native ETH row must survive",
+        );
+        assert_eq!(s.portfolio.len(), 2);
+    }
+
+    #[test]
+    fn swap_refetch_ignores_result_rows_outside_the_slots() {
+        let active = addr(0xAA);
+        let usdc = addr(0x01);
+        let weth = addr(0x02);
+        let mut s = screen_for(active, new_cache());
+        s.portfolio = vec![
+            token("ETH", Chain::Mainnet),
+            erc20("USDC", Chain::Mainnet, usdc, 100.0),
+            erc20("WETH", Chain::Mainnet, weth, 5.0),
+        ];
+        // An ERC-20 → ERC-20 fill: the walk still reads native ETH, but it's
+        // not a swap slot here, so the stray ETH row must be ignored — not
+        // merged in as a duplicate.
+        s.update(Message::SwapTokensRefetched {
+            address: active,
+            network: Chain::Mainnet.into(),
+            slots: vec![Some(weth), Some(usdc)],
+            result: Ok(vec![
+                erc20("WETH", Chain::Mainnet, weth, 105.0),
+                erc20("USDC", Chain::Mainnet, usdc, 0.5),
+                token("ETH", Chain::Mainnet),
+            ]),
+        });
+        assert_eq!(
+            s.portfolio.iter().filter(|t| t.contract.is_none()).count(),
+            1,
+            "the out-of-slot native ETH row must not be duplicated",
+        );
+    }
+
+    #[test]
+    fn swap_refetch_for_other_address_updates_cache_not_live_view() {
+        let active = addr(0xAA);
+        let other = addr(0xBB);
+        let weth = addr(0x02);
+        let cache = new_cache();
+        let mut s = screen_for(active, cache.clone());
+        // Seed `other`'s cache slot and the active live view with a stale row.
+        cache.lock().unwrap().insert(
+            (other, Chain::Mainnet.into()),
+            vec![erc20("WETH", Chain::Mainnet, weth, 5.0)],
+        );
+        s.portfolio = vec![erc20("WETH", Chain::Mainnet, weth, 5.0)];
+        s.update(Message::SwapTokensRefetched {
+            address: other,
+            network: Chain::Mainnet.into(),
+            slots: vec![Some(weth)],
+            result: Ok(vec![erc20("WETH", Chain::Mainnet, weth, 50.0)]),
+        });
+        // Live view belongs to `active` — a fill for `other` must not touch it.
+        assert_eq!(
+            s.portfolio[0].usd_value, 5.0,
+            "another account's fill must not pollute the live view",
+        );
+        // But `other`'s cache slot is still the right place for that data.
+        assert_eq!(
+            cache.lock().unwrap()[&(other, Chain::Mainnet.into())][0].usd_value,
+            50.0,
+            "the fetched address's cache slot must be refreshed",
+        );
     }
 
     #[test]

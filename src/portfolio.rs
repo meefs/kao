@@ -935,6 +935,51 @@ pub async fn fetch_portfolio_with_discovery(
     fetch_portfolio_for_tokens(owner, chain, provider, &merged).await
 }
 
+/// Refetch balances + prices for a *specific* set of token contracts on
+/// `chain` (plus native ETH, which the walk always reads). Used by the
+/// post-swap targeted refresh: refetching just the two assets an order
+/// touched is far cheaper than the full multi-chain portfolio walk, while
+/// still going through Multicall3 against the chain RPC so the user never
+/// sees an unverified balance.
+///
+/// Each requested token's metadata is taken from the chain's curated list
+/// when present (so a known Uniswap fee tier sticks); otherwise it falls
+/// back to the caller-supplied `DiscoveredToken` fields with the same
+/// 0.05 %/0.3 %/1 % pool-probe used for indexer-discovered tokens. Returns
+/// only non-zero rows, exactly like the full walk.
+pub async fn fetch_token_balances(
+    owner: Address,
+    chain: Chain,
+    provider: &RootProvider<Ethereum>,
+    tokens: &[DiscoveredToken],
+) -> Result<Vec<LiveToken>, String> {
+    let curated = tokens_for(chain);
+    let mut list: Vec<TokenMeta> = Vec::with_capacity(tokens.len());
+    let mut seen: std::collections::HashSet<Address> = std::collections::HashSet::new();
+    for d in tokens {
+        if !seen.insert(d.address) {
+            continue;
+        }
+        match curated.iter().find(|m| m.address == d.address) {
+            Some(meta) => list.push(TokenMeta {
+                symbol: meta.symbol.clone(),
+                name: meta.name.clone(),
+                address: meta.address,
+                decimals: meta.decimals,
+                price_source: meta.price_source,
+            }),
+            None => list.push(TokenMeta {
+                symbol: Cow::Owned(d.symbol.clone()),
+                name: Cow::Owned(d.name.clone()),
+                address: d.address,
+                decimals: d.decimals,
+                price_source: PriceSource::UniswapWethPoolProbe,
+            }),
+        }
+    }
+    fetch_portfolio_for_tokens(owner, chain, provider, &list).await
+}
+
 /// Native-coin balance for a user-defined custom network.
 ///
 /// Custom networks are unverified and carry only their native coin — there is
