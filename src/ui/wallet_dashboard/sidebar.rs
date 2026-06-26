@@ -35,10 +35,11 @@ pub fn view<'a>(
     display_name: String,
     display_addr: Address,
     is_safe: bool,
+    show_apps: bool,
     network_name: &'a str,
     verification: VerificationStatus,
 ) -> Element<'a, Message> {
-    let body = column![
+    let mut body = column![
         brand_header(t),
         Space::new().height(18),
         account_card(t, active_index, display_name, display_addr, is_safe),
@@ -46,23 +47,43 @@ pub fn view<'a>(
         divider(t),
         Space::new().height(14),
         nav_item(t, nav, Nav::Home, "(◕‿◕)", "Portfolio", "this account"),
-        Space::new().height(8),
-        nav_item(t, nav, Nav::Apps, "(ᵔᴥᵔ)", "Apps", "on-chain apps"),
-        Space::new().height(8),
-        nav_item(t, nav, Nav::Activity, "(˘ᵕ˘)", "Activity", "history"),
-        Space::new().height(8),
-        nav_item(
-            t,
-            nav,
-            Nav::Settings,
-            "(・ω・)",
-            "Settings",
-            "network · privacy"
-        ),
-        Space::new().height(Length::Fill),
-        network_footer(t, network_name, verification),
     ]
     .width(Length::Fill);
+
+    // The Apps (swap) section is hidden for identities that can't swap —
+    // view-only accounts and Safe mode.
+    if show_apps {
+        body = body.push(Space::new().height(8));
+        body = body.push(nav_item(
+            t,
+            nav,
+            Nav::Apps,
+            "(ᵔᴥᵔ)",
+            "Apps",
+            "on-chain apps",
+        ));
+    }
+
+    body = body.push(Space::new().height(8));
+    body = body.push(nav_item(
+        t,
+        nav,
+        Nav::Activity,
+        "(˘ᵕ˘)",
+        "Activity",
+        "history",
+    ));
+    body = body.push(Space::new().height(8));
+    body = body.push(nav_item(
+        t,
+        nav,
+        Nav::Settings,
+        "(・ω・)",
+        "Settings",
+        "network · privacy",
+    ));
+    body = body.push(Space::new().height(Length::Fill));
+    body = body.push(network_footer(t, network_name, verification));
 
     container(body)
         .padding(Padding {

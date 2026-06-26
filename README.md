@@ -30,7 +30,7 @@ For too long we've been relying on slow and vulnerable JavaScript for building u
     - [ ] Tornado Cash
     - [ ] Railgun
 - [ ] optional Revoke Cash integration
-- [ ] CoW Swap integration
+- [x] CoW Swap integration
 - [x] Tor support
 
 # ⊹ ࣪ ˖ macOS: "Kao Wallet is damaged and can't be opened" ૮₍ ˶•⤙•˶ ₎ა

@@ -9,7 +9,7 @@ use std::mem;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, B256, Bytes, TxHash};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use iced::border::Radius;
 use iced::widget::operation::focus as focus_widget;
 use iced::widget::{Space, column, container, row, stack, text};
@@ -38,6 +38,7 @@ mod swap;
 mod tx_details;
 
 use account_dropdown::AccountDropdown;
+use apps::AppsPane;
 use contacts_settings::ContactsPane;
 use receive::ReceivePane;
 use safe_tx_detail::SafeTxDetailPane;
@@ -65,6 +66,11 @@ use modal_chrome::ModalChrome;
 pub use nav::Nav;
 
 use crate::chain::PerChain;
+use crate::cow::{
+    self,
+    composer::SwapDraft,
+    tracked::{OrderStatus, TrackedOrder},
+};
 use crate::indexer::IndexedTx;
 use crate::net::{BalanceFetcher, VerificationStatus};
 use crate::portfolio::{LiveToken, PortfolioCache};
@@ -81,6 +87,14 @@ use crate::wallet::{
 };
 
 // ── Messages ────────────────────────────────────────────────────────────────
+
+/// Which swap surface a CoW task's result routes back to: the blocking modal
+/// (surface 1) or the persistent Apps pane (surface 2).
+#[derive(Debug, Clone, Copy)]
+pub enum CowHost {
+    Modal,
+    Apps,
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -241,6 +255,35 @@ pub enum Message {
         generation: u64,
         actual: Option<String>,
     },
+    /// Child messages from the Apps (swap workspace) pane.
+    Apps(apps::Message),
+    /// A CoW quote returned (or errored). Routed back to the host's composer.
+    CowQuote {
+        host: CowHost,
+        result: Result<crate::cow::api::QuoteResponse, String>,
+    },
+    /// A CoW order placement finished. Carries the signer back via
+    /// `SignerHandoff` (moved out for the async approve/sign path, like Send).
+    CowPlaced {
+        host: CowHost,
+        result: Result<TrackedOrder, String>,
+        signer: SignerHandoff,
+    },
+    /// An off-chain order cancellation finished. Signer handed back as above.
+    CowCancel {
+        uid: String,
+        result: Result<(), String>,
+        signer: SignerHandoff,
+    },
+    /// A tracked order's status poll returned. Errors (incl. indexer-lag 404s)
+    /// are ignored so a transient miss never flips an order to a wrong state.
+    CowStatus {
+        uid: String,
+        result: Result<crate::cow::api::OrderStatusResponse, String>,
+    },
+    /// Poll tick: refresh every non-terminal tracked order. Only fires while at
+    /// least one such order exists (see `subscription`).
+    CowPollTick,
 }
 
 /// Outcomes bubbled up to the parent app.
@@ -403,6 +446,13 @@ pub struct WalletScreen {
     /// `ClipboardClearArmed` / `ClipboardClearProbe` from an older arm
     /// can't clobber the chip or the clipboard.
     clipboard_clear_gen: u64,
+    /// CoW swap orders placed this session (both surfaces share this list).
+    /// In-memory for v1; the poll subscription refreshes non-terminal entries.
+    /// Filtered to the active address when rendered in the Apps pane.
+    tracked_orders: Vec<TrackedOrder>,
+    /// The Apps (swap workspace) pane state — its inline swap composer. The
+    /// order list it renders comes from `tracked_orders`, not the pane.
+    apps: AppsPane,
 }
 
 /// Tracks an in-flight clipboard auto-clear: when it lands, what we
@@ -497,6 +547,8 @@ impl WalletScreen {
             contacts,
             clipboard_clear: None,
             clipboard_clear_gen: 0,
+            tracked_orders: Vec::new(),
+            apps: AppsPane::new(),
         }
     }
 
@@ -709,6 +761,17 @@ impl WalletScreen {
                 self.accounts.get(self.active_index),
                 Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
             )
+    }
+
+    /// Whether the Swap quick action / modal should be live. Needs a signer
+    /// that can actually sign (orders are EIP-712-signed; ERC-20 sells and the
+    /// EthFlow path also broadcast on-chain) and an EOA identity — there's no
+    /// Safe-TX swap path in v1, so Safe mode disables it. CoW only runs on
+    /// Mainnet/Base, but that's surfaced inside the modal (the composer lists
+    /// only swappable balances) rather than gating the button, so a user with
+    /// no L1/Base balance still sees why nothing's available.
+    fn can_swap(&self) -> bool {
+        self.active_safe.is_none() && self.signer.can_sign()
     }
 
     /// Whether `safe` has at least one linked owner that's a `Local`
@@ -1820,12 +1883,10 @@ impl WalletScreen {
                 }
             }
             Message::OpenSwap => {
-                // Swap is meaningless from a Safe in v1 (no Safe-TX
-                // calldata composer for swap routers yet). Silently
-                // no-op when in Safe mode; the quick-action button
-                // gates itself on `can_swap()` so users don't see a
-                // disabled affordance.
-                if self.active_safe.is_some() {
+                // The quick-action button is disabled when `can_swap()` is
+                // false (view-only or Safe mode); guard here too so a stray
+                // message can't open a modal that can't sign.
+                if !self.can_swap() {
                     return (Task::none(), None);
                 }
                 self.modal = Modal::Swap(SwapPane::new());
@@ -1842,7 +1903,174 @@ impl WalletScreen {
                         self.chrome.start_close();
                         return (task, None);
                     }
+                    Some(swap::Outcome::RequestQuote(draft)) => {
+                        let q = spawn_cow_quote(CowHost::Modal, draft, self.address);
+                        return (Task::batch([task, q]), None);
+                    }
+                    Some(swap::Outcome::RequestPlace { draft, quote }) => {
+                        // Move the signer out for the async approve/sign path,
+                        // exactly like the Send broadcast; `CowPlaced` returns it.
+                        let signer =
+                            mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
+                        let handoff = handoff_with(signer);
+                        let place = spawn_cow_place(
+                            self.network.clone(),
+                            CowHost::Modal,
+                            handoff,
+                            draft,
+                            quote,
+                            self.address,
+                        );
+                        return (Task::batch([task, place]), None);
+                    }
+                    Some(swap::Outcome::RequestCancel { uid }) => {
+                        let Some(chain) = self
+                            .tracked_orders
+                            .iter()
+                            .find(|o| o.uid == uid)
+                            .map(|o| o.chain)
+                        else {
+                            return (task, None);
+                        };
+                        let signer =
+                            mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
+                        let handoff = handoff_with(signer);
+                        let cancel = spawn_cow_cancel(handoff, chain, uid);
+                        return (Task::batch([task, cancel]), None);
+                    }
                     None => return (task, None),
+                }
+            }
+            Message::Apps(child) => match self.apps.update(child) {
+                Some(apps::Outcome::RequestQuote(draft)) => {
+                    return (spawn_cow_quote(CowHost::Apps, draft, self.address), None);
+                }
+                Some(apps::Outcome::RequestPlace { draft, quote }) => {
+                    let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
+                    let handoff = handoff_with(signer);
+                    return (
+                        spawn_cow_place(
+                            self.network.clone(),
+                            CowHost::Apps,
+                            handoff,
+                            draft,
+                            quote,
+                            self.address,
+                        ),
+                        None,
+                    );
+                }
+                Some(apps::Outcome::RequestCancel { uid }) => {
+                    let Some(chain) = self
+                        .tracked_orders
+                        .iter()
+                        .find(|o| o.uid == uid)
+                        .map(|o| o.chain)
+                    else {
+                        return (Task::none(), None);
+                    };
+                    let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
+                    let handoff = handoff_with(signer);
+                    return (spawn_cow_cancel(handoff, chain, uid), None);
+                }
+                Some(apps::Outcome::RefreshOrders) => {
+                    // On-demand status poll for the active account's live orders.
+                    let tasks: Vec<Task<Message>> = self
+                        .tracked_orders
+                        .iter()
+                        .filter(|o| o.owner == self.address && !o.status.is_terminal())
+                        .map(|o| spawn_cow_status(o.chain, o.uid.clone()))
+                        .collect();
+                    return (Task::batch(tasks), None);
+                }
+                None => return (Task::none(), None),
+            },
+            Message::CowQuote { host, result } => match host {
+                CowHost::Modal => {
+                    if let Modal::Swap(p) = &mut self.modal {
+                        p.on_quote(result);
+                    }
+                }
+                CowHost::Apps => self.apps.on_quote(result),
+            },
+            Message::CowPlaced {
+                host,
+                result,
+                signer,
+            } => {
+                // Always reclaim the signer, regardless of pane state.
+                if let Ok(mut g) = signer.lock()
+                    && let Some(s) = g.take()
+                {
+                    self.signer = s;
+                }
+                match result {
+                    Ok(order) => {
+                        let uid = order.uid.clone();
+                        let chain = order.chain;
+                        if !self.tracked_orders.iter().any(|o| o.uid == uid) {
+                            self.tracked_orders.push(order);
+                        }
+                        match host {
+                            CowHost::Modal => {
+                                if let Modal::Swap(p) = &mut self.modal {
+                                    p.begin_tracking(uid.clone());
+                                }
+                            }
+                            CowHost::Apps => self.apps.placement_done(),
+                        }
+                        // Immediate status fetch so the UI isn't blank until the
+                        // 10s poll tick.
+                        return (spawn_cow_status(chain, uid), None);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "cow: order placement failed");
+                        match host {
+                            CowHost::Modal => {
+                                if let Modal::Swap(p) = &mut self.modal {
+                                    p.placement_failed(e);
+                                }
+                            }
+                            CowHost::Apps => self.apps.placement_failed(e),
+                        }
+                    }
+                }
+            }
+            Message::CowCancel {
+                uid,
+                result,
+                signer,
+            } => {
+                if let Ok(mut g) = signer.lock()
+                    && let Some(s) = g.take()
+                {
+                    self.signer = s;
+                }
+                match result {
+                    Ok(()) => {
+                        if let Some(o) = self.tracked_orders.iter_mut().find(|o| o.uid == uid) {
+                            o.status = OrderStatus::Cancelled;
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "cow: cancel failed"),
+                }
+            }
+            Message::CowStatus { uid, result } => {
+                if let Ok(resp) = result
+                    && let Some(o) = self.tracked_orders.iter_mut().find(|o| o.uid == uid)
+                {
+                    o.apply_status(resp.status, resp.executed());
+                }
+            }
+            Message::CowPollTick => {
+                let tasks: Vec<Task<Message>> = self
+                    .tracked_orders
+                    .iter()
+                    .filter(|o| !o.status.is_terminal())
+                    .map(|o| spawn_cow_status(o.chain, o.uid.clone()))
+                    .collect();
+                if !tasks.is_empty() {
+                    return (Task::batch(tasks), None);
                 }
             }
             Message::OpenAccountDropdown => {
@@ -2525,6 +2753,13 @@ impl WalletScreen {
             // for the 10-second auto-clear window.
             subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
         }
+        // Poll open CoW orders every 10s while any is non-terminal. This is the
+        // only background network activity in the swap feature, and it exists
+        // only because the user explicitly placed an order — nothing polls
+        // before that.
+        if self.tracked_orders.iter().any(|o| !o.status.is_terminal()) {
+            subs.push(iced::time::every(Duration::from_secs(10)).map(|_| Message::CowPollTick));
+        }
         Subscription::batch(subs)
     }
 
@@ -2544,6 +2779,7 @@ impl WalletScreen {
             self.display_name(),
             self.display_address(),
             self.active_safe.is_some(),
+            self.can_swap(),
             self.network_short_name(),
             self.verification,
         );
@@ -2582,7 +2818,13 @@ impl WalletScreen {
                     .map(Message::Send)
             }
             Modal::Receive(p) => p.view(t, self.chrome.progress()).map(Message::Receive),
-            Modal::Swap(p) => p.view(t, self.chrome.progress()).map(Message::Swap),
+            Modal::Swap(p) => {
+                let tracked = p
+                    .tracking_uid()
+                    .and_then(|uid| self.tracked_orders.iter().find(|o| o.uid == uid));
+                p.view(t, &self.portfolio, tracked, self.chrome.progress())
+                    .map(Message::Swap)
+            }
             Modal::AccountDropdown(d) => d
                 .view(
                     t,
@@ -2661,10 +2903,18 @@ impl WalletScreen {
             Some(g) => g,
             None => &empty_book,
         };
-        let body: Element<'_, Message> = match self.nav {
+        // If Apps got hidden (switched to a view-only/Safe identity while on it),
+        // fall back to the portfolio so the pane is never blank.
+        let active_nav = if matches!(self.nav, Nav::Apps) && !self.can_swap() {
+            Nav::Home
+        } else {
+            self.nav
+        };
+        let body: Element<'_, Message> = match active_nav {
             Nav::Home => home::view(
                 t,
                 self.can_send(),
+                self.can_swap(),
                 &self.portfolio,
                 self.portfolio_loading,
                 self.portfolio_refreshing,
@@ -2672,7 +2922,19 @@ impl WalletScreen {
                 self.safe_pending_loading,
                 self.safe_pending_error.as_deref(),
             ),
-            Nav::Apps => apps::view(t),
+            Nav::Apps => {
+                // Newest-first, scoped to the active account so a switch never
+                // shows another account's orders.
+                let orders: Vec<&TrackedOrder> = self
+                    .tracked_orders
+                    .iter()
+                    .rev()
+                    .filter(|o| o.owner == self.address)
+                    .collect();
+                self.apps
+                    .view(t, &self.portfolio, &orders)
+                    .map(Message::Apps)
+            }
             Nav::Activity => {
                 // Show the error placeholder only when every configured
                 // chain failed *and* nothing rendered. Otherwise partial
@@ -3615,6 +3877,372 @@ fn spawn_broadcast_task(
         move |result| Message::SendBroadcastReturn {
             result,
             signer: handoff,
+        },
+    )
+}
+
+// ── CoW swap tasks ────────────────────────────────────────────────────────────
+
+/// Build the `/quote` request for a draft. A native-ETH sell quotes against the
+/// EthFlow contract (eip1271, on-chain order); an ERC-20 sell quotes as the user
+/// (eip712). The receiver is always the user.
+fn cow_quote_request(draft: &SwapDraft, user: Address) -> crate::cow::api::QuoteRequest {
+    let (from, signing_scheme, onchain_order) = if draft.is_native {
+        (cow::ETHFLOW, "eip1271".to_string(), true)
+    } else {
+        (user, "eip712".to_string(), false)
+    };
+    crate::cow::api::QuoteRequest {
+        sell_token: draft.sell_token,
+        buy_token: draft.buy_token,
+        from,
+        receiver: Some(user),
+        kind: "sell".to_string(),
+        sell_amount_before_fee: draft.sell_amount,
+        valid_for: 1800,
+        // Quote with the same market-order appData we'll sign, so the orderbook
+        // classifies the order consistently (mirrors the cow-sdk flow).
+        app_data: cow::market_app_data(draft.slippage_bps).0,
+        signing_scheme,
+        onchain_order,
+        partially_fillable: false,
+    }
+}
+
+/// Fetch a quote (the first network call — only ever from an explicit click).
+fn spawn_cow_quote(host: CowHost, draft: SwapDraft, user: Address) -> Task<Message> {
+    let chain = draft.chain;
+    let req = cow_quote_request(&draft, user);
+    Task::perform(
+        async move { crate::cow::api::get_quote(chain, &req).await },
+        move |result| Message::CowQuote { host, result },
+    )
+}
+
+/// Place an order: ERC-20 (allowance → approve → sign → POST) or native ETH
+/// (EthFlow `createOrder`). Runs the whole sequence in one task; the modal shows
+/// a "Placing…" phase meanwhile. The signer rides in via `handoff` and back out
+/// in the result message.
+fn spawn_cow_place(
+    network: Arc<dyn BalanceFetcher>,
+    host: CowHost,
+    handoff: SignerHandoff,
+    draft: SwapDraft,
+    quote: crate::cow::api::QuoteResponse,
+    user: Address,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let chain = draft.chain;
+    Task::perform(
+        async move {
+            let provider =
+                match provider_for(&network, crate::chain::NetworkId::Builtin(chain)).await {
+                    Some(p) => p,
+                    None => {
+                        return Err::<TrackedOrder, String>("no execution RPC configured".into());
+                    }
+                };
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err("signer not available".into()),
+            };
+            let result = cow_place_order(&network, &provider, &signer, &draft, &quote, user).await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::CowPlaced {
+            host,
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// revm preflight of a CoW on-chain leg (ERC-20 `approve` or EthFlow
+/// `createOrder`) against Helios-verified state. Returns `Err` with the decoded
+/// revert reason if the tx would revert/halt — so we never spend gas on a doomed
+/// transaction (critical for the native path, where the gas is real ETH). A sim
+/// that can't run (state unavailable, custom network) is advisory and passes.
+/// The swap itself settles off-chain via solvers, so this covers only the
+/// on-chain legs — there's nothing else for revm to simulate.
+async fn cow_preflight_sim(
+    network: &Arc<dyn BalanceFetcher>,
+    chain: crate::chain::Chain,
+    from: Address,
+    to: Address,
+    value: U256,
+    input: Bytes,
+) -> Result<(), String> {
+    use crate::wallet::sim::{CallSpec, SimOutcome, simulate_call};
+    let spec = CallSpec {
+        chain,
+        from,
+        to,
+        value,
+        input,
+        nonce: 0,
+    };
+    match simulate_call(network.clone(), &spec).await {
+        Ok(r) => match r.outcome {
+            SimOutcome::Revert { reason, .. } => Err(format!("preflight: would revert — {reason}")),
+            SimOutcome::Halt { reason } => Err(format!("preflight: would fail — {reason}")),
+            // Success or Unavailable → don't block.
+            _ => Ok(()),
+        },
+        Err(e) => {
+            warn!(error = %e, "cow: preflight simulation unavailable (proceeding)");
+            Ok(())
+        }
+    }
+}
+
+/// The order-placement sequence shared by both surfaces.
+async fn cow_place_order(
+    network: &Arc<dyn BalanceFetcher>,
+    provider: &alloy::providers::RootProvider<alloy::network::Ethereum>,
+    signer: &KaoSigner,
+    draft: &SwapDraft,
+    quote: &crate::cow::api::QuoteResponse,
+    user: Address,
+) -> Result<TrackedOrder, String> {
+    let chain = draft.chain;
+    let q = &quote.quote;
+    // Modern CoW orders carry feeAmount = 0; the user parts with the full input
+    // (quote sellAmount + feeAmount) and solvers take their fee from the price.
+    let full_sell = q.sell_amount.saturating_add(q.fee_amount);
+    // Market-order appData: `orderClass = market` is what makes solvers fill the
+    // order at the quoted price. Without it the orderbook books a *limit* order,
+    // which only fills if the price gap covers the fee — so a near-market swap
+    // sits OPEN forever. We sign the hash and provide the matching pre-image.
+    let (full_app_data, app_data_hash) = cow::market_app_data(draft.slippage_bps);
+    if draft.is_native {
+        // Native ETH → EthFlow on-chain createOrder (msg.value = the full sell).
+        let data = cow::ethflow::build_ethflow_data(
+            draft.buy_token,
+            user,
+            full_sell,
+            q.buy_amount,
+            q.valid_to,
+            quote.id.unwrap_or_default(),
+            draft.slippage_bps,
+            app_data_hash,
+        );
+        // The native path never POSTs an order body, so upload the appData
+        // pre-image first — otherwise the orderbook only sees the bare hash and
+        // books a limit order. Best-effort: a transient PUT failure shouldn't
+        // burn the user's ETH, though the order then risks limit classification.
+        if let Err(e) =
+            cow::api::upload_app_data(chain, &format!("{app_data_hash:#x}"), &full_app_data).await
+        {
+            warn!(error = %e, "cow: appData upload failed (native order may book as limit)");
+        }
+        let calldata = cow::ethflow::create_order_calldata(&data);
+        let value = cow::ethflow::msg_value(&data);
+        // revm preflight before spending gas: catch a reverting createOrder
+        // (wrong params, contract guards) without losing the up-front ETH.
+        cow_preflight_sim(network, chain, user, cow::ETHFLOW, value, calldata.clone()).await?;
+        let hash = cow::onchain::send_contract_call(
+            provider,
+            signer,
+            chain,
+            cow::ETHFLOW,
+            value,
+            calldata,
+        )
+        .await?;
+        cow::onchain::wait_for_receipt(provider, hash, 40).await?;
+        let uid = cow::ethflow::ethflow_uid(&data, chain)?;
+        Ok(TrackedOrder {
+            uid: cow::order::uid_hex(&uid),
+            chain,
+            owner: user,
+            kind: cow::order::OrderKind::Sell,
+            sell_symbol: draft.sell_symbol.clone(),
+            buy_symbol: draft.buy_symbol.clone(),
+            sell_amount: draft.sell_amount,
+            buy_amount: cow::order::apply_slippage(q.buy_amount, draft.slippage_bps),
+            sell_decimals: draft.sell_decimals,
+            buy_decimals: draft.buy_decimals,
+            status: OrderStatus::Open,
+            executed: None,
+            is_ethflow: true,
+        })
+    } else {
+        // ERC-20 → ensure the vault relayer is approved, then sign + POST.
+        let allowance = cow::onchain::read_allowance(provider, draft.sell_token, user).await?;
+        info!(
+            chain_id = chain.chain_id(),
+            owner = %user,
+            token = %draft.sell_token,
+            allowance = %allowance,
+            full_sell = %full_sell,
+            needs_approve = allowance < full_sell,
+            "cow: erc20 allowance check",
+        );
+        let needs_approve = allowance < full_sell;
+        if needs_approve {
+            // revm preflight the approve — catches e.g. USDT, which reverts on a
+            // non-zero→non-zero approve, before we spend gas on it.
+            cow_preflight_sim(
+                network,
+                chain,
+                user,
+                draft.sell_token,
+                U256::ZERO,
+                cow::onchain::approve_calldata(U256::MAX),
+            )
+            .await?;
+            let hash =
+                cow::onchain::approve_relayer(provider, signer, chain, draft.sell_token, U256::MAX)
+                    .await?;
+            cow::onchain::wait_for_receipt(provider, hash, 40).await?;
+        }
+        let order = cow::order::build_sell_order(
+            draft.sell_token,
+            draft.buy_token,
+            user,
+            full_sell,
+            q.buy_amount,
+            q.valid_to,
+            draft.slippage_bps,
+            app_data_hash,
+        );
+        let domain = cow::order::cow_domain(chain);
+        let sig = cow::order::sign_order(signer, &order, &domain).await?;
+        // Register the appData doc first, mirroring the cow-sdk (which uploads
+        // before posting). The order body also carries the full pre-image, so a
+        // transient failure here isn't fatal — log and proceed.
+        let app_data_hex = format!("{app_data_hash:#x}");
+        if let Err(e) = cow::api::upload_app_data(chain, &app_data_hex, &full_app_data).await {
+            warn!(error = %e, "cow: appData upload failed (proceeding; order carries the pre-image)");
+        }
+        let body = cow::api::OrderCreation {
+            sell_token: order.sellToken,
+            buy_token: order.buyToken,
+            receiver: order.receiver,
+            sell_amount: order.sellAmount,
+            buy_amount: order.buyAmount,
+            valid_to: order.validTo,
+            // POST the exact pre-image of the signed appData hash (and the hash
+            // itself) so the orderbook reproduces it and reads orderClass=market.
+            app_data: full_app_data,
+            app_data_hash: app_data_hex,
+            fee_amount: order.feeAmount,
+            kind: "sell".to_string(),
+            partially_fillable: false,
+            sell_token_balance: "erc20".to_string(),
+            buy_token_balance: "erc20".to_string(),
+            signing_scheme: "eip712".to_string(),
+            signature: format!("0x{}", alloy::hex::encode(sig.as_bytes())),
+            from: user,
+            quote_id: quote.id,
+        };
+        // POST with a short retry when we *just* approved: on Base a tx is
+        // visible to us via a ~200ms flashblock preconfirmation, but CoW's
+        // orderbook only sees the allowance once it indexes the canonical block
+        // — a few seconds later. POSTing in that window 400s with "must give
+        // allowance to VaultRelayer" even though the approval is on-chain. Retry
+        // a few times so the orderbook can catch up. (No race when allowance was
+        // already present — `needs_approve` is false and we post once.)
+        let mut uid_result = cow::api::post_order(chain, &body).await;
+        if needs_approve {
+            let mut attempt = 0u32;
+            while let Err(e) = &uid_result {
+                if attempt >= 5 || !e.to_lowercase().contains("allowance") {
+                    break;
+                }
+                attempt += 1;
+                warn!(
+                    attempt,
+                    error = %e,
+                    "cow: orderbook hasn't indexed the fresh approval yet; retrying POST",
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                uid_result = cow::api::post_order(chain, &body).await;
+            }
+        }
+        let uid = uid_result?;
+        Ok(TrackedOrder {
+            uid,
+            chain,
+            owner: user,
+            kind: cow::order::OrderKind::Sell,
+            sell_symbol: draft.sell_symbol.clone(),
+            buy_symbol: draft.buy_symbol.clone(),
+            sell_amount: draft.sell_amount,
+            buy_amount: order.buyAmount,
+            sell_decimals: draft.sell_decimals,
+            buy_decimals: draft.buy_decimals,
+            status: OrderStatus::Open,
+            executed: None,
+            is_ethflow: false,
+        })
+    }
+}
+
+/// Off-chain cancel an ERC-20 order (signed `DELETE /orders`). EthFlow orders
+/// cancel on-chain (deferred) and never reach here — the Apps pane hides their
+/// cancel affordance.
+fn spawn_cow_cancel(
+    handoff: SignerHandoff,
+    chain: crate::chain::Chain,
+    uid: String,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let uid_for_msg = uid.clone();
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(), String>("signer not available".into()),
+            };
+            let res = cow_cancel(&signer, chain, &uid).await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            res
+        },
+        move |result| Message::CowCancel {
+            uid: uid_for_msg.clone(),
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+async fn cow_cancel(
+    signer: &KaoSigner,
+    chain: crate::chain::Chain,
+    uid: &str,
+) -> Result<(), String> {
+    let bytes = parse_order_uid(uid)?;
+    let domain = cow::order::cow_domain(chain);
+    let sig = cow::order::sign_cancellations(signer, &[bytes], &domain).await?;
+    let body = cow::api::CancellationBody {
+        order_uids: vec![uid.to_string()],
+        signature: format!("0x{}", alloy::hex::encode(sig.as_bytes())),
+        signing_scheme: "eip712".to_string(),
+    };
+    cow::api::delete_orders(chain, &body).await
+}
+
+fn parse_order_uid(uid: &str) -> Result<[u8; 56], String> {
+    let hex = uid.strip_prefix("0x").unwrap_or(uid);
+    let raw = alloy::hex::decode(hex).map_err(|e| format!("bad order uid: {e}"))?;
+    raw.try_into()
+        .map_err(|_| "order uid must be 56 bytes".to_string())
+}
+
+/// Poll one order's status.
+fn spawn_cow_status(chain: crate::chain::Chain, uid: String) -> Task<Message> {
+    let uid_for_msg = uid.clone();
+    Task::perform(
+        async move { crate::cow::api::get_order(chain, &uid).await },
+        move |result| Message::CowStatus {
+            uid: uid_for_msg.clone(),
+            result,
         },
     )
 }

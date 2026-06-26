@@ -3,6 +3,7 @@
 
 mod app;
 mod chain;
+mod cow;
 mod decode;
 mod ens;
 mod indexer;

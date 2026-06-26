@@ -497,6 +497,17 @@ fn tokens_for(chain: Chain) -> &'static [TokenMeta] {
     }
 }
 
+/// Curated token metadata for `chain` as `(symbol, address, decimals)` triples.
+/// Used by the swap composer's buy-token picker so it shares the wallet's vetted
+/// list (and bundled logos) rather than a separate hand-maintained address set:
+/// Mainnet is the curated overlay; L2s add the bundled Superchain tokenlist.
+pub fn curated_tokens(chain: Chain) -> Vec<(String, Address, u8)> {
+    tokens_for(chain)
+        .iter()
+        .map(|m| (m.symbol.to_string(), m.address, m.decimals))
+        .collect()
+}
+
 // ── LiveToken ────────────────────────────────────────────────────────────────
 
 /// A single portfolio entry with live data.
