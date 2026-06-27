@@ -263,6 +263,21 @@ pub enum SafeTrust {
     UnrecognizedImpl,
 }
 
+impl SafeTrust {
+    pub fn permits_signing(&self) -> bool {
+        matches!(self, Self::Canonical)
+    }
+
+    pub fn signing_block_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Canonical => None,
+            Self::UnrecognizedImpl => {
+                Some("Safe implementation is not recognized as canonical; signing is disabled.")
+            }
+        }
+    }
+}
+
 /// Persisted record of a Safe the user has onboarded. Lives in its own
 /// `safes` redb table — Safes have no private key material of their own
 /// (signing happens via linked owner accounts), so commingling with

@@ -667,7 +667,7 @@ impl WalletScreen {
     /// EOA's signing capability is irrelevant.
     fn can_send(&self) -> bool {
         if let Some(safe) = self.active_safe_descriptor() {
-            return self.has_local_linked_owner(safe);
+            return safe.trust.permits_signing() && self.has_local_linked_owner(safe);
         }
         self.signer.can_sign()
             || matches!(
@@ -722,6 +722,28 @@ impl WalletScreen {
         if let Modal::SafeTxDetail(p) = &mut self.modal {
             p.set_action_result(result);
         }
+    }
+
+    /// Re-check the active SafeDescriptor immediately before any queued
+    /// Safe action spawns. The modal carries a trust snapshot from open,
+    /// but refresh-on-open can replace descriptors while the modal remains
+    /// visible.
+    fn active_safe_signing_block(
+        &self,
+        safe: Address,
+        chain: crate::chain::Chain,
+    ) -> Option<String> {
+        let Some(desc) = self.active_safe_descriptor() else {
+            return Some(
+                "Safe selection changed; reopen transaction details before signing.".into(),
+            );
+        };
+        if desc.address() != safe || desc.chain_id != chain.chain_id() {
+            return Some(
+                "Safe selection changed; reopen transaction details before signing.".into(),
+            );
+        }
+        desc.trust.signing_block_reason().map(str::to_string)
     }
 
     /// Spawn the preflight tasks for the Safe-tx detail modal's loaded
@@ -1986,6 +2008,7 @@ impl WalletScreen {
                 let safe_addr = safe.address();
                 let threshold = safe.threshold;
                 let version = safe.version.clone();
+                let trust = safe.trust.clone();
                 let service_base = safe.tx_service_base().to_string();
                 let owners: Vec<Address> = safe.owners.iter().map(|o| Address::from(*o)).collect();
                 let signable: Vec<Address> = self
@@ -1999,6 +2022,7 @@ impl WalletScreen {
                     safe_addr,
                     chain,
                     version,
+                    trust,
                     service_base.clone(),
                     pending,
                     owners,
@@ -2173,6 +2197,11 @@ impl WalletScreen {
                         else {
                             return (task, None);
                         };
+                        if let Some(e) = self.active_safe_signing_block(safe, chain) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
                         // Version gate before any signer is built: a
                         // pre-1.3 (or unknown-shape) domain must refuse
                         // with the explainable error, not a late
@@ -2217,6 +2246,11 @@ impl WalletScreen {
                         let Some((tx, confirmations, safe, chain)) = prep else {
                             return (task, None);
                         };
+                        if let Some(e) = self.active_safe_signing_block(safe, chain) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
                         let executor_key = self.first_local_key();
                         self.mark_safe_detail_busy();
                         let Some(executor_key) = executor_key else {
@@ -2251,6 +2285,11 @@ impl WalletScreen {
                         let Some((safe, chain, nonce, owner, version, service_base)) = prep else {
                             return (task, None);
                         };
+                        if let Some(e) = self.active_safe_signing_block(safe, chain) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
                         // Same version gate as Confirm — a rejection is
                         // a SafeTx signature too.
                         if let Err(e) = crate::safe::tx::ensure_signable_version(&version) {
@@ -3089,6 +3128,9 @@ fn spawn_safe_prepare_task(
     Task::perform(
         async move {
             let result: Result<(u64, B256), String> = async {
+                if let Some(reason) = req.trust.signing_block_reason() {
+                    return Err(reason.to_string());
+                }
                 ensure_signable_version(&req.version)?;
                 let nonce = current_safe_nonce(network.as_ref(), req.safe_address, chain).await?;
                 let tx = build_safe_tx_with_nonce(req.safe_tx_input(), nonce);
@@ -3173,6 +3215,9 @@ async fn rebuild_reviewed_safe_tx(
         build_safe_tx_with_nonce, current_safe_nonce, ensure_signable_version, safe_domain,
         safe_tx_hash, verify_safe_tx_before_signing,
     };
+    if let Some(reason) = req.trust.signing_block_reason() {
+        return Err(reason.to_string());
+    }
     ensure_signable_version(&req.version)?;
     let pinned = req
         .prepared
@@ -3854,6 +3899,36 @@ mod tests {
     }
 
     #[test]
+    fn can_send_in_safe_mode_false_for_unrecognized_impl() {
+        let accounts = vec![
+            view_only_account(addr(1)),
+            crate::wallet::AccountDescriptor::Local {
+                name: None,
+                key_bytes: crate::wallet::SecretKeyBytes::new([0x7e; 32]),
+            },
+        ];
+        let mut safe = safe_descriptor(0x99, 1);
+        safe.trust = crate::wallet::SafeTrust::UnrecognizedImpl;
+        safe.linked_signer_indices = vec![1];
+        let mut screen = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            accounts,
+            vec![safe],
+            0,
+            Arc::new(MockFetcher::new()),
+            crate::portfolio::new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+
+        screen.active_safe = Some(0);
+        assert!(
+            !screen.can_send(),
+            "unrecognized Safe implementations must not expose Send"
+        );
+    }
+
+    #[test]
     fn allowed_chains_in_eoa_mode_returns_all_chains() {
         let screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
         assert_eq!(screen.allowed_chains(), Chain::ALL.to_vec());
@@ -4272,6 +4347,7 @@ mod tests {
             safe_address: addr(0x5A),
             chain: Chain::Mainnet,
             version: "1.4.1".into(),
+            trust: crate::wallet::SafeTrust::Canonical,
             service_base: crate::safe::service::DEFAULT_TX_SERVICE_BASE.into(),
             recipient: addr(0xDD),
             amount_units: U256::from(1_000u64),
@@ -4323,6 +4399,20 @@ mod tests {
         req.version = "1.1.1".into();
         let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
         assert!(err.contains("outside the signable range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_unrecognized_safe_before_any_chain_read() {
+        // Nothing planted on the mock: if the trust guard didn't fire
+        // first, the nonce read would fail with a different error.
+        let mock = CallMock::new();
+        let mut req = reviewed_req(Some(send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: B256::repeat_byte(0xaa),
+        }));
+        req.trust = crate::wallet::SafeTrust::UnrecognizedImpl;
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("not recognized as canonical"), "{err}");
     }
 
     #[tokio::test]
