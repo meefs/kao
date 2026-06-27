@@ -77,6 +77,11 @@ pub struct TrackedOrder {
     pub buy_amount: U256,
     pub sell_decimals: u8,
     pub buy_decimals: u8,
+    /// Unix timestamp the order is valid until — the value signed for ERC-20
+    /// orders, or `userValidTo` for EthFlow. Doubles as the newest-first sort
+    /// key for the Apps order list (≈ creation time for market orders), so a
+    /// fetched history page interleaves correctly with this session's orders.
+    pub valid_to: u32,
     pub status: OrderStatus,
     /// `(executedSellAmount, executedBuyAmount)` once (partially) filled.
     pub executed: Option<(U256, U256)>,
@@ -116,6 +121,7 @@ mod tests {
             buy_amount: U256::from(1u64),
             sell_decimals: 6,
             buy_decimals: 18,
+            valid_to: 0,
             status: OrderStatus::Open,
             executed: None,
             is_ethflow: false,

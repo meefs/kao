@@ -54,8 +54,13 @@ pub const VAULT_RELAYER: Address = address!("0xC92E8bdf79f0507f65a392b0ab4667716
 /// `0x40a50cf069e992aa4536211b23f286ef88752187` must NOT be used.
 pub const ETHFLOW: Address = address!("0xbA3cB449bD2B4ADddBc894D8697F5170800EAdeC");
 
-/// Our app identifier, stamped into every order's appData (`appCode`).
-pub const APP_CODE: &str = "Kao";
+/// Our partner / referral code, stamped into every order's appData as
+/// `appCode`. CoW attributes order volume to integrators by this string —
+/// it is the only referral mechanism in the appData schema (the metadata
+/// object is closed, and `metadata.referrer` takes an on-chain *address*,
+/// not a code). CoW's analytics group Kao's flow under this exact value, so
+/// changing it re-buckets attribution; keep it stable.
+pub const APP_CODE: &str = "KAOWALLET";
 
 /// The CoW appData schema version we emit — the latest published schema
 /// (`@cowprotocol/sdk-app-data`'s `LATEST_APP_DATA_VERSION`).
@@ -104,6 +109,20 @@ pub fn api_base(chain: Chain) -> Option<&'static str> {
     }
 }
 
+/// CoW Explorer web URL for a placed order, addressed by its `uid` (the
+/// `0x`-prefixed 56-byte order UID). The Explorer keys non-Mainnet chains by a
+/// slug in the path (`/base/…`); Mainnet has no prefix. `None` on chains
+/// without a CoW deployment (same gate as [`api_base`]), so callers can render
+/// the link only when an order can actually exist.
+pub fn explorer_order_url(chain: Chain, uid: &str) -> Option<String> {
+    let net = match chain {
+        Chain::Mainnet => "",
+        Chain::Base => "/base",
+        Chain::Optimism => return None,
+    };
+    Some(format!("https://explorer.cow.fi{net}/orders/{uid}"))
+}
+
 /// Wrapped-native (WETH) token for `chain` — the ERC-20 a native-ETH sell is
 /// quoted and settled against. `None` on chains without a CoW orderbook.
 pub fn wrapped_native(chain: Chain) -> Option<Address> {
@@ -127,7 +146,7 @@ mod tests {
         // trap or makes the signed hash unreproducible from the POSTed string.
         assert_eq!(
             json,
-            r#"{"appCode":"Kao","metadata":{"orderClass":{"orderClass":"market"},"quote":{"slippageBips":50}},"version":"1.15.0"}"#
+            r#"{"appCode":"KAOWALLET","metadata":{"orderClass":{"orderClass":"market"},"quote":{"slippageBips":50}},"version":"1.15.0"}"#
         );
         // The signed hash MUST be keccak256 of the exact POSTed pre-image.
         assert_eq!(hash, keccak256(json.as_bytes()));
@@ -158,6 +177,30 @@ mod tests {
             Some("https://api.cow.fi/base/api/v1")
         );
         assert_eq!(api_base(Chain::Optimism), None);
+    }
+
+    #[test]
+    fn explorer_order_url_per_chain() {
+        let uid = "0xabc123";
+        // Mainnet has no path prefix; Base is keyed by its slug.
+        assert_eq!(
+            explorer_order_url(Chain::Mainnet, uid).as_deref(),
+            Some("https://explorer.cow.fi/orders/0xabc123")
+        );
+        assert_eq!(
+            explorer_order_url(Chain::Base, uid).as_deref(),
+            Some("https://explorer.cow.fi/base/orders/0xabc123")
+        );
+        // No CoW deployment on Optimism — no order can exist, so no link.
+        assert_eq!(explorer_order_url(Chain::Optimism, uid), None);
+    }
+
+    #[test]
+    fn explorer_link_exists_exactly_where_orders_can() {
+        // The link is renderable on precisely the chains CoW runs on.
+        for c in Chain::ALL {
+            assert_eq!(explorer_order_url(c, "0x00").is_some(), supported(c));
+        }
     }
 
     #[test]

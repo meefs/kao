@@ -9,6 +9,7 @@
 
 use iced::border::Radius;
 use iced::keyboard;
+use iced::widget::text::Wrapping;
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription, Task};
 
@@ -33,6 +34,8 @@ pub enum Message {
     Composer(composer::Message),
     /// Cancel the order being tracked (off-chain signed cancel; ERC-20 only).
     CancelOrder(String),
+    /// Copy the order's CoW Explorer URL to the clipboard.
+    CopyExplorerLink(String),
     Close,
     BoxClickIgnored,
     Key(keyboard::Event),
@@ -53,6 +56,9 @@ pub enum Outcome {
     },
     /// Cancel the tracked order off-chain (the coordinator signs + DELETEs it).
     RequestCancel { uid: String },
+    /// Copy text to the clipboard (the order's CoW Explorer link). The
+    /// coordinator owns the clipboard write + auto-clear, mirroring TxDetails.
+    CopyText(String),
 }
 
 #[derive(Debug)]
@@ -122,6 +128,7 @@ impl SwapPane {
                 }
             }
             Message::CancelOrder(uid) => (Task::none(), Some(Outcome::RequestCancel { uid })),
+            Message::CopyExplorerLink(url) => (Task::none(), Some(Outcome::CopyText(url))),
             Message::Close => (Task::none(), Some(Outcome::Closed)),
             Message::BoxClickIgnored => (Task::none(), None),
             Message::Key(keyboard::Event::KeyPressed { key, .. }) => {
@@ -306,6 +313,14 @@ fn tracking_view<'a>(
         );
     }
 
+    // The order's CoW Explorer link — shown as soon as it's placed (waiting
+    // or settled) so the user can follow it on the web. `None` only on chains
+    // without a CoW deployment, where no order could be tracked here anyway.
+    if let Some(url) = crate::cow::explorer_order_url(o.chain, &o.uid) {
+        body = body.push(Space::new().height(16));
+        body = body.push(explorer_link_button(t, url));
+    }
+
     body = body.push(Space::new().height(18));
     if terminal {
         body = body.push(primary_button(t, "Done", true).on_press(Message::Close));
@@ -357,6 +372,74 @@ fn tracking_view<'a>(
     (body.into(), terminal)
 }
 
+/// One full-width clickable button for the order's CoW Explorer link: an icon,
+/// the action label, and a compact one-line URL preview. Clicking anywhere on
+/// it copies the full link (we copy rather than open a browser — launching the
+/// user's default browser would leak their IP + order UID outside the proxy
+/// tunnel). The copy rides the coordinator's clipboard-clear path via
+/// `Outcome::CopyText`.
+fn explorer_link_button<'a>(t: KaoTheme, url: String) -> Element<'a, Message> {
+    let preview = short_explorer_url(&url);
+    let inner = row![
+        text("↗").size(20).color(t.a1).font(bold()),
+        Space::new().width(12),
+        column![
+            text("Copy CoW Explorer link")
+                .size(13)
+                .color(t.text)
+                .font(bold()),
+            Space::new().height(3),
+            text(preview)
+                .size(11)
+                .color(t.a1)
+                .font(mono())
+                .wrapping(Wrapping::None),
+        ]
+        .width(Length::Fill),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    button(inner)
+        .padding(Padding::from([12, 16]))
+        .width(Length::Fill)
+        .on_press(Message::CopyExplorerLink(url))
+        .style(move |_, status| {
+            let bg = match status {
+                button::Status::Hovered | button::Status::Pressed => with_alpha(t.a1, 0.16),
+                _ => with_alpha(t.a1, 0.08),
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: t.text,
+                border: Border {
+                    color: with_alpha(t.a1, 0.35),
+                    width: 1.0,
+                    radius: Radius::from(12),
+                },
+                ..button::Style::default()
+            }
+        })
+        .into()
+}
+
+/// Compact one-line preview of an explorer URL for display inside the button:
+/// the `https://` scheme dropped and the long order UID elided in the middle.
+/// The full URL (with scheme) is what actually gets copied.
+fn short_explorer_url(url: &str) -> String {
+    let bare = url.strip_prefix("https://").unwrap_or(url);
+    let chars: Vec<char> = bare.chars().collect();
+    // Keep enough head to show `…/orders/0xNNNNNN` and a short uid tail.
+    const HEAD: usize = 34;
+    const TAIL: usize = 8;
+    if chars.len() <= HEAD + TAIL + 1 {
+        return bare.to_string();
+    }
+    let head: String = chars[..HEAD].iter().collect();
+    let tail: String = chars[chars.len() - TAIL..].iter().collect();
+    format!("{head}…{tail}")
+}
+
 fn status_badge<'a>(t: KaoTheme, status: OrderStatus) -> Element<'a, Message> {
     let (fg, bg) = match status {
         OrderStatus::Fulfilled => (t.up, with_alpha(t.up, 0.12)),
@@ -376,4 +459,37 @@ fn status_badge<'a>(t: KaoTheme, status: OrderStatus) -> Element<'a, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_explorer_url_drops_scheme_and_elides_long_uid() {
+        let url = "https://explorer.cow.fi/base/orders/0xad599b7aa5710f9de3aa53d6b7f02e829a7f96245be85ea184b02eb1785ae5b56ff87f9ee53c1b22d3b74bb6dc191e11b45734d66a3e4edb";
+        let short = short_explorer_url(url);
+        assert!(!short.contains("https://"), "scheme should be dropped");
+        assert!(short.contains('…'), "long uid should be middle-elided");
+        assert!(
+            short.starts_with("explorer.cow.fi/base/orders/0x"),
+            "host + order path should be preserved: {short}"
+        );
+        // Tail keeps the last 8 chars of the uid so the row is still identifiable.
+        assert!(
+            short.ends_with("6a3e4edb"),
+            "uid tail should survive: {short}"
+        );
+        // Comfortably one line — far shorter than the ~150-char raw URL.
+        assert!(short.chars().count() < 60, "preview must stay compact");
+    }
+
+    #[test]
+    fn short_explorer_url_leaves_short_inputs_intact() {
+        // Nothing to elide — just the scheme is stripped.
+        assert_eq!(
+            short_explorer_url("https://explorer.cow.fi/orders/0xabc"),
+            "explorer.cow.fi/orders/0xabc"
+        );
+    }
 }

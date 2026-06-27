@@ -144,6 +144,56 @@ impl OrderStatusResponse {
     }
 }
 
+/// One order from `GET /account/{owner}/orders` — the subset of the full
+/// `Order` schema the Apps order list renders. Token symbols/decimals aren't on
+/// the wire (only addresses), so the caller resolves those from the curated
+/// token list. A non-null `ethflowData` marks a native-ETH (EthFlow) order;
+/// such orders' on-chain `owner` is the EthFlow contract, so callers tag them
+/// with the queried user address instead.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountOrder {
+    pub uid: String,
+    pub sell_token: Address,
+    pub buy_token: Address,
+    #[serde(with = "u256_dec")]
+    pub sell_amount: U256,
+    #[serde(with = "u256_dec")]
+    pub buy_amount: U256,
+    pub valid_to: u32,
+    pub kind: String,
+    pub status: OrderStatus,
+    #[serde(default, deserialize_with = "u256_dec_opt::deserialize")]
+    pub executed_sell_amount: Option<U256>,
+    #[serde(default, deserialize_with = "u256_dec_opt::deserialize")]
+    pub executed_buy_amount: Option<U256>,
+    /// Present (non-null) only for EthFlow orders — its presence is how we
+    /// detect them, and `userValidTo` is the real `validTo` (the on-chain one
+    /// is `uint256::MAX`).
+    #[serde(default)]
+    pub ethflow_data: Option<EthflowData>,
+}
+
+/// EthFlow-specific fields nested in an [`AccountOrder`]. Only `userValidTo` is
+/// modelled (the rest — `refundTxHash` — isn't rendered).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EthflowData {
+    #[serde(default)]
+    pub user_valid_to: Option<u32>,
+}
+
+impl AccountOrder {
+    /// The `(executedSell, executedBuy)` pair if any fill is present — same
+    /// rule as [`OrderStatusResponse::executed`].
+    pub fn executed(&self) -> Option<(U256, U256)> {
+        match (self.executed_sell_amount, self.executed_buy_amount) {
+            (Some(s), Some(b)) if !s.is_zero() => Some((s, b)),
+            _ => None,
+        }
+    }
+}
+
 /// `DELETE /orders` body — signed bulk cancellation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -226,6 +276,28 @@ pub async fn get_order(chain: Chain, uid: &str) -> Result<OrderStatusResponse, S
     resp.json::<OrderStatusResponse>()
         .await
         .map_err(|e| format!("cow order status decode: {}", redact_url_in_err(e)))
+}
+
+/// Fetch the most recent orders the orderbook holds for `owner` (newest
+/// first), up to `limit` (CoW caps it at 1000). Backs the Apps "Fetch" action:
+/// surfaces the address's full CoW order history — including orders placed in
+/// past sessions, which the in-memory tracked list doesn't carry — not just
+/// this session's. A clean account with no orders returns an empty array.
+pub async fn get_account_orders(
+    chain: Chain,
+    owner: Address,
+    limit: u16,
+) -> Result<Vec<AccountOrder>, String> {
+    let url = format!("{}/account/{owner}/orders?limit={limit}", base(chain)?);
+    let resp = http_client_or_err()?
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("cow account orders: {}", redact_url_in_err(e)))?;
+    let resp = check_status(resp, "account orders").await?;
+    resp.json::<Vec<AccountOrder>>()
+        .await
+        .map_err(|e| format!("cow account orders decode: {}", redact_url_in_err(e)))
 }
 
 /// Cancel one or more open orders (off-chain signed). Used for EOA/ERC-20
@@ -473,6 +545,71 @@ mod tests {
         };
         let v = serde_json::to_value(&body).unwrap();
         assert!(v.get("quoteId").is_none());
+    }
+
+    #[test]
+    fn account_orders_deserialize_array_and_resolve_executed() {
+        // A page as `/account/{owner}/orders` returns it: an ERC-20 sell and a
+        // native EthFlow buy, extra fields ignored.
+        let body = json!([
+            {
+                "uid": "0xaaaa",
+                "sellToken": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "buyToken": "0x6b175474e89094c44da98b954eedeac495271d0f",
+                "sellAmount": "1000000",
+                "buyAmount": "990000000000000000",
+                "validTo": 1900000000u64,
+                "kind": "sell",
+                "status": "fulfilled",
+                "executedSellAmount": "1000000",
+                "executedBuyAmount": "991000000000000000",
+                "owner": "0x1111111111111111111111111111111111111111",
+                "class": "market"
+            },
+            {
+                "uid": "0xbbbb",
+                "sellToken": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+                "buyToken": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+                "sellAmount": "500000000000000000",
+                "buyAmount": "1200000000",
+                "validTo": 4294967295u64,
+                "kind": "sell",
+                "status": "open",
+                "ethflowData": { "refundTxHash": null, "userValidTo": 1899999999u64 }
+            }
+        ]);
+        let orders: Vec<AccountOrder> = serde_json::from_value(body).unwrap();
+        assert_eq!(orders.len(), 2);
+
+        let erc20 = &orders[0];
+        assert_eq!(erc20.uid, "0xaaaa");
+        assert!(
+            erc20.ethflow_data.is_none(),
+            "ERC-20 order has no ethflowData"
+        );
+        assert_eq!(
+            erc20.executed(),
+            Some((
+                U256::from(1_000_000u64),
+                U256::from(991_000_000_000_000_000u64)
+            ))
+        );
+
+        let ethflow = &orders[1];
+        assert!(
+            ethflow.ethflow_data.is_some(),
+            "EthFlow order detected via ethflowData",
+        );
+        assert_eq!(
+            ethflow.ethflow_data.as_ref().unwrap().user_valid_to,
+            Some(1_899_999_999),
+            "userValidTo carries the real validity for EthFlow",
+        );
+        assert_eq!(
+            ethflow.executed(),
+            None,
+            "unfilled open order → no executed"
+        );
     }
 
     #[test]

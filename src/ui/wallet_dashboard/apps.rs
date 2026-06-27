@@ -8,8 +8,9 @@
 //! this pane) and is threaded into [`AppsPane::view`].
 
 use iced::border::Radius;
+use iced::keyboard;
 use iced::widget::{Space, button, column, container, row, scrollable, text};
-use iced::{Alignment, Background, Border, Element, Length, Padding};
+use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription};
 
 use crate::cow::api::QuoteResponse;
 use crate::cow::composer::{self, SwapComposer, SwapDraft};
@@ -32,8 +33,13 @@ pub enum Message {
     BackHome,
     Composer(composer::Message),
     Cancel(String),
+    /// Copy an order's CoW Explorer URL to the clipboard.
+    CopyExplorerLink(String),
     /// User asked to refresh the tracked orders' status now.
     RefreshOrders,
+    /// Raw keyboard event — only subscribed inside the Swap app, where Esc
+    /// steps back to the launcher.
+    Key(keyboard::Event),
 }
 
 /// Which Apps view is showing: the launcher, or the Swap app.
@@ -56,6 +62,9 @@ pub enum Outcome {
     RequestCancel {
         uid: String,
     },
+    /// Copy text to the clipboard (an order's CoW Explorer link). The
+    /// coordinator owns the clipboard write + auto-clear, mirroring TxDetails.
+    CopyText(String),
     /// Poll the tracked orders' status on demand.
     RefreshOrders,
 }
@@ -107,7 +116,31 @@ impl AppsPane {
                 None => None,
             },
             Message::Cancel(uid) => Some(Outcome::RequestCancel { uid }),
+            Message::CopyExplorerLink(url) => Some(Outcome::CopyText(url)),
             Message::RefreshOrders => Some(Outcome::RefreshOrders),
+            Message::Key(event) => {
+                // Esc inside the Swap app steps back to the launcher (the same
+                // as the "← Apps" link), rather than doing nothing.
+                if let keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                    ..
+                } = event
+                    && self.view == AppsView::Swap
+                {
+                    self.view = AppsView::Launcher;
+                }
+                None
+            }
+        }
+    }
+
+    /// Listen for Esc only while the Swap app is open, so it can step back to
+    /// the launcher. The launcher itself has nothing to step back to, so it
+    /// subscribes to nothing.
+    pub fn subscription(&self) -> Subscription<Message> {
+        match self.view {
+            AppsView::Swap => keyboard::listen().map(Message::Key),
+            AppsView::Launcher => Subscription::none(),
         }
     }
 
@@ -122,15 +155,23 @@ impl AppsPane {
             AppsView::Swap => self.swap_view(t, portfolio, orders),
         };
 
-        let scroller = scrollable(container(content).padding(Padding::from([28, 32])))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(move |_, status| kao_scrollable_style(t, status));
+        // Center the bounded (max-width 560) content within the full-width
+        // scroll area. Centering has to live on the inner container: the
+        // scrollable fills the pane, so its own child is what needs to be
+        // both Fill-width and center-aligned — an outer `center_x` on the
+        // scrollable itself is a no-op (it already fills).
+        let scroller = scrollable(
+            container(content)
+                .center_x(Length::Fill)
+                .padding(Padding::from([28, 32])),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_, status| kao_scrollable_style(t, status));
 
         container(scroller)
             .width(Length::Fill)
             .height(Length::Fill)
-            .center_x(Length::Fill)
             .into()
     }
 
@@ -185,14 +226,16 @@ impl AppsPane {
                 ..container::Style::default()
             });
 
-        // Orders header: label + a fetch button (only when there are orders).
-        let mut orders_header = row![text("YOUR ORDERS").size(11).color(t.sub).font(mono_bold())]
-            .align_y(Alignment::Center)
-            .width(Length::Fill);
-        if !orders.is_empty() {
-            orders_header = orders_header.push(Space::new().width(Length::Fill));
-            orders_header = orders_header.push(fetch_button(t));
-        }
+        // Orders header: label + a fetch button. The button is always present —
+        // "Fetch" pulls the address's full CoW order history, so it must be
+        // reachable even from a fresh session with no orders listed yet.
+        let orders_header = row![
+            text("YOUR ORDERS").size(11).color(t.sub).font(mono_bold()),
+            Space::new().width(Length::Fill),
+            fetch_button(t),
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
 
         let mut content = column![
             ghost_button(t, text("← Apps").size(13).color(t.sub).font(bold()))
@@ -215,7 +258,7 @@ impl AppsPane {
 
         if orders.is_empty() {
             content = content.push(
-                text("No orders yet — place a swap above.")
+                text("No orders yet — place a swap above, or tap Fetch to load your history.")
                     .size(12)
                     .color(t.sub),
             );
@@ -236,6 +279,28 @@ fn fetch_button<'a>(t: KaoTheme) -> Element<'a, Message> {
     button(text("↻ Fetch").size(11).color(t.a1).font(bold()))
         .padding(Padding::from([4, 10]))
         .on_press(Message::RefreshOrders)
+        .style(move |_, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => with_alpha(t.a1, 0.16),
+                _ => with_alpha(t.a1, 0.10),
+            })),
+            text_color: t.a1,
+            border: Border {
+                color: with_alpha(t.a1, 0.3),
+                width: 1.0,
+                radius: Radius::from(8),
+            },
+            ..button::Style::default()
+        })
+        .into()
+}
+
+/// Small "↗ Explorer" button on an order row that copies its CoW Explorer
+/// link. Shares `fetch_button`'s accent-pill styling for a consistent row.
+fn explorer_button<'a>(t: KaoTheme, url: String) -> Element<'a, Message> {
+    button(text("↗ Explorer").size(11).color(t.a1).font(bold()))
+        .padding(Padding::from([4, 10]))
+        .on_press(Message::CopyExplorerLink(url))
         .style(move |_, status| button::Style {
             background: Some(Background::Color(match status {
                 button::Status::Hovered | button::Status::Pressed => with_alpha(t.a1, 0.16),
@@ -334,6 +399,13 @@ fn order_row<'a>(t: KaoTheme, o: &'a TrackedOrder) -> Element<'a, Message> {
 
     let mut right = row![status_badge(t, o.status)].align_y(Alignment::Center);
 
+    // CoW Explorer link for the placed order (copies to clipboard). `None`
+    // only on chains without a CoW deployment, where no order can exist.
+    if let Some(url) = crate::cow::explorer_order_url(o.chain, &o.uid) {
+        right = right.push(Space::new().width(8));
+        right = right.push(explorer_button(t, url));
+    }
+
     // Off-chain cancel is only wired for ERC-20 orders; EthFlow orders cancel
     // on-chain (deferred) and so show no cancel affordance in v1.
     if !o.status.is_terminal() && !o.is_ethflow {
@@ -399,4 +471,47 @@ fn status_badge<'a>(t: KaoTheme, status: OrderStatus) -> Element<'a, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn esc_event() -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::default(),
+            text: None,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn esc_steps_back_from_swap_app_to_launcher() {
+        let mut pane = AppsPane::new();
+        assert_eq!(pane.view, AppsView::Launcher);
+        pane.update(Message::OpenSwapApp);
+        assert_eq!(pane.view, AppsView::Swap);
+        // Esc inside the Swap app returns to the launcher — same as "← Apps".
+        let out = pane.update(Message::Key(esc_event()));
+        assert!(
+            out.is_none(),
+            "stepping back is internal, no outcome bubbles up"
+        );
+        assert_eq!(pane.view, AppsView::Launcher);
+    }
+
+    #[test]
+    fn esc_on_launcher_is_a_noop() {
+        let mut pane = AppsPane::new();
+        pane.update(Message::Key(esc_event()));
+        assert_eq!(
+            pane.view,
+            AppsView::Launcher,
+            "launcher has nothing to step back to",
+        );
+    }
 }

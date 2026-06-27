@@ -277,9 +277,14 @@ const MAINNET_OVERLAY: &[OverlayEntry] = &[
     },
 ];
 
-/// Base core overlay — staples the Superchain Token List omits. Native
-/// USDC + canonical WETH + Coinbase BTC. Other Base tokens come from
-/// the bundled tokenlist.
+/// Base core overlay. Two jobs: (1) staples the Superchain Token List omits
+/// (native USDC + canonical WETH + Coinbase BTC), and (2) preferred tokens the
+/// list *does* carry but which would otherwise be buried — the overlay always
+/// sorts to the front of `curated_tokens`, so listing the major stablecoins
+/// here promotes them into the swap picker's popular set instead of letting
+/// the alphabetically-first long-tail (0xBTC, ABT, ADS, ADX, AIKEK, …) take
+/// those slots. Overlay entries win on address collision (see `merge_overlay`),
+/// so the dedup against the bundled list is harmless.
 const BASE_OVERLAY: &[OverlayEntry] = &[
     OverlayEntry {
         symbol: "USDC",
@@ -301,6 +306,44 @@ const BASE_OVERLAY: &[OverlayEntry] = &[
         address: address!("0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf"),
         decimals: 8,
         price_source: PriceSource::UniswapWethPool { fee: 500 },
+    },
+    // Major stablecoins — already in the bundled list, promoted here so the
+    // swap picker shows them up top rather than long-tail junk. Thin/varied
+    // Base liquidity, so each probes fee tiers rather than pinning one.
+    OverlayEntry {
+        symbol: "DAI",
+        name: "Dai Stablecoin",
+        address: address!("0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb"),
+        decimals: 18,
+        price_source: PriceSource::UniswapWethPoolProbe,
+    },
+    OverlayEntry {
+        symbol: "crvUSD",
+        name: "Curve.Fi USD Stablecoin",
+        address: address!("0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93"),
+        decimals: 18,
+        price_source: PriceSource::UniswapWethPoolProbe,
+    },
+    OverlayEntry {
+        symbol: "fxUSD",
+        name: "f(x) USD",
+        address: address!("0x63525b8f9a78251611ada0a05724eeef48100fbd"),
+        decimals: 18,
+        price_source: PriceSource::UniswapWethPoolProbe,
+    },
+    OverlayEntry {
+        symbol: "eUSD",
+        name: "Electronic Dollar",
+        address: address!("0xCfA3Ef56d303AE4fAabA0592388F19d7C3399FB4"),
+        decimals: 18,
+        price_source: PriceSource::UniswapWethPoolProbe,
+    },
+    OverlayEntry {
+        symbol: "USDT",
+        name: "Tether USD",
+        address: address!("0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2"),
+        decimals: 6,
+        price_source: PriceSource::UniswapWethPoolProbe,
     },
 ];
 
@@ -353,6 +396,15 @@ const OPTIMISM_OVERLAY: &[OverlayEntry] = &[
 
 // ── Bundled Superchain Token List ───────────────────────────────────────────
 
+/// Bundled-tokenlist entries to drop entirely — dead or junk tokens that only
+/// surface because they sort first alphabetically and would otherwise crowd the
+/// swap picker's popular set. Matched by address at parse time.
+const TOKENLIST_BLOCKLIST: &[Address] = &[
+    // 0xBitcoin (Base) — a long-abandoned mineable ERC-20; replaced in the
+    // popular set by USDT.
+    address!("0xc4D4FD4F4459730d176844c170F2bB323c87Eb3B"),
+];
+
 /// The Superchain Token List, embedded at compile time. Already shipped
 /// with the binary for SVG-logo lookup; reused here for L2 ERC-20
 /// metadata. Mainnet entries (chainId 1) are dropped at parse time —
@@ -398,6 +450,9 @@ fn parse_tokenlist() -> (Vec<TokenMeta>, Vec<TokenMeta>) {
             debug!(address = %entry.address, "skipping tokenlist entry with unparseable address");
             continue;
         };
+        if TOKENLIST_BLOCKLIST.contains(&addr) {
+            continue;
+        }
         bucket.push(TokenMeta {
             symbol: Cow::Owned(entry.symbol),
             name: Cow::Owned(entry.name),
@@ -1380,6 +1435,37 @@ mod tokenlist_tests {
         );
         assert_eq!(merged.len(), BASE_OVERLAY.len() + 1);
         assert!(merged.iter().any(|t| t.address == only_in_tokenlist));
+    }
+
+    /// The Base swap picker's "popular" set is the first 10 of
+    /// `curated_tokens` (overlay first, then the alphabetical tokenlist). The
+    /// major stablecoins must occupy those slots instead of the long-tail junk
+    /// that sorts first alphabetically (ABT, ADS, ADX, AIKEK, …).
+    #[test]
+    fn base_swap_picker_top10_shows_stables_not_alphabetical_junk() {
+        let curated = curated_tokens(Chain::Base);
+        let top10: Vec<String> = curated
+            .iter()
+            .take(10)
+            .map(|(sym, _, _)| sym.clone())
+            .collect();
+        for stable in ["DAI", "crvUSD", "fxUSD", "eUSD", "USDT"] {
+            assert!(
+                top10.iter().any(|s| s == stable),
+                "{stable} should be a top-10 Base swap target; got {top10:?}",
+            );
+        }
+        for junk in ["ABT", "ADS", "ADX", "AIKEK"] {
+            assert!(
+                !top10.iter().any(|s| s == junk),
+                "{junk} should be pushed out of the top 10; got {top10:?}",
+            );
+        }
+        // 0xBTC is blocklisted — it must not appear anywhere in the Base list.
+        assert!(
+            !curated.iter().any(|(sym, _, _)| sym == "0xBTC"),
+            "0xBTC should be dropped from the Base token list entirely",
+        );
     }
 }
 
