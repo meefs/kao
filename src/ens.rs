@@ -83,12 +83,14 @@ const ADDR_SELECTOR: [u8; 4] = [0x3b, 0x3b, 0x57, 0xde];
 // keccak256("name(bytes32)")[..4]
 pub(crate) const NAME_SELECTOR: [u8; 4] = [0x69, 0x1f, 0x34, 0x31];
 
-/// Error returned when an ENS read completed but did not cross Helios's
-/// verified path — the light client was unavailable and the value came back
-/// over the raw-RPC fallback. ENS feeds signing decisions, so an unverified
-/// answer is a hard failure rather than something to silently trust.
+/// Error returned when a name-service read completed but did not cross
+/// Helios's verified path — the light client was unavailable and the value
+/// came back over the raw-RPC fallback. These lookups feed signing decisions,
+/// so an unverified answer is a hard failure rather than something to silently
+/// trust. Shared by ENS and the GNS/WNS namespaces ([`crate::names`]), hence
+/// the namespace-neutral wording.
 const UNVERIFIED: &str =
-    "ENS lookup could not be verified by the light client; enter the address directly";
+    "Name lookup could not be verified by the light client; enter the address directly";
 
 /// Compute the ENSIP-1 namehash of `name`.
 ///

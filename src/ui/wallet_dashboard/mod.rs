@@ -1276,17 +1276,17 @@ impl WalletScreen {
         }
         Task::perform(
             async move {
-                debug!(addr = %short_address(address), "ens reverse lookup");
+                debug!(addr = %short_address(address), "name reverse lookup");
                 let started = std::time::Instant::now();
-                // Verified (Helios, mainnet-only) reverse lookup. An
-                // unverified read fails closed inside `lookup_address`, so
-                // the address simply shows without an ENS name rather than
-                // a name a hostile RPC could fabricate.
+                // Verified (Helios, mainnet-only) reverse lookup across ENS /
+                // GNS / WNS. An unverified read fails closed inside
+                // `lookup_address`, so the address simply shows without a name
+                // rather than a name a hostile RPC could fabricate.
                 let result = crate::names::lookup_address(network.as_ref(), address).await;
                 debug!(
                     elapsed = ?started.elapsed(),
                     found = matches!(&result, Ok(Some(_))),
-                    "ens reverse lookup completed",
+                    "name reverse lookup completed",
                 );
                 (address, result)
             },
@@ -1861,7 +1861,7 @@ impl WalletScreen {
                     Ok(Some(n)) => n,
                     Ok(None) => return (Task::none(), None),
                     Err(e) => {
-                        warn!(error = %e, "ens auto-name lookup failed");
+                        warn!(error = %e, "auto-name lookup failed");
                         return (Task::none(), None);
                     }
                 };
