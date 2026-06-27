@@ -25,7 +25,6 @@ use alloy::primitives::{Address, B256, Bytes, I256, U256};
 
 use crate::chain::Chain;
 use crate::decode::{bytecode, fourbyte, matcher, proxy};
-use crate::ens;
 use crate::net::BalanceFetcher;
 use crate::sanitize;
 
@@ -99,7 +98,8 @@ pub struct DecodedArg {
 #[allow(dead_code)]
 pub enum ArgDisplay {
     /// Address; `ens` populated when the chain is Mainnet and reverse
-    /// resolution succeeded (forward-verified by `ens::lookup_address`).
+    /// resolution succeeded (forward-verified by `crate::names::lookup_address`,
+    /// across ENS / GNS / WNS).
     Address {
         addr: Address,
         ens: Option<String>,
@@ -329,7 +329,10 @@ async fn humanize_arg(
             // the light client, so an unverified answer fails closed (no
             // name) rather than letting a hostile RPC fabricate one.
             let ens = if matches!(chain, Chain::Mainnet) {
-                ens::lookup_address(net, *addr).await.ok().flatten()
+                crate::names::lookup_address(net, *addr)
+                    .await
+                    .ok()
+                    .flatten()
             } else {
                 None
             };

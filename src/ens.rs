@@ -74,14 +74,14 @@ pub fn beautify(name: &str) -> String {
 }
 
 /// ENS Registry on Ethereum mainnet (ENSIP-1).
-const ENS_REGISTRY: Address = address!("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e");
+pub(crate) const ENS_REGISTRY: Address = address!("0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e");
 
 // keccak256("resolver(bytes32)")[..4]
-const RESOLVER_SELECTOR: [u8; 4] = [0x01, 0x78, 0xb8, 0xbf];
+pub(crate) const RESOLVER_SELECTOR: [u8; 4] = [0x01, 0x78, 0xb8, 0xbf];
 // keccak256("addr(bytes32)")[..4]
 const ADDR_SELECTOR: [u8; 4] = [0x3b, 0x3b, 0x57, 0xde];
 // keccak256("name(bytes32)")[..4]
-const NAME_SELECTOR: [u8; 4] = [0x69, 0x1f, 0x34, 0x31];
+pub(crate) const NAME_SELECTOR: [u8; 4] = [0x69, 0x1f, 0x34, 0x31];
 
 /// Error returned when an ENS read completed but did not cross Helios's
 /// verified path — the light client was unavailable and the value came back
@@ -228,14 +228,18 @@ pub async fn lookup_address(
     Ok(Some(beautify(&normalized)))
 }
 
-/// Issue one ENS `eth_call` (`selector` followed by the 32-byte `node`)
-/// against `to` through the light-client-verified path on Ethereum mainnet.
+/// Issue one name-service `eth_call` (`selector` followed by a single 32-byte
+/// argument `node`) against `to` through the light-client-verified path on
+/// Ethereum mainnet. Shared by ENS and by the single-contract GNS/WNS
+/// namespaces ([`crate::names`]); `node` is a namehash for `addr(bytes32)` or a
+/// left-padded address for `reverseResolve(address)`.
 ///
 /// Returns the raw return bytes on a verified read, or `Err` ([`UNVERIFIED`])
-/// when the value came back over the raw-RPC fallback. ENS is mainnet-only,
-/// so the chain is pinned to [`Chain::Mainnet`] regardless of which chain the
-/// caller is viewing — see the module docs for why every read fails closed.
-async fn verified_call(
+/// when the value came back over the raw-RPC fallback. These namespaces are
+/// mainnet-only, so the chain is pinned to [`Chain::Mainnet`] regardless of
+/// which chain the caller is viewing — see the module docs for why every read
+/// fails closed.
+pub(crate) async fn verified_call(
     net: &dyn BalanceFetcher,
     to: Address,
     selector: [u8; 4],
@@ -291,7 +295,7 @@ async fn registry_resolver(net: &dyn BalanceFetcher, node: B256) -> Result<Addre
 }
 
 /// Decode a left-padded 32-byte ABI-encoded address.
-fn decode_address(data: &[u8]) -> Address {
+pub(crate) fn decode_address(data: &[u8]) -> Address {
     debug_assert!(data.len() >= 32);
     Address::from_slice(&data[12..32])
 }
@@ -299,7 +303,7 @@ fn decode_address(data: &[u8]) -> Address {
 /// Decode a single ABI-encoded `string` return: head (32-byte offset) +
 /// tail (32-byte length followed by `length` bytes, padded to a 32-byte
 /// multiple). Returns `None` on malformed input.
-fn decode_string(data: &[u8]) -> Option<String> {
+pub(crate) fn decode_string(data: &[u8]) -> Option<String> {
     if data.len() < 64 {
         return None;
     }

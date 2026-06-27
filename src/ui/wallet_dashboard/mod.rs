@@ -1282,7 +1282,7 @@ impl WalletScreen {
                 // unverified read fails closed inside `lookup_address`, so
                 // the address simply shows without an ENS name rather than
                 // a name a hostile RPC could fabricate.
-                let result = crate::ens::lookup_address(network.as_ref(), address).await;
+                let result = crate::names::lookup_address(network.as_ref(), address).await;
                 debug!(
                     elapsed = ?started.elapsed(),
                     found = matches!(&result, Ok(Some(_))),
@@ -3344,7 +3344,7 @@ fn spawn_ens_resolve_task(
             // Verified (Helios, mainnet-only) forward resolution: the
             // resolved address becomes the signed send recipient, so an
             // unverified RPC answer fails closed rather than being trusted.
-            let result = crate::ens::resolve_name(network.as_ref(), &name).await;
+            let result = crate::names::resolve_name(network.as_ref(), &name).await;
             (seq, name, result)
         },
         |(seq, name, result)| Message::Send(send::Message::EnsResolved { seq, name, result }),
@@ -3364,7 +3364,7 @@ fn spawn_contacts_ens_resolve_task(
             // Verified (Helios, mainnet-only) forward resolution; the
             // resolved address is saved as a contact and later reused as a
             // send recipient, so unverified answers fail closed.
-            let result = crate::ens::resolve_name(network.as_ref(), &name).await;
+            let result = crate::names::resolve_name(network.as_ref(), &name).await;
             (seq, name, result)
         },
         |(seq, name, result)| {

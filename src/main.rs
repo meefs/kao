@@ -6,7 +6,9 @@ mod chain;
 mod cow;
 mod decode;
 mod ens;
+mod gns;
 mod indexer;
+mod names;
 mod net;
 mod paths;
 mod portfolio;
@@ -15,6 +17,7 @@ mod sanitize;
 mod settings;
 mod ui;
 mod wallet;
+mod wns;
 
 use app::App;
 use tracing_subscriber::EnvFilter;
