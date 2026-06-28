@@ -328,7 +328,11 @@ fn hardware_footer<'a>(t: KaoTheme, status: HardwareStatus) -> Element<'a, Messa
     };
 
     let dot_color = if connected { t.up } else { t.down };
-    let state_text = if connected { "connected" } else { "disconnected" };
+    let state_text = if connected {
+        "connected"
+    } else {
+        "disconnected"
+    };
     let state_color = if connected { t.sub } else { t.down };
 
     let dot = container(Space::new())
