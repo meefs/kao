@@ -22,7 +22,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subsc
 use super::home::{format_symbol, network_display_name, network_label};
 use crate::chain::Chain;
 use crate::decode::clear_sign::DecodeResult;
-use crate::ens;
+use crate::names;
 use crate::portfolio::LiveToken;
 use crate::safe::tx::{Operation, SafeTxInput};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
@@ -484,7 +484,7 @@ impl SendPane {
             } else {
                 Resolution::Address(addr)
             }
-        } else if ens::looks_like_ens(trimmed) {
+        } else if names::looks_like_name(trimmed) {
             Resolution::Resolving {
                 name: trimmed.to_string(),
             }
@@ -1218,7 +1218,7 @@ impl SendPane {
         } else {
             bold()
         });
-        let input = text_input("0x… address or name.eth", &self.to)
+        let input = text_input("0x… address or a name (.eth / .gwei / .wei)", &self.to)
             .on_input(Message::SetTo)
             .padding(Padding::from([12, 14]))
             .size(15)
@@ -1270,7 +1270,7 @@ impl SendPane {
                             .font(mono()),
                     ]
                     .align_y(Alignment::Center),
-                    text("(verifying ENS…)").size(10).color(t.sub),
+                    text("(verifying name…)").size(10).color(t.sub),
                 ]
                 .spacing(2),
             )
@@ -1300,18 +1300,16 @@ impl SendPane {
             .padding(Padding::from([4, 0]))
             .into(),
             Resolution::NotFound { name } => container(
-                text(format!(
-                    "ENS name \u{201C}{name}\u{201D} has no address record"
-                ))
-                .size(11)
-                .color(t.down)
-                .font(bold()),
+                text(format!("\u{201C}{name}\u{201D} has no address record"))
+                    .size(11)
+                    .color(t.down)
+                    .font(bold()),
             )
             .padding(Padding::from([4, 0]))
             .into(),
             Resolution::Error { name, msg } => container(
                 text(format!(
-                    "ENS lookup for \u{201C}{name}\u{201D} failed: {msg}"
+                    "Name lookup for \u{201C}{name}\u{201D} failed: {msg}"
                 ))
                 .size(11)
                 .color(t.down)
@@ -1326,7 +1324,7 @@ impl SendPane {
             } => {
                 let b = column![
                     text(format!(
-                        "⚠ ENS \u{201C}{name}\u{201D} now resolves to a different address"
+                        "⚠ \u{201C}{name}\u{201D} now resolves to a different address"
                     ))
                     .size(12)
                     .color(t.down)
@@ -1365,7 +1363,7 @@ impl SendPane {
                     .into()
             }
             Resolution::Invalid => container(
-                text("Not a valid 0x… address or ENS name")
+                text("Not a valid 0x… address or name")
                     .size(11)
                     .color(t.down)
                     .font(bold()),

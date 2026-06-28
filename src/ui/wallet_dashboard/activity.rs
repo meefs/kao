@@ -1,10 +1,10 @@
 //! Activity pane — transaction list backed by the configured indexer.
 //!
-//! Counterparty addresses surface as short `0x….` strings; reverse-ENS is
-//! deliberately *not* applied here without forward verification, since
-//! unverified reverse records are owner-controlled and impersonate
-//! arbitrary names. If we later want ENS labels on this pane, the lookup
-//! must go through `crate::ens::lookup_address`.
+//! Counterparty addresses surface as short `0x….` strings; reverse name
+//! resolution is deliberately *not* applied here without forward
+//! verification, since unverified reverse records are owner-controlled and
+//! impersonate arbitrary names. If we later want name labels (ENS / GNS /
+//! WNS) on this pane, the lookup must go through `crate::names::lookup_address`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
