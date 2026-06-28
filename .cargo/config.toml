@@ -1,2 +1,7 @@
 [alias]
 xtask = "run --package xtask --"
+
+# Statically link the MSVC CRT on Windows so the binary does not depend on the
+# Visual C++ Redistributable (vcruntime140.dll / msvcp140.dll) being installed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
