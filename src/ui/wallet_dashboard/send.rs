@@ -471,6 +471,10 @@ impl SendPane {
 
     pub fn apply_max(&mut self, amount_str: String) {
         self.amount = amount_str;
+        // Max changes the amount, so any prior EOA quote no longer matches the
+        // plan — invalidate here too, keeping the rule uniform across every
+        // amount mutation (no-op for Safe mode).
+        self.invalidate_eoa_quote();
     }
 
     pub fn take_pending_ens(&mut self) -> Option<(u64, String)> {
@@ -553,15 +557,18 @@ impl SendPane {
     }
 
     pub fn quote_started(&mut self) -> u64 {
-        if let Some(eoa) = self.eoa_mut() {
-            eoa.quote_seq = eoa.quote_seq.wrapping_add(1);
-            eoa.quote = None;
-            eoa.quote_loading = true;
-            let seq = eoa.quote_seq;
-            self.error = None;
-            return seq;
-        }
-        0
+        // Bump the seq and clear the stale quote via the shared invalidator,
+        // then flip into the loading state and return the fresh seq the quote
+        // task must echo back.
+        self.invalidate_eoa_quote();
+        self.error = None;
+        let Some(eoa) = self.eoa_mut() else {
+            // Non-EOA modes never quote; this sentinel is unused (real seqs
+            // start at 1 after the first bump above).
+            return 0;
+        };
+        eoa.quote_loading = true;
+        eoa.quote_seq
     }
 
     pub fn decode_started(&mut self) -> u64 {
@@ -809,16 +816,12 @@ impl SendPane {
             }
             Message::SetToken(i) => {
                 self.token_idx = i;
-                match &mut self.mode {
-                    SendMode::Eoa(eoa) => {
-                        eoa.quote_seq = eoa.quote_seq.wrapping_add(1);
-                        eoa.quote = None;
-                        eoa.quote_loading = false;
-                    }
-                    SendMode::Safe(_) => {
-                        self.amount.clear();
-                    }
+                if let SendMode::Safe(_) = &self.mode {
+                    self.amount.clear();
                 }
+                // EOA: token (and thus chain) changed — the prior quote is
+                // stale. No-op for Safe mode.
+                self.invalidate_eoa_quote();
                 self.error = None;
                 (Task::none(), None)
             }
