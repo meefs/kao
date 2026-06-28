@@ -5718,6 +5718,31 @@ mod tests {
     }
 
     #[test]
+    fn active_safe_signing_block_catches_demotion_and_swap() {
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x99, 1)]);
+        screen.active_safe = Some(0);
+        let safe = screen.safes[0].address();
+        let chain = Chain::Mainnet;
+
+        // Canonical + matching descriptor → signing allowed.
+        assert!(screen.active_safe_signing_block(safe, chain).is_none());
+
+        // A refresh-on-open demotes the live descriptor while the modal's
+        // snapshot is still Canonical → the re-check must block.
+        screen.safes[0].trust = crate::wallet::SafeTrust::UnrecognizedImpl;
+        assert!(screen.active_safe_signing_block(safe, chain).is_some());
+
+        // Trust restored, but a wholesale SafesUpdated replace reordered the
+        // active slot onto a different Safe → block on address mismatch.
+        screen.safes[0] = safe_descriptor(0xAB, 1);
+        assert!(screen.active_safe_signing_block(safe, chain).is_some());
+
+        // No active descriptor at all (deleted / switched to EOA) → block.
+        screen.active_safe = None;
+        assert!(screen.active_safe_signing_block(safe, chain).is_some());
+    }
+
+    #[test]
     fn allowed_chains_in_eoa_mode_returns_all_chains() {
         let screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
         assert_eq!(screen.allowed_chains(), Chain::ALL.to_vec());

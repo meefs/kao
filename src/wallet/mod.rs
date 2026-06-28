@@ -265,7 +265,7 @@ pub enum SafeTrust {
 
 impl SafeTrust {
     pub fn permits_signing(&self) -> bool {
-        matches!(self, Self::Canonical)
+        self.signing_block_reason().is_none()
     }
 
     pub fn signing_block_reason(&self) -> Option<&'static str> {
