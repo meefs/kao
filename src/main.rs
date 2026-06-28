@@ -3,9 +3,10 @@
 
 mod app;
 mod chain;
+mod cow;
 mod decode;
-mod ens;
 mod indexer;
+mod names;
 mod net;
 mod paths;
 mod portfolio;

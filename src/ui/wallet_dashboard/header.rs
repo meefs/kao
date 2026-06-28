@@ -1,17 +1,17 @@
-//! Top header strip — wallet name (with inline rename), address pill,
-//! network row, mood pill.
+//! Top header strip — wallet name (with inline rename), Helios verification
+//! badge, mood pill. The account selector and network/privacy status moved
+//! into the sidebar; this strip is now just the active-account title and the
+//! at-a-glance verification + mood affordances.
 
-use alloy::primitives::Address;
 use iced::border::Radius;
-use iced::widget::{Space, button, column, container, mouse_area, row, text, text_input};
+use iced::widget::{Space, button, container, row, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use crate::net::VerificationStatus;
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    black, bold, hover_tint, kao_text, mono, mono_bold, text_input_style, verification_badge,
+    black, bold, hover_tint, kao_text, text_input_style, verification_badge,
 };
-use crate::wallet::short_address;
 
 use super::{MOOD, Message};
 
@@ -23,66 +23,19 @@ pub const RENAME_INPUT_ID: &str = "wallet_dashboard_rename_input";
 
 pub fn view<'a>(
     t: KaoTheme,
-    address: Address,
     verification: VerificationStatus,
     display_name: String,
     rename_draft: Option<&'a str>,
-    network_label: &'a str,
     // When `true`, the title slot renders a non-editable Safe name
     // row (no rename pencil) — Safe rename isn't a feature yet, so
     // the affordance would be a false promise.
     is_safe: bool,
 ) -> Element<'a, Message> {
-    let addr_short = short_address(address);
-    // Address pill: clickable trigger that opens the account dropdown.
-    let addr_pill = container(
-        row![
-            text(addr_short).size(22).color(t.text).font(mono_bold()),
-            Space::new().width(8),
-            text("▾").size(14).color(t.sub),
-        ]
-        .align_y(Alignment::Center),
-    )
-    .padding(Padding::from([4, 10]))
-    .style(move |_| container::Style {
-        background: Some(Background::Color(t.ab1)),
-        border: Border {
-            color: with_alpha(t.a1, 0.18),
-            width: 1.0,
-            radius: Radius::from(10),
-        },
-        text_color: Some(t.text),
-        ..container::Style::default()
-    });
-    let addr_trigger: Element<'_, Message> = mouse_area(addr_pill)
-        .on_press(Message::OpenAccountDropdown)
-        .interaction(iced::mouse::Interaction::Pointer)
-        .into();
-
-    let net_row = row![
-        text(network_label.to_string())
-            .size(11)
-            .color(t.sub)
-            .font(mono()),
-        Space::new().width(8),
-        verification_badge(t, verification),
-    ]
-    .align_y(Alignment::Center);
-
     let title_slot: Element<'a, Message> = match (rename_draft, is_safe) {
         (Some(draft), _) => rename_input(t, draft),
         (None, false) => static_name(t, display_name),
         (None, true) => safe_name_static(t, display_name),
     };
-
-    let title_col = column![
-        title_slot,
-        Space::new().height(2),
-        addr_trigger,
-        Space::new().height(2),
-        net_row,
-    ]
-    .spacing(1);
 
     let mood_pill = container(kao_text(t, MOOD, 15.0))
         .padding(Padding::from([6, 13]))
@@ -97,9 +50,15 @@ pub fn view<'a>(
         });
 
     container(
-        row![title_col, Space::new().width(Length::Fill), mood_pill]
-            .align_y(Alignment::Center)
-            .width(Length::Fill),
+        row![
+            title_slot,
+            Space::new().width(Length::Fill),
+            verification_badge(t, verification),
+            Space::new().width(12),
+            mood_pill,
+        ]
+        .align_y(Alignment::Center)
+        .width(Length::Fill),
     )
     .padding(Padding::from([14, 24]))
     .width(Length::Fill)

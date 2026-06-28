@@ -37,7 +37,7 @@ use iced::widget::{Space, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
 use crate::chain::Chain;
-use crate::ens;
+use crate::names;
 use crate::net::BalanceFetcher;
 use crate::safe::{self, SafeMetadata, ScanResult};
 use crate::settings;
@@ -454,18 +454,18 @@ impl SafeOnboardingScreen {
         };
         let trimmed = input.trim().to_string();
         if trimmed.is_empty() {
-            self.set_address_error("Please enter an Ethereum address or ENS name.");
+            self.set_address_error("Please enter an Ethereum address or name.");
             return (Task::none(), None);
         }
-        // Try hex address first; cheaper than spawning an ENS task.
+        // Try hex address first; cheaper than spawning a name-resolution task.
         if let Ok(address) = trimmed.parse::<Address>() {
             return self.kick_off_scan(address, trimmed);
         }
-        if ens::looks_like_ens(&trimmed) {
+        if names::looks_like_name(&trimmed) {
             return self.kick_off_ens(trimmed);
         }
         self.set_address_error(
-            "Not a valid Ethereum address or ENS name. Expected `0x…` (40 hex chars) or `name.eth`.",
+            "Not a valid Ethereum address or name. Expected `0x…` (40 hex chars) or a `.eth` / `.gwei` / `.wei` name.",
         );
         (Task::none(), None)
     }
@@ -478,10 +478,10 @@ impl SafeOnboardingScreen {
         let network = self.network.clone();
         let task = Task::perform(
             async move {
-                // ENS resolution rides the Helios-verified path (mainnet
+                // Name resolution rides the Helios-verified path (mainnet
                 // only); a hostile exec RPC can't substitute the resolved
                 // address that becomes a Safe owner.
-                let result = ens::resolve_name(network.as_ref(), &name).await;
+                let result = names::resolve_name(network.as_ref(), &name).await;
                 (seq, name, result)
             },
             |(seq, name, result)| Message::EnsResolved { seq, name, result },
@@ -504,11 +504,11 @@ impl SafeOnboardingScreen {
         match result {
             Ok(Some(address)) => self.kick_off_scan(address, name),
             Ok(None) => {
-                self.set_address_error(&format!("ENS name “{name}” has no address record."));
+                self.set_address_error(&format!("“{name}” has no address record."));
                 (Task::none(), None)
             }
             Err(e) => {
-                self.set_address_error(&format!("ENS lookup failed: {e}"));
+                self.set_address_error(&format!("Name lookup failed: {e}"));
                 (Task::none(), None)
             }
         }
@@ -1107,7 +1107,7 @@ fn view_address_input<'a>(
     error: Option<&'a str>,
     resolving: bool,
 ) -> Element<'a, Message> {
-    let addr_input = text_input("0x… or name.eth", input)
+    let addr_input = text_input("0x… or a name (.eth / .gwei / .wei)", input)
         .id(ADDRESS_INPUT_ID)
         .on_input(Message::AddressInput)
         .on_submit(Message::AddressSubmit)
@@ -1117,7 +1117,7 @@ fn view_address_input<'a>(
         .style(move |_theme, status| text_input_style(t, status));
 
     let btn_label = if resolving {
-        "Resolving ENS…"
+        "Resolving name…"
     } else {
         "Scan →"
     };
@@ -1148,7 +1148,7 @@ fn view_address_input<'a>(
         vspace(6),
         screen_subtitle(
             t,
-            "Paste the Safe's address (or ENS name) — Kao scans Mainnet, Optimism, and Base."
+            "Paste the Safe's address (or name) — Kao scans Mainnet, Optimism, and Base."
         ),
         vspace(22),
         addr_input,
