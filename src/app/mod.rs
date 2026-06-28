@@ -201,12 +201,17 @@ pub struct App {
     /// Monotonic counter bumped on every fresh error so an older
     /// dismissal task firing late can no-op against a newer toast.
     toast_gen: u64,
-    /// Set when the user clicked Send on a hardware account whose device
-    /// wasn't connected at unlock. Carries the dashboard nav the user was
-    /// on so a successful reconnect restores it (and a Back drops them
-    /// back to the read-only dashboard with the same tab). `None` means
-    /// the current connect-screen session is not a send-reconnect.
+    /// Set when the user triggered a hardware reconnect from the dashboard
+    /// (Send on a disconnected device, or the sidebar's Reconnect button).
+    /// Carries the dashboard nav the user was on so a successful reconnect
+    /// restores it (and a Back drops them back to the read-only dashboard
+    /// with the same tab). `None` means the current connect-screen session
+    /// is not a reconnect.
     send_reconnect: Option<crate::ui::wallet_dashboard::Nav>,
+    /// Whether the in-flight reconnect (see `send_reconnect`) should re-open
+    /// the Send modal on success. True for a Send-triggered reconnect, false
+    /// for the sidebar Reconnect button, which just restores the dashboard.
+    reconnect_open_send: bool,
     /// Stack of parked SafeOnboardingScreens, innermost-last. Set by
     /// the add-signer flow: each `begin_add_signer_flow` pushes; each
     /// resume (back / finish) pops. A stack (rather than `Option`)
@@ -249,6 +254,7 @@ impl App {
                 toast: None,
                 toast_gen: 0,
                 send_reconnect: None,
+                reconnect_open_send: false,
                 pending_add_signer: Vec::new(),
             };
             let task = focus_widget(crate::ui::unlock::PASSWORD_INPUT_ID).map(Message::Unlock);
@@ -266,6 +272,7 @@ impl App {
                 toast: None,
                 toast_gen: 0,
                 send_reconnect: None,
+                reconnect_open_send: false,
                 pending_add_signer: Vec::new(),
             };
             let task = focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
@@ -424,6 +431,7 @@ impl App {
     fn request_send_reconnect(
         &mut self,
         nav: crate::ui::wallet_dashboard::Nav,
+        open_send: bool,
     ) -> iced::Task<Message> {
         let Some(wallet) = self.wallet.as_ref() else {
             return iced::Task::perform(
@@ -438,6 +446,7 @@ impl App {
                     ConnectLedgerScreen::new_reconnect(path, expected, self.network.clone());
                 self.screen = Screen::ConnectLedger(screen);
                 self.send_reconnect = Some(nav);
+                self.reconnect_open_send = open_send;
                 task.map(Message::ConnectLedger)
             }
             AccountDescriptor::Trezor { path, address, .. } => {
@@ -446,6 +455,7 @@ impl App {
                     ConnectTrezorScreen::new_reconnect(path, expected, self.network.clone());
                 self.screen = Screen::ConnectTrezor(screen);
                 self.send_reconnect = Some(nav);
+                self.reconnect_open_send = open_send;
                 task.map(Message::ConnectTrezor)
             }
             _ => iced::Task::perform(
@@ -461,8 +471,9 @@ impl App {
     /// when this isn't a send-reconnect session.
     fn finish_send_reconnect(&mut self, signer: KaoSigner) -> iced::Task<Message> {
         let nav = self.send_reconnect.take();
+        let open_send = std::mem::take(&mut self.reconnect_open_send);
         let enter = self.enter_dashboard(signer, nav);
-        if nav.is_some() {
+        if open_send {
             iced::Task::batch(vec![
                 enter,
                 iced::Task::done(Message::WalletDashboard(
@@ -481,6 +492,7 @@ impl App {
     /// picker if we're in initial setup).
     fn connect_back(&mut self) -> iced::Task<Message> {
         if let Some(nav) = self.send_reconnect.take() {
+            self.reconnect_open_send = false;
             return self.enter_active_from_wallet(Some(nav));
         }
         self.screen = if wallet::wallet_exists() {
@@ -1468,9 +1480,9 @@ impl App {
                         let save = self.rename_active_account(name);
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
                     }
-                    Some(WalletDashboardOutcome::NeedsHardwareReconnect) => {
+                    Some(WalletDashboardOutcome::NeedsHardwareReconnect { open_send }) => {
                         let nav = screen.current_nav();
-                        self.request_send_reconnect(nav)
+                        self.request_send_reconnect(nav, open_send)
                     }
                     Some(WalletDashboardOutcome::SaveContacts(new_contacts)) => {
                         // Update the in-memory book synchronously so the
@@ -1777,6 +1789,7 @@ mod tests {
             toast: None,
             toast_gen: 0,
             send_reconnect: None,
+            reconnect_open_send: false,
             pending_add_signer: Vec::new(),
         }
     }

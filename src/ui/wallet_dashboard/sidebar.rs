@@ -14,11 +14,11 @@ use crate::net::VerificationStatus;
 use crate::settings::{self, ProxyType};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    avatar, black, bold, hover_tint, kao_fit, kaomoji_for_account, mono, mono_bold,
+    avatar, black, bold, hover_fill, hover_tint, kao_fit, kaomoji_for_account, mono, mono_bold,
 };
 use crate::wallet::short_address;
 
-use super::{Message, Nav};
+use super::{HardwareStatus, Message, Nav};
 
 /// Sidebar width. Wide enough to seat the account card (name + WALLET
 /// badge + address) and the two-line nav rows without truncation.
@@ -36,6 +36,7 @@ pub fn view<'a>(
     display_addr: Address,
     is_safe: bool,
     show_apps: bool,
+    hardware: Option<HardwareStatus>,
     network_name: &'a str,
     verification: VerificationStatus,
 ) -> Element<'a, Message> {
@@ -83,6 +84,14 @@ pub fn view<'a>(
         "network · privacy",
     ));
     body = body.push(Space::new().height(Length::Fill));
+    // Hardware-device card sits just above the network footer, both pinned
+    // to the bottom. Only shown for hardware accounts — it's the only path
+    // to reconnect a Ledger / Trezor once the device is unplugged (which
+    // otherwise just hides Apps + Swap with no way back).
+    if let Some(status) = hardware {
+        body = body.push(hardware_footer(t, status));
+        body = body.push(Space::new().height(10));
+    }
     body = body.push(network_footer(t, network_name, verification));
 
     container(body)
@@ -305,6 +314,112 @@ fn divider<'a>(t: KaoTheme) -> Element<'a, Message> {
             ..container::Style::default()
         })
         .into()
+}
+
+/// Bottom status card for the active hardware account: a connection dot,
+/// the device name + connection state, and — when the device isn't
+/// connected — a Reconnect button. This is the only affordance that brings
+/// a Ledger / Trezor back after it's unplugged; without it the Apps and
+/// Swap surfaces simply vanish with no way to restore them.
+fn hardware_footer<'a>(t: KaoTheme, status: HardwareStatus) -> Element<'a, Message> {
+    let (device, connected) = match status {
+        HardwareStatus::Ledger { connected } => ("Ledger", connected),
+        HardwareStatus::Trezor { connected } => ("Trezor", connected),
+    };
+
+    let dot_color = if connected { t.up } else { t.down };
+    let state_text = if connected { "connected" } else { "disconnected" };
+    let state_color = if connected { t.sub } else { t.down };
+
+    let dot = container(Space::new())
+        .width(Length::Fixed(8.0))
+        .height(Length::Fixed(8.0))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(dot_color)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::from(4),
+            },
+            ..container::Style::default()
+        });
+
+    let top = row![
+        dot,
+        Space::new().width(8),
+        text(device).size(13).color(t.text).font(bold()),
+        Space::new().width(Length::Fill),
+        text(state_text)
+            .size(11)
+            .color(state_color)
+            .font(mono())
+            .wrapping(Wrapping::None),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    let mut body = column![top].spacing(0).width(Length::Fill);
+    if !connected {
+        body = body.push(Space::new().height(9));
+        body = body.push(reconnect_button(t, device));
+    }
+
+    // A disconnected device gets a red-tinted outline so the card reads as a
+    // call to action, not just an info line.
+    let outline = if connected {
+        t.border
+    } else {
+        with_alpha(t.down, 0.45)
+    };
+
+    container(body)
+        .padding(Padding::from([10, 12]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card)),
+            border: Border {
+                color: outline,
+                width: 1.0,
+                radius: Radius::from(12),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// Accent "Reconnect" action inside the hardware card. Emits
+/// `Message::ReconnectHardware`, which the dashboard escalates to the App to
+/// push the matching Ledger / Trezor connect screen.
+fn reconnect_button<'a>(t: KaoTheme, device: &'a str) -> Element<'a, Message> {
+    button(
+        container(
+            text(format!("Reconnect {device}"))
+                .size(13)
+                .color(Color::WHITE)
+                .font(bold())
+                .wrapping(Wrapping::None),
+        )
+        .width(Length::Fill)
+        .align_x(Horizontal::Center)
+        .padding(Padding::from([8, 0])),
+    )
+    .width(Length::Fill)
+    .on_press(Message::ReconnectHardware)
+    .style(move |_theme, status| button::Style {
+        background: Some(Background::Color(match status {
+            button::Status::Hovered | button::Status::Pressed => hover_fill(t.a1, Color::WHITE),
+            _ => t.a1,
+        })),
+        text_color: Color::WHITE,
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::from(10),
+        },
+        ..button::Style::default()
+    })
+    .into()
 }
 
 /// Bottom status card: a connection dot (colored by Helios verification

@@ -158,6 +158,10 @@ pub enum Message {
     OpenReceive,
     OpenSwap,
     OpenAccountDropdown,
+    /// User clicked the sidebar's "Reconnect" button for a hardware account
+    /// whose device isn't connected. Escalates to the App to push the
+    /// matching connect screen (no Send modal afterwards).
+    ReconnectHardware,
     /// User clicked the refresh button next to the assets list.
     /// Re-issues the portfolio fetch (and verification refresh) for
     /// the current identity. Tokens stay visible during the refresh;
@@ -366,12 +370,16 @@ pub enum Outcome {
     /// User saved a new/edited contacts list. The App writes the vec
     /// into the shared in-memory book and dispatches a disk save.
     SaveContacts(Vec<Contact>),
-    /// User clicked Send on a hardware account whose signer is the
-    /// view-only placeholder (the device wasn't connected at unlock).
-    /// The App pushes the matching reconnect screen and, on success,
-    /// re-enters the dashboard with the live signer and the Send modal
-    /// pre-opened.
-    NeedsHardwareReconnect,
+    /// User asked to reconnect a hardware account whose signer is the
+    /// view-only placeholder (the device wasn't connected at unlock). The
+    /// App pushes the matching reconnect screen and, on success, re-enters
+    /// the dashboard with the live signer. `open_send` is set when the
+    /// reconnect was triggered by clicking Send (so the Send modal is
+    /// re-opened afterwards); the sidebar's Reconnect button leaves it
+    /// false, landing the user back on the dashboard with nothing popped.
+    NeedsHardwareReconnect {
+        open_send: bool,
+    },
     /// User changed a Safe's transaction-service mirror in Settings →
     /// Safes. The App writes it into `wallet.safes[index]`, persists,
     /// and pushes the updated list back via `Message::SafesUpdated`.
@@ -379,6 +387,18 @@ pub enum Outcome {
         index: usize,
         url: Option<String>,
     },
+}
+
+/// Connection state of the active account's hardware device, surfaced as a
+/// status card at the bottom of the sidebar. `None` for software / view-only
+/// accounts, which have no device to connect — the card is only meaningful
+/// for Ledger / Trezor accounts. `connected` is false while the live signer
+/// is the view-only placeholder (device not opened since unlock), which is
+/// also what hides the Apps and Swap surfaces.
+#[derive(Debug, Clone, Copy)]
+pub enum HardwareStatus {
+    Ledger { connected: bool },
+    Trezor { connected: bool },
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -871,6 +891,22 @@ impl WalletScreen {
     /// the live `can_swap()`.
     fn apps_available(&self) -> bool {
         self.can_swap() || self.order_op_in_flight
+    }
+
+    /// Hardware-device status for the active account, used to render the
+    /// sidebar's connection card. `None` for software / view-only accounts.
+    /// "Connected" means we hold a live signer: either it can sign, or it's
+    /// momentarily parked as a placeholder for an in-flight order
+    /// (`order_op_in_flight`) — the same reasoning that keeps the Apps
+    /// surface up mid-order applies here, so the card doesn't flicker to
+    /// "disconnected" while a swap is being signed.
+    fn hardware_status(&self) -> Option<HardwareStatus> {
+        let connected = self.signer.can_sign() || self.order_op_in_flight;
+        match self.accounts.get(self.active_index) {
+            Some(AccountDescriptor::Ledger { .. }) => Some(HardwareStatus::Ledger { connected }),
+            Some(AccountDescriptor::Trezor { .. }) => Some(HardwareStatus::Trezor { connected }),
+            _ => None,
+        }
     }
 
     /// Park the live EOA signer for an in-flight CoW order op (place/cancel),
@@ -1704,6 +1740,21 @@ impl WalletScreen {
                 self.theme_kind = k;
                 settings::set_theme(k);
             }
+            Message::ReconnectHardware => {
+                // The sidebar only shows the Reconnect button for a
+                // disconnected hardware account, but guard anyway so a
+                // stray message is a no-op rather than a spurious connect
+                // screen for a software / view-only identity.
+                if matches!(
+                    self.accounts.get(self.active_index),
+                    Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
+                ) {
+                    return (
+                        Task::none(),
+                        Some(Outcome::NeedsHardwareReconnect { open_send: false }),
+                    );
+                }
+            }
             Message::OpenSend => {
                 // Safe mode: route Send to the unified SendPane in
                 // Safe mode. The EOA signer stays alive in
@@ -1724,7 +1775,10 @@ impl WalletScreen {
                         self.accounts.get(self.active_index),
                         Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
                     ) {
-                        return (Task::none(), Some(Outcome::NeedsHardwareReconnect));
+                        return (
+                            Task::none(),
+                            Some(Outcome::NeedsHardwareReconnect { open_send: true }),
+                        );
                     }
                     info!("send disabled: active account is view-only");
                     return (Task::none(), None);
@@ -3176,6 +3230,7 @@ impl WalletScreen {
             self.display_address(),
             self.active_safe.is_some(),
             self.apps_available(),
+            self.hardware_status(),
             self.network_short_name(),
             self.verification,
         );
