@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alloy::primitives::{Address, Bytes, U256};
 use tracing::{debug, info, trace, warn};
@@ -24,7 +26,6 @@ use clear_signing::{
 use crate::chain::Chain;
 use crate::decode::proxy;
 use crate::decode::render::{DecodedCall, decode_call, read_token_meta};
-use crate::ens;
 use crate::net::BalanceFetcher;
 
 // ---------------------------------------------------------------------------
@@ -38,6 +39,7 @@ use crate::net::BalanceFetcher;
 pub struct KaoDataProvider<'a> {
     net: &'a dyn BalanceFetcher,
     chain: Chain,
+    all_verified: Arc<AtomicBool>,
     /// Snapshot of contacts + own account names, keyed by address.
     /// Built once at task-spawn time so the async decode doesn't need
     /// the `RwLock<ContactsBook>`.
@@ -53,19 +55,31 @@ impl<'a> KaoDataProvider<'a> {
         Self {
             net,
             chain,
+            all_verified: Arc::new(AtomicBool::new(true)),
             local_names,
         }
+    }
+
+    pub fn all_verified(&self) -> bool {
+        self.all_verified.load(Ordering::Relaxed)
     }
 }
 
 impl DataProvider for KaoDataProvider<'_> {
     fn resolve_token(
         &self,
-        _chain_id: u64,
+        chain_id: u64,
         address: &str,
     ) -> Pin<Box<dyn Future<Output = Option<TokenMeta>> + Send + '_>> {
         let address = address.to_string();
         Box::pin(async move {
+            let Some(chain) = Chain::from_chain_id(chain_id) else {
+                debug!(
+                    chain_id,
+                    address, "clear-sign: resolve_token: unsupported lookup chain"
+                );
+                return None;
+            };
             let addr: Address = match address.parse() {
                 Ok(a) => a,
                 Err(_) => {
@@ -73,12 +87,16 @@ impl DataProvider for KaoDataProvider<'_> {
                     return None;
                 }
             };
-            match read_token_meta(self.net, self.chain, addr).await {
+            match read_token_meta(self.net, chain, addr).await {
                 Some((info, verified)) => {
+                    if !verified {
+                        self.all_verified.store(false, Ordering::Relaxed);
+                    }
                     debug!(
                         symbol = %info.symbol,
                         decimals = info.decimals,
                         verified,
+                        lookup_chain = ?chain,
                         %addr,
                         "clear-sign: resolved token metadata"
                     );
@@ -137,10 +155,11 @@ impl DataProvider for KaoDataProvider<'_> {
                     return None;
                 }
             };
-            // Verified (Helios, mainnet-only) reverse lookup — an unverified
-            // read fails closed inside `lookup_address`, so a hostile RPC
-            // can't fabricate a name on the clear-signing review surface.
-            match ens::lookup_address(self.net, addr).await {
+            // Verified (Helios, mainnet-only) reverse lookup across ENS / GNS /
+            // WNS — an unverified read fails closed inside `lookup_address`, so
+            // a hostile RPC can't fabricate a name on the clear-signing review
+            // surface.
+            match crate::names::lookup_address(self.net, addr).await {
                 Ok(Some(name)) => {
                     debug!(%addr, %name, "clear-sign: resolved ENS name");
                     Some(name)
@@ -179,6 +198,7 @@ pub enum DecodeResult {
         model: DisplayModel,
         reason: clear_signing::FallbackReason,
         diagnostics: Vec<FormatDiagnostic>,
+        all_verified: bool,
         heuristic: DecodedCall,
     },
     /// No descriptor or format failure. Existing heuristic pipeline.
@@ -292,7 +312,7 @@ pub async fn decode_transaction(
                                 model,
                                 diagnostics,
                                 proxy_hops,
-                                all_verified,
+                                all_verified: all_verified && data_provider.all_verified(),
                             };
                         }
                         Ok(FormatOutcome::Fallback {
@@ -311,6 +331,7 @@ pub async fn decode_transaction(
                                 model,
                                 reason,
                                 diagnostics,
+                                all_verified: all_verified && data_provider.all_verified(),
                                 heuristic,
                             };
                         }
@@ -344,4 +365,202 @@ pub async fn decode_transaction(
     debug!(%selector, "clear-sign: using heuristic pipeline");
     let decoded = decode_call(net, chain, to, calldata).await;
     DecodeResult::Heuristic(decoded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::{BalanceFetcher, LatestBlock, VerificationStatus, VerifiedRead};
+    use alloy::network::Ethereum;
+    use alloy::providers::RootProvider;
+    use async_trait::async_trait;
+    use clear_signing::DataProvider;
+    use std::sync::Mutex;
+
+    fn abi_encode_string(s: &str) -> Bytes {
+        let mut buf = Vec::with_capacity(64 + s.len().next_multiple_of(32));
+        let mut offset = [0u8; 32];
+        offset[31] = 0x20;
+        buf.extend_from_slice(&offset);
+        let mut len = [0u8; 32];
+        len[24..32].copy_from_slice(&(s.len() as u64).to_be_bytes());
+        buf.extend_from_slice(&len);
+        buf.extend_from_slice(s.as_bytes());
+        let pad = (32 - (s.len() % 32)) % 32;
+        buf.extend(std::iter::repeat_n(0u8, pad));
+        Bytes::from(buf)
+    }
+
+    fn abi_encode_uint8(v: u8) -> Bytes {
+        let mut buf = [0u8; 32];
+        buf[31] = v;
+        Bytes::from(buf.to_vec())
+    }
+
+    #[derive(Debug)]
+    struct TokenMetaMock {
+        calls: Mutex<Vec<Chain>>,
+        verified: bool,
+    }
+
+    impl TokenMetaMock {
+        fn new(verified: bool) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                verified,
+            }
+        }
+        fn called_chains(&self) -> Vec<Chain> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl BalanceFetcher for TokenMetaMock {
+        async fn balance(&self, _: Address, _: Chain) -> Result<String, String> {
+            Ok("0".into())
+        }
+        async fn invalidate(&self) {}
+        fn last_status(&self, _: Chain) -> VerificationStatus {
+            VerificationStatus::Verified
+        }
+        async fn provider(&self, _: Chain) -> Option<RootProvider<Ethereum>> {
+            None
+        }
+        async fn get_code(&self, _: Address, _: Chain) -> Result<VerifiedRead<Bytes>, String> {
+            Ok(VerifiedRead {
+                value: Bytes::new(),
+                verified: true,
+            })
+        }
+        async fn get_storage_at(
+            &self,
+            _: Address,
+            _: U256,
+            _: Chain,
+        ) -> Result<VerifiedRead<alloy::primitives::B256>, String> {
+            Ok(VerifiedRead {
+                value: alloy::primitives::B256::ZERO,
+                verified: true,
+            })
+        }
+        async fn call(
+            &self,
+            _: Address,
+            data: Bytes,
+            chain: Chain,
+        ) -> Result<VerifiedRead<Bytes>, String> {
+            self.calls.lock().unwrap().push(chain);
+            let value = match data.as_ref() {
+                [0x95, 0xd8, 0x9b, 0x41] => abi_encode_string("TOK"),
+                [0x31, 0x3c, 0xe5, 0x67] => abi_encode_uint8(18),
+                _ => Bytes::new(),
+            };
+            Ok(VerifiedRead {
+                value,
+                verified: self.verified,
+            })
+        }
+        async fn get_balance_raw(
+            &self,
+            _: Address,
+            _: Chain,
+        ) -> Result<VerifiedRead<U256>, String> {
+            Ok(VerifiedRead {
+                value: U256::ZERO,
+                verified: true,
+            })
+        }
+        async fn get_transaction_count(
+            &self,
+            _: Address,
+            _: Chain,
+        ) -> Result<VerifiedRead<u64>, String> {
+            Ok(VerifiedRead {
+                value: 0,
+                verified: true,
+            })
+        }
+        async fn latest_block(&self, _: Chain) -> Result<VerifiedRead<LatestBlock>, String> {
+            Ok(VerifiedRead {
+                value: LatestBlock {
+                    number: 0,
+                    hash: alloy::primitives::B256::ZERO,
+                    timestamp: 0,
+                    gas_limit: 30_000_000,
+                    base_fee_per_gas: 0,
+                    prevrandao: alloy::primitives::B256::ZERO,
+                    beneficiary: Address::ZERO,
+                    excess_blob_gas: None,
+                },
+                verified: true,
+            })
+        }
+        async fn get_code_raw(
+            &self,
+            addr: Address,
+            chain: Chain,
+        ) -> Result<VerifiedRead<Bytes>, String> {
+            self.get_code(addr, chain).await
+        }
+        async fn get_storage_at_raw(
+            &self,
+            addr: Address,
+            slot: U256,
+            chain: Chain,
+        ) -> Result<VerifiedRead<alloy::primitives::B256>, String> {
+            self.get_storage_at(addr, slot, chain).await
+        }
+        async fn call_raw(
+            &self,
+            to: Address,
+            data: Bytes,
+            chain: Chain,
+        ) -> Result<VerifiedRead<Bytes>, String> {
+            self.call(to, data, chain).await
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_token_honors_descriptor_selected_chain_id() {
+        let net = TokenMetaMock::new(true);
+        let provider = KaoDataProvider::new(&net, Chain::Mainnet, HashMap::new());
+        let token = Address::repeat_byte(0x22).to_checksum(None);
+
+        let meta = provider
+            .resolve_token(Chain::Base.chain_id(), &token)
+            .await
+            .expect("token metadata");
+
+        assert_eq!(meta.symbol, "TOK");
+        assert_eq!(meta.decimals, 18);
+        assert_eq!(net.called_chains(), vec![Chain::Base, Chain::Base]);
+        assert!(provider.all_verified());
+    }
+
+    #[tokio::test]
+    async fn resolve_token_marks_unverified_metadata() {
+        let net = TokenMetaMock::new(false);
+        let provider = KaoDataProvider::new(&net, Chain::Mainnet, HashMap::new());
+        let token = Address::repeat_byte(0x33).to_checksum(None);
+
+        let meta = provider
+            .resolve_token(Chain::Mainnet.chain_id(), &token)
+            .await
+            .expect("token metadata");
+
+        assert_eq!(meta.symbol, "TOK");
+        assert!(!provider.all_verified());
+    }
+
+    #[tokio::test]
+    async fn resolve_token_rejects_unsupported_lookup_chain() {
+        let net = TokenMetaMock::new(true);
+        let provider = KaoDataProvider::new(&net, Chain::Mainnet, HashMap::new());
+        let token = Address::repeat_byte(0x44).to_checksum(None);
+
+        assert!(provider.resolve_token(999_999, &token).await.is_none());
+        assert!(net.called_chains().is_empty());
+        assert!(provider.all_verified());
+    }
 }

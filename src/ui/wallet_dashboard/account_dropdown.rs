@@ -1,4 +1,4 @@
-//! Account picker overlay anchored under the header address pill. Lists all
+//! Account picker overlay anchored under the sidebar account card. Lists all
 //! accounts in the unlocked wallet and an "Add new address" action.
 //!
 //! TEA component: owns no internal state today (it's a pure view of the
@@ -134,14 +134,15 @@ impl AccountDropdown {
             ..container::Style::default()
         });
 
-        // Anchor the panel under the header address. Sidebar width is 100,
-        // header padding is [14, 24] and the address pill sits below the
-        // title. ~78 from window top, ~124 from window left lands under the
-        // trigger.
+        // Anchor the panel just under the sidebar account card (the trigger).
+        // The sidebar is 256 wide with 16px padding; an 18px-tall brand row
+        // and an ~56px-tall card sit above, so the card's bottom lands ~128
+        // from the window top. Left-align the panel with the card at ~16 from
+        // the window left; the 296-wide panel overhangs into the content pane.
         let layer = container(column![
-            Space::new().height(78.0),
+            Space::new().height(128.0),
             row![
-                Space::new().width(124.0),
+                Space::new().width(16.0),
                 mouse_area(panel).on_press(Message::BoxClickIgnored),
                 Space::new().width(Length::Fill),
             ],

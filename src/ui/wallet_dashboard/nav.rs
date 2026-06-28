@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Nav {
     Home,
+    Apps,
     Activity,
     Settings,
 }

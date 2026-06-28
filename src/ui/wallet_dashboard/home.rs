@@ -26,6 +26,7 @@ const PENDING_KAO: &str = "(・–・)";
 pub fn view<'a>(
     t: KaoTheme,
     can_send: bool,
+    can_swap: bool,
     portfolio: &'a [LiveToken],
     portfolio_loading: bool,
     portfolio_refreshing: bool,
@@ -34,7 +35,7 @@ pub fn view<'a>(
     safe_pending_error: Option<&'a str>,
 ) -> Element<'a, Message> {
     let hero = balance_hero(t, portfolio);
-    let actions = quick_actions(t, can_send);
+    let actions = quick_actions(t, can_send, can_swap);
     let assets_label_row = row![
         text("ASSETS").size(11).color(t.sub).font(bold()),
         Space::new().width(Length::Fill),
@@ -323,13 +324,13 @@ fn status_badge<'a>(t: KaoTheme, state: SafeTxState) -> Element<'a, Message> {
         .into()
 }
 
-fn quick_actions<'a>(t: KaoTheme, can_send: bool) -> Element<'a, Message> {
+fn quick_actions<'a>(t: KaoTheme, can_send: bool, can_swap: bool) -> Element<'a, Message> {
     // View-only accounts can't sign, so Send is disabled. Receive still works
     // because it just shows the address. Hardware accounts whose device is
     // not currently attached are *still* sendable here — clicking Send
     // escalates to a reconnect flow rather than being a no-op.
     let send_press = can_send.then_some(Message::OpenSend);
-    row![
+    let mut actions = row![
         quick_action(t, "Send", "ᕕ( ᐛ )ᕗ", t.ab1, t.a1, send_press),
         Space::new().width(10),
         quick_action(
@@ -340,11 +341,24 @@ fn quick_actions<'a>(t: KaoTheme, can_send: bool) -> Element<'a, Message> {
             t.a2,
             Some(Message::OpenReceive),
         ),
-        Space::new().width(10),
-        quick_action(t, "Swap", "(⇌ω⇌)", t.ab3, t.a3, Some(Message::OpenSwap)),
     ]
-    .width(Length::Fill)
-    .into()
+    .width(Length::Fill);
+
+    // Swap is hidden entirely (not just disabled) for identities that can't
+    // swap — view-only accounts and Safe mode (no Safe-TX swap path in v1).
+    if can_swap {
+        actions = actions.push(Space::new().width(10));
+        actions = actions.push(quick_action(
+            t,
+            "Swap",
+            "(⇌ω⇌)",
+            t.ab3,
+            t.a3,
+            Some(Message::OpenSwap),
+        ));
+    }
+
+    actions.into()
 }
 
 fn quick_action<'a>(

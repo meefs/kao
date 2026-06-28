@@ -479,7 +479,7 @@ impl ContactsPane {
             AddressResolution::Empty
         } else if let Ok(addr) = Address::from_str(trimmed) {
             AddressResolution::Hex(addr)
-        } else if looks_like_dot_eth(trimmed) {
+        } else if crate::names::looks_like_known_name(trimmed) {
             AddressResolution::Resolving {
                 name: trimmed.to_string(),
             }
@@ -522,23 +522,23 @@ impl ContactsPane {
                 }),
             ),
             AddressResolution::Empty => {
-                errs.push("Address or ENS name required".into());
+                errs.push("Address or name required".into());
                 (None, None)
             }
             AddressResolution::Invalid => {
-                errs.push("Not a valid 0x… address or ENS name".into());
+                errs.push("Not a valid 0x… address or name".into());
                 (None, None)
             }
             AddressResolution::Resolving { .. } => {
-                errs.push("Resolving ENS name… try again in a sec".into());
+                errs.push("Resolving name… try again in a sec".into());
                 (None, None)
             }
             AddressResolution::NotFound { name } => {
-                errs.push(format!("ENS name “{name}” has no address record"));
+                errs.push(format!("“{name}” has no address record"));
                 (None, None)
             }
             AddressResolution::Error { name, msg } => {
-                errs.push(format!("ENS lookup for “{name}” failed: {msg}"));
+                errs.push(format!("Name lookup for “{name}” failed: {msg}"));
                 (None, None)
             }
         };
@@ -742,8 +742,8 @@ impl ContactsPane {
         );
         let addr_field = labeled_input(
             t,
-            "ADDRESS OR ENS NAME",
-            "0x… or vitalik.eth",
+            "ADDRESS OR NAME",
+            "0x… or a name (.eth / .gwei / .wei)",
             &self.draft.address_input,
             Message::AddressChanged,
         );
@@ -833,7 +833,7 @@ fn address_parse_hint<'a>(t: KaoTheme, r: &AddressResolution) -> Element<'a, Mes
         .padding(pad)
         .into(),
         AddressResolution::NotFound { name } => {
-            ctr(text(format!("ENS name “{name}” has no address record"))
+            ctr(text(format!("“{name}” has no address record"))
                 .size(11)
                 .color(t.down)
                 .font(bold()))
@@ -841,14 +841,14 @@ fn address_parse_hint<'a>(t: KaoTheme, r: &AddressResolution) -> Element<'a, Mes
             .into()
         }
         AddressResolution::Error { name, msg } => {
-            ctr(text(format!("ENS lookup for “{name}” failed: {msg}"))
+            ctr(text(format!("Name lookup for “{name}” failed: {msg}"))
                 .size(11)
                 .color(t.down)
                 .font(bold()))
             .padding(pad)
             .into()
         }
-        AddressResolution::Invalid => ctr(text("Not a valid 0x… address or ENS name")
+        AddressResolution::Invalid => ctr(text("Not a valid 0x… address or name")
             .size(11)
             .color(t.down)
             .font(bold()))
@@ -870,16 +870,17 @@ fn list_card<'a>(
     };
     let name = c.name.clone();
     let addr = c.address();
-    // ENS line and notes line are always rendered (with `text("")`
+    // Name-service line and notes line are always rendered (with `text("")`
     // placeholders when missing) so cards stay uniform-height in the
     // 2-column grid regardless of which contacts have which fields
     // populated. The earlier "render only when present" approach made
-    // the row shorter when a card lacked ENS, which left the grid
-    // looking ragged.
+    // the row shorter when a card lacked a name, which left the grid
+    // looking ragged. The label reflects which service vouches for the
+    // name (ENS / GNS / WNS), keyed off its TLD.
     let ens_text = c
         .ens
         .as_ref()
-        .map(|e| format!("ens: {}", e.name))
+        .map(|e| format!("{}: {}", crate::names::namespace_label(&e.name), e.name))
         .unwrap_or_default();
     let notes_text = c.notes.clone();
 
@@ -1080,22 +1081,6 @@ fn small_danger_button<'a>(t: KaoTheme, label: &'a str) -> button::Button<'a, Me
             },
             ..button::Style::default()
         })
-}
-
-/// Strict `.eth`-suffix check used by the contacts add/edit form.
-/// Looser `crate::ens::looks_like_ens` accepts any dotted string that
-/// isn't hex — fine for the Send recipient input where the user has
-/// committed to typing an ENS name, but too eager here, where a stray
-/// `chrome.com` paste shouldn't fire an on-chain lookup. We only
-/// treat the input as ENS-shaped when it ends in `.eth` and has a
-/// non-empty label before the suffix (so `.eth` and `foo..eth` are
-/// rejected).
-fn looks_like_dot_eth(input: &str) -> bool {
-    let lc = input.to_ascii_lowercase();
-    let Some(stem) = lc.strip_suffix(".eth") else {
-        return false;
-    };
-    !stem.is_empty() && !stem.ends_with('.')
 }
 
 /// Pick a kaomoji from the pool. Avoids returning the current value so
