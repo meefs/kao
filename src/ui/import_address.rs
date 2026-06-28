@@ -5,7 +5,7 @@ use iced::keyboard;
 use iced::widget::{Space, column, container, row, text, text_input};
 use iced::{Alignment, Element, Length, Padding, Subscription, Task};
 
-use crate::ens;
+use crate::names;
 use crate::net::BalanceFetcher;
 use crate::settings;
 use crate::ui::kao_theme::KaoTheme;
@@ -96,11 +96,11 @@ impl ImportAddressScreen {
                         }),
                     ),
                     Ok(None) => {
-                        self.error = Some(format!("ENS name “{name}” has no address record."));
+                        self.error = Some(format!("“{name}” has no address record."));
                         (Task::none(), None)
                     }
                     Err(e) => {
-                        self.error = Some(format!("ENS lookup failed: {e}"));
+                        self.error = Some(format!("Name lookup failed: {e}"));
                         (Task::none(), None)
                     }
                 }
@@ -119,7 +119,7 @@ impl ImportAddressScreen {
     fn try_import(&mut self) -> (Task<Message>, Option<Outcome>) {
         let trimmed = self.address_input.trim().to_string();
         if trimmed.is_empty() {
-            self.error = Some("Please enter an Ethereum address or ENS name.".into());
+            self.error = Some("Please enter an Ethereum address or name.".into());
             return (Task::none(), None);
         }
         // Hex first: a 40-char hex string with optional 0x parses straight to
@@ -134,7 +134,7 @@ impl ImportAddressScreen {
                 }),
             );
         }
-        if ens::looks_like_ens(&trimmed) {
+        if names::looks_like_name(&trimmed) {
             self.error = None;
             let seq = self.input_seq;
             self.resolving = Some(seq);
@@ -142,10 +142,10 @@ impl ImportAddressScreen {
             let name = trimmed;
             let task = Task::perform(
                 async move {
-                    // Verified (Helios, mainnet-only) ENS resolution — the
+                    // Verified (Helios, mainnet-only) name resolution — the
                     // resolved address is what gets imported as a watched
                     // account, so an unverified RPC answer must not be trusted.
-                    let result = ens::resolve_name(network.as_ref(), &name).await;
+                    let result = names::resolve_name(network.as_ref(), &name).await;
                     (seq, name, result)
                 },
                 |(seq, name, result)| Message::EnsResolved { seq, name, result },
@@ -153,7 +153,7 @@ impl ImportAddressScreen {
             return (task, None);
         }
         self.error = Some(
-            "Not a valid Ethereum address or ENS name. Expected `0x…` (40 hex chars) or `name.eth`.".into(),
+            "Not a valid Ethereum address or name. Expected `0x…` (40 hex chars) or a `.eth` / `.gwei` / `.wei` name.".into(),
         );
         (Task::none(), None)
     }
@@ -165,7 +165,7 @@ impl ImportAddressScreen {
     pub fn view(&self) -> Element<'_, Message> {
         let t = KaoTheme::for_kind(settings::theme());
 
-        let address_input = text_input("0x… or name.eth", &self.address_input)
+        let address_input = text_input("0x… or a name (.eth / .gwei / .wei)", &self.address_input)
             .id(ADDRESS_INPUT_ID)
             .on_input(Message::AddressInput)
             .on_submit(Message::AddPressed)
@@ -176,7 +176,7 @@ impl ImportAddressScreen {
 
         let resolving_now = self.resolving.is_some();
         let btn_label = if resolving_now {
-            "Resolving ENS…"
+            "Resolving name…"
         } else {
             "Watch Address →"
         };
@@ -206,10 +206,7 @@ impl ImportAddressScreen {
             vspace(10),
             screen_title(t, "Watch an Address"),
             vspace(6),
-            screen_subtitle(
-                t,
-                "Track any wallet read-only — paste an address or ENS name."
-            ),
+            screen_subtitle(t, "Track any wallet read-only — paste an address or name."),
             vspace(22),
             address_input,
             vspace(18),

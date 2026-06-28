@@ -24,7 +24,6 @@ use clear_signing::{
 use crate::chain::Chain;
 use crate::decode::proxy;
 use crate::decode::render::{DecodedCall, decode_call, read_token_meta};
-use crate::ens;
 use crate::net::BalanceFetcher;
 
 // ---------------------------------------------------------------------------
@@ -137,10 +136,11 @@ impl DataProvider for KaoDataProvider<'_> {
                     return None;
                 }
             };
-            // Verified (Helios, mainnet-only) reverse lookup — an unverified
-            // read fails closed inside `lookup_address`, so a hostile RPC
-            // can't fabricate a name on the clear-signing review surface.
-            match ens::lookup_address(self.net, addr).await {
+            // Verified (Helios, mainnet-only) reverse lookup across ENS / GNS /
+            // WNS — an unverified read fails closed inside `lookup_address`, so
+            // a hostile RPC can't fabricate a name on the clear-signing review
+            // surface.
+            match crate::names::lookup_address(self.net, addr).await {
                 Ok(Some(name)) => {
                     debug!(%addr, %name, "clear-sign: resolved ENS name");
                     Some(name)
