@@ -40,7 +40,7 @@ use crate::wallet::tx::{
     SendPlan, SendToken, TxQuote, erc20_transfer_calldata, parse_amount_units,
 };
 use crate::wallet::{
-    AccountDescriptor, ContactsBook, SafeDescriptor, account_address, short_address,
+    AccountDescriptor, ContactsBook, SafeDescriptor, SafeTrust, account_address, short_address,
 };
 
 // ── Picker types ────────────────────────────────────────────────────────────
@@ -279,6 +279,7 @@ struct SafeState {
     safe_chain: Option<Chain>,
     safe_chain_id: u64,
     safe_version: String,
+    trust: SafeTrust,
     service_base: String,
     version_block: Option<String>,
     threshold: u32,
@@ -397,6 +398,7 @@ impl SendPane {
                 safe_chain: chain,
                 safe_chain_id: safe.chain_id,
                 safe_version: safe.version.clone(),
+                trust: safe.trust.clone(),
                 service_base: safe.tx_service_base().to_string(),
                 version_block: crate::safe::tx::ensure_signable_version(&safe.version).err(),
                 threshold: safe.threshold,
@@ -598,6 +600,7 @@ impl SendPane {
             SendMode::Safe(s) => {
                 s.safe_chain.is_some()
                     && s.version_block.is_none()
+                    && s.trust.permits_signing()
                     && self.has_any_signable()
                     && self.resolution.recipient().is_some()
                     && !matches!(self.resolution, Resolution::EnsDivergence { .. })
@@ -698,6 +701,9 @@ impl SendPane {
         if s.version_block.is_some() {
             return None;
         }
+        if s.trust.signing_block_reason().is_some() {
+            return None;
+        }
         let recipient = self.resolution.recipient()?;
         // Same zero-address guard as `build_plan`. Every Safe signing path
         // (prepare / broadcast / propose) re-derives the request here, so one
@@ -715,6 +721,7 @@ impl SendPane {
             safe_address: s.safe_address,
             chain: s.safe_chain?,
             version: s.safe_version.clone(),
+            trust: s.trust.clone(),
             service_base: s.service_base.clone(),
             recipient,
             amount_units,
@@ -1083,6 +1090,18 @@ impl SendPane {
                     safe_progress_bar(t, 0),
                     vspace(20),
                     banner(t, "Unsupported Safe version", reason.clone()),
+                    vspace(16),
+                    primary_button(t, "Close", true).on_press(Message::Close),
+                ]
+                .width(Length::Fill);
+                return wrap_safe_modal(t, progress, body.into());
+            }
+            if let Some(reason) = s.trust.signing_block_reason() {
+                let body = column![
+                    safe_step_header(t, 0),
+                    safe_progress_bar(t, 0),
+                    vspace(20),
+                    banner(t, "Unrecognized Safe implementation", reason.to_string()),
                     vspace(16),
                     primary_button(t, "Close", true).on_press(Message::Close),
                 ]
@@ -1598,12 +1617,12 @@ impl SendPane {
         .width(Length::Fill);
 
         let back_btn = secondary_button(t, "← Back").on_press(Message::Step(0));
-        let review_btn =
-            primary_button(t, "Review →", amount_valid).on_press_maybe(if amount_valid {
-                Some(Message::Step(2))
-            } else {
-                None
-            });
+        let can_review = amount_valid && self.can_continue_recipient();
+        let review_btn = primary_button(t, "Review →", can_review).on_press_maybe(if can_review {
+            Some(Message::Step(2))
+        } else {
+            None
+        });
         let action_row = row![
             container(back_btn).width(Length::FillPortion(1)),
             Space::new().width(9),
@@ -3305,6 +3324,7 @@ pub struct SafeSendRequest {
     pub safe_address: Address,
     pub chain: Chain,
     pub version: String,
+    pub trust: SafeTrust,
     pub service_base: String,
     pub recipient: Address,
     pub amount_units: U256,
@@ -3686,6 +3706,28 @@ mod tests {
         assert!(
             pane.outgoing_request(&test_portfolio()).is_none(),
             "outgoing_request must reject a zero recipient",
+        );
+    }
+
+    #[test]
+    fn unrecognized_safe_blocks_continue_and_outgoing_request() {
+        let mut desc = safe_only(1, vec![0]);
+        desc.trust = SafeTrust::UnrecognizedImpl;
+        let mut pane = SendPane::new_safe(&desc, &[local_account_simple(1)]);
+        pane.amount = "0.001".into();
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::repeat_byte(0xCD),
+            ens: None,
+        });
+
+        assert!(pane.has_any_signable(), "control: linked signer exists");
+        assert!(
+            !pane.can_continue_recipient(),
+            "unrecognized Safe must not advance to review"
+        );
+        assert!(
+            pane.outgoing_request(&test_portfolio()).is_none(),
+            "unrecognized Safe must not build a signable request"
         );
     }
 
