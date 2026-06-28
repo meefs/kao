@@ -1829,9 +1829,10 @@ impl WalletScreen {
                         let plan = p.build_plan(&self.portfolio);
                         match plan {
                             Some(pl) => {
-                                p.quote_started();
+                                let quote_seq = p.quote_started();
                                 let decode_seq = p.decode_started();
-                                let quote_task = spawn_quote_task(self.network.clone(), pl.clone());
+                                let quote_task =
+                                    spawn_quote_task(self.network.clone(), quote_seq, pl.clone());
                                 let local_names =
                                     build_local_names(&self.accounts, &self.safes, &self.contacts);
                                 let decode_task = spawn_decode_task(
@@ -1861,7 +1862,7 @@ impl WalletScreen {
                 if let send::Message::Confirm = &child_msg {
                     if p.is_eoa() {
                         let plan = p.build_plan(&self.portfolio);
-                        let quote = p.quote().cloned();
+                        let quote = plan.as_ref().and_then(|pl| p.quote_for_plan(pl)).cloned();
                         info!(
                             has_plan = plan.is_some(),
                             has_quote = quote.is_some(),
@@ -1888,9 +1889,8 @@ impl WalletScreen {
                             let task = task.map(Message::Send);
                             return (Task::batch([pre_task, task]), None);
                         }
-                        warn!("send: confirm dropped — no plan or no quote");
-                        let (task, _outcome) = p.update(child_msg);
-                        return (task.map(Message::Send), None);
+                        warn!("send: confirm dropped — no current plan/quote pair");
+                        return (Task::none(), None);
                     }
                     // Safe mode: collect owner keys and broadcast.
                     let Some(req) = p.outgoing_request(&self.portfolio) else {
@@ -3728,7 +3728,7 @@ async fn provider_for(
 /// Spawn a quote task using a provider resolved from `plan.chain` — the L2 RPC
 /// for an L2 send, the user's raw RPC for a custom network. The same provider
 /// later serves the broadcast.
-fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, plan: SendPlan) -> Task<Message> {
+fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, seq: u64, plan: SendPlan) -> Task<Message> {
     let chain = plan.chain;
     Task::perform(
         async move {
@@ -3745,7 +3745,7 @@ fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, plan: SendPlan) -> Task<Me
                 }
             }
         },
-        |result| Message::Send(send::Message::QuoteFetched(result)),
+        move |result| Message::Send(send::Message::QuoteFetched { seq, result }),
     )
 }
 
