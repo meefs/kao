@@ -40,7 +40,7 @@ use crate::wallet::tx::{
     SendPlan, SendToken, TxQuote, erc20_transfer_calldata, parse_amount_units,
 };
 use crate::wallet::{
-    AccountDescriptor, ContactsBook, SafeDescriptor, account_address, short_address,
+    AccountDescriptor, ContactsBook, SafeDescriptor, SafeTrust, account_address, short_address,
 };
 
 // ── Picker types ────────────────────────────────────────────────────────────
@@ -168,7 +168,10 @@ pub enum Message {
     Max,
     Step(u8),
     Confirm,
-    QuoteFetched(Result<TxQuote, String>),
+    QuoteFetched {
+        seq: u64,
+        result: Result<TxQuote, String>,
+    },
     BroadcastDone(Result<TxHash, String>),
     DecodedReady {
         seq: u64,
@@ -262,6 +265,7 @@ struct EoaState {
     from: Address,
     quote: Option<TxQuote>,
     quote_loading: bool,
+    quote_seq: u64,
     decoded: Option<Box<DecodeResult>>,
     decoded_loading: bool,
     decoded_seq: u64,
@@ -275,6 +279,7 @@ struct SafeState {
     safe_chain: Option<Chain>,
     safe_chain_id: u64,
     safe_version: String,
+    trust: SafeTrust,
     service_base: String,
     version_block: Option<String>,
     threshold: u32,
@@ -335,6 +340,7 @@ impl SendPane {
                 from,
                 quote: None,
                 quote_loading: false,
+                quote_seq: 0,
                 decoded: None,
                 decoded_loading: false,
                 decoded_seq: 0,
@@ -392,6 +398,7 @@ impl SendPane {
                 safe_chain: chain,
                 safe_chain_id: safe.chain_id,
                 safe_version: safe.version.clone(),
+                trust: safe.trust.clone(),
                 service_base: safe.tx_service_base().to_string(),
                 version_block: crate::safe::tx::ensure_signable_version(&safe.version).err(),
                 threshold: safe.threshold,
@@ -453,8 +460,23 @@ impl SendPane {
         self.eoa().and_then(|e| e.quote.as_ref())
     }
 
+    pub fn quote_for_plan(&self, plan: &SendPlan) -> Option<&TxQuote> {
+        self.eoa()
+            .and_then(|e| e.quote.as_ref())
+            .filter(|q| q.matches_plan(plan))
+    }
+
+    pub fn quote_for_current_plan(&self, portfolio: &[LiveToken]) -> Option<&TxQuote> {
+        let plan = self.build_plan(portfolio)?;
+        self.quote_for_plan(&plan)
+    }
+
     pub fn apply_max(&mut self, amount_str: String) {
         self.amount = amount_str;
+        // Max changes the amount, so any prior EOA quote no longer matches the
+        // plan — invalidate here too, keeping the rule uniform across every
+        // amount mutation (no-op for Safe mode).
+        self.invalidate_eoa_quote();
     }
 
     pub fn take_pending_ens(&mut self) -> Option<(u64, String)> {
@@ -528,11 +550,27 @@ impl SendPane {
         })
     }
 
-    pub fn quote_started(&mut self) {
+    fn invalidate_eoa_quote(&mut self) {
         if let Some(eoa) = self.eoa_mut() {
-            eoa.quote_loading = true;
+            eoa.quote_seq = eoa.quote_seq.wrapping_add(1);
+            eoa.quote = None;
+            eoa.quote_loading = false;
         }
+    }
+
+    pub fn quote_started(&mut self) -> u64 {
+        // Bump the seq and clear the stale quote via the shared invalidator,
+        // then flip into the loading state and return the fresh seq the quote
+        // task must echo back.
+        self.invalidate_eoa_quote();
         self.error = None;
+        let Some(eoa) = self.eoa_mut() else {
+            // Non-EOA modes never quote; this sentinel is unused (real seqs
+            // start at 1 after the first bump above).
+            return 0;
+        };
+        eoa.quote_loading = true;
+        eoa.quote_seq
     }
 
     pub fn decode_started(&mut self) -> u64 {
@@ -562,6 +600,7 @@ impl SendPane {
             SendMode::Safe(s) => {
                 s.safe_chain.is_some()
                     && s.version_block.is_none()
+                    && s.trust.permits_signing()
                     && self.has_any_signable()
                     && self.resolution.recipient().is_some()
                     && !matches!(self.resolution, Resolution::EnsDivergence { .. })
@@ -662,6 +701,9 @@ impl SendPane {
         if s.version_block.is_some() {
             return None;
         }
+        if s.trust.signing_block_reason().is_some() {
+            return None;
+        }
         let recipient = self.resolution.recipient()?;
         // Same zero-address guard as `build_plan`. Every Safe signing path
         // (prepare / broadcast / propose) re-derives the request here, so one
@@ -679,6 +721,7 @@ impl SendPane {
             safe_address: s.safe_address,
             chain: s.safe_chain?,
             version: s.safe_version.clone(),
+            trust: s.trust.clone(),
             service_base: s.service_base.clone(),
             recipient,
             amount_units,
@@ -702,6 +745,7 @@ impl SendPane {
         match msg {
             Message::SetTo(s) => {
                 self.set_to(s);
+                self.invalidate_eoa_quote();
                 self.error = None;
                 (Task::none(), None)
             }
@@ -715,12 +759,14 @@ impl SendPane {
                     },
                     None => Resolution::Address(address),
                 };
+                self.invalidate_eoa_quote();
                 (Task::none(), None)
             }
             Message::EnsResolved { seq, name, result } => {
                 if seq != self.resolution_seq {
                     return (Task::none(), None);
                 }
+                let before = self.resolution.recipient();
                 match &self.resolution {
                     Resolution::Resolving { name: pending } if pending == &name => {
                         self.resolution = match result {
@@ -746,11 +792,15 @@ impl SendPane {
                     }
                     _ => {}
                 }
+                if before != self.resolution.recipient() {
+                    self.invalidate_eoa_quote();
+                }
                 (Task::none(), None)
             }
             Message::AcceptEnsDivergence => {
                 if let Resolution::EnsDivergence { fresh, .. } = self.resolution.clone() {
                     self.resolution = Resolution::Address(fresh);
+                    self.invalidate_eoa_quote();
                 }
                 (Task::none(), None)
             }
@@ -767,19 +817,18 @@ impl SendPane {
             }
             Message::SetAmount(s) => {
                 self.amount = s;
+                self.invalidate_eoa_quote();
                 self.error = None;
                 (Task::none(), None)
             }
             Message::SetToken(i) => {
                 self.token_idx = i;
-                match &mut self.mode {
-                    SendMode::Eoa(eoa) => {
-                        eoa.quote = None;
-                    }
-                    SendMode::Safe(_) => {
-                        self.amount.clear();
-                    }
+                if let SendMode::Safe(_) = &self.mode {
+                    self.amount.clear();
                 }
+                // EOA: token (and thus chain) changed — the prior quote is
+                // stale. No-op for Safe mode.
+                self.invalidate_eoa_quote();
                 self.error = None;
                 (Task::none(), None)
             }
@@ -826,8 +875,11 @@ impl SendPane {
                 (Task::none(), None)
             }
             Message::Propose => (Task::none(), None), // Dashboard intercepts
-            Message::QuoteFetched(result) => {
+            Message::QuoteFetched { seq, result } => {
                 if let Some(eoa) = self.eoa_mut() {
+                    if seq != eoa.quote_seq {
+                        return (Task::none(), None);
+                    }
                     eoa.quote_loading = false;
                     match result {
                         Ok(q) => {
@@ -1038,6 +1090,18 @@ impl SendPane {
                     safe_progress_bar(t, 0),
                     vspace(20),
                     banner(t, "Unsupported Safe version", reason.clone()),
+                    vspace(16),
+                    primary_button(t, "Close", true).on_press(Message::Close),
+                ]
+                .width(Length::Fill);
+                return wrap_safe_modal(t, progress, body.into());
+            }
+            if let Some(reason) = s.trust.signing_block_reason() {
+                let body = column![
+                    safe_step_header(t, 0),
+                    safe_progress_bar(t, 0),
+                    vspace(20),
+                    banner(t, "Unrecognized Safe implementation", reason.to_string()),
                     vspace(16),
                     primary_button(t, "Close", true).on_press(Message::Close),
                 ]
@@ -1553,12 +1617,12 @@ impl SendPane {
         .width(Length::Fill);
 
         let back_btn = secondary_button(t, "← Back").on_press(Message::Step(0));
-        let review_btn =
-            primary_button(t, "Review →", amount_valid).on_press_maybe(if amount_valid {
-                Some(Message::Step(2))
-            } else {
-                None
-            });
+        let can_review = amount_valid && self.can_continue_recipient();
+        let review_btn = primary_button(t, "Review →", can_review).on_press_maybe(if can_review {
+            Some(Message::Step(2))
+        } else {
+            None
+        });
         let action_row = row![
             container(back_btn).width(Length::FillPortion(1)),
             Space::new().width(9),
@@ -1639,8 +1703,9 @@ impl SendPane {
         let token_sym = token.map(|t| t.symbol.as_str()).unwrap_or("ETH");
         let recipient = self.resolution.recipient();
         let chain = token.map(|t| t.chain).unwrap_or_default();
+        let current_quote = self.quote_for_current_plan(portfolio);
 
-        let has_insufficient_eth = match (token, eoa.quote.as_ref()) {
+        let has_insufficient_eth = match (token, current_quote) {
             (Some(tk), Some(q)) => {
                 let eth_balance = portfolio
                     .iter()
@@ -1657,11 +1722,7 @@ impl SendPane {
             }
             _ => false,
         };
-        let sim_reverted = eoa
-            .quote
-            .as_ref()
-            .map(|q| q.sim.is_revert())
-            .unwrap_or(false);
+        let sim_reverted = current_quote.map(|q| q.sim.is_revert()).unwrap_or(false);
 
         let recipient_short = recipient_name.clone().unwrap_or_else(|| {
             recipient
@@ -1726,14 +1787,12 @@ impl SendPane {
         });
 
         // Simulated balance changes
-        let sim_unavailable = eoa
-            .quote
-            .as_ref()
+        let sim_unavailable = current_quote
             .map(|q| matches!(q.sim.outcome, SimOutcome::Unavailable))
             .unwrap_or(true);
 
         let balance_changes_card: Element<'_, Message> = if sim_reverted || sim_unavailable {
-            match eoa.quote.as_ref().map(|q| &q.sim) {
+            match current_quote.map(|q| &q.sim) {
                 Some(sim) => simulation_block(t, sim, chain, portfolio),
                 None => Space::new().height(0).into(),
             }
@@ -1751,7 +1810,7 @@ impl SendPane {
                 t.down,
             ));
             changes_col = changes_col.push(divider_line(t));
-            if let Some(q) = &eoa.quote {
+            if let Some(q) = current_quote {
                 let eth_str = format_units(q.eth_cost_wei, 18u8).unwrap_or_else(|_| "0".into());
                 let eth_short = trim_eth_display(&eth_str);
                 let eth_usd = portfolio.first().map(|p| p.usd_price).unwrap_or(0.0);
@@ -2044,7 +2103,7 @@ impl SendPane {
         // gate the Helios badge on whether the reads were verified — a sim that
         // ran on fallback state must not display as Helios-verified.
         let sim_ok = !sim_reverted && !sim_unavailable;
-        let sim_verified = eoa.quote.as_ref().map(|q| q.sim.verified).unwrap_or(false);
+        let sim_verified = current_quote.map(|q| q.sim.verified).unwrap_or(false);
         let badges_row: Element<'_, Message> = if sim_ok {
             let helios = if sim_verified {
                 good_badge("✓ Verified by Helios")
@@ -2066,9 +2125,7 @@ impl SendPane {
 
         // Gas warning
         let gas_warning: Element<'_, Message> = if has_insufficient_eth {
-            let gas_eth_str = eoa
-                .quote
-                .as_ref()
+            let gas_eth_str = current_quote
                 .map(|q| {
                     let s = format_units(q.eth_cost_wei, 18u8).unwrap_or_else(|_| "0".into());
                     trim_eth_display(&s).to_string()
@@ -2105,14 +2162,18 @@ impl SendPane {
         };
 
         let back_btn = secondary_button(t, "← Back").on_press(Message::Step(1));
-        let confirm_enabled = !self.busy && eoa.quote.is_some() && !has_insufficient_eth;
+        let confirm_enabled = !self.busy && current_quote.is_some() && !has_insufficient_eth;
         // Soften the primary action whenever any read is unverified — either
         // the calldata decode fell back to unverified RPC, or the local sim
         // wasn't Helios-verified — matching the reverting-sim treatment so
         // every unverified sign is a deliberate, acknowledged choice.
         let decode_unverified = match eoa.decoded.as_deref() {
             Some(DecodeResult::ClearSigned { all_verified, .. }) => !all_verified,
-            Some(DecodeResult::Fallback { heuristic, .. }) => !heuristic.all_verified,
+            Some(DecodeResult::Fallback {
+                all_verified,
+                heuristic,
+                ..
+            }) => !(*all_verified && heuristic.all_verified),
             Some(DecodeResult::Heuristic(c)) => !c.all_verified,
             Some(DecodeResult::Empty) | None => false,
         };
@@ -3263,6 +3324,7 @@ pub struct SafeSendRequest {
     pub safe_address: Address,
     pub chain: Chain,
     pub version: String,
+    pub trust: SafeTrust,
     pub service_base: String,
     pub recipient: Address,
     pub amount_units: U256,
@@ -3498,6 +3560,28 @@ mod tests {
         }]
     }
 
+    fn quote_for_plan(plan: &SendPlan) -> TxQuote {
+        TxQuote {
+            plan: plan.clone(),
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            nonce: 0,
+            eth_cost_wei: U256::from(21_000u64),
+            sim: SimulationResult::unavailable(),
+        }
+    }
+
+    fn eoa_pane(amount: &str) -> SendPane {
+        let mut pane = SendPane::new_eoa(Address::repeat_byte(0xab));
+        pane.amount = amount.to_string();
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::repeat_byte(0xcd),
+            ens: None,
+        });
+        pane
+    }
+
     #[test]
     fn threshold_label_shows_total_owners() {
         let pane = SendPane::new_safe(
@@ -3555,6 +3639,54 @@ mod tests {
     }
 
     #[test]
+    fn eoa_amount_change_clears_review_quote() {
+        let portfolio = test_portfolio();
+        let mut pane = eoa_pane("0.1");
+        let plan = pane.build_plan(&portfolio).unwrap();
+        pane.eoa_mut().unwrap().quote = Some(quote_for_plan(&plan));
+        assert!(pane.quote_for_current_plan(&portfolio).is_some());
+
+        let _ = pane.update(Message::SetAmount("0.2".to_string()));
+
+        assert!(pane.quote().is_none());
+        assert!(pane.quote_for_current_plan(&portfolio).is_none());
+    }
+
+    #[test]
+    fn eoa_late_quote_after_input_change_is_dropped() {
+        let portfolio = test_portfolio();
+        let mut pane = eoa_pane("0.1");
+        let reviewed_plan = pane.build_plan(&portfolio).unwrap();
+        let quote_seq = pane.quote_started();
+
+        let _ = pane.update(Message::SetAmount("0.2".to_string()));
+        let _ = pane.update(Message::QuoteFetched {
+            seq: quote_seq,
+            result: Ok(quote_for_plan(&reviewed_plan)),
+        });
+
+        assert!(pane.quote().is_none());
+        assert!(!pane.eoa().unwrap().quote_loading);
+    }
+
+    #[test]
+    fn eoa_current_quote_requires_current_plan() {
+        let portfolio = test_portfolio();
+        let mut pane = eoa_pane("0.1");
+        let old_plan = pane.build_plan(&portfolio).unwrap();
+
+        // Direct field mutation simulates the pre-fix broken state: the form
+        // now describes a different transaction while an old quote remains.
+        pane.amount = "0.2".to_string();
+        let current_plan = pane.build_plan(&portfolio).unwrap();
+        assert_ne!(old_plan, current_plan);
+        pane.eoa_mut().unwrap().quote = Some(quote_for_plan(&old_plan));
+
+        assert!(pane.quote_for_plan(&old_plan).is_some());
+        assert!(pane.quote_for_current_plan(&portfolio).is_none());
+    }
+
+    #[test]
     fn outgoing_request_rejects_zero_recipient() {
         let mut pane = SendPane::new_safe(&safe_only(1, vec![0]), &[local_account_simple(1)]);
         pane.amount = "0.001".into();
@@ -3574,6 +3706,28 @@ mod tests {
         assert!(
             pane.outgoing_request(&test_portfolio()).is_none(),
             "outgoing_request must reject a zero recipient",
+        );
+    }
+
+    #[test]
+    fn unrecognized_safe_blocks_continue_and_outgoing_request() {
+        let mut desc = safe_only(1, vec![0]);
+        desc.trust = SafeTrust::UnrecognizedImpl;
+        let mut pane = SendPane::new_safe(&desc, &[local_account_simple(1)]);
+        pane.amount = "0.001".into();
+        let _ = pane.update(Message::PickRecipient {
+            address: Address::repeat_byte(0xCD),
+            ens: None,
+        });
+
+        assert!(pane.has_any_signable(), "control: linked signer exists");
+        assert!(
+            !pane.can_continue_recipient(),
+            "unrecognized Safe must not advance to review"
+        );
+        assert!(
+            pane.outgoing_request(&test_portfolio()).is_none(),
+            "unrecognized Safe must not build a signable request"
         );
     }
 

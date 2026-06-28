@@ -13,11 +13,13 @@
 use alloy::primitives::{Address, B256};
 use iced::border::Radius;
 use iced::keyboard;
+use iced::widget::text::Wrapping;
 use iced::widget::{Space, column, container, row, scrollable, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
 use crate::chain::Chain;
 use crate::portfolio::LiveToken;
+use crate::safe::SafeTx;
 use crate::safe::service::{PendingSafeTx, SafeTxDetail, SafeTxState};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
@@ -25,8 +27,8 @@ use crate::ui::kao_widgets::{
     mono_black, mono_bold, primary_button, secondary_button, section_card, small_secondary_button,
 };
 use crate::ui::wallet_dashboard::sim_view;
-use crate::wallet::short_address;
 use crate::wallet::sim::SimulationResult;
+use crate::wallet::{SafeTrust, short_address};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -64,6 +66,9 @@ pub struct SafeTxDetailPane {
     /// `safe::tx::ensure_signable_version` with this — signing for a
     /// pre-1.3 domain shape is refused before any signer is built.
     version: String,
+    /// Trust snapshot from the active SafeDescriptor at open. Only
+    /// canonical implementations may emit signing/execution outcomes.
+    trust: SafeTrust,
     /// Transaction-service base for THIS Safe (custom mirror or the
     /// public default), snapshotted at open so every action in the
     /// modal talks to the same service the queue row came from.
@@ -123,6 +128,7 @@ impl SafeTxDetailPane {
         safe: Address,
         chain: Chain,
         version: String,
+        trust: SafeTrust,
         service_base: String,
         pending: PendingSafeTx,
         owners: Vec<Address>,
@@ -133,6 +139,7 @@ impl SafeTxDetailPane {
             safe,
             chain,
             version,
+            trust,
             service_base,
             pending,
             owners,
@@ -292,15 +299,15 @@ impl SafeTxDetailPane {
             Message::BoxClickIgnored => (Task::none(), None),
             // Swallow action presses while one is already in flight so a
             // double-tap can't fire two signatures / broadcasts.
-            Message::Confirm if !self.busy => {
+            Message::Confirm if !self.busy && self.action_availability().0 => {
                 self.pending_execute = false;
                 (Task::none(), Some(Outcome::Confirm))
             }
-            Message::Execute if !self.busy => {
+            Message::Execute if !self.busy && self.action_availability().1 => {
                 self.pending_execute = true;
                 (Task::none(), Some(Outcome::Execute))
             }
-            Message::Reject if !self.busy => {
+            Message::Reject if !self.busy && self.action_availability().2 => {
                 self.pending_execute = false;
                 (Task::none(), Some(Outcome::Reject))
             }
@@ -416,6 +423,26 @@ impl SafeTxDetailPane {
             format!("{} ETH", format_eth(self.pending.value)),
         ));
         fields = fields.push(section_card(t, "TRANSACTION", tx_col.into()));
+
+        if let Some(detail) = &self.detail {
+            let signed_fields = non_default_signed_fields(&detail.tx);
+            if !signed_fields.is_empty() {
+                let mut signed_col = column![].spacing(8).width(Length::Fill);
+                signed_col = signed_col.push(
+                    text("These non-default fields are part of the Safe hash.")
+                        .size(11)
+                        .color(t.sub),
+                );
+                for field in signed_fields {
+                    signed_col = signed_col.push(wrapped_field(t, field.label, field.value));
+                }
+                fields = fields.push(section_card(
+                    t,
+                    "NON-DEFAULT SIGNED FIELDS",
+                    signed_col.into(),
+                ));
+            }
+        }
 
         // The full safeTxHash, chunked and coloured like addresses.
         // This is THE cross-device verification anchor: it's what every
@@ -669,6 +696,9 @@ impl SafeTxDetailPane {
         if self.exec_submitted {
             return (false, false, false);
         }
+        if self.trust.signing_block_reason().is_some() {
+            return (false, false, false);
+        }
         let state = self.effective_state();
         let can_confirm = matches!(state, SafeTxState::AwaitingConfirmations { .. })
             && !self.unsigned_signable().is_empty();
@@ -749,6 +779,8 @@ impl SafeTxDetailPane {
             // rather than showing dead buttons.
             let why = if self.exec_submitted && !matches!(state, SafeTxState::Executed { .. }) {
                 "Execution submitted — waiting for the network to confirm."
+            } else if let Some(reason) = self.trust.signing_block_reason() {
+                reason
             } else {
                 match state {
                     SafeTxState::Executed { .. } => "Already executed.",
@@ -796,6 +828,93 @@ fn simple_field<'a>(t: KaoTheme, label: &'a str, value: String) -> Element<'a, M
     .padding(Padding::from([2, 0]))
     .width(Length::Fill)
     .into()
+}
+
+fn wrapped_field<'a>(t: KaoTheme, label: &'a str, value: String) -> Element<'a, Message> {
+    column![
+        text(label.to_string()).size(13).color(t.sub),
+        Space::new().height(2),
+        text(value)
+            .size(12)
+            .color(t.text)
+            .font(mono_bold())
+            .wrapping(Wrapping::WordOrGlyph),
+    ]
+    .width(Length::Fill)
+    .spacing(0)
+    .into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignedField {
+    label: &'static str,
+    value: String,
+}
+
+fn non_default_signed_fields(tx: &SafeTx) -> Vec<SignedField> {
+    let mut fields = Vec::new();
+
+    if !tx.data.is_empty() {
+        fields.push(SignedField {
+            label: "data",
+            value: format_calldata(tx.data.as_ref()),
+        });
+    }
+    if tx.operation != 0 {
+        fields.push(SignedField {
+            label: "operation",
+            value: format_operation(tx.operation),
+        });
+    }
+    if !tx.safeTxGas.is_zero() {
+        fields.push(SignedField {
+            label: "safeTxGas",
+            value: tx.safeTxGas.to_string(),
+        });
+    }
+    if !tx.baseGas.is_zero() {
+        fields.push(SignedField {
+            label: "baseGas",
+            value: tx.baseGas.to_string(),
+        });
+    }
+    if !tx.gasPrice.is_zero() {
+        fields.push(SignedField {
+            label: "gasPrice",
+            value: tx.gasPrice.to_string(),
+        });
+    }
+    if tx.gasToken != Address::ZERO {
+        fields.push(SignedField {
+            label: "gasToken",
+            value: tx.gasToken.to_checksum(None),
+        });
+    }
+    if tx.refundReceiver != Address::ZERO {
+        fields.push(SignedField {
+            label: "refundReceiver",
+            value: tx.refundReceiver.to_checksum(None),
+        });
+    }
+
+    fields
+}
+
+fn format_operation(operation: u8) -> String {
+    match operation {
+        1 => "1 (delegatecall)".to_string(),
+        other => format!("{other} (unknown)"),
+    }
+}
+
+fn format_calldata(bytes: &[u8]) -> String {
+    let hex = alloy::hex::encode(bytes);
+    let rendered = if hex.len() <= 96 {
+        hex
+    } else {
+        format!("{}…{}", &hex[..64], &hex[hex.len() - 16..])
+    };
+    format!("0x{rendered} ({} bytes)", bytes.len())
 }
 
 /// Loud red banner for non-call operations. Delegatecall gets the full
@@ -918,6 +1037,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn non_default_signed_fields_empty_for_plain_safe_tx() {
+        assert!(non_default_signed_fields(&zero_safe_tx()).is_empty());
+    }
+
+    #[test]
+    fn non_default_signed_fields_detects_relay_and_refund_values() {
+        let mut tx = zero_safe_tx();
+        tx.safeTxGas = U256::from(100u64);
+        tx.baseGas = U256::from(50u64);
+        tx.gasPrice = U256::from(7u64);
+        tx.gasToken = owner(0x22);
+        tx.refundReceiver = owner(0x33);
+
+        let fields = non_default_signed_fields(&tx);
+        let labels: Vec<_> = fields.iter().map(|field| field.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "safeTxGas",
+                "baseGas",
+                "gasPrice",
+                "gasToken",
+                "refundReceiver"
+            ]
+        );
+        assert_eq!(fields[0].value, "100");
+        assert_eq!(fields[1].value, "50");
+        assert_eq!(fields[2].value, "7");
+        assert_eq!(fields[3].value, owner(0x22).to_checksum(None));
+        assert_eq!(fields[4].value, owner(0x33).to_checksum(None));
+    }
+
+    #[test]
+    fn non_default_signed_fields_include_calldata_and_operation() {
+        let mut tx = zero_safe_tx();
+        tx.data = Bytes::from(vec![0xab, 0xcd]);
+        tx.operation = 1;
+
+        let fields = non_default_signed_fields(&tx);
+        assert_eq!(
+            fields,
+            vec![
+                SignedField {
+                    label: "data",
+                    value: "0xabcd (2 bytes)".to_string()
+                },
+                SignedField {
+                    label: "operation",
+                    value: "1 (delegatecall)".to_string()
+                }
+            ]
+        );
+    }
+
     fn pending(state: SafeTxState) -> PendingSafeTx {
         PendingSafeTx {
             safe_tx_hash: B256::ZERO,
@@ -949,21 +1123,31 @@ mod tests {
 
     /// Pane with two Safe owners; `signable` are the ones this wallet
     /// controls. `has_exec` toggles the local gas payer.
-    fn pane(
+    fn pane_with_trust(
         signable: Vec<Address>,
         has_exec: bool,
         pending_state: SafeTxState,
+        trust: SafeTrust,
     ) -> SafeTxDetailPane {
         SafeTxDetailPane::new(
             Address::ZERO,
             Chain::Mainnet,
             "1.4.1".to_string(),
+            trust,
             crate::safe::service::DEFAULT_TX_SERVICE_BASE.to_string(),
             pending(pending_state),
             vec![owner(0x11), owner(0x22)],
             signable,
             has_exec,
         )
+    }
+
+    fn pane(
+        signable: Vec<Address>,
+        has_exec: bool,
+        pending_state: SafeTxState,
+    ) -> SafeTxDetailPane {
+        pane_with_trust(signable, has_exec, pending_state, SafeTrust::Canonical)
     }
 
     #[test]
@@ -1088,6 +1272,50 @@ mod tests {
             vec![owner(0x11), owner(0x22)],
         )));
         assert!(!p.action_availability().1);
+    }
+
+    #[test]
+    fn actions_blocked_for_unrecognized_safe_impl() {
+        let mut p = pane_with_trust(
+            vec![owner(0x22)],
+            true,
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
+            SafeTrust::UnrecognizedImpl,
+        );
+        p.set_detail(Ok(detail(
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2,
+            },
+            vec![owner(0x11)],
+        )));
+
+        assert_eq!(p.action_availability(), (false, false, false));
+        assert!(p.update(Message::Confirm).1.is_none());
+        assert!(p.update(Message::Reject).1.is_none());
+
+        let mut ready = pane_with_trust(
+            vec![owner(0x11)],
+            true,
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: true,
+            },
+            SafeTrust::UnrecognizedImpl,
+        );
+        ready.set_detail(Ok(detail(
+            SafeTxState::AwaitingExecution {
+                required: 2,
+                is_next: true,
+            },
+            vec![owner(0x11), owner(0x22)],
+        )));
+
+        assert_eq!(ready.action_availability(), (false, false, false));
+        assert!(ready.update(Message::Execute).1.is_none());
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub fn view<'a, M: 'a>(
         DecodeResult::Fallback {
             model,
             diagnostics,
+            all_verified,
             heuristic,
             ..
         } => Some(clear_signed_panel(
@@ -69,7 +70,7 @@ pub fn view<'a, M: 'a>(
             model,
             diagnostics,
             &heuristic.proxy_hops,
-            heuristic.all_verified,
+            *all_verified && heuristic.all_verified,
             // The heuristic ran alongside the partial descriptor; don't drop
             // its spoof/ambiguity signals just because we're showing the
             // descriptor's intent.

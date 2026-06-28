@@ -861,7 +861,7 @@ impl WalletScreen {
     /// EOA's signing capability is irrelevant.
     fn can_send(&self) -> bool {
         if let Some(safe) = self.active_safe_descriptor() {
-            return self.has_local_linked_owner(safe);
+            return safe.trust.permits_signing() && self.has_local_linked_owner(safe);
         }
         self.signer.can_sign()
             || matches!(
@@ -1095,6 +1095,28 @@ impl WalletScreen {
         if let Modal::SafeTxDetail(p) = &mut self.modal {
             p.set_action_result(result);
         }
+    }
+
+    /// Re-check the active SafeDescriptor immediately before any queued
+    /// Safe action spawns. The modal carries a trust snapshot from open,
+    /// but refresh-on-open can replace descriptors while the modal remains
+    /// visible.
+    fn active_safe_signing_block(
+        &self,
+        safe: Address,
+        chain: crate::chain::Chain,
+    ) -> Option<String> {
+        let Some(desc) = self.active_safe_descriptor() else {
+            return Some(
+                "Safe selection changed; reopen transaction details before signing.".into(),
+            );
+        };
+        if desc.address() != safe || desc.chain_id != chain.chain_id() {
+            return Some(
+                "Safe selection changed; reopen transaction details before signing.".into(),
+            );
+        }
+        desc.trust.signing_block_reason().map(str::to_string)
     }
 
     /// Spawn the preflight tasks for the Safe-tx detail modal's loaded
@@ -1829,9 +1851,10 @@ impl WalletScreen {
                         let plan = p.build_plan(&self.portfolio);
                         match plan {
                             Some(pl) => {
-                                p.quote_started();
+                                let quote_seq = p.quote_started();
                                 let decode_seq = p.decode_started();
-                                let quote_task = spawn_quote_task(self.network.clone(), pl.clone());
+                                let quote_task =
+                                    spawn_quote_task(self.network.clone(), quote_seq, pl.clone());
                                 let local_names =
                                     build_local_names(&self.accounts, &self.safes, &self.contacts);
                                 let decode_task = spawn_decode_task(
@@ -1861,7 +1884,7 @@ impl WalletScreen {
                 if let send::Message::Confirm = &child_msg {
                     if p.is_eoa() {
                         let plan = p.build_plan(&self.portfolio);
-                        let quote = p.quote().cloned();
+                        let quote = plan.as_ref().and_then(|pl| p.quote_for_plan(pl)).cloned();
                         info!(
                             has_plan = plan.is_some(),
                             has_quote = quote.is_some(),
@@ -1888,9 +1911,8 @@ impl WalletScreen {
                             let task = task.map(Message::Send);
                             return (Task::batch([pre_task, task]), None);
                         }
-                        warn!("send: confirm dropped — no plan or no quote");
-                        let (task, _outcome) = p.update(child_msg);
-                        return (task.map(Message::Send), None);
+                        warn!("send: confirm dropped — no current plan/quote pair");
+                        return (Task::none(), None);
                     }
                     // Safe mode: collect owner keys and broadcast.
                     let Some(req) = p.outgoing_request(&self.portfolio) else {
@@ -2693,6 +2715,7 @@ impl WalletScreen {
                 let safe_addr = safe.address();
                 let threshold = safe.threshold;
                 let version = safe.version.clone();
+                let trust = safe.trust.clone();
                 let service_base = safe.tx_service_base().to_string();
                 let owners: Vec<Address> = safe.owners.iter().map(|o| Address::from(*o)).collect();
                 let signable: Vec<Address> = self
@@ -2706,6 +2729,7 @@ impl WalletScreen {
                     safe_addr,
                     chain,
                     version,
+                    trust,
                     service_base.clone(),
                     pending,
                     owners,
@@ -2880,6 +2904,11 @@ impl WalletScreen {
                         else {
                             return (task, None);
                         };
+                        if let Some(e) = self.active_safe_signing_block(safe, chain) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
                         // Version gate before any signer is built: a
                         // pre-1.3 (or unknown-shape) domain must refuse
                         // with the explainable error, not a late
@@ -2924,6 +2953,11 @@ impl WalletScreen {
                         let Some((tx, confirmations, safe, chain)) = prep else {
                             return (task, None);
                         };
+                        if let Some(e) = self.active_safe_signing_block(safe, chain) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
                         let executor_key = self.first_local_key();
                         self.mark_safe_detail_busy();
                         let Some(executor_key) = executor_key else {
@@ -2958,6 +2992,11 @@ impl WalletScreen {
                         let Some((safe, chain, nonce, owner, version, service_base)) = prep else {
                             return (task, None);
                         };
+                        if let Some(e) = self.active_safe_signing_block(safe, chain) {
+                            self.mark_safe_detail_busy();
+                            self.set_safe_detail_result(Err(e));
+                            return (task, None);
+                        }
                         // Same version gate as Confirm — a rejection is
                         // a SafeTx signature too.
                         if let Err(e) = crate::safe::tx::ensure_signable_version(&version) {
@@ -3728,7 +3767,7 @@ async fn provider_for(
 /// Spawn a quote task using a provider resolved from `plan.chain` — the L2 RPC
 /// for an L2 send, the user's raw RPC for a custom network. The same provider
 /// later serves the broadcast.
-fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, plan: SendPlan) -> Task<Message> {
+fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, seq: u64, plan: SendPlan) -> Task<Message> {
     let chain = plan.chain;
     Task::perform(
         async move {
@@ -3745,7 +3784,7 @@ fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, plan: SendPlan) -> Task<Me
                 }
             }
         },
-        |result| Message::Send(send::Message::QuoteFetched(result)),
+        move |result| Message::Send(send::Message::QuoteFetched { seq, result }),
     )
 }
 
@@ -3837,6 +3876,9 @@ fn spawn_safe_prepare_task(
     Task::perform(
         async move {
             let result: Result<(u64, B256), String> = async {
+                if let Some(reason) = req.trust.signing_block_reason() {
+                    return Err(reason.to_string());
+                }
                 ensure_signable_version(&req.version)?;
                 let nonce = current_safe_nonce(network.as_ref(), req.safe_address, chain).await?;
                 let tx = build_safe_tx_with_nonce(req.safe_tx_input(), nonce);
@@ -3921,6 +3963,9 @@ async fn rebuild_reviewed_safe_tx(
         build_safe_tx_with_nonce, current_safe_nonce, ensure_signable_version, safe_domain,
         safe_tx_hash, verify_safe_tx_before_signing,
     };
+    if let Some(reason) = req.trust.signing_block_reason() {
+        return Err(reason.to_string());
+    }
     ensure_signable_version(&req.version)?;
     let pinned = req
         .prepared
@@ -5643,6 +5688,61 @@ mod tests {
     }
 
     #[test]
+    fn can_send_in_safe_mode_false_for_unrecognized_impl() {
+        let accounts = vec![
+            view_only_account(addr(1)),
+            crate::wallet::AccountDescriptor::Local {
+                name: None,
+                key_bytes: crate::wallet::SecretKeyBytes::new([0x7e; 32]),
+            },
+        ];
+        let mut safe = safe_descriptor(0x99, 1);
+        safe.trust = crate::wallet::SafeTrust::UnrecognizedImpl;
+        safe.linked_signer_indices = vec![1];
+        let mut screen = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            accounts,
+            vec![safe],
+            0,
+            Arc::new(MockFetcher::new()),
+            crate::portfolio::new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+
+        screen.active_safe = Some(0);
+        assert!(
+            !screen.can_send(),
+            "unrecognized Safe implementations must not expose Send"
+        );
+    }
+
+    #[test]
+    fn active_safe_signing_block_catches_demotion_and_swap() {
+        let mut screen = screen_with_safes(addr(1), vec![safe_descriptor(0x99, 1)]);
+        screen.active_safe = Some(0);
+        let safe = screen.safes[0].address();
+        let chain = Chain::Mainnet;
+
+        // Canonical + matching descriptor → signing allowed.
+        assert!(screen.active_safe_signing_block(safe, chain).is_none());
+
+        // A refresh-on-open demotes the live descriptor while the modal's
+        // snapshot is still Canonical → the re-check must block.
+        screen.safes[0].trust = crate::wallet::SafeTrust::UnrecognizedImpl;
+        assert!(screen.active_safe_signing_block(safe, chain).is_some());
+
+        // Trust restored, but a wholesale SafesUpdated replace reordered the
+        // active slot onto a different Safe → block on address mismatch.
+        screen.safes[0] = safe_descriptor(0xAB, 1);
+        assert!(screen.active_safe_signing_block(safe, chain).is_some());
+
+        // No active descriptor at all (deleted / switched to EOA) → block.
+        screen.active_safe = None;
+        assert!(screen.active_safe_signing_block(safe, chain).is_some());
+    }
+
+    #[test]
     fn allowed_chains_in_eoa_mode_returns_all_chains() {
         let screen = screen_with_safes(addr(1), vec![safe_descriptor(0x55, 1)]);
         assert_eq!(screen.allowed_chains(), Chain::ALL.to_vec());
@@ -6061,6 +6161,7 @@ mod tests {
             safe_address: addr(0x5A),
             chain: Chain::Mainnet,
             version: "1.4.1".into(),
+            trust: crate::wallet::SafeTrust::Canonical,
             service_base: crate::safe::service::DEFAULT_TX_SERVICE_BASE.into(),
             recipient: addr(0xDD),
             amount_units: U256::from(1_000u64),
@@ -6112,6 +6213,20 @@ mod tests {
         req.version = "1.1.1".into();
         let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
         assert!(err.contains("outside the signable range"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn rebuild_refuses_unrecognized_safe_before_any_chain_read() {
+        // Nothing planted on the mock: if the trust guard didn't fire
+        // first, the nonce read would fail with a different error.
+        let mock = CallMock::new();
+        let mut req = reviewed_req(Some(send::PreparedSafeTx {
+            nonce: 7,
+            safe_tx_hash: B256::repeat_byte(0xaa),
+        }));
+        req.trust = crate::wallet::SafeTrust::UnrecognizedImpl;
+        let err = rebuild_reviewed_safe_tx(&mock, &req).await.unwrap_err();
+        assert!(err.contains("not recognized as canonical"), "{err}");
     }
 
     #[tokio::test]

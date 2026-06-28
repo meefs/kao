@@ -59,6 +59,14 @@ pub fn resolve(
     match (parsed.len(), bytecode_arg_types) {
         (0, Some(types)) if !types.is_empty() => Resolved::TypesOnly(types.to_vec()),
         (0, _) => Resolved::Unknown,
+        (1, Some(bytecode_types)) if !bytecode_types.is_empty() => {
+            let (name, arg_types) = parsed.into_iter().next().unwrap();
+            if arg_types == bytecode_types {
+                Resolved::Unique { name, arg_types }
+            } else {
+                Resolved::BytecodeMismatch(vec![(name, arg_types)])
+            }
+        }
         (1, _) => {
             let (name, arg_types) = parsed.into_iter().next().unwrap();
             Resolved::Unique { name, arg_types }
@@ -258,6 +266,32 @@ mod tests {
                 assert!(names.contains(&"approve"));
             }
             other => panic!("expected BytecodeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_candidate_bytecode_mismatch_is_flagged() {
+        let candidates = &["transfer(address,uint256)"];
+        let bytecode = vec![DynSolType::Bool, DynSolType::Bool];
+        match resolve(candidates, Some(&bytecode)) {
+            Resolved::BytecodeMismatch(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].0, "transfer");
+            }
+            other => panic!("expected BytecodeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_candidate_matching_bytecode_stays_unique() {
+        let candidates = &["transfer(address,uint256)"];
+        let bytecode = vec![DynSolType::Address, DynSolType::Uint(256)];
+        match resolve(candidates, Some(&bytecode)) {
+            Resolved::Unique { name, arg_types } => {
+                assert_eq!(name, "transfer");
+                assert_eq!(arg_types, bytecode);
+            }
+            other => panic!("expected Unique, got {other:?}"),
         }
     }
 
