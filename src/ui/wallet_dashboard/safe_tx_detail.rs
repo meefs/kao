@@ -13,11 +13,13 @@
 use alloy::primitives::{Address, B256};
 use iced::border::Radius;
 use iced::keyboard;
+use iced::widget::text::Wrapping;
 use iced::widget::{Space, column, container, row, scrollable, text};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Subscription, Task};
 
 use crate::chain::Chain;
 use crate::portfolio::LiveToken;
+use crate::safe::SafeTx;
 use crate::safe::service::{PendingSafeTx, SafeTxDetail, SafeTxState};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
@@ -422,6 +424,26 @@ impl SafeTxDetailPane {
         ));
         fields = fields.push(section_card(t, "TRANSACTION", tx_col.into()));
 
+        if let Some(detail) = &self.detail {
+            let signed_fields = non_default_signed_fields(&detail.tx);
+            if !signed_fields.is_empty() {
+                let mut signed_col = column![].spacing(8).width(Length::Fill);
+                signed_col = signed_col.push(
+                    text("These non-default fields are part of the Safe hash.")
+                        .size(11)
+                        .color(t.sub),
+                );
+                for field in signed_fields {
+                    signed_col = signed_col.push(wrapped_field(t, field.label, field.value));
+                }
+                fields = fields.push(section_card(
+                    t,
+                    "NON-DEFAULT SIGNED FIELDS",
+                    signed_col.into(),
+                ));
+            }
+        }
+
         // The full safeTxHash, chunked and coloured like addresses.
         // This is THE cross-device verification anchor: it's what every
         // owner signs, what the Transaction Service keys this record
@@ -808,6 +830,93 @@ fn simple_field<'a>(t: KaoTheme, label: &'a str, value: String) -> Element<'a, M
     .into()
 }
 
+fn wrapped_field<'a>(t: KaoTheme, label: &'a str, value: String) -> Element<'a, Message> {
+    column![
+        text(label.to_string()).size(13).color(t.sub),
+        Space::new().height(2),
+        text(value)
+            .size(12)
+            .color(t.text)
+            .font(mono_bold())
+            .wrapping(Wrapping::WordOrGlyph),
+    ]
+    .width(Length::Fill)
+    .spacing(0)
+    .into()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignedField {
+    label: &'static str,
+    value: String,
+}
+
+fn non_default_signed_fields(tx: &SafeTx) -> Vec<SignedField> {
+    let mut fields = Vec::new();
+
+    if !tx.data.is_empty() {
+        fields.push(SignedField {
+            label: "data",
+            value: format_calldata(tx.data.as_ref()),
+        });
+    }
+    if tx.operation != 0 {
+        fields.push(SignedField {
+            label: "operation",
+            value: format_operation(tx.operation),
+        });
+    }
+    if !tx.safeTxGas.is_zero() {
+        fields.push(SignedField {
+            label: "safeTxGas",
+            value: tx.safeTxGas.to_string(),
+        });
+    }
+    if !tx.baseGas.is_zero() {
+        fields.push(SignedField {
+            label: "baseGas",
+            value: tx.baseGas.to_string(),
+        });
+    }
+    if !tx.gasPrice.is_zero() {
+        fields.push(SignedField {
+            label: "gasPrice",
+            value: tx.gasPrice.to_string(),
+        });
+    }
+    if tx.gasToken != Address::ZERO {
+        fields.push(SignedField {
+            label: "gasToken",
+            value: tx.gasToken.to_checksum(None),
+        });
+    }
+    if tx.refundReceiver != Address::ZERO {
+        fields.push(SignedField {
+            label: "refundReceiver",
+            value: tx.refundReceiver.to_checksum(None),
+        });
+    }
+
+    fields
+}
+
+fn format_operation(operation: u8) -> String {
+    match operation {
+        1 => "1 (delegatecall)".to_string(),
+        other => format!("{other} (unknown)"),
+    }
+}
+
+fn format_calldata(bytes: &[u8]) -> String {
+    let hex = alloy::hex::encode(bytes);
+    let rendered = if hex.len() <= 96 {
+        hex
+    } else {
+        format!("{}…{}", &hex[..64], &hex[hex.len() - 16..])
+    };
+    format!("0x{rendered} ({} bytes)", bytes.len())
+}
+
 /// Loud red banner for non-call operations. Delegatecall gets the full
 /// explanation; any other non-zero byte is flagged as malformed.
 fn operation_warning<'a>(t: KaoTheme, operation: u8) -> Element<'a, Message> {
@@ -926,6 +1035,61 @@ mod tests {
             refundReceiver: Address::ZERO,
             nonce: U256::from(5u64),
         }
+    }
+
+    #[test]
+    fn non_default_signed_fields_empty_for_plain_safe_tx() {
+        assert!(non_default_signed_fields(&zero_safe_tx()).is_empty());
+    }
+
+    #[test]
+    fn non_default_signed_fields_detects_relay_and_refund_values() {
+        let mut tx = zero_safe_tx();
+        tx.safeTxGas = U256::from(100u64);
+        tx.baseGas = U256::from(50u64);
+        tx.gasPrice = U256::from(7u64);
+        tx.gasToken = owner(0x22);
+        tx.refundReceiver = owner(0x33);
+
+        let fields = non_default_signed_fields(&tx);
+        let labels: Vec<_> = fields.iter().map(|field| field.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "safeTxGas",
+                "baseGas",
+                "gasPrice",
+                "gasToken",
+                "refundReceiver"
+            ]
+        );
+        assert_eq!(fields[0].value, "100");
+        assert_eq!(fields[1].value, "50");
+        assert_eq!(fields[2].value, "7");
+        assert_eq!(fields[3].value, owner(0x22).to_checksum(None));
+        assert_eq!(fields[4].value, owner(0x33).to_checksum(None));
+    }
+
+    #[test]
+    fn non_default_signed_fields_include_calldata_and_operation() {
+        let mut tx = zero_safe_tx();
+        tx.data = Bytes::from(vec![0xab, 0xcd]);
+        tx.operation = 1;
+
+        let fields = non_default_signed_fields(&tx);
+        assert_eq!(
+            fields,
+            vec![
+                SignedField {
+                    label: "data",
+                    value: "0xabcd (2 bytes)".to_string()
+                },
+                SignedField {
+                    label: "operation",
+                    value: "1 (delegatecall)".to_string()
+                }
+            ]
+        );
     }
 
     fn pending(state: SafeTxState) -> PendingSafeTx {

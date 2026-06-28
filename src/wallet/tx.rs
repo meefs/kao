@@ -59,7 +59,7 @@ pub fn parse_amount_units(amount: &str, decimals: u8) -> Result<U256, String> {
 }
 
 /// What kind of token this send moves: native ETH, or an ERC-20 contract.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendToken {
     Native,
     Erc20 { contract: Address },
@@ -76,7 +76,7 @@ pub enum SendToken {
 /// [`NetworkId`] so the send flow works on a user-defined custom network
 /// (which carries `NetworkId::Custom(chain_id)`) exactly as it does on a
 /// built-in — only the provider the caller hands in differs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendPlan {
     pub from: Address,
     pub recipient: Address,
@@ -119,6 +119,9 @@ impl SendPlan {
 /// same numbers they reviewed.
 #[derive(Debug, Clone)]
 pub struct TxQuote {
+    /// Exact plan this quote/simulation was produced for. The signer re-checks
+    /// it so a stale review quote cannot be paired with a newly-built plan.
+    pub plan: SendPlan,
     pub gas_limit: u64,
     pub max_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
@@ -133,6 +136,12 @@ pub struct TxQuote {
     /// it's a `SimulationResult::unavailable()` placeholder. Sim is
     /// always advisory — the review screen never blocks on it.
     pub sim: SimulationResult,
+}
+
+impl TxQuote {
+    pub fn matches_plan(&self, plan: &SendPlan) -> bool {
+        &self.plan == plan
+    }
 }
 
 /// Quote a send: estimate gas, fetch 1559 fees, fetch the pending nonce,
@@ -242,6 +251,7 @@ pub async fn build_quote(
     );
 
     Ok(TxQuote {
+        plan: plan.clone(),
         gas_limit,
         max_fee_per_gas: fees.max_fee_per_gas,
         max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
@@ -271,6 +281,17 @@ pub async fn sign_and_send(
     if plan.recipient.is_zero() {
         warn!(from = %plan.from, "sign+send: refusing zero-address recipient");
         return Err("refusing to send to the zero address".to_string());
+    }
+    if !quote.matches_plan(&plan) {
+        warn!(
+            from = %plan.from,
+            current_recipient = %plan.recipient,
+            quoted_recipient = %quote.plan.recipient,
+            current_amount_units = %plan.amount_units,
+            quoted_amount_units = %quote.plan.amount_units,
+            "sign+send: refusing stale quote",
+        );
+        return Err("quote no longer matches the reviewed send — review again".to_string());
     }
     let (to, value, input) = plan.tx_target();
     let token_kind = match &plan.token {
@@ -476,8 +497,9 @@ mod tests {
         }
     }
 
-    fn dummy_quote() -> TxQuote {
+    fn dummy_quote(plan: &SendPlan) -> TxQuote {
         TxQuote {
+            plan: plan.clone(),
             gas_limit: 21_000,
             max_fee_per_gas: 1,
             max_priority_fee_per_gas: 1,
@@ -501,7 +523,8 @@ mod tests {
             amount_units: U256::from(1u64),
             chain: NetworkId::Builtin(Chain::Mainnet),
         };
-        let res = sign_and_send(&provider, &signer, plan, dummy_quote()).await;
+        let quote = dummy_quote(&plan);
+        let res = sign_and_send(&provider, &signer, plan, quote).await;
         assert!(
             res.is_err(),
             "native send to the zero address must be refused"
@@ -525,10 +548,38 @@ mod tests {
             amount_units: U256::from(1_000_000u64),
             chain: NetworkId::Builtin(Chain::Base),
         };
-        let res = sign_and_send(&provider, &signer, plan, dummy_quote()).await;
+        let quote = dummy_quote(&plan);
+        let res = sign_and_send(&provider, &signer, plan, quote).await;
         assert!(
             res.is_err(),
             "erc20 transfer to the zero address must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn sign_and_send_refuses_quote_for_different_plan() {
+        use alloy::signers::local::PrivateKeySigner;
+
+        let signer = KaoSigner::Local(PrivateKeySigner::random());
+        let provider = RootProvider::<Ethereum>::new_http("http://127.0.0.1:1".parse().unwrap());
+        let reviewed = SendPlan {
+            from: signer.address(),
+            recipient: address!("000000000000000000000000000000000000dEaD"),
+            token: SendToken::Native,
+            amount_units: U256::from(1u64),
+            chain: NetworkId::Builtin(Chain::Mainnet),
+        };
+        let current = SendPlan {
+            amount_units: U256::from(2u64),
+            ..reviewed.clone()
+        };
+
+        let err = sign_and_send(&provider, &signer, current, dummy_quote(&reviewed))
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("quote no longer matches"),
+            "stale quote must be refused before signing, got {err}",
         );
     }
 }

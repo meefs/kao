@@ -1,15 +1,15 @@
 //! Kao Wallet dashboard — the main screen shown after unlock.
 //!
-//! Layout mirrors the HTML mock in `kao/project/Kao Wallet.html`:
-//! a thin sidebar (wordmark · Home/Activity/Settings · theme dots), a header
-//! with a mood kaomoji, and one of three content panes. Send and Receive are
-//! modal overlays rendered via `stack`.
+//! Layout: a wide sidebar (brand mark · account card · Portfolio/Apps/
+//! Activity/Settings nav rows · network-privacy footer), a slim header
+//! (account title · Helios badge · mood kaomoji), and one of the content
+//! panes. Send and Receive are modal overlays rendered via `stack`.
 
 use std::mem;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use alloy::primitives::{Address, B256, Bytes, TxHash};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use iced::border::Radius;
 use iced::widget::operation::focus as focus_widget;
 use iced::widget::{Space, column, container, row, stack, text};
@@ -19,11 +19,13 @@ use tracing::{debug, info, warn};
 mod account_dropdown;
 mod activity;
 mod appearance;
+mod apps;
 mod contacts_settings;
 mod function_panel;
 mod header;
 mod home;
 mod modal_chrome;
+mod names_app;
 mod nav;
 mod networks;
 mod receive;
@@ -37,6 +39,7 @@ mod swap;
 mod tx_details;
 
 use account_dropdown::AccountDropdown;
+use apps::AppsPane;
 use contacts_settings::ContactsPane;
 use receive::ReceivePane;
 use safe_tx_detail::SafeTxDetailPane;
@@ -55,6 +58,13 @@ pub(super) const MOOD: &str = "(´｡• ᵕ •｡`)";
 /// enough that providers without server-side paging stay responsive.
 const HISTORY_LIMIT: usize = 50;
 
+/// How many of the address's CoW orders the Apps "Fetch" action pulls per
+/// chain (newest first). CoW caps a page at 1000; 100 covers essentially any
+/// real user's history in one round trip without rendering a huge list. Repeat
+/// fetches dedup by UID, so this is a per-fetch page size, not a hard ceiling
+/// on what can accumulate.
+const ACCOUNT_ORDERS_LIMIT: u16 = 100;
+
 /// How long after a copy we wait before nuking the clipboard. Doubles as
 /// the lifetime of the bottom-right "autoclear in N…" chip — the chip's
 /// progress bar fills this whole duration.
@@ -64,9 +74,16 @@ use modal_chrome::ModalChrome;
 pub use nav::Nav;
 
 use crate::chain::PerChain;
+use crate::cow::{
+    self,
+    composer::SwapDraft,
+    tracked::{OrderStatus, TrackedOrder},
+};
 use crate::indexer::IndexedTx;
+use crate::names::manage::{NameStatus, Registry, SearchHit};
+use crate::names::registrar::{Namespace, RegisterPlan};
 use crate::net::{BalanceFetcher, VerificationStatus};
-use crate::portfolio::{LiveToken, PortfolioCache};
+use crate::portfolio::{DiscoveredToken, LiveToken, PortfolioCache};
 use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
@@ -80,6 +97,14 @@ use crate::wallet::{
 };
 
 // ── Messages ────────────────────────────────────────────────────────────────
+
+/// Which swap surface a CoW task's result routes back to: the blocking modal
+/// (surface 1) or the persistent Apps pane (surface 2).
+#[derive(Debug, Clone, Copy)]
+pub enum CowHost {
+    Modal,
+    Apps,
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -133,6 +158,10 @@ pub enum Message {
     OpenReceive,
     OpenSwap,
     OpenAccountDropdown,
+    /// User clicked the sidebar's "Reconnect" button for a hardware account
+    /// whose device isn't connected. Escalates to the App to push the
+    /// matching connect screen (no Send modal afterwards).
+    ReconnectHardware,
     /// User clicked the refresh button next to the assets list.
     /// Re-issues the portfolio fetch (and verification refresh) for
     /// the current identity. Tokens stay visible during the refresh;
@@ -240,6 +269,94 @@ pub enum Message {
         generation: u64,
         actual: Option<String>,
     },
+    /// Child messages from the Apps (swap workspace) pane.
+    Apps(apps::Message),
+    /// Names app: reverse-lookup discovery finished. `owner` is the account the
+    /// scan was spawned for — the handler drops it if the active account changed.
+    NameReverseScanned {
+        owner: Address,
+        result: Result<Vec<NameStatus>, String>,
+    },
+    /// Names app: a manually-added name's verified status.
+    NameStatusLoaded {
+        owner: Address,
+        result: Result<NameStatus, String>,
+    },
+    /// Names app: cross-namespace availability + price search finished.
+    NameSearched {
+        owner: Address,
+        result: Result<Vec<SearchHit>, String>,
+    },
+    /// Names app: the commit landed (mined). Carries the plan (with its secret)
+    /// for the reveal step, and the parked signer back.
+    NameCommitted {
+        result: Result<(RegisterPlan, TxHash), String>,
+        signer: SignerHandoff,
+    },
+    /// Names app: register/reveal finished. `String` is the registered name.
+    NameRegistered {
+        result: Result<(String, TxHash), String>,
+        signer: SignerHandoff,
+    },
+    /// Names app: renewal finished.
+    NameRenewed {
+        result: Result<(String, TxHash), String>,
+        signer: SignerHandoff,
+    },
+    /// Names app: set-recipient finished.
+    NameRecipientSet {
+        result: Result<(String, TxHash), String>,
+        signer: SignerHandoff,
+    },
+    /// A CoW quote returned (or errored). Routed back to the host's composer.
+    CowQuote {
+        host: CowHost,
+        result: Result<crate::cow::api::QuoteResponse, String>,
+    },
+    /// A CoW order placement finished. Carries the signer back via
+    /// `SignerHandoff` (moved out for the async approve/sign path, like Send).
+    CowPlaced {
+        host: CowHost,
+        result: Result<TrackedOrder, String>,
+        signer: SignerHandoff,
+    },
+    /// An off-chain order cancellation finished. Signer handed back as above.
+    CowCancel {
+        uid: String,
+        result: Result<(), String>,
+        signer: SignerHandoff,
+    },
+    /// A tracked order's status poll returned. Errors (incl. indexer-lag 404s)
+    /// are ignored so a transient miss never flips an order to a wrong state.
+    CowStatus {
+        uid: String,
+        result: Result<crate::cow::api::OrderStatusResponse, String>,
+    },
+    /// Poll tick: refresh every non-terminal tracked order. Only fires while at
+    /// least one such order exists (see `subscription`).
+    CowPollTick,
+    /// Result of the Apps "Fetch" action: the address's CoW order history for
+    /// `chain`, already mapped to `TrackedOrder`s. Upserted into
+    /// `tracked_orders` (dedup by UID) so orders from past sessions appear and
+    /// known orders pick up fresh status. `address` guards against an account
+    /// switch landing the fetch on the wrong identity.
+    CowAccountOrders {
+        address: Address,
+        chain: crate::chain::Chain,
+        result: Result<Vec<TrackedOrder>, String>,
+    },
+    /// Targeted balance refresh after a swap filled. Carries the two assets
+    /// the order touched (the "slots": native ETH as `None`, each ERC-20 leg
+    /// as `Some(addr)`) so the handler replaces *only* those rows instead of
+    /// the whole network — a drained sell token disappears, a freshly-bought
+    /// token appears, every other row is left alone. `address`/`network` gate
+    /// the merge the same way `PortfolioFetched` does.
+    SwapTokensRefetched {
+        address: Address,
+        network: crate::chain::NetworkId,
+        slots: Vec<Option<Address>>,
+        result: Result<Vec<LiveToken>, String>,
+    },
 }
 
 /// Outcomes bubbled up to the parent app.
@@ -253,12 +370,16 @@ pub enum Outcome {
     /// User saved a new/edited contacts list. The App writes the vec
     /// into the shared in-memory book and dispatches a disk save.
     SaveContacts(Vec<Contact>),
-    /// User clicked Send on a hardware account whose signer is the
-    /// view-only placeholder (the device wasn't connected at unlock).
-    /// The App pushes the matching reconnect screen and, on success,
-    /// re-enters the dashboard with the live signer and the Send modal
-    /// pre-opened.
-    NeedsHardwareReconnect,
+    /// User asked to reconnect a hardware account whose signer is the
+    /// view-only placeholder (the device wasn't connected at unlock). The
+    /// App pushes the matching reconnect screen and, on success, re-enters
+    /// the dashboard with the live signer. `open_send` is set when the
+    /// reconnect was triggered by clicking Send (so the Send modal is
+    /// re-opened afterwards); the sidebar's Reconnect button leaves it
+    /// false, landing the user back on the dashboard with nothing popped.
+    NeedsHardwareReconnect {
+        open_send: bool,
+    },
     /// User changed a Safe's transaction-service mirror in Settings →
     /// Safes. The App writes it into `wallet.safes[index]`, persists,
     /// and pushes the updated list back via `Message::SafesUpdated`.
@@ -266,6 +387,18 @@ pub enum Outcome {
         index: usize,
         url: Option<String>,
     },
+}
+
+/// Connection state of the active account's hardware device, surfaced as a
+/// status card at the bottom of the sidebar. `None` for software / view-only
+/// accounts, which have no device to connect — the card is only meaningful
+/// for Ledger / Trezor accounts. `connected` is false while the live signer
+/// is the view-only placeholder (device not opened since unlock), which is
+/// also what hides the Apps and Swap surfaces.
+#[derive(Debug, Clone, Copy)]
+pub enum HardwareStatus {
+    Ledger { connected: bool },
+    Trezor { connected: bool },
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -402,6 +535,20 @@ pub struct WalletScreen {
     /// `ClipboardClearArmed` / `ClipboardClearProbe` from an older arm
     /// can't clobber the chip or the clipboard.
     clipboard_clear_gen: u64,
+    /// CoW swap orders placed this session (both surfaces share this list).
+    /// In-memory for v1; the poll subscription refreshes non-terminal entries.
+    /// Filtered to the active address when rendered in the Apps pane.
+    tracked_orders: Vec<TrackedOrder>,
+    /// True while the EOA signer is parked for an in-flight CoW order op
+    /// (place or cancel). During that window `self.signer` is a view-only
+    /// placeholder, so `can_swap()` would read false and transiently hide the
+    /// sidebar Apps tab + redirect `Nav::Apps` to the portfolio. The Apps
+    /// surface keys off `apps_available()` (which ORs this in) so it stays put
+    /// until the order op resolves in `CowPlaced` / `CowCancel`.
+    order_op_in_flight: bool,
+    /// The Apps (swap workspace) pane state — its inline swap composer. The
+    /// order list it renders comes from `tracked_orders`, not the pane.
+    apps: AppsPane,
 }
 
 /// Tracks an in-flight clipboard auto-clear: when it lands, what we
@@ -496,6 +643,9 @@ impl WalletScreen {
             contacts,
             clipboard_clear: None,
             clipboard_clear_gen: 0,
+            tracked_orders: Vec::new(),
+            order_op_in_flight: false,
+            apps: AppsPane::new(address),
         }
     }
 
@@ -527,6 +677,40 @@ impl WalletScreen {
     /// shouldn't happen but cheaper than panicking).
     fn active_safe_descriptor(&self) -> Option<&SafeDescriptor> {
         self.active_safe.and_then(|i| self.safes.get(i))
+    }
+
+    /// Display name for the active identity — the Safe's name with its
+    /// threshold badge in Safe mode, otherwise the active account's name
+    /// (falling back to a positional default). Shown both in the sidebar
+    /// account card and as the header title.
+    fn display_name(&self) -> String {
+        match self.active_safe_descriptor() {
+            Some(safe) => {
+                let idx = self.active_safe.unwrap_or(0);
+                let base = safe.display_name(idx);
+                let total_owners = safe.owners.len().max(safe.linked_signer_indices.len());
+                format!("{base} — Safe {} of {}", safe.threshold, total_owners)
+            }
+            None => self
+                .accounts
+                .get(self.active_index)
+                .map(|a| a.display_name(self.active_index))
+                .unwrap_or_else(|| format!("Account {}", self.active_index + 1)),
+        }
+    }
+
+    /// Short network label for the sidebar footer — the Safe's chain in
+    /// Safe mode, otherwise "Ethereum" (the EOA's primary network; the
+    /// portfolio itself may span several chains).
+    fn network_short_name(&self) -> &'static str {
+        match self.active_safe_descriptor() {
+            Some(safe) => crate::chain::Chain::ALL
+                .iter()
+                .find(|c| c.chain_id() == safe.chain_id)
+                .map(|c| c.label())
+                .unwrap_or("Unknown chain"),
+            None => "Ethereum",
+        }
     }
 
     /// Chains whose balances/history are valid for the current
@@ -646,6 +830,16 @@ impl WalletScreen {
         }
     }
 
+    /// True while *any* signing operation has the live signer parked — a Send /
+    /// Safe broadcast ([`Self::is_send_busy`]) or a CoW / name-service write
+    /// (`order_op_in_flight`). The App gates leaving the dashboard
+    /// (begin-add-account) on this: `into_signer()` would otherwise hand back the
+    /// `ViewOnly` placeholder and strand the real signer in the in-flight task's
+    /// handoff. Name writes also refuse to start while this is true.
+    pub fn is_signing_busy(&self) -> bool {
+        self.is_send_busy() || self.order_op_in_flight
+    }
+
     /// The active address in short `0xabcd…ef01` form. For diagnostic logs.
     pub fn address_for_log(&self) -> String {
         short_address(self.address)
@@ -674,6 +868,185 @@ impl WalletScreen {
                 self.accounts.get(self.active_index),
                 Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
             )
+    }
+
+    /// Whether the Swap quick action / modal should be live. Needs a signer
+    /// that can actually sign (orders are EIP-712-signed; ERC-20 sells and the
+    /// EthFlow path also broadcast on-chain) and an EOA identity — there's no
+    /// Safe-TX swap path in v1, so Safe mode disables it. CoW only runs on
+    /// Mainnet/Base, but that's surfaced inside the modal (the composer lists
+    /// only swappable balances) rather than gating the button, so a user with
+    /// no L1/Base balance still sees why nothing's available.
+    fn can_swap(&self) -> bool {
+        self.active_safe.is_none() && self.signer.can_sign()
+    }
+
+    /// Whether the Apps (Swap) surface should be available for the active
+    /// identity. Same as [`Self::can_swap`], but stays true while an order is
+    /// being placed or cancelled: the signer is parked as a view-only
+    /// placeholder for the async sign path, which would otherwise flip
+    /// `can_swap()` false and transiently yank the sidebar Apps tab (and
+    /// redirect `Nav::Apps` to the portfolio) mid-order. Drives the sidebar
+    /// gate and the nav fallback only — starting a *new* swap still keys off
+    /// the live `can_swap()`.
+    fn apps_available(&self) -> bool {
+        self.can_swap() || self.order_op_in_flight
+    }
+
+    /// Hardware-device status for the active account, used to render the
+    /// sidebar's connection card. `None` for software / view-only accounts.
+    /// "Connected" means we hold a live signer: either it can sign, or it's
+    /// momentarily parked as a placeholder for an in-flight order
+    /// (`order_op_in_flight`) — the same reasoning that keeps the Apps
+    /// surface up mid-order applies here, so the card doesn't flicker to
+    /// "disconnected" while a swap is being signed.
+    fn hardware_status(&self) -> Option<HardwareStatus> {
+        let connected = self.signer.can_sign() || self.order_op_in_flight;
+        match self.accounts.get(self.active_index) {
+            Some(AccountDescriptor::Ledger { .. }) => Some(HardwareStatus::Ledger { connected }),
+            Some(AccountDescriptor::Trezor { .. }) => Some(HardwareStatus::Trezor { connected }),
+            _ => None,
+        }
+    }
+
+    /// Park the live EOA signer for an in-flight CoW order op (place/cancel),
+    /// returning the handoff cell the async task signs with — the swap analogue
+    /// of the Send broadcast handoff. Flags `order_op_in_flight` so the Apps
+    /// surface stays available (see [`Self::apps_available`]) while the signer
+    /// is momentarily a view-only placeholder; the flag is cleared when the
+    /// signer is reclaimed in `CowPlaced` / `CowCancel`.
+    fn park_signer_for_order(&mut self) -> SignerHandoff {
+        self.order_op_in_flight = true;
+        let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
+        handoff_with(signer)
+    }
+
+    /// Reclaim the EOA signer parked for a name-service write op and clear the
+    /// in-flight flag — the shared tail of every `Name*` result handler.
+    ///
+    /// Only a *real* signer for the *current* account is restored. Refusing a
+    /// `ViewOnly` placeholder stops a stray/late reclaim from downgrading a live
+    /// signer to view-only (which would silently disable signing across the whole
+    /// wallet); refusing a signer whose address ≠ the active account stops an op
+    /// spawned before an account switch from contaminating the new account with
+    /// the old account's key. In both cases the reclaimed value is simply
+    /// dropped.
+    fn reclaim_order_signer(&mut self, signer: SignerHandoff) {
+        self.install_reclaimed_signer(&signer);
+        self.order_op_in_flight = false;
+    }
+
+    /// Safely restore a signer parked for an in-flight signing op: install it
+    /// only if it's a *real* signer for the *current* account. This is the
+    /// invariant that keeps the shared signer-park machinery (Send / CoW /
+    /// name-service writes) safe under overlap — a `ViewOnly` placeholder (from a
+    /// concurrent double-park) or a different account's key (from a mid-op
+    /// account switch) is dropped rather than overwriting the live signer, so no
+    /// overlap can silently strand the wallet as view-only.
+    fn install_reclaimed_signer(&mut self, signer: &SignerHandoff) {
+        if let Ok(mut g) = signer.lock()
+            && let Some(s) = g.take()
+            && s.can_sign()
+            && s.address() == self.address
+        {
+            self.signer = s;
+        }
+    }
+
+    /// Service a request bubbled up from the Names app: read-only ones spawn a
+    /// verified-read task; write ones park the signer first (so the Apps surface
+    /// survives the in-flight window) and mint the commit secret here, where the
+    /// RNG lives.
+    fn handle_name_outcome(&mut self, o: names_app::Outcome) -> Task<Message> {
+        // Serialize signing: refuse a new write-op while one is already in
+        // flight, so a second park can't strand the real signer in the first
+        // op's handoff. Reads (Scan/Status/Check) don't park the signer, so
+        // they're exempt.
+        let is_write = matches!(
+            o,
+            names_app::Outcome::Commit { .. }
+                | names_app::Outcome::Register { .. }
+                | names_app::Outcome::RegisterXns { .. }
+                | names_app::Outcome::Renew { .. }
+                | names_app::Outcome::SetRecipient { .. }
+        );
+        if is_write && self.is_signing_busy() {
+            // Another signing op already holds the signer. Refuse — but the pane
+            // has already flipped to a busy phase, so feed the error back so it
+            // reverts (rather than stranding it, or letting a second park strand
+            // the signer).
+            let msg =
+                "another signing operation is in progress — try again in a moment".to_string();
+            let pane = self.apps.names_pane();
+            match o {
+                names_app::Outcome::Commit { .. } => pane.on_commit(Err(msg)),
+                // Both the legacy reveal and the XNS one-shot resolve via `on_register`.
+                names_app::Outcome::Register { .. } | names_app::Outcome::RegisterXns { .. } => {
+                    pane.on_register(Err(msg))
+                }
+                names_app::Outcome::Renew { .. } => pane.on_renew(Err(msg)),
+                names_app::Outcome::SetRecipient { .. } => pane.on_set_recipient(Err(msg)),
+                _ => {}
+            }
+            return Task::none();
+        }
+        // Every async result is tagged with `self.address` and dropped on arrival
+        // if the active account has since changed (see the `Name*` handlers), so
+        // an op spawned for one account can't populate another's view.
+        let owner = self.address;
+        match o {
+            names_app::Outcome::ReverseScan => spawn_name_reverse_scan(self.network.clone(), owner),
+            names_app::Outcome::Status { registry, label } => {
+                spawn_name_status(self.network.clone(), owner, registry, label)
+            }
+            names_app::Outcome::Search { label, registries } => {
+                spawn_name_search(self.network.clone(), owner, label, registries)
+            }
+            names_app::Outcome::RegisterXns { namespace, label } => {
+                let handoff = self.park_signer_for_order();
+                spawn_name_register_xns(self.network.clone(), handoff, namespace, label)
+            }
+            names_app::Outcome::Commit {
+                namespace,
+                label,
+                years,
+            } => {
+                // Fresh commit/reveal nonce — never reused, kept in the plan. The
+                // name is registered to the signing account (`self.address`): the
+                // GNS/WNS reveal mints to msg.sender and binds the commitment to
+                // it, so owner must equal the signer.
+                let secret = B256::from(rand::random::<[u8; 32]>());
+                let plan = RegisterPlan {
+                    namespace,
+                    label,
+                    owner: self.address,
+                    duration_secs: crate::names::registrar::ens_duration_secs(years),
+                    secret,
+                };
+                let handoff = self.park_signer_for_order();
+                spawn_name_commit(self.network.clone(), handoff, plan)
+            }
+            names_app::Outcome::Register { plan } => {
+                let handoff = self.park_signer_for_order();
+                spawn_name_register(self.network.clone(), handoff, plan)
+            }
+            names_app::Outcome::Renew {
+                namespace,
+                label,
+                years,
+            } => {
+                let handoff = self.park_signer_for_order();
+                spawn_name_renew(self.network.clone(), handoff, namespace, label, years)
+            }
+            names_app::Outcome::SetRecipient {
+                namespace,
+                label,
+                recipient,
+            } => {
+                let handoff = self.park_signer_for_order();
+                spawn_name_set_recipient(self.network.clone(), handoff, namespace, label, recipient)
+            }
+        }
     }
 
     /// Whether `safe` has at least one linked owner that's a `Local`
@@ -1139,17 +1512,17 @@ impl WalletScreen {
         }
         Task::perform(
             async move {
-                debug!(addr = %short_address(address), "ens reverse lookup");
+                debug!(addr = %short_address(address), "name reverse lookup");
                 let started = std::time::Instant::now();
-                // Verified (Helios, mainnet-only) reverse lookup. An
-                // unverified read fails closed inside `lookup_address`, so
-                // the address simply shows without an ENS name rather than
-                // a name a hostile RPC could fabricate.
-                let result = crate::ens::lookup_address(network.as_ref(), address).await;
+                // Verified (Helios, mainnet-only) reverse lookup across ENS /
+                // GNS / WNS. An unverified read fails closed inside
+                // `lookup_address`, so the address simply shows without a name
+                // rather than a name a hostile RPC could fabricate.
+                let result = crate::names::lookup_address(network.as_ref(), address).await;
                 debug!(
                     elapsed = ?started.elapsed(),
                     found = matches!(&result, Ok(Some(_))),
-                    "ens reverse lookup completed",
+                    "name reverse lookup completed",
                 );
                 (address, result)
             },
@@ -1268,18 +1641,7 @@ impl WalletScreen {
                         // fetched, or a stale row would survive the retain.
                         self.portfolio
                             .extend(tokens.into_iter().filter(|t| t.chain == network));
-                        self.portfolio.sort_by(|a, b| {
-                            // Native ETH bubbles up first per chain.
-                            let a_native = a.contract.is_none();
-                            let b_native = b.contract.is_none();
-                            match b_native.cmp(&a_native) {
-                                std::cmp::Ordering::Equal => b
-                                    .usd_value
-                                    .partial_cmp(&a.usd_value)
-                                    .unwrap_or(std::cmp::Ordering::Equal),
-                                other => other,
-                            }
-                        });
+                        sort_portfolio_rows(&mut self.portfolio);
                     }
                     Err(e) => warn!(
                         chain_id = network.chain_id(),
@@ -1400,6 +1762,21 @@ impl WalletScreen {
                 self.theme_kind = k;
                 settings::set_theme(k);
             }
+            Message::ReconnectHardware => {
+                // The sidebar only shows the Reconnect button for a
+                // disconnected hardware account, but guard anyway so a
+                // stray message is a no-op rather than a spurious connect
+                // screen for a software / view-only identity.
+                if matches!(
+                    self.accounts.get(self.active_index),
+                    Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
+                ) {
+                    return (
+                        Task::none(),
+                        Some(Outcome::NeedsHardwareReconnect { open_send: false }),
+                    );
+                }
+            }
             Message::OpenSend => {
                 // Safe mode: route Send to the unified SendPane in
                 // Safe mode. The EOA signer stays alive in
@@ -1420,7 +1797,10 @@ impl WalletScreen {
                         self.accounts.get(self.active_index),
                         Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
                     ) {
-                        return (Task::none(), Some(Outcome::NeedsHardwareReconnect));
+                        return (
+                            Task::none(),
+                            Some(Outcome::NeedsHardwareReconnect { open_send: true }),
+                        );
                     }
                     info!("send disabled: active account is view-only");
                     return (Task::none(), None);
@@ -1471,9 +1851,10 @@ impl WalletScreen {
                         let plan = p.build_plan(&self.portfolio);
                         match plan {
                             Some(pl) => {
-                                p.quote_started();
+                                let quote_seq = p.quote_started();
                                 let decode_seq = p.decode_started();
-                                let quote_task = spawn_quote_task(self.network.clone(), pl.clone());
+                                let quote_task =
+                                    spawn_quote_task(self.network.clone(), quote_seq, pl.clone());
                                 let local_names =
                                     build_local_names(&self.accounts, &self.safes, &self.contacts);
                                 let decode_task = spawn_decode_task(
@@ -1503,7 +1884,7 @@ impl WalletScreen {
                 if let send::Message::Confirm = &child_msg {
                     if p.is_eoa() {
                         let plan = p.build_plan(&self.portfolio);
-                        let quote = p.quote().cloned();
+                        let quote = plan.as_ref().and_then(|pl| p.quote_for_plan(pl)).cloned();
                         info!(
                             has_plan = plan.is_some(),
                             has_quote = quote.is_some(),
@@ -1530,9 +1911,8 @@ impl WalletScreen {
                             let task = task.map(Message::Send);
                             return (Task::batch([pre_task, task]), None);
                         }
-                        warn!("send: confirm dropped — no plan or no quote");
-                        let (task, _outcome) = p.update(child_msg);
-                        return (task.map(Message::Send), None);
+                        warn!("send: confirm dropped — no current plan/quote pair");
+                        return (Task::none(), None);
                     }
                     // Safe mode: collect owner keys and broadcast.
                     let Some(req) = p.outgoing_request(&self.portfolio) else {
@@ -1663,15 +2043,10 @@ impl WalletScreen {
                 }
             }
             Message::SendBroadcastReturn { result, signer } => {
-                // Reclaim the signer regardless of pane state — the
-                // dashboard must always end up holding it again.
-                if let Ok(mut g) = signer.lock() {
-                    if let Some(s) = g.take() {
-                        self.signer = s;
-                    } else {
-                        warn!("broadcast return: signer cell was empty");
-                    }
-                }
+                // Reclaim the signer regardless of pane state — the dashboard
+                // must end up holding it again (and only if it's the real signer
+                // for the current account; see `install_reclaimed_signer`).
+                self.install_reclaimed_signer(&signer);
                 // Pump the result into the pane if it's still open. If
                 // the user closed the modal mid-broadcast we silently
                 // drop the result — the tx was still sent and a future
@@ -1735,7 +2110,7 @@ impl WalletScreen {
                     Ok(Some(n)) => n,
                     Ok(None) => return (Task::none(), None),
                     Err(e) => {
-                        warn!(error = %e, "ens auto-name lookup failed");
+                        warn!(error = %e, "auto-name lookup failed");
                         return (Task::none(), None);
                     }
                 };
@@ -1807,12 +2182,10 @@ impl WalletScreen {
                 }
             }
             Message::OpenSwap => {
-                // Swap is meaningless from a Safe in v1 (no Safe-TX
-                // calldata composer for swap routers yet). Silently
-                // no-op when in Safe mode; the quick-action button
-                // gates itself on `can_swap()` so users don't see a
-                // disabled affordance.
-                if self.active_safe.is_some() {
+                // The quick-action button is disabled when `can_swap()` is
+                // false (view-only or Safe mode); guard here too so a stray
+                // message can't open a modal that can't sign.
+                if !self.can_swap() {
                     return (Task::none(), None);
                 }
                 self.modal = Modal::Swap(SwapPane::new());
@@ -1829,8 +2202,342 @@ impl WalletScreen {
                         self.chrome.start_close();
                         return (task, None);
                     }
+                    Some(swap::Outcome::RequestQuote(draft)) => {
+                        let q = spawn_cow_quote(CowHost::Modal, draft, self.address);
+                        return (Task::batch([task, q]), None);
+                    }
+                    Some(swap::Outcome::RequestPlace { draft, quote }) => {
+                        // Park the signer for the async approve/sign path,
+                        // exactly like the Send broadcast; `CowPlaced` returns it.
+                        let handoff = self.park_signer_for_order();
+                        let place = spawn_cow_place(
+                            self.network.clone(),
+                            CowHost::Modal,
+                            handoff,
+                            draft,
+                            quote,
+                            self.address,
+                        );
+                        return (Task::batch([task, place]), None);
+                    }
+                    Some(swap::Outcome::RequestCancel { uid }) => {
+                        let Some(chain) = self
+                            .tracked_orders
+                            .iter()
+                            .find(|o| o.uid == uid)
+                            .map(|o| o.chain)
+                        else {
+                            return (task, None);
+                        };
+                        let handoff = self.park_signer_for_order();
+                        let cancel = spawn_cow_cancel(handoff, chain, uid);
+                        return (Task::batch([task, cancel]), None);
+                    }
+                    Some(swap::Outcome::CopyText(s)) => {
+                        let copy = self.arm_clipboard_clear(s);
+                        return (Task::batch([task, copy]), None);
+                    }
                     None => return (task, None),
                 }
+            }
+            Message::Apps(child) => match self.apps.update(child) {
+                Some(apps::Outcome::RequestQuote(draft)) => {
+                    return (spawn_cow_quote(CowHost::Apps, draft, self.address), None);
+                }
+                Some(apps::Outcome::RequestPlace { draft, quote }) => {
+                    let handoff = self.park_signer_for_order();
+                    return (
+                        spawn_cow_place(
+                            self.network.clone(),
+                            CowHost::Apps,
+                            handoff,
+                            draft,
+                            quote,
+                            self.address,
+                        ),
+                        None,
+                    );
+                }
+                Some(apps::Outcome::RequestCancel { uid }) => {
+                    let Some(chain) = self
+                        .tracked_orders
+                        .iter()
+                        .find(|o| o.uid == uid)
+                        .map(|o| o.chain)
+                    else {
+                        return (Task::none(), None);
+                    };
+                    let handoff = self.park_signer_for_order();
+                    return (spawn_cow_cancel(handoff, chain, uid), None);
+                }
+                Some(apps::Outcome::RefreshOrders) => {
+                    // "Fetch" pulls the address's full CoW order history — this
+                    // session's orders plus any from past sessions — from every
+                    // chain CoW runs on, upserting each page into
+                    // `tracked_orders`. (The 10s background tick still does the
+                    // lightweight per-order status poll between fetches.)
+                    let address = self.address;
+                    let tasks: Vec<Task<Message>> = crate::chain::Chain::ALL
+                        .into_iter()
+                        .filter(|c| crate::cow::supported(*c))
+                        .map(|chain| spawn_cow_account_orders(chain, address))
+                        .collect();
+                    return (Task::batch(tasks), None);
+                }
+                Some(apps::Outcome::CopyText(s)) => {
+                    return (self.arm_clipboard_clear(s), None);
+                }
+                Some(apps::Outcome::Name(o)) => {
+                    return (self.handle_name_outcome(o), None);
+                }
+                None => return (Task::none(), None),
+            },
+            Message::NameReverseScanned { owner, result } => {
+                if owner == self.address {
+                    self.apps.names_pane().on_reverse_scan(result);
+                }
+            }
+            Message::NameStatusLoaded { owner, result } => {
+                if owner == self.address {
+                    self.apps.names_pane().on_status(result);
+                }
+            }
+            Message::NameSearched { owner, result } => {
+                if owner == self.address {
+                    self.apps.names_pane().on_search(result);
+                }
+            }
+            Message::NameCommitted { result, signer } => {
+                self.reclaim_order_signer(signer);
+                self.apps.names_pane().on_commit(result);
+            }
+            Message::NameRegistered { result, signer } => {
+                self.reclaim_order_signer(signer);
+                self.apps.names_pane().on_register(result);
+            }
+            Message::NameRenewed { result, signer } => {
+                self.reclaim_order_signer(signer);
+                self.apps.names_pane().on_renew(result);
+            }
+            Message::NameRecipientSet { result, signer } => {
+                self.reclaim_order_signer(signer);
+                self.apps.names_pane().on_set_recipient(result);
+            }
+            Message::CowQuote { host, result } => match host {
+                CowHost::Modal => {
+                    if let Modal::Swap(p) = &mut self.modal {
+                        p.on_quote(result);
+                    }
+                }
+                CowHost::Apps => self.apps.on_quote(result),
+            },
+            Message::CowPlaced {
+                host,
+                result,
+                signer,
+            } => {
+                // Always reclaim the signer, regardless of pane state.
+                self.install_reclaimed_signer(&signer);
+                // The order op has resolved — the signer is back, so the Apps
+                // surface no longer needs the in-flight reprieve.
+                self.order_op_in_flight = false;
+                match result {
+                    Ok(order) => {
+                        let uid = order.uid.clone();
+                        let chain = order.chain;
+                        if !self.tracked_orders.iter().any(|o| o.uid == uid) {
+                            self.tracked_orders.push(order);
+                        }
+                        match host {
+                            CowHost::Modal => {
+                                if let Modal::Swap(p) = &mut self.modal {
+                                    p.begin_tracking(uid.clone());
+                                }
+                            }
+                            CowHost::Apps => self.apps.placement_done(),
+                        }
+                        // Immediate status fetch so the UI isn't blank until the
+                        // 10s poll tick.
+                        return (spawn_cow_status(chain, uid), None);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "cow: order placement failed");
+                        match host {
+                            CowHost::Modal => {
+                                if let Modal::Swap(p) = &mut self.modal {
+                                    p.placement_failed(e);
+                                }
+                            }
+                            CowHost::Apps => self.apps.placement_failed(e),
+                        }
+                    }
+                }
+            }
+            Message::CowCancel {
+                uid,
+                result,
+                signer,
+            } => {
+                self.install_reclaimed_signer(&signer);
+                self.order_op_in_flight = false;
+                match result {
+                    Ok(()) => {
+                        if let Some(o) = self.tracked_orders.iter_mut().find(|o| o.uid == uid) {
+                            o.status = OrderStatus::Cancelled;
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "cow: cancel failed"),
+                }
+            }
+            Message::CowStatus { uid, result } => {
+                // A just-filled order's legs, captured so the borrow on
+                // `tracked_orders` is dropped before we touch `self` again.
+                let mut filled: Option<SwapFillRefresh> = None;
+                if let Ok(resp) = result
+                    && let Some(o) = self.tracked_orders.iter_mut().find(|o| o.uid == uid)
+                {
+                    let was_terminal = o.status.is_terminal();
+                    o.apply_status(resp.status, resp.executed());
+                    // A non-terminal → Fulfilled edge is the only point where the
+                    // swapped balances become stale; once terminal the poll stops,
+                    // so this fires at most once per order.
+                    if !was_terminal && o.status == OrderStatus::Fulfilled {
+                        // Sell leg: native ETH (None) for an EthFlow order — the
+                        // user spent ETH, not an ERC-20 — else the token sold.
+                        let sell_slot = if o.is_ethflow {
+                            None
+                        } else {
+                            Some(o.sell_token)
+                        };
+                        let slots = vec![Some(o.buy_token), sell_slot];
+                        let mut fetch = vec![DiscoveredToken {
+                            symbol: o.buy_symbol.clone(),
+                            name: o.buy_symbol.clone(),
+                            address: o.buy_token,
+                            decimals: o.buy_decimals,
+                        }];
+                        if let Some(addr) = sell_slot {
+                            fetch.push(DiscoveredToken {
+                                symbol: o.sell_symbol.clone(),
+                                name: o.sell_symbol.clone(),
+                                address: addr,
+                                decimals: o.sell_decimals,
+                            });
+                        }
+                        filled = Some(SwapFillRefresh {
+                            chain: o.chain,
+                            owner: o.owner,
+                            slots,
+                            fetch,
+                        });
+                    }
+                }
+                if let Some(r) = filled
+                    && r.owner == self.display_address()
+                {
+                    // Refetch just the two assets the order touched rather than
+                    // the whole portfolio — see `spawn_swap_token_refresh`.
+                    return (
+                        spawn_swap_token_refresh(
+                            self.network.clone(),
+                            r.owner,
+                            r.chain,
+                            r.slots,
+                            r.fetch,
+                        ),
+                        None,
+                    );
+                }
+            }
+            Message::CowPollTick => {
+                let tasks: Vec<Task<Message>> = self
+                    .tracked_orders
+                    .iter()
+                    .filter(|o| !o.status.is_terminal())
+                    .map(|o| spawn_cow_status(o.chain, o.uid.clone()))
+                    .collect();
+                if !tasks.is_empty() {
+                    return (Task::batch(tasks), None);
+                }
+            }
+            Message::CowAccountOrders {
+                address,
+                chain,
+                result,
+            } => {
+                // Stale guard: a fetch landing after an account switch.
+                if address != self.address {
+                    return (Task::none(), None);
+                }
+                match result {
+                    Ok(fetched) => {
+                        for o in fetched {
+                            match self.tracked_orders.iter_mut().find(|e| e.uid == o.uid) {
+                                // Known order (incl. this session's): refresh its
+                                // status/fill, keep the richer in-session metadata.
+                                Some(existing) => existing.apply_status(o.status, o.executed),
+                                // New (a past-session order): add it.
+                                None => self.tracked_orders.push(o),
+                            }
+                        }
+                    }
+                    Err(e) => warn!(
+                        chain = %chain.label(),
+                        error = %e,
+                        "cow: account orders fetch failed",
+                    ),
+                }
+            }
+            Message::SwapTokensRefetched {
+                address,
+                network,
+                slots,
+                result,
+            } => {
+                let tokens = match result {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(
+                            chain_id = network.chain_id(),
+                            error = %e,
+                            "post-swap token refresh failed",
+                        );
+                        return (Task::none(), None);
+                    }
+                };
+                // Keep this address's cache slot consistent so a later
+                // switch-away-and-back reflects the post-swap balances. The
+                // slot holds only `network`'s rows, so a slot match on
+                // `contract` is enough. Done regardless of the live guards
+                // below — it's still the right slot for that address.
+                if let Ok(mut cache) = self.portfolio_cache.lock()
+                    && let Some(slot) = cache.get_mut(&(address, network))
+                {
+                    slot.retain(|t| !slots.contains(&t.contract));
+                    slot.extend(
+                        tokens
+                            .iter()
+                            .filter(|t| t.chain == network && slots.contains(&t.contract))
+                            .cloned(),
+                    );
+                    sort_portfolio_rows(slot);
+                }
+                // Same staleness/scope guards as `PortfolioFetched`: a fill that
+                // lands after the user switched identity (or off this network)
+                // must not pollute what's now on screen.
+                if address != self.display_address() || !self.allowed_networks().contains(&network)
+                {
+                    return (Task::none(), None);
+                }
+                // Replace only the refreshed slots; every other row stays put.
+                self.portfolio
+                    .retain(|t| !(t.chain == network && slots.contains(&t.contract)));
+                self.portfolio.extend(
+                    tokens
+                        .into_iter()
+                        .filter(|t| t.chain == network && slots.contains(&t.contract)),
+                );
+                sort_portfolio_rows(&mut self.portfolio);
             }
             Message::OpenAccountDropdown => {
                 self.modal = Modal::AccountDropdown(AccountDropdown::new());
@@ -2518,6 +3225,12 @@ impl WalletScreen {
             SettingsPane::Contacts(p) => subs.push(p.subscription().map(Message::Contacts)),
             _ => {}
         }
+        // Apps tab with no modal over it: let the pane listen for Esc so the
+        // Swap app can step back to its launcher. Gated on `Modal::None` so an
+        // open modal keeps Esc for closing itself (never both at once).
+        if matches!(self.modal, Modal::None) && matches!(self.nav, Nav::Apps) {
+            subs.push(self.apps.subscription().map(Message::Apps));
+        }
         if self.chrome.is_animating() || self.clipboard_clear.is_some() {
             // `time::every` actively drives ticks (and therefore redraws)
             // on a timer; `window::frames()` only observes redraws the
@@ -2528,6 +3241,13 @@ impl WalletScreen {
             // the same subscription so its progress bar animates smoothly
             // for the 10-second auto-clear window.
             subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
+        }
+        // Poll open CoW orders every 10s while any is non-terminal. This is the
+        // only background network activity in the swap feature, and it exists
+        // only because the user explicitly placed an order — nothing polls
+        // before that.
+        if self.tracked_orders.iter().any(|o| !o.status.is_terminal()) {
+            subs.push(iced::time::every(Duration::from_secs(10)).map(|_| Message::CowPollTick));
         }
         Subscription::batch(subs)
     }
@@ -2541,7 +3261,19 @@ impl WalletScreen {
     pub fn view(&self) -> Element<'_, Message> {
         let t = self.theme();
 
-        let app = row![sidebar::view(t, self.nav), self.main_pane(t)]
+        let sidebar = sidebar::view(
+            t,
+            self.nav,
+            self.active_index,
+            self.display_name(),
+            self.display_address(),
+            self.active_safe.is_some(),
+            self.apps_available(),
+            self.hardware_status(),
+            self.network_short_name(),
+            self.verification,
+        );
+        let app = row![sidebar, self.main_pane(t)]
             .width(Length::Fill)
             .height(Length::Fill);
 
@@ -2576,7 +3308,13 @@ impl WalletScreen {
                     .map(Message::Send)
             }
             Modal::Receive(p) => p.view(t, self.chrome.progress()).map(Message::Receive),
-            Modal::Swap(p) => p.view(t, self.chrome.progress()).map(Message::Swap),
+            Modal::Swap(p) => {
+                let tracked = p
+                    .tracking_uid()
+                    .and_then(|uid| self.tracked_orders.iter().find(|o| o.uid == uid));
+                p.view(t, &self.portfolio, tracked, self.chrome.progress())
+                    .map(Message::Swap)
+            }
             Modal::AccountDropdown(d) => d
                 .view(
                     t,
@@ -2605,10 +3343,19 @@ impl WalletScreen {
         // pointer-event sink only over its own card area; the rest of
         // the overlay is `Space`, so clicks on the screen below pass
         // through to the active modal/dashboard.
-        match &self.clipboard_clear {
-            None => composed,
-            Some(state) => stack![composed, clipboard_clear_chip(t, state)].into(),
-        }
+        //
+        // Keep the tree shape constant — `stack![composed, chip_layer]`
+        // whether or not a chip is showing (an empty `Space` stands in when
+        // it isn't), for the same reason the modal layer above does: if the
+        // root flips between `composed` and a 2-child stack, iced treats it
+        // as a different widget and resets all state below — notably the
+        // Apps/Activity scroll offset would jump back to the top the moment
+        // a copy armed the chip.
+        let chip_layer: Element<'_, Message> = match &self.clipboard_clear {
+            None => Space::new().width(0).height(0).into(),
+            Some(state) => clipboard_clear_chip(t, state),
+        };
+        stack![composed, chip_layer].into()
     }
 
     // ── Send-flow helpers used by the broadcast Tasks ──────────────────────
@@ -2655,10 +3402,21 @@ impl WalletScreen {
             Some(g) => g,
             None => &empty_book,
         };
-        let body: Element<'_, Message> = match self.nav {
+        // If Apps got hidden (switched to a view-only/Safe identity while on it),
+        // fall back to the portfolio so the pane is never blank. Uses
+        // `apps_available()` (not `can_swap()`) so an in-flight place/cancel —
+        // which momentarily parks the signer — doesn't bounce the user off the
+        // Apps pane and back mid-order.
+        let active_nav = if matches!(self.nav, Nav::Apps) && !self.apps_available() {
+            Nav::Home
+        } else {
+            self.nav
+        };
+        let body: Element<'_, Message> = match active_nav {
             Nav::Home => home::view(
                 t,
                 self.can_send(),
+                self.can_swap(),
                 &self.portfolio,
                 self.portfolio_loading,
                 self.portfolio_refreshing,
@@ -2666,6 +3424,22 @@ impl WalletScreen {
                 self.safe_pending_loading,
                 self.safe_pending_error.as_deref(),
             ),
+            Nav::Apps => {
+                // Scoped to the active account so a switch never shows another
+                // account's orders, then sorted newest-first by `valid_to`
+                // (≈ creation order) so a fetched history page interleaves
+                // correctly with this session's freshly-placed orders. UID is
+                // the tiebreak for a stable order.
+                let mut orders: Vec<&TrackedOrder> = self
+                    .tracked_orders
+                    .iter()
+                    .filter(|o| o.owner == self.address)
+                    .collect();
+                orders.sort_by(|a, b| b.valid_to.cmp(&a.valid_to).then_with(|| b.uid.cmp(&a.uid)));
+                self.apps
+                    .view(t, &self.portfolio, &orders)
+                    .map(Message::Apps)
+            }
             Nav::Activity => {
                 // Show the error placeholder only when every configured
                 // chain failed *and* nothing rendered. Otherwise partial
@@ -2698,39 +3472,13 @@ impl WalletScreen {
             },
         };
 
-        let display_addr = self.display_address();
-        let display_name: String = match self.active_safe_descriptor() {
-            Some(safe) => {
-                let idx = self.active_safe.unwrap_or(0);
-                let base = safe.display_name(idx);
-                let total_owners = safe.owners.len().max(safe.linked_signer_indices.len());
-                format!("{base} — Safe {} of {}", safe.threshold, total_owners)
-            }
-            None => self
-                .accounts
-                .get(self.active_index)
-                .map(|a| a.display_name(self.active_index))
-                .unwrap_or_else(|| format!("Account {}", self.active_index + 1)),
-        };
-        let network_label: &str = match self.active_safe_descriptor() {
-            Some(safe) => crate::chain::Chain::ALL
-                .iter()
-                .find(|c| c.chain_id() == safe.chain_id)
-                .map(|c| c.display_name())
-                .unwrap_or("Unknown chain"),
-            None => "Ethereum Mainnet",
-        };
-        let is_safe = self.active_safe.is_some();
-
         column![
             header::view(
                 t,
-                display_addr,
                 self.verification,
-                display_name,
+                self.display_name(),
                 self.rename_draft.as_deref(),
-                network_label,
-                is_safe,
+                self.active_safe.is_some(),
             ),
             body
         ]
@@ -2889,7 +3637,7 @@ fn spawn_ens_resolve_task(
             // Verified (Helios, mainnet-only) forward resolution: the
             // resolved address becomes the signed send recipient, so an
             // unverified RPC answer fails closed rather than being trusted.
-            let result = crate::ens::resolve_name(network.as_ref(), &name).await;
+            let result = crate::names::resolve_name(network.as_ref(), &name).await;
             (seq, name, result)
         },
         |(seq, name, result)| Message::Send(send::Message::EnsResolved { seq, name, result }),
@@ -2909,7 +3657,7 @@ fn spawn_contacts_ens_resolve_task(
             // Verified (Helios, mainnet-only) forward resolution; the
             // resolved address is saved as a contact and later reused as a
             // send recipient, so unverified answers fail closed.
-            let result = crate::ens::resolve_name(network.as_ref(), &name).await;
+            let result = crate::names::resolve_name(network.as_ref(), &name).await;
             (seq, name, result)
         },
         |(seq, name, result)| {
@@ -3019,7 +3767,7 @@ async fn provider_for(
 /// Spawn a quote task using a provider resolved from `plan.chain` — the L2 RPC
 /// for an L2 send, the user's raw RPC for a custom network. The same provider
 /// later serves the broadcast.
-fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, plan: SendPlan) -> Task<Message> {
+fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, seq: u64, plan: SendPlan) -> Task<Message> {
     let chain = plan.chain;
     Task::perform(
         async move {
@@ -3036,7 +3784,7 @@ fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, plan: SendPlan) -> Task<Me
                 }
             }
         },
-        |result| Message::Send(send::Message::QuoteFetched(result)),
+        move |result| Message::Send(send::Message::QuoteFetched { seq, result }),
     )
 }
 
@@ -3644,6 +4392,753 @@ fn spawn_broadcast_task(
     )
 }
 
+// ── CoW swap tasks ────────────────────────────────────────────────────────────
+
+/// Build the `/quote` request for a draft. A native-ETH sell quotes against the
+/// EthFlow contract (eip1271, on-chain order); an ERC-20 sell quotes as the user
+/// (eip712). The receiver is always the user.
+fn cow_quote_request(draft: &SwapDraft, user: Address) -> crate::cow::api::QuoteRequest {
+    let (from, signing_scheme, onchain_order) = if draft.is_native {
+        (cow::ETHFLOW, "eip1271".to_string(), true)
+    } else {
+        (user, "eip712".to_string(), false)
+    };
+    crate::cow::api::QuoteRequest {
+        sell_token: draft.sell_token,
+        buy_token: draft.buy_token,
+        from,
+        receiver: Some(user),
+        kind: "sell".to_string(),
+        sell_amount_before_fee: draft.sell_amount,
+        valid_for: 1800,
+        // Quote with the same market-order appData we'll sign, so the orderbook
+        // classifies the order consistently (mirrors the cow-sdk flow).
+        app_data: cow::market_app_data(draft.slippage_bps).0,
+        signing_scheme,
+        onchain_order,
+        partially_fillable: false,
+    }
+}
+
+// ── Names app tasks ──────────────────────────────────────────────────────────
+//
+// Reads go through the verified mainnet path (fail-closed); writes take the
+// parked signer, broadcast, then wait for the receipt so the UI only advances on
+// a mined, non-reverted transaction. All pin to mainnet inside `crate::names`.
+
+/// Discover names that resolve to the active account via reverse lookup.
+fn spawn_name_reverse_scan(network: Arc<dyn BalanceFetcher>, owner: Address) -> Task<Message> {
+    Task::perform(
+        async move { crate::names::manage::reverse_owned_names(&*network, owner).await },
+        move |result| Message::NameReverseScanned { owner, result },
+    )
+}
+
+/// Verify a single manually-entered name's status.
+fn spawn_name_status(
+    network: Arc<dyn BalanceFetcher>,
+    owner: Address,
+    registry: Registry,
+    label: String,
+) -> Task<Message> {
+    Task::perform(
+        async move { crate::names::manage::name_status(&*network, &registry, &label).await },
+        move |result| Message::NameStatusLoaded { owner, result },
+    )
+}
+
+/// Check `label` across `registries` (availability + price) for the search bar.
+fn spawn_name_search(
+    network: Arc<dyn BalanceFetcher>,
+    owner: Address,
+    label: String,
+    registries: Vec<Registry>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            Ok::<_, String>(crate::names::manage::search(&*network, &label, registries).await)
+        },
+        move |result| Message::NameSearched { owner, result },
+    )
+}
+
+/// Wait for `hash` to be mined on mainnet (≈ up to 3 min). Shared tail of the
+/// name write tasks so the UI only advances on a confirmed, non-reverted tx.
+async fn await_mined(network: &Arc<dyn BalanceFetcher>, hash: TxHash) -> Result<(), String> {
+    let provider = network
+        .provider(crate::chain::Chain::Mainnet)
+        .await
+        .ok_or_else(|| "no Ethereum mainnet RPC configured".to_string())?;
+    crate::cow::onchain::wait_for_receipt(&provider, hash, 60).await
+}
+
+/// Registration step 1: broadcast the commit and wait for it to mine.
+fn spawn_name_commit(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    plan: RegisterPlan,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => {
+                    return Err::<(RegisterPlan, TxHash), String>("signer not available".into());
+                }
+            };
+            let result = async {
+                let hash = crate::names::manage::submit_commit(&*network, &signer, &plan).await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((plan.clone(), hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameCommitted {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Registration step 2: broadcast the reveal/register and wait for it to mine.
+fn spawn_name_register(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    plan: RegisterPlan,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let name = format!("{}{}", plan.label, plan.namespace.tld());
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            };
+            let result = async {
+                let hash = crate::names::manage::submit_register(&*network, &signer, &plan).await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((name, hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameRegistered {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// XNS one-shot registration: broadcast `registerName` and wait for it to mine.
+/// Reuses `Message::NameRegistered` (the pane's `on_register` handles both the
+/// commit-reveal reveal and this single-step path).
+fn spawn_name_register_xns(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    namespace: String,
+    label: String,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let name = format!("{label}.{namespace}");
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            };
+            let result = async {
+                let hash = crate::names::manage::submit_register_xns(
+                    &*network, &signer, &namespace, &label,
+                )
+                .await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((name, hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameRegistered {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Renew ("prolong") an owned name.
+fn spawn_name_renew(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    namespace: Namespace,
+    label: String,
+    years: u32,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let name = format!("{label}{}", namespace.tld());
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            };
+            let result = async {
+                let duration = crate::names::registrar::ens_duration_secs(years);
+                let hash = crate::names::manage::submit_renew(
+                    &*network, &signer, namespace, &label, duration,
+                )
+                .await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((name, hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameRenewed {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Point an owned name at a new recipient address.
+fn spawn_name_set_recipient(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    namespace: Namespace,
+    label: String,
+    recipient: Address,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let name = format!("{label}{}", namespace.tld());
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            };
+            let result = async {
+                let hash = crate::names::manage::submit_set_recipient(
+                    &*network, &signer, namespace, &label, recipient,
+                )
+                .await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((name, hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameRecipientSet {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Fetch a quote (the first network call — only ever from an explicit click).
+fn spawn_cow_quote(host: CowHost, draft: SwapDraft, user: Address) -> Task<Message> {
+    let chain = draft.chain;
+    let req = cow_quote_request(&draft, user);
+    Task::perform(
+        async move { crate::cow::api::get_quote(chain, &req).await },
+        move |result| Message::CowQuote { host, result },
+    )
+}
+
+/// Place an order: ERC-20 (allowance → approve → sign → POST) or native ETH
+/// (EthFlow `createOrder`). Runs the whole sequence in one task; the modal shows
+/// a "Placing…" phase meanwhile. The signer rides in via `handoff` and back out
+/// in the result message.
+fn spawn_cow_place(
+    network: Arc<dyn BalanceFetcher>,
+    host: CowHost,
+    handoff: SignerHandoff,
+    draft: SwapDraft,
+    quote: crate::cow::api::QuoteResponse,
+    user: Address,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let chain = draft.chain;
+    Task::perform(
+        async move {
+            let provider =
+                match provider_for(&network, crate::chain::NetworkId::Builtin(chain)).await {
+                    Some(p) => p,
+                    None => {
+                        return Err::<TrackedOrder, String>("no execution RPC configured".into());
+                    }
+                };
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err("signer not available".into()),
+            };
+            let result = cow_place_order(&network, &provider, &signer, &draft, &quote, user).await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::CowPlaced {
+            host,
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// revm preflight of a CoW on-chain leg (ERC-20 `approve` or EthFlow
+/// `createOrder`) against Helios-verified state. Returns `Err` with the decoded
+/// revert reason if the tx would revert/halt — so we never spend gas on a doomed
+/// transaction (critical for the native path, where the gas is real ETH). A sim
+/// that can't run (state unavailable, custom network) is advisory and passes.
+/// The swap itself settles off-chain via solvers, so this covers only the
+/// on-chain legs — there's nothing else for revm to simulate.
+async fn cow_preflight_sim(
+    network: &Arc<dyn BalanceFetcher>,
+    chain: crate::chain::Chain,
+    from: Address,
+    to: Address,
+    value: U256,
+    input: Bytes,
+) -> Result<(), String> {
+    use crate::wallet::sim::{CallSpec, SimOutcome, simulate_call};
+    let spec = CallSpec {
+        chain,
+        from,
+        to,
+        value,
+        input,
+        nonce: 0,
+    };
+    match simulate_call(network.clone(), &spec).await {
+        Ok(r) => match r.outcome {
+            SimOutcome::Revert { reason, .. } => Err(format!("preflight: would revert — {reason}")),
+            SimOutcome::Halt { reason } => Err(format!("preflight: would fail — {reason}")),
+            // Success or Unavailable → don't block.
+            _ => Ok(()),
+        },
+        Err(e) => {
+            warn!(error = %e, "cow: preflight simulation unavailable (proceeding)");
+            Ok(())
+        }
+    }
+}
+
+/// The order-placement sequence shared by both surfaces.
+async fn cow_place_order(
+    network: &Arc<dyn BalanceFetcher>,
+    provider: &alloy::providers::RootProvider<alloy::network::Ethereum>,
+    signer: &KaoSigner,
+    draft: &SwapDraft,
+    quote: &crate::cow::api::QuoteResponse,
+    user: Address,
+) -> Result<TrackedOrder, String> {
+    let chain = draft.chain;
+    let q = &quote.quote;
+    // Modern CoW orders carry feeAmount = 0; the user parts with the full input
+    // (quote sellAmount + feeAmount) and solvers take their fee from the price.
+    let full_sell = q.sell_amount.saturating_add(q.fee_amount);
+    // Market-order appData: `orderClass = market` is what makes solvers fill the
+    // order at the quoted price. Without it the orderbook books a *limit* order,
+    // which only fills if the price gap covers the fee — so a near-market swap
+    // sits OPEN forever. We sign the hash and provide the matching pre-image.
+    let (full_app_data, app_data_hash) = cow::market_app_data(draft.slippage_bps);
+    if draft.is_native {
+        // Native ETH → EthFlow on-chain createOrder (msg.value = the full sell).
+        let data = cow::ethflow::build_ethflow_data(
+            draft.buy_token,
+            user,
+            full_sell,
+            q.buy_amount,
+            q.valid_to,
+            quote.id.unwrap_or_default(),
+            draft.slippage_bps,
+            app_data_hash,
+        );
+        // The native path never POSTs an order body, so upload the appData
+        // pre-image first — otherwise the orderbook only sees the bare hash and
+        // books a limit order. Best-effort: a transient PUT failure shouldn't
+        // burn the user's ETH, though the order then risks limit classification.
+        if let Err(e) =
+            cow::api::upload_app_data(chain, &format!("{app_data_hash:#x}"), &full_app_data).await
+        {
+            warn!(error = %e, "cow: appData upload failed (native order may book as limit)");
+        }
+        let calldata = cow::ethflow::create_order_calldata(&data);
+        let value = cow::ethflow::msg_value(&data);
+        // revm preflight before spending gas: catch a reverting createOrder
+        // (wrong params, contract guards) without losing the up-front ETH.
+        cow_preflight_sim(network, chain, user, cow::ETHFLOW, value, calldata.clone()).await?;
+        let hash = cow::onchain::send_contract_call(
+            provider,
+            signer,
+            chain,
+            cow::ETHFLOW,
+            value,
+            calldata,
+        )
+        .await?;
+        cow::onchain::wait_for_receipt(provider, hash, 40).await?;
+        let uid = cow::ethflow::ethflow_uid(&data, chain)?;
+        Ok(TrackedOrder {
+            uid: cow::order::uid_hex(&uid),
+            chain,
+            owner: user,
+            kind: cow::order::OrderKind::Sell,
+            sell_token: draft.sell_token,
+            buy_token: draft.buy_token,
+            sell_symbol: draft.sell_symbol.clone(),
+            buy_symbol: draft.buy_symbol.clone(),
+            sell_amount: draft.sell_amount,
+            buy_amount: cow::order::apply_slippage(q.buy_amount, draft.slippage_bps),
+            sell_decimals: draft.sell_decimals,
+            buy_decimals: draft.buy_decimals,
+            valid_to: q.valid_to,
+            status: OrderStatus::Open,
+            executed: None,
+            is_ethflow: true,
+        })
+    } else {
+        // ERC-20 → ensure the vault relayer is approved, then sign + POST.
+        let allowance = cow::onchain::read_allowance(provider, draft.sell_token, user).await?;
+        info!(
+            chain_id = chain.chain_id(),
+            owner = %user,
+            token = %draft.sell_token,
+            allowance = %allowance,
+            full_sell = %full_sell,
+            needs_approve = allowance < full_sell,
+            "cow: erc20 allowance check",
+        );
+        let needs_approve = allowance < full_sell;
+        if needs_approve {
+            // revm preflight the approve — catches e.g. USDT, which reverts on a
+            // non-zero→non-zero approve, before we spend gas on it.
+            cow_preflight_sim(
+                network,
+                chain,
+                user,
+                draft.sell_token,
+                U256::ZERO,
+                cow::onchain::approve_calldata(U256::MAX),
+            )
+            .await?;
+            let hash =
+                cow::onchain::approve_relayer(provider, signer, chain, draft.sell_token, U256::MAX)
+                    .await?;
+            cow::onchain::wait_for_receipt(provider, hash, 40).await?;
+        }
+        let order = cow::order::build_sell_order(
+            draft.sell_token,
+            draft.buy_token,
+            user,
+            full_sell,
+            q.buy_amount,
+            q.valid_to,
+            draft.slippage_bps,
+            app_data_hash,
+        );
+        let domain = cow::order::cow_domain(chain);
+        let sig = cow::order::sign_order(signer, &order, &domain).await?;
+        // Register the appData doc first, mirroring the cow-sdk (which uploads
+        // before posting). The order body also carries the full pre-image, so a
+        // transient failure here isn't fatal — log and proceed.
+        let app_data_hex = format!("{app_data_hash:#x}");
+        if let Err(e) = cow::api::upload_app_data(chain, &app_data_hex, &full_app_data).await {
+            warn!(error = %e, "cow: appData upload failed (proceeding; order carries the pre-image)");
+        }
+        let body = cow::api::OrderCreation {
+            sell_token: order.sellToken,
+            buy_token: order.buyToken,
+            receiver: order.receiver,
+            sell_amount: order.sellAmount,
+            buy_amount: order.buyAmount,
+            valid_to: order.validTo,
+            // POST the exact pre-image of the signed appData hash (and the hash
+            // itself) so the orderbook reproduces it and reads orderClass=market.
+            app_data: full_app_data,
+            app_data_hash: app_data_hex,
+            fee_amount: order.feeAmount,
+            kind: "sell".to_string(),
+            partially_fillable: false,
+            sell_token_balance: "erc20".to_string(),
+            buy_token_balance: "erc20".to_string(),
+            signing_scheme: "eip712".to_string(),
+            signature: format!("0x{}", alloy::hex::encode(sig.as_bytes())),
+            from: user,
+            quote_id: quote.id,
+        };
+        // POST with a short retry when we *just* approved: on Base a tx is
+        // visible to us via a ~200ms flashblock preconfirmation, but CoW's
+        // orderbook only sees the allowance once it indexes the canonical block
+        // — a few seconds later. POSTing in that window 400s with "must give
+        // allowance to VaultRelayer" even though the approval is on-chain. Retry
+        // a few times so the orderbook can catch up. (No race when allowance was
+        // already present — `needs_approve` is false and we post once.)
+        let mut uid_result = cow::api::post_order(chain, &body).await;
+        if needs_approve {
+            let mut attempt = 0u32;
+            while let Err(e) = &uid_result {
+                if attempt >= 5 || !e.to_lowercase().contains("allowance") {
+                    break;
+                }
+                attempt += 1;
+                warn!(
+                    attempt,
+                    error = %e,
+                    "cow: orderbook hasn't indexed the fresh approval yet; retrying POST",
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                uid_result = cow::api::post_order(chain, &body).await;
+            }
+        }
+        let uid = uid_result?;
+        Ok(TrackedOrder {
+            uid,
+            chain,
+            owner: user,
+            kind: cow::order::OrderKind::Sell,
+            sell_token: draft.sell_token,
+            buy_token: draft.buy_token,
+            sell_symbol: draft.sell_symbol.clone(),
+            buy_symbol: draft.buy_symbol.clone(),
+            sell_amount: draft.sell_amount,
+            buy_amount: order.buyAmount,
+            sell_decimals: draft.sell_decimals,
+            buy_decimals: draft.buy_decimals,
+            valid_to: q.valid_to,
+            status: OrderStatus::Open,
+            executed: None,
+            is_ethflow: false,
+        })
+    }
+}
+
+/// Off-chain cancel an ERC-20 order (signed `DELETE /orders`). EthFlow orders
+/// cancel on-chain (deferred) and never reach here — the Apps pane hides their
+/// cancel affordance.
+fn spawn_cow_cancel(
+    handoff: SignerHandoff,
+    chain: crate::chain::Chain,
+    uid: String,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let uid_for_msg = uid.clone();
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(), String>("signer not available".into()),
+            };
+            let res = cow_cancel(&signer, chain, &uid).await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            res
+        },
+        move |result| Message::CowCancel {
+            uid: uid_for_msg.clone(),
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+async fn cow_cancel(
+    signer: &KaoSigner,
+    chain: crate::chain::Chain,
+    uid: &str,
+) -> Result<(), String> {
+    let bytes = parse_order_uid(uid)?;
+    let domain = cow::order::cow_domain(chain);
+    let sig = cow::order::sign_cancellations(signer, &[bytes], &domain).await?;
+    let body = cow::api::CancellationBody {
+        order_uids: vec![uid.to_string()],
+        signature: format!("0x{}", alloy::hex::encode(sig.as_bytes())),
+        signing_scheme: "eip712".to_string(),
+    };
+    cow::api::delete_orders(chain, &body).await
+}
+
+fn parse_order_uid(uid: &str) -> Result<[u8; 56], String> {
+    let hex = uid.strip_prefix("0x").unwrap_or(uid);
+    let raw = alloy::hex::decode(hex).map_err(|e| format!("bad order uid: {e}"))?;
+    raw.try_into()
+        .map_err(|_| "order uid must be 56 bytes".to_string())
+}
+
+/// Poll one order's status.
+fn spawn_cow_status(chain: crate::chain::Chain, uid: String) -> Task<Message> {
+    let uid_for_msg = uid.clone();
+    Task::perform(
+        async move { crate::cow::api::get_order(chain, &uid).await },
+        move |result| Message::CowStatus {
+            uid: uid_for_msg.clone(),
+            result,
+        },
+    )
+}
+
+/// The two legs of a just-filled swap order, captured for the targeted
+/// post-swap balance refresh. `slots` are the portfolio rows to replace
+/// (native ETH as `None`); `fetch` are the ERC-20 contracts to re-read
+/// on-chain (native ETH rides the walk's always-included native read).
+struct SwapFillRefresh {
+    chain: crate::chain::Chain,
+    owner: Address,
+    slots: Vec<Option<Address>>,
+    fetch: Vec<DiscoveredToken>,
+}
+
+/// Fetch the address's CoW order history for `chain` and map it to
+/// `TrackedOrder`s for the Apps list. Backs the "Fetch" action — surfaces all
+/// of the address's orders (incl. past sessions), not just this session's.
+fn spawn_cow_account_orders(chain: crate::chain::Chain, owner: Address) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = crate::cow::api::get_account_orders(chain, owner, ACCOUNT_ORDERS_LIMIT)
+                .await
+                .map(|orders| account_orders_to_tracked(chain, owner, orders));
+            (owner, chain, result)
+        },
+        |(owner, chain, result)| Message::CowAccountOrders {
+            address: owner,
+            chain,
+            result,
+        },
+    )
+}
+
+/// Map a page of CoW account orders into `TrackedOrder`s, resolving token
+/// symbols/decimals from the chain's curated list (long-tail tokens fall back
+/// to a short address + 18 decimals). `owner` is the queried address, used as
+/// the tracked owner so the Apps filter shows them even for EthFlow orders
+/// (whose on-chain `owner` is the EthFlow contract). EthFlow sells are shown as
+/// native ETH to match the in-session rows.
+fn account_orders_to_tracked(
+    chain: crate::chain::Chain,
+    owner: Address,
+    orders: Vec<crate::cow::api::AccountOrder>,
+) -> Vec<TrackedOrder> {
+    use std::collections::HashMap;
+    let lookup: HashMap<Address, (String, u8)> = crate::portfolio::curated_tokens(chain)
+        .into_iter()
+        .map(|(sym, addr, dec)| (addr, (sym, dec)))
+        .collect();
+    let resolve = |addr: Address| -> (String, u8) {
+        lookup
+            .get(&addr)
+            .cloned()
+            .unwrap_or_else(|| (short_address(addr), 18))
+    };
+    orders
+        .into_iter()
+        .map(|o| {
+            let is_ethflow = o.ethflow_data.is_some();
+            let (sell_symbol, sell_decimals) = if is_ethflow {
+                ("ETH".to_string(), 18)
+            } else {
+                resolve(o.sell_token)
+            };
+            let (buy_symbol, buy_decimals) = resolve(o.buy_token);
+            // EthFlow's on-chain validTo is uint256::MAX; the signed one lives
+            // in userValidTo. Prefer it so the sort key stays sane.
+            let valid_to = o
+                .ethflow_data
+                .as_ref()
+                .and_then(|e| e.user_valid_to)
+                .unwrap_or(o.valid_to);
+            let executed = o.executed();
+            TrackedOrder {
+                uid: o.uid,
+                chain,
+                owner,
+                kind: if o.kind == "buy" {
+                    cow::order::OrderKind::Buy
+                } else {
+                    cow::order::OrderKind::Sell
+                },
+                sell_token: o.sell_token,
+                buy_token: o.buy_token,
+                sell_symbol,
+                buy_symbol,
+                sell_amount: o.sell_amount,
+                buy_amount: o.buy_amount,
+                sell_decimals,
+                buy_decimals,
+                valid_to,
+                status: o.status,
+                executed,
+                is_ethflow,
+            }
+        })
+        .collect()
+}
+
+/// Targeted balance refresh after a swap fills: re-read just the sell + buy
+/// assets (the "actives" the order touched) on `chain` instead of walking the
+/// whole multi-chain portfolio. `fetch` is the ERC-20 legs to read on-chain;
+/// `slots` (carried through to the handler) are the portfolio rows to replace
+/// — native ETH included as `None` for an EthFlow sell. CoW only runs on
+/// built-in chains, so the provider resolves through `NetworkId::Builtin`.
+fn spawn_swap_token_refresh(
+    network: Arc<dyn BalanceFetcher>,
+    address: Address,
+    chain: crate::chain::Chain,
+    slots: Vec<Option<Address>>,
+    fetch: Vec<DiscoveredToken>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = match provider_for(&network, crate::chain::NetworkId::Builtin(chain)).await
+            {
+                Some(p) => crate::portfolio::fetch_token_balances(address, chain, &p, &fetch).await,
+                None => Err(format!("no execution RPC configured for {}", chain.label())),
+            };
+            (address, chain, slots, result)
+        },
+        |(address, chain, slots, result)| Message::SwapTokensRefetched {
+            address,
+            network: crate::chain::NetworkId::Builtin(chain),
+            slots,
+            result,
+        },
+    )
+}
+
+/// ETH-first, then by USD value descending — the stable portfolio row order
+/// both the full fetch and the targeted post-swap refresh re-apply after
+/// merging fresh rows in.
+fn sort_portfolio_rows(rows: &mut [LiveToken]) {
+    rows.sort_by(|a, b| {
+        // Native ETH bubbles up first per chain.
+        let a_native = a.contract.is_none();
+        let b_native = b.contract.is_none();
+        match b_native.cmp(&a_native) {
+            std::cmp::Ordering::Equal => b
+                .usd_value
+                .partial_cmp(&a.usd_value)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            other => other,
+        }
+    });
+}
+
 #[cfg(test)]
 #[allow(unused_must_use)]
 mod tests {
@@ -3688,6 +5183,300 @@ mod tests {
             usd_value: 1.0,
             chain: chain.into(),
         }
+    }
+
+    /// An ERC-20 row with a specific contract + USD value, so the targeted
+    /// post-swap refresh tests can tell rows apart by slot and assert the
+    /// merge replaced the right one.
+    fn erc20(symbol: &str, chain: Chain, contract: Address, usd: f64) -> LiveToken {
+        LiveToken {
+            symbol: symbol.into(),
+            name: symbol.into(),
+            balance: "1".into(),
+            balance_f64: 1.0,
+            balance_raw: U256::from(1u64),
+            decimals: 18,
+            contract: Some(contract),
+            usd_price: usd,
+            usd_value: usd,
+            chain: chain.into(),
+        }
+    }
+
+    #[test]
+    fn swap_refetch_replaces_targeted_slots_and_leaves_the_rest() {
+        let active = addr(0xAA);
+        let usdc = addr(0x01);
+        let weth = addr(0x02);
+        let mut s = screen_for(active, new_cache());
+        // ETH (untouched), USDC (about to be fully sold), WETH (bought into).
+        s.portfolio = vec![
+            token("ETH", Chain::Mainnet),
+            erc20("USDC", Chain::Mainnet, usdc, 100.0),
+            erc20("WETH", Chain::Mainnet, weth, 5.0),
+        ];
+        // Sold all USDC for more WETH: the drained sell token isn't in the
+        // result (zero balances drop out of the walk); the buy token grows.
+        s.update(Message::SwapTokensRefetched {
+            address: active,
+            network: Chain::Mainnet.into(),
+            slots: vec![Some(weth), Some(usdc)],
+            result: Ok(vec![erc20("WETH", Chain::Mainnet, weth, 105.0)]),
+        });
+        assert!(
+            s.portfolio.iter().all(|t| t.contract != Some(usdc)),
+            "drained sell token must disappear",
+        );
+        let w = s
+            .portfolio
+            .iter()
+            .find(|t| t.contract == Some(weth))
+            .expect("buy token present");
+        assert_eq!(w.usd_value, 105.0, "buy token must be refreshed");
+        assert!(
+            s.portfolio.iter().any(|t| t.contract.is_none()),
+            "the untouched native ETH row must survive",
+        );
+        assert_eq!(s.portfolio.len(), 2);
+    }
+
+    #[test]
+    fn swap_refetch_ignores_result_rows_outside_the_slots() {
+        let active = addr(0xAA);
+        let usdc = addr(0x01);
+        let weth = addr(0x02);
+        let mut s = screen_for(active, new_cache());
+        s.portfolio = vec![
+            token("ETH", Chain::Mainnet),
+            erc20("USDC", Chain::Mainnet, usdc, 100.0),
+            erc20("WETH", Chain::Mainnet, weth, 5.0),
+        ];
+        // An ERC-20 → ERC-20 fill: the walk still reads native ETH, but it's
+        // not a swap slot here, so the stray ETH row must be ignored — not
+        // merged in as a duplicate.
+        s.update(Message::SwapTokensRefetched {
+            address: active,
+            network: Chain::Mainnet.into(),
+            slots: vec![Some(weth), Some(usdc)],
+            result: Ok(vec![
+                erc20("WETH", Chain::Mainnet, weth, 105.0),
+                erc20("USDC", Chain::Mainnet, usdc, 0.5),
+                token("ETH", Chain::Mainnet),
+            ]),
+        });
+        assert_eq!(
+            s.portfolio.iter().filter(|t| t.contract.is_none()).count(),
+            1,
+            "the out-of-slot native ETH row must not be duplicated",
+        );
+    }
+
+    #[test]
+    fn swap_refetch_for_other_address_updates_cache_not_live_view() {
+        let active = addr(0xAA);
+        let other = addr(0xBB);
+        let weth = addr(0x02);
+        let cache = new_cache();
+        let mut s = screen_for(active, cache.clone());
+        // Seed `other`'s cache slot and the active live view with a stale row.
+        cache.lock().unwrap().insert(
+            (other, Chain::Mainnet.into()),
+            vec![erc20("WETH", Chain::Mainnet, weth, 5.0)],
+        );
+        s.portfolio = vec![erc20("WETH", Chain::Mainnet, weth, 5.0)];
+        s.update(Message::SwapTokensRefetched {
+            address: other,
+            network: Chain::Mainnet.into(),
+            slots: vec![Some(weth)],
+            result: Ok(vec![erc20("WETH", Chain::Mainnet, weth, 50.0)]),
+        });
+        // Live view belongs to `active` — a fill for `other` must not touch it.
+        assert_eq!(
+            s.portfolio[0].usd_value, 5.0,
+            "another account's fill must not pollute the live view",
+        );
+        // But `other`'s cache slot is still the right place for that data.
+        assert_eq!(
+            cache.lock().unwrap()[&(other, Chain::Mainnet.into())][0].usd_value,
+            50.0,
+            "the fetched address's cache slot must be refreshed",
+        );
+    }
+
+    fn tracked_order(
+        uid: &str,
+        owner: Address,
+        status: OrderStatus,
+        valid_to: u32,
+    ) -> TrackedOrder {
+        TrackedOrder {
+            uid: uid.into(),
+            chain: Chain::Base,
+            owner,
+            kind: cow::order::OrderKind::Sell,
+            sell_token: addr(0x01),
+            buy_token: addr(0x02),
+            sell_symbol: "USDC".into(),
+            buy_symbol: "DAI".into(),
+            sell_amount: U256::from(1_000_000u64),
+            buy_amount: U256::from(990_000u64),
+            sell_decimals: 6,
+            buy_decimals: 18,
+            valid_to,
+            status,
+            executed: None,
+            is_ethflow: false,
+        }
+    }
+
+    #[test]
+    fn fetch_account_orders_upserts_history_and_refreshes_known() {
+        let active = addr(0xAA);
+        let mut s = screen_for(active, new_cache());
+        // One order from this session, still open.
+        s.tracked_orders
+            .push(tracked_order("0xsession", active, OrderStatus::Open, 100));
+
+        // A fetch returns the same order (now filled) plus a past-session one.
+        s.update(Message::CowAccountOrders {
+            address: active,
+            chain: Chain::Base,
+            result: Ok(vec![
+                tracked_order("0xsession", active, OrderStatus::Fulfilled, 100),
+                tracked_order("0xhistory", active, OrderStatus::Expired, 50),
+            ]),
+        });
+        assert_eq!(
+            s.tracked_orders.len(),
+            2,
+            "history order added; the known one is updated in place, not duplicated",
+        );
+        let session = s
+            .tracked_orders
+            .iter()
+            .find(|o| o.uid == "0xsession")
+            .unwrap();
+        assert_eq!(
+            session.status,
+            OrderStatus::Fulfilled,
+            "a known order picks up its fresh status from the fetch",
+        );
+        assert!(s.tracked_orders.iter().any(|o| o.uid == "0xhistory"));
+    }
+
+    #[test]
+    fn fetch_account_orders_for_other_address_is_dropped() {
+        let active = addr(0xAA);
+        let other = addr(0xBB);
+        let mut s = screen_for(active, new_cache());
+        s.update(Message::CowAccountOrders {
+            address: other,
+            chain: Chain::Base,
+            result: Ok(vec![tracked_order(
+                "0xhistory",
+                other,
+                OrderStatus::Open,
+                50,
+            )]),
+        });
+        assert!(
+            s.tracked_orders.is_empty(),
+            "a fetch for another account must not populate this one",
+        );
+    }
+
+    #[test]
+    fn placing_an_order_keeps_apps_available_until_it_resolves() {
+        use crate::wallet::local_account;
+        use alloy::signers::local::PrivateKeySigner;
+
+        // A Local EOA — inherently swap-capable.
+        let pk = PrivateKeySigner::random();
+        let desc = local_account(&pk);
+        let mut s = WalletScreen::new(
+            KaoSigner::Local(pk),
+            vec![desc],
+            Vec::new(),
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        assert!(s.can_swap());
+        assert!(s.apps_available());
+
+        // Parking the signer (what RequestPlace/RequestCancel do) makes the
+        // live signer unable to sign — but the Apps surface must NOT vanish.
+        let handoff = s.park_signer_for_order();
+        assert!(!s.can_swap(), "parked signer can't sign right now");
+        assert!(
+            s.apps_available(),
+            "Apps tab must stay available while an order is in flight",
+        );
+
+        // Resolving the op (here an errored placement) reclaims the signer and
+        // clears the in-flight reprieve — back to the normal capability check.
+        s.update(Message::CowPlaced {
+            host: CowHost::Apps,
+            result: Err("placement failed (test)".into()),
+            signer: handoff,
+        });
+        assert!(
+            !s.order_op_in_flight,
+            "in-flight flag must clear on resolve"
+        );
+        assert!(s.can_swap(), "signer reclaimed after the op resolves");
+        assert!(s.apps_available());
+    }
+
+    #[test]
+    fn concurrent_signer_park_never_strands_the_wallet() {
+        use crate::wallet::local_account;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let pk = PrivateKeySigner::random();
+        let desc = local_account(&pk);
+        let mut s = WalletScreen::new(
+            KaoSigner::Local(pk),
+            vec![desc],
+            Vec::new(),
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        assert!(s.can_swap());
+        assert!(!s.is_signing_busy());
+
+        // Two overlapping signing ops park the signer (e.g. a CoW order started
+        // while a name write is still in flight). The second park only captures
+        // the ViewOnly placeholder the first one left behind.
+        let h1 = s.park_signer_for_order();
+        let h2 = s.park_signer_for_order();
+        assert!(s.is_signing_busy());
+
+        // The first op (holding the REAL signer) resolves first — restoring it.
+        s.update(Message::CowPlaced {
+            host: CowHost::Apps,
+            result: Err("first op (test)".into()),
+            signer: h1,
+        });
+        assert!(s.can_swap(), "real signer restored by the first reclaim");
+
+        // The second op resolves later holding only the ViewOnly placeholder.
+        // The hardened reclaim must NOT overwrite the live signer with it — that
+        // is exactly the bug that would strand the wallet as view-only.
+        s.update(Message::CowPlaced {
+            host: CowHost::Apps,
+            result: Err("second op (test)".into()),
+            signer: h2,
+        });
+        assert!(
+            s.can_swap(),
+            "a stale ViewOnly placeholder must never strand the live signer",
+        );
     }
 
     #[test]

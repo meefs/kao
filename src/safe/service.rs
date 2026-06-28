@@ -36,7 +36,7 @@ use crate::chain::Chain;
 use crate::net::BalanceFetcher;
 
 use super::SafeTx;
-use super::tx::current_safe_nonce;
+use super::tx::{current_safe_nonce, safe_domain, safe_tx_hash as compute_safe_tx_hash};
 
 /// The public Safe Transaction Service gateway. Every service call
 /// takes an explicit `base` so a Safe can point at a self-hosted
@@ -540,6 +540,44 @@ fn propose_url(base: &str, safe: Address, chain: Chain) -> String {
     )
 }
 
+fn build_detail_from_raw(
+    raw: &RawMultisigTx,
+    safe: Address,
+    chain: Chain,
+    requested_hash: B256,
+    threshold: u32,
+    current_nonce: u64,
+) -> Result<SafeTxDetail, String> {
+    let tx = raw_to_safe_tx(raw).ok_or("safe-service: unparsable tx detail")?;
+    let body_hash = compute_safe_tx_hash(&tx, &safe_domain(safe, chain));
+    if body_hash != requested_hash {
+        return Err(format!(
+            "safe-service detail hash mismatch: requested {requested_hash:#x} but body hashes to {body_hash:#x}"
+        ));
+    }
+    let nonce = u64::try_from(tx.nonce).unwrap_or(u64::MAX);
+    let required = raw
+        .confirmations_required
+        .unwrap_or(threshold as u64)
+        .max(1);
+    let confirmations = parse_confirmations(&raw.confirmations);
+    let state = derive_state(
+        confirmations.len() as u64,
+        required,
+        nonce,
+        raw.is_executed,
+        raw.is_successful,
+        current_nonce,
+    );
+    Ok(SafeTxDetail {
+        safe_tx_hash: body_hash,
+        tx,
+        state,
+        confirmations,
+        confirmations_required: required,
+    })
+}
+
 /// Fetch full detail for one queued tx, including each owner's signature.
 /// Reads the Safe's live nonce to derive the lifecycle state (same as
 /// the list path). `threshold` is the fallback when the service omits
@@ -575,28 +613,7 @@ pub async fn fetch_detail(
             )
         })?;
 
-    let tx = raw_to_safe_tx(&raw).ok_or("safe-service: unparsable tx detail")?;
-    let nonce = u64::try_from(tx.nonce).unwrap_or(u64::MAX);
-    let required = raw
-        .confirmations_required
-        .unwrap_or(threshold as u64)
-        .max(1);
-    let confirmations = parse_confirmations(&raw.confirmations);
-    let state = derive_state(
-        confirmations.len() as u64,
-        required,
-        nonce,
-        raw.is_executed,
-        raw.is_successful,
-        current_nonce,
-    );
-    Ok(SafeTxDetail {
-        safe_tx_hash,
-        tx,
-        state,
-        confirmations,
-        confirmations_required: required,
-    })
+    build_detail_from_raw(&raw, safe, chain, safe_tx_hash, threshold, current_nonce)
 }
 
 // ── Write path (propose / confirm) ───────────────────────────────────────────
@@ -1275,6 +1292,75 @@ mod tests {
             .parse::<Bytes>()
             .unwrap();
         assert_eq!(sig.len(), 65);
+    }
+
+    fn detail_raw_for_hash_tests() -> RawMultisigTx {
+        RawMultisigTx {
+            safe_tx_hash: "0x".to_string() + &"bb".repeat(32),
+            to: "0x000000000000000000000000000000000000dEaD".to_string(),
+            value: "5".to_string(),
+            data: Some("0xabcd".to_string()),
+            nonce: "3".to_string(),
+            operation: 0,
+            safe_tx_gas: Some("21000".to_string()),
+            base_gas: Some("0".to_string()),
+            gas_price: Some("0".to_string()),
+            gas_token: Some("0x0000000000000000000000000000000000000000".to_string()),
+            refund_receiver: None,
+            is_executed: false,
+            is_successful: None,
+            confirmations_required: Some(2),
+            confirmations: vec![RawConfirmation {
+                owner: Some("0x2222222222222222222222222222222222222222".to_string()),
+                signature: Some("0x".to_string() + &"11".repeat(65)),
+            }],
+            submission_date: None,
+        }
+    }
+
+    #[test]
+    fn detail_builder_binds_body_to_requested_hash() {
+        let safe = Address::repeat_byte(0x11);
+        let chain = Chain::Mainnet;
+        let raw = detail_raw_for_hash_tests();
+        let tx = raw_to_safe_tx(&raw).unwrap();
+        let requested_hash = compute_safe_tx_hash(&tx, &safe_domain(safe, chain));
+
+        let detail = build_detail_from_raw(&raw, safe, chain, requested_hash, 2, 3).unwrap();
+
+        assert_eq!(detail.safe_tx_hash, requested_hash);
+        assert_eq!(detail.tx.to, tx.to);
+        assert_eq!(detail.tx.value, tx.value);
+        assert_eq!(detail.tx.data, tx.data);
+        assert_eq!(detail.tx.operation, tx.operation);
+        assert_eq!(detail.tx.safeTxGas, tx.safeTxGas);
+        assert_eq!(detail.tx.baseGas, tx.baseGas);
+        assert_eq!(detail.tx.gasPrice, tx.gasPrice);
+        assert_eq!(detail.tx.gasToken, tx.gasToken);
+        assert_eq!(detail.tx.refundReceiver, tx.refundReceiver);
+        assert_eq!(detail.tx.nonce, tx.nonce);
+        assert_eq!(
+            detail.state,
+            SafeTxState::AwaitingConfirmations {
+                have: 1,
+                required: 2
+            }
+        );
+        assert_eq!(detail.confirmations.len(), 1);
+    }
+
+    #[test]
+    fn detail_builder_rejects_mismatched_body_hash() {
+        let safe = Address::repeat_byte(0x11);
+        let chain = Chain::Mainnet;
+        let raw = detail_raw_for_hash_tests();
+        let wrong_requested_hash = B256::repeat_byte(0x42);
+
+        let err = build_detail_from_raw(&raw, safe, chain, wrong_requested_hash, 2, 3)
+            .expect_err("service detail whose body hashes differently must be rejected");
+
+        assert!(err.contains("detail hash mismatch"), "{err}");
+        assert!(err.contains(&format!("{wrong_requested_hash:#x}")), "{err}");
     }
 
     #[test]

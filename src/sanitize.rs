@@ -16,7 +16,7 @@
 //! "Verified" (Helios) only attests that the RPC answer is the genuine
 //! contract return — the contract itself is still attacker-deployed, so the
 //! bytes must be sanitized before they are shown. This mirrors the ENSIP-15
-//! normalization `crate::ens` applies to ENS names; arbitrary display strings
+//! normalization `crate::names::ens` applies to ENS names; arbitrary display strings
 //! are not ENS names, so they get this lighter-weight strip-and-clamp instead.
 
 use std::borrow::Cow;
