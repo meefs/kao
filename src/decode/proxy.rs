@@ -86,6 +86,11 @@ pub async fn resolve_implementation(
             Some((impl_addr, verified)) => {
                 if !verified {
                     all_verified = false;
+                    // Do not let raw-RPC storage select the implementation
+                    // used for clear-signing descriptors or bytecode
+                    // introspection. The caller still sees all_verified=false
+                    // and can warn, but the untrusted pointer is not followed.
+                    break;
                 }
                 if impl_addr == current {
                     // Self-pointer; treat as terminal to avoid an
@@ -417,7 +422,8 @@ mod tests {
             false,
         );
         let res = resolve_implementation(&mock, Chain::Mainnet, proxy_addr).await;
-        assert_eq!(res.implementation, impl_addr);
+        assert_eq!(res.implementation, proxy_addr);
+        assert!(res.hops.is_empty());
         assert!(!res.all_verified, "unverified slot read must flip the flag");
     }
 

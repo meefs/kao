@@ -2112,7 +2112,11 @@ impl SendPane {
         // every unverified sign is a deliberate, acknowledged choice.
         let decode_unverified = match eoa.decoded.as_deref() {
             Some(DecodeResult::ClearSigned { all_verified, .. }) => !all_verified,
-            Some(DecodeResult::Fallback { heuristic, .. }) => !heuristic.all_verified,
+            Some(DecodeResult::Fallback {
+                all_verified,
+                heuristic,
+                ..
+            }) => !(*all_verified && heuristic.all_verified),
             Some(DecodeResult::Heuristic(c)) => !c.all_verified,
             Some(DecodeResult::Empty) | None => false,
         };
