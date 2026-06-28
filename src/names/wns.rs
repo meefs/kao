@@ -5,7 +5,7 @@
 //! reuses the shared [`crate::names::NftNameService`] core — this module only
 //! supplies the deployment constant. Forward goes through `addr(bytes32)`,
 //! reverse through `reverseResolve(address)`; both ride the Helios-verified
-//! mainnet path and fail closed (see [`crate::names`]). GNS ([`crate::gns`]) is
+//! mainnet path and fail closed (see [`crate::names`]). GNS ([`crate::names::gns`]) is
 //! an ownerless fork of this contract with an identical resolver interface.
 //!
 //! Pinned to Ethereum mainnet (the only chain WNS is deployed on).
@@ -24,7 +24,7 @@ pub(crate) const WNS: NftNameService = NftNameService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ens::namehash;
+    use crate::names::ens::namehash;
     use alloy::primitives::B256;
 
     #[test]

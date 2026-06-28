@@ -1,7 +1,7 @@
 //! Gwei Name Service (GNS) — the `.gwei` namespace
 //! (<https://github.com/lucadonnoh/gwei-names>).
 //!
-//! An ownerless, non-upgradeable fork of WNS ([`crate::wns`]). A single
+//! An ownerless, non-upgradeable fork of WNS ([`crate::names::wns`]). A single
 //! `NameNFT` contract is both registry and resolver, so resolution reuses the
 //! shared [`crate::names::NftNameService`] core — this module only supplies the
 //! deployment constant. Forward goes through `addr(bytes32)`, reverse through
@@ -11,7 +11,7 @@
 //! Pinned to Ethereum mainnet. GNS is also deployed at the *same* address on
 //! Sepolia (identical deployer + nonces), but every name read goes through the
 //! verified mainnet light client regardless of the chain being viewed —
-//! matching the ENS posture in [`crate::ens`].
+//! matching the ENS posture in [`crate::names::ens`].
 
 use alloy::primitives::address;
 
@@ -27,7 +27,7 @@ pub(crate) const GNS: NftNameService = NftNameService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ens::namehash;
+    use crate::names::ens::namehash;
     use alloy::primitives::B256;
 
     #[test]

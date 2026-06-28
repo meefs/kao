@@ -12,10 +12,14 @@ use iced::keyboard;
 use iced::widget::{Space, button, column, container, row, scrollable, text};
 use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription};
 
+use alloy::primitives::Address;
+
 use crate::cow::api::QuoteResponse;
 use crate::cow::composer::{self, SwapComposer, SwapDraft};
 use crate::cow::tracked::{OrderStatus, TrackedOrder};
 use crate::portfolio::{LiveToken, format_token_balance};
+
+use super::names_app::{self, NamesApp};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     avatar, bold, ghost_button, kao_scrollable_style, mono, mono_bold, screen_subtitle,
@@ -29,7 +33,11 @@ use crate::ui::kao_widgets::{
 pub enum Message {
     /// Open the Swap app from the launcher.
     OpenSwapApp,
-    /// Return from the Swap app to the launcher.
+    /// Open the Names app from the launcher.
+    OpenNamesApp,
+    /// Messages for the embedded Names app.
+    Names(names_app::Message),
+    /// Return from a sub-app to the launcher.
     BackHome,
     Composer(composer::Message),
     Cancel(String),
@@ -42,11 +50,12 @@ pub enum Message {
     Key(keyboard::Event),
 }
 
-/// Which Apps view is showing: the launcher, or the Swap app.
+/// Which Apps view is showing: the launcher, or one of the sub-apps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppsView {
     Launcher,
     Swap,
+    Names,
 }
 
 // `Request*`-prefixed by design (these are the requests the pane bubbles up);
@@ -67,20 +76,32 @@ pub enum Outcome {
     CopyText(String),
     /// Poll the tracked orders' status on demand.
     RefreshOrders,
+    /// A request bubbled up from the embedded Names app (verified read or
+    /// signed transaction); the coordinator services it and feeds the result
+    /// back via [`AppsPane::names_pane`].
+    Name(names_app::Outcome),
 }
 
 #[derive(Debug)]
 pub struct AppsPane {
     composer: SwapComposer,
+    names: NamesApp,
     view: AppsView,
 }
 
 impl AppsPane {
-    pub fn new() -> Self {
+    pub fn new(owner: Address) -> Self {
         Self {
             composer: SwapComposer::new(),
+            names: NamesApp::new(owner),
             view: AppsView::Launcher,
         }
+    }
+
+    /// Mutable access to the Names app so the coordinator can deliver async
+    /// results (`on_scan` / `on_commit` / …).
+    pub fn names_pane(&mut self) -> &mut NamesApp {
+        &mut self.names
     }
 
     pub fn on_quote(&mut self, result: Result<QuoteResponse, String>) {
@@ -104,6 +125,12 @@ impl AppsPane {
                 self.view = AppsView::Swap;
                 None
             }
+            Message::OpenNamesApp => {
+                self.view = AppsView::Names;
+                // Kick off the reverse-lookup scan the first time it's opened.
+                self.names.on_open().map(Outcome::Name)
+            }
+            Message::Names(child) => self.names.update(child).map(Outcome::Name),
             Message::BackHome => {
                 self.view = AppsView::Launcher;
                 None
@@ -125,7 +152,7 @@ impl AppsPane {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
                 } = event
-                    && self.view == AppsView::Swap
+                    && matches!(self.view, AppsView::Swap | AppsView::Names)
                 {
                     self.view = AppsView::Launcher;
                 }
@@ -140,6 +167,11 @@ impl AppsPane {
     pub fn subscription(&self) -> Subscription<Message> {
         match self.view {
             AppsView::Swap => keyboard::listen().map(Message::Key),
+            // Names also needs its own 1s tick for the commit→reveal countdown.
+            AppsView::Names => Subscription::batch([
+                keyboard::listen().map(Message::Key),
+                self.names.subscription().map(Message::Names),
+            ]),
             AppsView::Launcher => Subscription::none(),
         }
     }
@@ -153,6 +185,7 @@ impl AppsPane {
         let content = match self.view {
             AppsView::Launcher => self.launcher_view(t, orders),
             AppsView::Swap => self.swap_view(t, portfolio, orders),
+            AppsView::Names => self.names.view(t).map(Message::Names),
         };
 
         // Center the bounded (max-width 560) content within the full-width
@@ -188,9 +221,17 @@ impl AppsPane {
         column![
             screen_title(t, "Apps"),
             Space::new().height(6),
-            screen_subtitle(t, "On-chain apps — MEV-protected swaps via CoW Protocol"),
+            screen_subtitle(t, "On-chain apps — swaps and name registration"),
             Space::new().height(20),
             app_card(t, "(⇌ω⇌)", "Swap", &swap_sub, Message::OpenSwapApp),
+            Space::new().height(10),
+            app_card(
+                t,
+                "(✎ω✎)",
+                "Names",
+                "Search & register .eth / .gwei / .wei / .xns names",
+                Message::OpenNamesApp,
+            ),
         ]
         .width(Length::Fill)
         .max_width(560)
@@ -491,7 +532,7 @@ mod tests {
 
     #[test]
     fn esc_steps_back_from_swap_app_to_launcher() {
-        let mut pane = AppsPane::new();
+        let mut pane = AppsPane::new(Address::ZERO);
         assert_eq!(pane.view, AppsView::Launcher);
         pane.update(Message::OpenSwapApp);
         assert_eq!(pane.view, AppsView::Swap);
@@ -506,7 +547,7 @@ mod tests {
 
     #[test]
     fn esc_on_launcher_is_a_noop() {
-        let mut pane = AppsPane::new();
+        let mut pane = AppsPane::new(Address::ZERO);
         pane.update(Message::Key(esc_event()));
         assert_eq!(
             pane.view,

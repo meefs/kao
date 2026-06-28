@@ -25,6 +25,7 @@ mod function_panel;
 mod header;
 mod home;
 mod modal_chrome;
+mod names_app;
 mod nav;
 mod networks;
 mod receive;
@@ -79,6 +80,8 @@ use crate::cow::{
     tracked::{OrderStatus, TrackedOrder},
 };
 use crate::indexer::IndexedTx;
+use crate::names::manage::{NameStatus, Registry, SearchHit};
+use crate::names::registrar::{Namespace, RegisterPlan};
 use crate::net::{BalanceFetcher, VerificationStatus};
 use crate::portfolio::{DiscoveredToken, LiveToken, PortfolioCache};
 use crate::settings::{self, IndexerProvider};
@@ -264,6 +267,43 @@ pub enum Message {
     },
     /// Child messages from the Apps (swap workspace) pane.
     Apps(apps::Message),
+    /// Names app: reverse-lookup discovery finished. `owner` is the account the
+    /// scan was spawned for — the handler drops it if the active account changed.
+    NameReverseScanned {
+        owner: Address,
+        result: Result<Vec<NameStatus>, String>,
+    },
+    /// Names app: a manually-added name's verified status.
+    NameStatusLoaded {
+        owner: Address,
+        result: Result<NameStatus, String>,
+    },
+    /// Names app: cross-namespace availability + price search finished.
+    NameSearched {
+        owner: Address,
+        result: Result<Vec<SearchHit>, String>,
+    },
+    /// Names app: the commit landed (mined). Carries the plan (with its secret)
+    /// for the reveal step, and the parked signer back.
+    NameCommitted {
+        result: Result<(RegisterPlan, TxHash), String>,
+        signer: SignerHandoff,
+    },
+    /// Names app: register/reveal finished. `String` is the registered name.
+    NameRegistered {
+        result: Result<(String, TxHash), String>,
+        signer: SignerHandoff,
+    },
+    /// Names app: renewal finished.
+    NameRenewed {
+        result: Result<(String, TxHash), String>,
+        signer: SignerHandoff,
+    },
+    /// Names app: set-recipient finished.
+    NameRecipientSet {
+        result: Result<(String, TxHash), String>,
+        signer: SignerHandoff,
+    },
     /// A CoW quote returned (or errored). Routed back to the host's composer.
     CowQuote {
         host: CowHost,
@@ -585,7 +625,7 @@ impl WalletScreen {
             clipboard_clear_gen: 0,
             tracked_orders: Vec::new(),
             order_op_in_flight: false,
-            apps: AppsPane::new(),
+            apps: AppsPane::new(address),
         }
     }
 
@@ -770,6 +810,16 @@ impl WalletScreen {
         }
     }
 
+    /// True while *any* signing operation has the live signer parked — a Send /
+    /// Safe broadcast ([`Self::is_send_busy`]) or a CoW / name-service write
+    /// (`order_op_in_flight`). The App gates leaving the dashboard
+    /// (begin-add-account) on this: `into_signer()` would otherwise hand back the
+    /// `ViewOnly` placeholder and strand the real signer in the in-flight task's
+    /// handoff. Name writes also refuse to start while this is true.
+    pub fn is_signing_busy(&self) -> bool {
+        self.is_send_busy() || self.order_op_in_flight
+    }
+
     /// The active address in short `0xabcd…ef01` form. For diagnostic logs.
     pub fn address_for_log(&self) -> String {
         short_address(self.address)
@@ -833,6 +883,134 @@ impl WalletScreen {
         self.order_op_in_flight = true;
         let signer = mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
         handoff_with(signer)
+    }
+
+    /// Reclaim the EOA signer parked for a name-service write op and clear the
+    /// in-flight flag — the shared tail of every `Name*` result handler.
+    ///
+    /// Only a *real* signer for the *current* account is restored. Refusing a
+    /// `ViewOnly` placeholder stops a stray/late reclaim from downgrading a live
+    /// signer to view-only (which would silently disable signing across the whole
+    /// wallet); refusing a signer whose address ≠ the active account stops an op
+    /// spawned before an account switch from contaminating the new account with
+    /// the old account's key. In both cases the reclaimed value is simply
+    /// dropped.
+    fn reclaim_order_signer(&mut self, signer: SignerHandoff) {
+        self.install_reclaimed_signer(&signer);
+        self.order_op_in_flight = false;
+    }
+
+    /// Safely restore a signer parked for an in-flight signing op: install it
+    /// only if it's a *real* signer for the *current* account. This is the
+    /// invariant that keeps the shared signer-park machinery (Send / CoW /
+    /// name-service writes) safe under overlap — a `ViewOnly` placeholder (from a
+    /// concurrent double-park) or a different account's key (from a mid-op
+    /// account switch) is dropped rather than overwriting the live signer, so no
+    /// overlap can silently strand the wallet as view-only.
+    fn install_reclaimed_signer(&mut self, signer: &SignerHandoff) {
+        if let Ok(mut g) = signer.lock()
+            && let Some(s) = g.take()
+            && s.can_sign()
+            && s.address() == self.address
+        {
+            self.signer = s;
+        }
+    }
+
+    /// Service a request bubbled up from the Names app: read-only ones spawn a
+    /// verified-read task; write ones park the signer first (so the Apps surface
+    /// survives the in-flight window) and mint the commit secret here, where the
+    /// RNG lives.
+    fn handle_name_outcome(&mut self, o: names_app::Outcome) -> Task<Message> {
+        // Serialize signing: refuse a new write-op while one is already in
+        // flight, so a second park can't strand the real signer in the first
+        // op's handoff. Reads (Scan/Status/Check) don't park the signer, so
+        // they're exempt.
+        let is_write = matches!(
+            o,
+            names_app::Outcome::Commit { .. }
+                | names_app::Outcome::Register { .. }
+                | names_app::Outcome::RegisterXns { .. }
+                | names_app::Outcome::Renew { .. }
+                | names_app::Outcome::SetRecipient { .. }
+        );
+        if is_write && self.is_signing_busy() {
+            // Another signing op already holds the signer. Refuse — but the pane
+            // has already flipped to a busy phase, so feed the error back so it
+            // reverts (rather than stranding it, or letting a second park strand
+            // the signer).
+            let msg =
+                "another signing operation is in progress — try again in a moment".to_string();
+            let pane = self.apps.names_pane();
+            match o {
+                names_app::Outcome::Commit { .. } => pane.on_commit(Err(msg)),
+                // Both the legacy reveal and the XNS one-shot resolve via `on_register`.
+                names_app::Outcome::Register { .. } | names_app::Outcome::RegisterXns { .. } => {
+                    pane.on_register(Err(msg))
+                }
+                names_app::Outcome::Renew { .. } => pane.on_renew(Err(msg)),
+                names_app::Outcome::SetRecipient { .. } => pane.on_set_recipient(Err(msg)),
+                _ => {}
+            }
+            return Task::none();
+        }
+        // Every async result is tagged with `self.address` and dropped on arrival
+        // if the active account has since changed (see the `Name*` handlers), so
+        // an op spawned for one account can't populate another's view.
+        let owner = self.address;
+        match o {
+            names_app::Outcome::ReverseScan => spawn_name_reverse_scan(self.network.clone(), owner),
+            names_app::Outcome::Status { registry, label } => {
+                spawn_name_status(self.network.clone(), owner, registry, label)
+            }
+            names_app::Outcome::Search { label, registries } => {
+                spawn_name_search(self.network.clone(), owner, label, registries)
+            }
+            names_app::Outcome::RegisterXns { namespace, label } => {
+                let handoff = self.park_signer_for_order();
+                spawn_name_register_xns(self.network.clone(), handoff, namespace, label)
+            }
+            names_app::Outcome::Commit {
+                namespace,
+                label,
+                years,
+            } => {
+                // Fresh commit/reveal nonce — never reused, kept in the plan. The
+                // name is registered to the signing account (`self.address`): the
+                // GNS/WNS reveal mints to msg.sender and binds the commitment to
+                // it, so owner must equal the signer.
+                let secret = B256::from(rand::random::<[u8; 32]>());
+                let plan = RegisterPlan {
+                    namespace,
+                    label,
+                    owner: self.address,
+                    duration_secs: crate::names::registrar::ens_duration_secs(years),
+                    secret,
+                };
+                let handoff = self.park_signer_for_order();
+                spawn_name_commit(self.network.clone(), handoff, plan)
+            }
+            names_app::Outcome::Register { plan } => {
+                let handoff = self.park_signer_for_order();
+                spawn_name_register(self.network.clone(), handoff, plan)
+            }
+            names_app::Outcome::Renew {
+                namespace,
+                label,
+                years,
+            } => {
+                let handoff = self.park_signer_for_order();
+                spawn_name_renew(self.network.clone(), handoff, namespace, label, years)
+            }
+            names_app::Outcome::SetRecipient {
+                namespace,
+                label,
+                recipient,
+            } => {
+                let handoff = self.park_signer_for_order();
+                spawn_name_set_recipient(self.network.clone(), handoff, namespace, label, recipient)
+            }
+        }
     }
 
     /// Whether `safe` has at least one linked owner that's a `Local`
@@ -1789,15 +1967,10 @@ impl WalletScreen {
                 }
             }
             Message::SendBroadcastReturn { result, signer } => {
-                // Reclaim the signer regardless of pane state — the
-                // dashboard must always end up holding it again.
-                if let Ok(mut g) = signer.lock() {
-                    if let Some(s) = g.take() {
-                        self.signer = s;
-                    } else {
-                        warn!("broadcast return: signer cell was empty");
-                    }
-                }
+                // Reclaim the signer regardless of pane state — the dashboard
+                // must end up holding it again (and only if it's the real signer
+                // for the current account; see `install_reclaimed_signer`).
+                self.install_reclaimed_signer(&signer);
                 // Pump the result into the pane if it's still open. If
                 // the user closed the modal mid-broadcast we silently
                 // drop the result — the tx was still sent and a future
@@ -2038,8 +2211,42 @@ impl WalletScreen {
                 Some(apps::Outcome::CopyText(s)) => {
                     return (self.arm_clipboard_clear(s), None);
                 }
+                Some(apps::Outcome::Name(o)) => {
+                    return (self.handle_name_outcome(o), None);
+                }
                 None => return (Task::none(), None),
             },
+            Message::NameReverseScanned { owner, result } => {
+                if owner == self.address {
+                    self.apps.names_pane().on_reverse_scan(result);
+                }
+            }
+            Message::NameStatusLoaded { owner, result } => {
+                if owner == self.address {
+                    self.apps.names_pane().on_status(result);
+                }
+            }
+            Message::NameSearched { owner, result } => {
+                if owner == self.address {
+                    self.apps.names_pane().on_search(result);
+                }
+            }
+            Message::NameCommitted { result, signer } => {
+                self.reclaim_order_signer(signer);
+                self.apps.names_pane().on_commit(result);
+            }
+            Message::NameRegistered { result, signer } => {
+                self.reclaim_order_signer(signer);
+                self.apps.names_pane().on_register(result);
+            }
+            Message::NameRenewed { result, signer } => {
+                self.reclaim_order_signer(signer);
+                self.apps.names_pane().on_renew(result);
+            }
+            Message::NameRecipientSet { result, signer } => {
+                self.reclaim_order_signer(signer);
+                self.apps.names_pane().on_set_recipient(result);
+            }
             Message::CowQuote { host, result } => match host {
                 CowHost::Modal => {
                     if let Modal::Swap(p) = &mut self.modal {
@@ -2054,11 +2261,7 @@ impl WalletScreen {
                 signer,
             } => {
                 // Always reclaim the signer, regardless of pane state.
-                if let Ok(mut g) = signer.lock()
-                    && let Some(s) = g.take()
-                {
-                    self.signer = s;
-                }
+                self.install_reclaimed_signer(&signer);
                 // The order op has resolved — the signer is back, so the Apps
                 // surface no longer needs the in-flight reprieve.
                 self.order_op_in_flight = false;
@@ -2099,11 +2302,7 @@ impl WalletScreen {
                 result,
                 signer,
             } => {
-                if let Ok(mut g) = signer.lock()
-                    && let Some(s) = g.take()
-                {
-                    self.signer = s;
-                }
+                self.install_reclaimed_signer(&signer);
                 self.order_op_in_flight = false;
                 match result {
                     Ok(()) => {
@@ -4121,6 +4320,236 @@ fn cow_quote_request(draft: &SwapDraft, user: Address) -> crate::cow::api::Quote
     }
 }
 
+// ── Names app tasks ──────────────────────────────────────────────────────────
+//
+// Reads go through the verified mainnet path (fail-closed); writes take the
+// parked signer, broadcast, then wait for the receipt so the UI only advances on
+// a mined, non-reverted transaction. All pin to mainnet inside `crate::names`.
+
+/// Discover names that resolve to the active account via reverse lookup.
+fn spawn_name_reverse_scan(network: Arc<dyn BalanceFetcher>, owner: Address) -> Task<Message> {
+    Task::perform(
+        async move { crate::names::manage::reverse_owned_names(&*network, owner).await },
+        move |result| Message::NameReverseScanned { owner, result },
+    )
+}
+
+/// Verify a single manually-entered name's status.
+fn spawn_name_status(
+    network: Arc<dyn BalanceFetcher>,
+    owner: Address,
+    registry: Registry,
+    label: String,
+) -> Task<Message> {
+    Task::perform(
+        async move { crate::names::manage::name_status(&*network, &registry, &label).await },
+        move |result| Message::NameStatusLoaded { owner, result },
+    )
+}
+
+/// Check `label` across `registries` (availability + price) for the search bar.
+fn spawn_name_search(
+    network: Arc<dyn BalanceFetcher>,
+    owner: Address,
+    label: String,
+    registries: Vec<Registry>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            Ok::<_, String>(crate::names::manage::search(&*network, &label, registries).await)
+        },
+        move |result| Message::NameSearched { owner, result },
+    )
+}
+
+/// Wait for `hash` to be mined on mainnet (≈ up to 3 min). Shared tail of the
+/// name write tasks so the UI only advances on a confirmed, non-reverted tx.
+async fn await_mined(network: &Arc<dyn BalanceFetcher>, hash: TxHash) -> Result<(), String> {
+    let provider = network
+        .provider(crate::chain::Chain::Mainnet)
+        .await
+        .ok_or_else(|| "no Ethereum mainnet RPC configured".to_string())?;
+    crate::cow::onchain::wait_for_receipt(&provider, hash, 60).await
+}
+
+/// Registration step 1: broadcast the commit and wait for it to mine.
+fn spawn_name_commit(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    plan: RegisterPlan,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => {
+                    return Err::<(RegisterPlan, TxHash), String>("signer not available".into());
+                }
+            };
+            let result = async {
+                let hash = crate::names::manage::submit_commit(&*network, &signer, &plan).await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((plan.clone(), hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameCommitted {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Registration step 2: broadcast the reveal/register and wait for it to mine.
+fn spawn_name_register(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    plan: RegisterPlan,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let name = format!("{}{}", plan.label, plan.namespace.tld());
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            };
+            let result = async {
+                let hash = crate::names::manage::submit_register(&*network, &signer, &plan).await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((name, hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameRegistered {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// XNS one-shot registration: broadcast `registerName` and wait for it to mine.
+/// Reuses `Message::NameRegistered` (the pane's `on_register` handles both the
+/// commit-reveal reveal and this single-step path).
+fn spawn_name_register_xns(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    namespace: String,
+    label: String,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let name = format!("{label}.{namespace}");
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            };
+            let result = async {
+                let hash = crate::names::manage::submit_register_xns(
+                    &*network, &signer, &namespace, &label,
+                )
+                .await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((name, hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameRegistered {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Renew ("prolong") an owned name.
+fn spawn_name_renew(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    namespace: Namespace,
+    label: String,
+    years: u32,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let name = format!("{label}{}", namespace.tld());
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            };
+            let result = async {
+                let duration = crate::names::registrar::ens_duration_secs(years);
+                let hash = crate::names::manage::submit_renew(
+                    &*network, &signer, namespace, &label, duration,
+                )
+                .await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((name, hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameRenewed {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Point an owned name at a new recipient address.
+fn spawn_name_set_recipient(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    namespace: Namespace,
+    label: String,
+    recipient: Address,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let name = format!("{label}{}", namespace.tld());
+    Task::perform(
+        async move {
+            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
+                Some(s) => s,
+                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            };
+            let result = async {
+                let hash = crate::names::manage::submit_set_recipient(
+                    &*network, &signer, namespace, &label, recipient,
+                )
+                .await?;
+                await_mined(&network, hash).await?;
+                Ok::<_, String>((name, hash))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::NameRecipientSet {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
 /// Fetch a quote (the first network call — only ever from an explicit click).
 fn spawn_cow_quote(host: CowHost, draft: SwapDraft, user: Address) -> Task<Message> {
     let chain = draft.chain;
@@ -4899,6 +5328,55 @@ mod tests {
         );
         assert!(s.can_swap(), "signer reclaimed after the op resolves");
         assert!(s.apps_available());
+    }
+
+    #[test]
+    fn concurrent_signer_park_never_strands_the_wallet() {
+        use crate::wallet::local_account;
+        use alloy::signers::local::PrivateKeySigner;
+
+        let pk = PrivateKeySigner::random();
+        let desc = local_account(&pk);
+        let mut s = WalletScreen::new(
+            KaoSigner::Local(pk),
+            vec![desc],
+            Vec::new(),
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        assert!(s.can_swap());
+        assert!(!s.is_signing_busy());
+
+        // Two overlapping signing ops park the signer (e.g. a CoW order started
+        // while a name write is still in flight). The second park only captures
+        // the ViewOnly placeholder the first one left behind.
+        let h1 = s.park_signer_for_order();
+        let h2 = s.park_signer_for_order();
+        assert!(s.is_signing_busy());
+
+        // The first op (holding the REAL signer) resolves first — restoring it.
+        s.update(Message::CowPlaced {
+            host: CowHost::Apps,
+            result: Err("first op (test)".into()),
+            signer: h1,
+        });
+        assert!(s.can_swap(), "real signer restored by the first reclaim");
+
+        // The second op resolves later holding only the ViewOnly placeholder.
+        // The hardened reclaim must NOT overwrite the live signer with it — that
+        // is exactly the bug that would strand the wallet as view-only.
+        s.update(Message::CowPlaced {
+            host: CowHost::Apps,
+            result: Err("second op (test)".into()),
+            signer: h2,
+        });
+        assert!(
+            s.can_swap(),
+            "a stale ViewOnly placeholder must never strand the live signer",
+        );
     }
 
     #[test]

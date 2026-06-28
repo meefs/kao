@@ -1,7 +1,7 @@
 //! Unified name-service resolution: dispatches forward (`name → address`) and
 //! reverse (`address → name`) lookups across the supported namespaces — ENS
-//! (`.eth` and DNS names, [`crate::ens`]), GNS (`.gwei`, [`crate::gns`]) and
-//! WNS (`.wei`, [`crate::wns`]).
+//! (`.eth` and DNS names, [`crate::names::ens`]), GNS (`.gwei`, [`crate::names::gns`]) and
+//! WNS (`.wei`, [`crate::names::wns`]).
 //!
 //! ENS sits behind a registry→resolver indirection. GNS and WNS are
 //! *single-contract* namespaces: one `NameNFT` contract is both the registry
@@ -9,8 +9,8 @@
 //! alongside a convenience `reverseResolve(address) → string` (reverse). The
 //! shared [`NftNameService`] core handles those two; this module routes by TLD.
 //!
-//! Every read inherits [`crate::ens`]'s trust model: it goes through the
-//! Helios-verified mainnet path ([`crate::ens::verified_call`]) and **fails
+//! Every read inherits [`crate::names::ens`]'s trust model: it goes through the
+//! Helios-verified mainnet path ([`crate::names::ens::verified_call`]) and **fails
 //! closed** when the light client can't verify it. A resolved address feeds the
 //! signed Send recipient, imported watch-only accounts and Safe owners, so an
 //! unverified RPC answer is an error, never a trusted address. Names are
@@ -23,10 +23,19 @@
 
 use alloy::primitives::{Address, B256};
 
-use crate::ens::{
-    self, beautify, decode_address, decode_string, namehash, normalize, verified_call,
-};
+use self::ens::{beautify, decode_address, decode_string, namehash, normalize, verified_call};
 use crate::net::BalanceFetcher;
+
+// Per-service resolver modules (ENS multi-contract; GNS/WNS single-contract
+// NameNFTs; XNS permissionless `label.namespace`). The whole name-service
+// subsystem lives under `src/names/`.
+pub mod ens;
+pub mod gns;
+pub mod wns;
+pub mod xns;
+// The registration/management app layer that builds on the resolvers.
+pub mod manage;
+pub mod registrar;
 
 /// `keccak256("reverseResolve(address)")[..4]` — the GNS/WNS convenience
 /// reverse lookup. Verified against the signature in the unit tests below.
@@ -43,7 +52,7 @@ pub(crate) const ADDR_SELECTOR: [u8; 4] = [0x3b, 0x3b, 0x57, 0xde];
 /// resolver: token ids are `uint256(namehash(name))` (EIP-137), `addr(bytes32)`
 /// resolves a node to an address, and `reverseResolve(address)` returns the
 /// primary name (already self-verified on-chain, but we re-verify — see
-/// [`NftNameService::lookup_address`]). [`crate::gns`] and [`crate::wns`]
+/// [`NftNameService::lookup_address`]). [`crate::names::gns`] and [`crate::names::wns`]
 /// supply the deployment constants.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NftNameService {
@@ -156,12 +165,17 @@ pub fn looks_like_name(input: &str) -> bool {
 /// [`looks_like_name`] would eagerly fire a lookup on any pasted domain.
 pub fn looks_like_known_name(input: &str) -> bool {
     let lc = input.trim().to_ascii_lowercase();
-    [".eth", crate::gns::GNS.tld, crate::wns::WNS.tld]
-        .iter()
-        .any(|tld| {
-            lc.strip_suffix(tld)
-                .is_some_and(|stem| !stem.is_empty() && !stem.ends_with('.'))
-        })
+    [
+        ".eth",
+        crate::names::gns::GNS.tld,
+        crate::names::wns::WNS.tld,
+        ".xns",
+    ]
+    .iter()
+    .any(|tld| {
+        lc.strip_suffix(tld)
+            .is_some_and(|stem| !stem.is_empty() && !stem.ends_with('.'))
+    })
 }
 
 /// The short display label for the namespace a resolved name belongs to,
@@ -170,9 +184,9 @@ pub fn looks_like_known_name(input: &str) -> bool {
 /// service that vouches for it instead of always saying "ENS".
 pub fn namespace_label(name: &str) -> &'static str {
     let lc = name.to_ascii_lowercase();
-    if lc.ends_with(crate::gns::GNS.tld) {
+    if lc.ends_with(crate::names::gns::GNS.tld) {
         "GNS"
-    } else if lc.ends_with(crate::wns::WNS.tld) {
+    } else if lc.ends_with(crate::names::wns::WNS.tld) {
         "WNS"
     } else {
         "ENS"
@@ -184,13 +198,91 @@ pub fn namespace_label(name: &str) -> &'static str {
 /// [`ens::resolve_name`] so the call sites are namespace-agnostic.
 pub async fn resolve_name(net: &dyn BalanceFetcher, name: &str) -> Result<Option<Address>, String> {
     let lc = name.trim().to_ascii_lowercase();
-    if lc.ends_with(crate::gns::GNS.tld) {
-        crate::gns::GNS.resolve_name(net, name).await
-    } else if lc.ends_with(crate::wns::WNS.tld) {
-        crate::wns::WNS.resolve_name(net, name).await
+    if lc.ends_with(crate::names::gns::GNS.tld) {
+        crate::names::gns::GNS.resolve_name(net, name).await
+    } else if lc.ends_with(crate::names::wns::WNS.tld) {
+        crate::names::wns::WNS.resolve_name(net, name).await
+    } else if let Some(label) = lc.strip_suffix(".xns") {
+        // `.xns` is the canonical XNS namespace — route it to the XNS contract.
+        // Arbitrary XNS namespaces (`.crops`, `.cheese`, …) are *not* claimed by
+        // this wallet-wide resolver (they'd collide with ENS DNS names); the
+        // names app resolves those through its own XNS path instead.
+        xns_forward(net, label, "xns").await
     } else {
         ens::resolve_name(net, name).await
     }
+}
+
+/// Verified forward resolution of an XNS `label.namespace` to a non-zero address.
+/// Both parts are validated against XNS's own rules (lowercase `[a-z0-9-]`, 1–20)
+/// before any read — an invalid name can't be registered, so it can't resolve.
+/// `Ok(None)` for an unregistered / malformed name; `Err` on an unverified read
+/// (the resolved address may become a signed recipient — never trust an
+/// unverified answer).
+pub(crate) async fn xns_forward(
+    net: &dyn BalanceFetcher,
+    label: &str,
+    namespace: &str,
+) -> Result<Option<Address>, String> {
+    let (Some(label), Some(namespace)) =
+        (xns::normalize_label(label), xns::normalize_label(namespace))
+    else {
+        return Ok(None);
+    };
+    let (to, cd) = xns::get_address_call(&label, &namespace);
+    let out = ens::verified_call_raw(net, to, cd).await?;
+    let addr = decode_address(&out);
+    Ok((addr != Address::ZERO).then_some(addr))
+}
+
+/// Verified reverse lookup for the XNS primary (and only) name of `addr`, with
+/// forward-verification. Discards bare names and any first-class TLD
+/// (`.eth`/`.gwei`/`.wei`) so XNS can't put another namespace's label on a
+/// signing surface, and confirms the name forward-resolves back to `addr` before
+/// trusting it. `Err` on an unverified read; the call sites render no name on
+/// `Err`.
+pub(crate) async fn xns_lookup_address(
+    net: &dyn BalanceFetcher,
+    addr: Address,
+) -> Result<Option<String>, String> {
+    let (to, cd) = xns::get_name_call(addr);
+    let raw = ens::verified_call_raw(net, to, cd).await?;
+    let name = match decode_string(&raw) {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(None),
+    };
+    // Only `label.namespace` names — a bare name (the special `x` namespace)
+    // has no TLD and would be ambiguous/spoofy on a review surface.
+    let Some((label, namespace)) = name.rsplit_once('.') else {
+        return Ok(None);
+    };
+    // XNS must never vouch for ENS/GNS/WNS's TLDs.
+    if is_first_class_tld(&name) {
+        return Ok(None);
+    }
+    // Normalize before forward-verify *and* display, so the bytes we vouch for
+    // are exactly what we re-resolved. XNS only stores lowercase `[a-z0-9-]`, so
+    // this is identity today — defence-in-depth, mirroring the NFT reverse path.
+    let (Some(label), Some(namespace)) =
+        (xns::normalize_label(label), xns::normalize_label(namespace))
+    else {
+        return Ok(None);
+    };
+    if xns_forward(net, &label, &namespace).await? != Some(addr) {
+        return Ok(None);
+    }
+    Ok(Some(format!("{label}.{namespace}")))
+}
+
+/// Whether `name` ends in a first-class namespace TLD this wallet resolves
+/// through a dedicated registry (`.eth` via ENS, `.gwei` via GNS, `.wei` via
+/// WNS). XNS reverse results carrying one of these are discarded — only the
+/// owning registry is authoritative for them.
+fn is_first_class_tld(name: &str) -> bool {
+    let lc = name.to_ascii_lowercase();
+    lc.ends_with(".eth")
+        || lc.ends_with(crate::names::gns::GNS.tld)
+        || lc.ends_with(crate::names::wns::WNS.tld)
 }
 
 /// A name carries a single-contract namespace's TLD (`.gwei` / `.wei`).
@@ -204,7 +296,9 @@ pub async fn resolve_name(net: &dyn BalanceFetcher, name: &str) -> Result<Option
 /// a "verified" GNS name with no relationship to the real `.gwei` holder.
 fn is_reserved_namespace_name(name: &str) -> bool {
     let lc = name.to_ascii_lowercase();
-    lc.ends_with(crate::gns::GNS.tld) || lc.ends_with(crate::wns::WNS.tld)
+    lc.ends_with(crate::names::gns::GNS.tld)
+        || lc.ends_with(crate::names::wns::WNS.tld)
+        || lc.ends_with(".xns")
 }
 
 /// Reverse resolution across every namespace, with precedence ENS > GNS > WNS:
@@ -226,10 +320,11 @@ pub async fn lookup_address(
     net: &dyn BalanceFetcher,
     addr: Address,
 ) -> Result<Option<String>, String> {
-    let (ens_res, gns_res, wns_res) = futures::future::join3(
+    let (ens_res, gns_res, wns_res, xns_res) = futures::future::join4(
         ens::lookup_address(net, addr),
-        crate::gns::GNS.lookup_address(net, addr),
-        crate::wns::WNS.lookup_address(net, addr),
+        crate::names::gns::GNS.lookup_address(net, addr),
+        crate::names::wns::WNS.lookup_address(net, addr),
+        xns_lookup_address(net, addr),
     )
     .await;
 
@@ -237,8 +332,8 @@ pub async fn lookup_address(
     // lower-priority name is considered, matching a fail-closed sequential walk.
     match ens_res {
         Err(e) => return Err(e),
-        // ENS may not vouch for a `.gwei`/`.wei` name — fall through to the
-        // owning namespace's contract, which is the only authority for it.
+        // ENS may not vouch for a `.gwei`/`.wei`/`.xns` name — fall through to
+        // the owning namespace's contract, which is the only authority for it.
         Ok(Some(name)) if !is_reserved_namespace_name(&name) => return Ok(Some(name)),
         _ => {}
     }
@@ -248,6 +343,11 @@ pub async fn lookup_address(
         _ => {}
     }
     match wns_res {
+        Err(e) => return Err(e),
+        Ok(Some(name)) => return Ok(Some(name)),
+        _ => {}
+    }
+    match xns_res {
         Err(e) => return Err(e),
         Ok(Some(name)) => return Ok(Some(name)),
         _ => {}
@@ -379,10 +479,11 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_known_name_accepts_three_tlds() {
+    fn looks_like_known_name_accepts_known_tlds() {
         assert!(looks_like_known_name("alice.eth"));
         assert!(looks_like_known_name("alice.gwei"));
         assert!(looks_like_known_name("alice.wei"));
+        assert!(looks_like_known_name("alice.xns"));
         assert!(looks_like_known_name("SUB.alice.GWEI"));
     }
 
@@ -520,7 +621,7 @@ mod tests {
         let net = CallMock::new();
         let node = namehash(&normalize("alice.gwei").unwrap());
         net.set_call(
-            crate::gns::GNS.registry,
+            crate::names::gns::GNS.registry,
             calldata(ADDR_SELECTOR, node),
             abi_address(TARGET),
             true,
@@ -536,7 +637,7 @@ mod tests {
         let net = CallMock::new();
         let node = namehash(&normalize("alice.wei").unwrap());
         net.set_call(
-            crate::wns::WNS.registry,
+            crate::names::wns::WNS.registry,
             calldata(ADDR_SELECTOR, node),
             abi_address(TARGET),
             true,
@@ -551,13 +652,13 @@ mod tests {
         let net = CallMock::new();
         let node = namehash(&normalize("alice.gwei").unwrap());
         net.set_call(
-            crate::gns::GNS.registry,
+            crate::names::gns::GNS.registry,
             calldata(REVERSE_RESOLVE_SELECTOR, address_word(TARGET)),
             abi_string("alice.gwei"),
             true,
         );
         net.set_call(
-            crate::gns::GNS.registry,
+            crate::names::gns::GNS.registry,
             calldata(ADDR_SELECTOR, node),
             abi_address(TARGET),
             true,
@@ -579,12 +680,110 @@ mod tests {
     }
 
     #[test]
-    fn reserved_namespace_name_detects_gwei_and_wei() {
+    fn reserved_namespace_name_detects_gwei_wei_and_xns() {
         assert!(is_reserved_namespace_name("victim.gwei"));
         assert!(is_reserved_namespace_name("VICTIM.WEI"));
         assert!(is_reserved_namespace_name("sub.victim.gwei"));
+        assert!(is_reserved_namespace_name("victim.xns"));
         assert!(!is_reserved_namespace_name("alice.eth"));
         assert!(!is_reserved_namespace_name("alice.xyz"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_routes_xns_to_xns_contract() {
+        // `.xns` must hit the XNS contract via getAddress(label, namespace),
+        // not ENS. Only XNS is mocked, so a misroute would return None.
+        let net = CallMock::new();
+        let (to, cd) = xns::get_address_call("alice", "xns");
+        net.set_call(to, cd, abi_address(TARGET), true);
+        assert_eq!(resolve_name(&net, "alice.xns").await.unwrap(), Some(TARGET));
+    }
+
+    #[tokio::test]
+    async fn xns_forward_fails_closed_when_unverified() {
+        let net = CallMock::new();
+        let (to, cd) = xns::get_address_call("alice", "xns");
+        net.set_call(to, cd, abi_address(TARGET), false);
+        assert!(resolve_name(&net, "alice.xns").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn xns_reverse_returns_forward_verified_name() {
+        let net = CallMock::new();
+        let (gto, gcd) = xns::get_name_call(TARGET);
+        net.set_call(gto, gcd, abi_string("alice.crops"), true);
+        let (fto, fcd) = xns::get_address_call("alice", "crops");
+        net.set_call(fto, fcd, abi_address(TARGET), true);
+        assert_eq!(
+            xns_lookup_address(&net, TARGET).await.unwrap(),
+            Some("alice.crops".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn xns_reverse_rejects_first_class_tld() {
+        // XNS namespaces are permissionless, so a `.gwei` namespace *could* be
+        // registered in XNS — but `.gwei` is GNS's authority. An XNS reverse
+        // result in a first-class TLD must be discarded before forward-verify.
+        let net = CallMock::new();
+        let (gto, gcd) = xns::get_name_call(TARGET);
+        net.set_call(gto, gcd, abi_string("victim.gwei"), true);
+        assert_eq!(xns_lookup_address(&net, TARGET).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn xns_reverse_rejects_bare_name() {
+        // A bare XNS name (special `x` namespace) has no TLD; it would be
+        // ambiguous on a signing surface, so reverse skips it.
+        let net = CallMock::new();
+        let (gto, gcd) = xns::get_name_call(TARGET);
+        net.set_call(gto, gcd, abi_string("vitalik"), true);
+        assert_eq!(xns_lookup_address(&net, TARGET).await.unwrap(), None);
+    }
+
+    // The real wehi.crops ↔ 0xa149…451f pair, both directions, at the
+    // dispatcher level (custom XNS namespaces resolve via `xns_forward`, not the
+    // wallet-wide `resolve_name`, which only routes `.xns`).
+    #[tokio::test]
+    async fn wehi_crops_forward_resolves_to_real_address() {
+        let net = CallMock::new();
+        let wehi = address!("0xa1491eFf7CaC231440C8C0E6FaC043D8965C451f");
+        let (to, cd) = xns::get_address_call("wehi", "crops");
+        net.set_call(to, cd, abi_address(wehi), true);
+        assert_eq!(
+            xns_forward(&net, "wehi", "crops").await.unwrap(),
+            Some(wehi)
+        );
+    }
+
+    #[tokio::test]
+    async fn wehi_crops_reverse_resolves_from_real_address() {
+        let net = CallMock::new();
+        let wehi = address!("0xa1491eFf7CaC231440C8C0E6FaC043D8965C451f");
+        let (gto, gcd) = xns::get_name_call(wehi);
+        net.set_call(gto, gcd, abi_string("wehi.crops"), true);
+        // Forward-verification leg: getAddress("wehi","crops") == wehi.
+        let (fto, fcd) = xns::get_address_call("wehi", "crops");
+        net.set_call(fto, fcd, abi_address(wehi), true);
+        assert_eq!(
+            xns_lookup_address(&net, wehi).await.unwrap(),
+            Some("wehi.crops".to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_falls_through_to_xns_after_others() {
+        // ENS/GNS/WNS have no record; XNS does. The precedence walk should reach
+        // XNS and return its forward-verified name.
+        let net = CallMock::new();
+        let (gto, gcd) = xns::get_name_call(TARGET);
+        net.set_call(gto, gcd, abi_string("alice.xns"), true);
+        let (fto, fcd) = xns::get_address_call("alice", "xns");
+        net.set_call(fto, fcd, abi_address(TARGET), true);
+        assert_eq!(
+            lookup_address(&net, TARGET).await.unwrap(),
+            Some("alice.xns".to_string()),
+        );
     }
 
     #[tokio::test]
@@ -621,7 +820,7 @@ mod tests {
         let net = CallMock::new();
         let node = namehash(&normalize("alice.gwei").unwrap());
         net.set_call(
-            crate::gns::GNS.registry,
+            crate::names::gns::GNS.registry,
             calldata(ADDR_SELECTOR, node),
             abi_address(TARGET),
             true,
@@ -667,7 +866,7 @@ mod tests {
         let net = CallMock::new();
         let resolver = address!("0x1111111111111111111111111111111111111111");
         mock_ens_reverse(&net, TARGET, "alice.eth", resolver);
-        mock_nft_reverse(&net, crate::gns::GNS.registry, TARGET, "alice.gwei");
+        mock_nft_reverse(&net, crate::names::gns::GNS.registry, TARGET, "alice.gwei");
         assert_eq!(
             lookup_address(&net, TARGET).await.unwrap(),
             Some("alice.eth".to_string()),
@@ -678,8 +877,8 @@ mod tests {
     async fn reverse_prefers_gns_over_wns() {
         // ENS empty; GNS (.gwei) and WNS (.wei) both verify a name. GNS wins.
         let net = CallMock::new();
-        mock_nft_reverse(&net, crate::gns::GNS.registry, TARGET, "alice.gwei");
-        mock_nft_reverse(&net, crate::wns::WNS.registry, TARGET, "bob.wei");
+        mock_nft_reverse(&net, crate::names::gns::GNS.registry, TARGET, "alice.gwei");
+        mock_nft_reverse(&net, crate::names::wns::WNS.registry, TARGET, "bob.wei");
         assert_eq!(
             lookup_address(&net, TARGET).await.unwrap(),
             Some("alice.gwei".to_string()),

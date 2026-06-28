@@ -951,15 +951,15 @@ impl App {
     /// account. The signer of the currently-active account is parked so a
     /// cancel can return to the dashboard cheaply.
     fn begin_add_account(&mut self) -> iced::Task<Message> {
-        // Refuse to leave the dashboard while a send is in flight: the
-        // signer has been moved into the broadcast task, so
-        // `into_signer()` would return a `KaoSigner::ViewOnly` placeholder
-        // and the user would silently lose their real signer when the
-        // broadcast task finished and tried to put it back.
+        // Refuse to leave the dashboard while ANY signing op is in flight (a
+        // Send/Safe broadcast OR a CoW / name-service write): the signer has been
+        // moved into the in-flight task, so `into_signer()` would return a
+        // `KaoSigner::ViewOnly` placeholder and the user would silently lose their
+        // real signer when that task finished and tried to put it back.
         if let Screen::Wallet(screen) = &self.screen
-            && screen.is_send_busy()
+            && screen.is_signing_busy()
         {
-            warn!("add-account refused: send in flight");
+            warn!("add-account refused: signing op in flight");
             return iced::Task::perform(
                 async {
                     "transaction in flight; finish or cancel before adding an account".to_string()

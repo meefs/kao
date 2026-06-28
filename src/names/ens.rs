@@ -257,6 +257,25 @@ pub(crate) async fn verified_call(
     Ok(read.value)
 }
 
+/// Verified `eth_call` with caller-supplied calldata (selector + ABI-encoded
+/// args), for reads whose argument shape isn't a single `bytes32` node — e.g.
+/// the registrar/pricing reads in [`crate::names::manage`]. Same mainnet pin and
+/// fail-closed contract as [`verified_call`]: returns `Err` ([`UNVERIFIED`]) when
+/// the value came back over the raw-RPC fallback rather than Helios's verified
+/// path. These reads gate registration/renewal payment and ownership display, so
+/// an unverified answer is a hard failure, never a trusted value.
+pub(crate) async fn verified_call_raw(
+    net: &dyn BalanceFetcher,
+    to: Address,
+    calldata: Bytes,
+) -> Result<Bytes, String> {
+    let read = net.call(to, calldata, Chain::Mainnet).await?;
+    if !read.verified {
+        return Err(UNVERIFIED.to_string());
+    }
+    Ok(read.value)
+}
+
 /// Resolve the `addr` record for an already-namehashed node. Shared by
 /// `resolve_name` and the forward-verification step in `lookup_address`.
 async fn resolver_addr(net: &dyn BalanceFetcher, node: B256) -> Result<Option<Address>, String> {
