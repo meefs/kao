@@ -285,7 +285,7 @@ struct SafeState {
     threshold: u32,
     linked_local_indices: Vec<u32>,
     signable_indices: Vec<u32>,
-    linked_local_addresses: Vec<Address>,
+    signable_addresses: Vec<Address>,
     unsupported_owner_kinds: Vec<&'static str>,
     owner_count: usize,
     proposed: bool,
@@ -352,25 +352,26 @@ impl SendPane {
 
     pub fn new_safe(safe: &SafeDescriptor, accounts: &[AccountDescriptor]) -> Self {
         let mut linked_local_indices = Vec::new();
-        let mut linked_local_addresses = Vec::new();
         let mut signable_indices = Vec::new();
+        let mut signable_addresses = Vec::new();
         let mut unsupported_owner_kinds = Vec::new();
         for &idx in &safe.linked_signer_indices {
             match accounts.get(idx as usize) {
-                Some(acc @ AccountDescriptor::Local { .. }) => {
-                    linked_local_indices.push(idx);
+                // Local **and** hardware owners can sign: software via a
+                // local key, Ledger/Trezor on-device through EIP-712. Only
+                // view-only owners (no key material) are unsupported.
+                Some(
+                    acc @ (AccountDescriptor::Local { .. }
+                    | AccountDescriptor::Ledger { .. }
+                    | AccountDescriptor::Trezor { .. }),
+                ) => {
                     signable_indices.push(idx);
-                    if let Some(addr) = account_address(acc) {
-                        linked_local_addresses.push(addr);
+                    if matches!(acc, AccountDescriptor::Local { .. }) {
+                        linked_local_indices.push(idx);
                     }
-                }
-                Some(AccountDescriptor::Ledger { .. }) => {
-                    signable_indices.push(idx);
-                    unsupported_owner_kinds.push("Ledger");
-                }
-                Some(AccountDescriptor::Trezor { .. }) => {
-                    signable_indices.push(idx);
-                    unsupported_owner_kinds.push("Trezor");
+                    if let Some(addr) = account_address(acc) {
+                        signable_addresses.push(addr);
+                    }
                 }
                 Some(AccountDescriptor::ViewOnly { .. }) => {
                     unsupported_owner_kinds.push("View only")
@@ -404,7 +405,7 @@ impl SendPane {
                 threshold: safe.threshold,
                 linked_local_indices,
                 signable_indices,
-                linked_local_addresses,
+                signable_addresses,
                 unsupported_owner_kinds,
                 owner_count: safe.owners.len(),
                 proposed: false,
@@ -583,9 +584,13 @@ impl SendPane {
         0
     }
 
-    pub fn has_enough_local_signers(&self) -> bool {
+    /// True when this wallet holds at least `threshold` *signable* linked
+    /// owners (Local or hardware) — enough to sign and broadcast the Safe
+    /// transaction directly, rather than proposing to remote co-signers.
+    /// A 1/1 Safe owned by a single Ledger/Trezor satisfies this.
+    pub fn has_enough_signable_signers(&self) -> bool {
         self.safe()
-            .is_some_and(|s| (s.linked_local_indices.len() as u32) >= s.threshold)
+            .is_some_and(|s| (s.signable_indices.len() as u32) >= s.threshold)
     }
     pub fn has_any_signable(&self) -> bool {
         self.safe().is_some_and(|s| !s.signable_indices.is_empty())
@@ -627,7 +632,7 @@ impl SendPane {
             SendMode::Safe(s) => {
                 !self.busy
                     && !self.settled()
-                    && self.has_enough_local_signers()
+                    && self.has_enough_signable_signers()
                     && self.can_continue_recipient()
                     && s.prepared.is_some()
             }
@@ -727,7 +732,6 @@ impl SendPane {
             amount_units,
             token: send_token,
             threshold: s.threshold,
-            linked_local_indices: s.linked_local_indices.clone(),
             signable_indices: s.signable_indices.clone(),
             prepared: s.prepared.map(|(nonce, safe_tx_hash)| PreparedSafeTx {
                 nonce,
@@ -2672,7 +2676,7 @@ impl SendPane {
         // Signing card
         let threshold_label = self.threshold_label();
         let mut owners_col = column![].spacing(4);
-        let signing = s.linked_local_addresses.iter().take(s.threshold as usize);
+        let signing = s.signable_addresses.iter().take(s.threshold as usize);
         for (i, addr) in signing.enumerate() {
             let kao = kaomoji_for_index(i);
             owners_col = owners_col.push(
@@ -2732,7 +2736,7 @@ impl SendPane {
         let can_propose = self.can_propose();
         let mut propose_btn = primary_button(
             t,
-            if self.busy && !self.has_enough_local_signers() {
+            if self.busy && !self.has_enough_signable_signers() {
                 "Proposing…"
             } else if sim_revert {
                 "Propose anyway ⚠"
@@ -2745,7 +2749,7 @@ impl SendPane {
             propose_btn = propose_btn.on_press(Message::Propose);
         }
 
-        let action_row: Element<'_, Message> = if self.has_enough_local_signers() {
+        let action_row: Element<'_, Message> = if self.has_enough_signable_signers() {
             let can_exec = self.can_execute_now();
             let mut exec_btn = primary_button(
                 t,
@@ -3330,7 +3334,6 @@ pub struct SafeSendRequest {
     pub amount_units: U256,
     pub token: SendToken,
     pub threshold: u32,
-    pub linked_local_indices: Vec<u32>,
     pub signable_indices: Vec<u32>,
     pub prepared: Option<PreparedSafeTx>,
 }

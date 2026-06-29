@@ -329,7 +329,7 @@ pub async fn sign_and_send(
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "sign+send: sign failed");
-            return Err(format!("sign failed: {e}"));
+            return Err(crate::wallet::friendly_signer_error(&e));
         }
     };
     debug!("sign+send: signed");

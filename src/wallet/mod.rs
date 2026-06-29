@@ -530,17 +530,18 @@ impl KaoSigner {
         }
     }
 
-    /// Sign a precomputed 32-byte hash. Used by the Safe-TX flow,
-    /// which computes the EIP-712 signing hash locally (and
-    /// cross-checks it against the Safe's `getTransactionHash`)
-    /// then signs the bare hash as `r ‖ s ‖ v` with `v ∈ {27, 28}`.
+    /// Sign a precomputed 32-byte hash as bare `r ‖ s ‖ v` with
+    /// `v ∈ {27, 28}`. The Safe flow no longer calls this directly — it
+    /// drives every owner through [`Self::sign_eip712`] so software and
+    /// hardware share one path — but it's retained as the reference the
+    /// `local_eip712_matches_sign_hash` test pins that path against.
     ///
     /// Hardware variants return `UnsupportedOperation` on purpose:
     /// Ledger's Ethereum app refuses bare-hash signing under its
     /// blind-signing policy, and Trezor likewise. Device EIP-712
     /// signing needs the structured-fields APDU path
-    /// (`sign_typed_data_v4`) — a separate slice. `ViewOnly` has no
-    /// key.
+    /// (`sign_typed_data_v4`). `ViewOnly` has no key.
+    #[allow(dead_code)]
     pub async fn sign_hash(&self, hash: B256) -> Result<Signature, alloy::signers::Error> {
         match self {
             KaoSigner::Local(s) => s.sign_hash(&hash).await,
@@ -601,6 +602,44 @@ impl KaoSigner {
                 alloy::signers::UnsupportedSignerOperation::SignMessage,
             )),
         }
+    }
+}
+
+/// Turn a raw signer error into a line a human can act on.
+///
+/// Hardware wallets surface the bare APDU status word from the device, which is
+/// opaque ("APDU Response error `Code 6985 …`"). The two cases users actually
+/// hit on a contract call both come back as `6985 CONDITIONS_NOT_SATISFIED`:
+/// declining the on-device prompt, and having **Blind signing** disabled in the
+/// Ledger Ethereum app (it refuses calldata it can't decode). Since our name /
+/// swap / Safe calls can't be clear-signed, those collapse into one actionable
+/// message instead of leaking the status word. A locked device / no-app-open
+/// (`6511`, `6e00`, `6d00`) gets its own hint; everything else falls back to the
+/// raw text so we never hide a genuinely novel failure.
+pub fn friendly_signer_error(e: &alloy::signers::Error) -> String {
+    friendly_signer_error_text(&e.to_string())
+}
+
+/// Inner string-matcher for [`friendly_signer_error`], split out so the APDU
+/// classification is unit-testable without fabricating an `alloy` error.
+fn friendly_signer_error_text(raw: &str) -> String {
+    let low = raw.to_lowercase();
+    let has = |needle: &str| low.contains(needle);
+    if has("6985")
+        || has("conditions_not_satisfied")
+        || has("conditions of use")
+        || has("denied")
+        || has("rejected")
+        || has("cancel")
+    {
+        "rejected on your hardware wallet — approve the transaction on the device, and make sure \
+         \"Blind signing\" is enabled in its Ethereum app"
+            .to_string()
+    } else if has("6511") || has("6e00") || has("6d00") || has("no device") || has("not found") {
+        "couldn't reach your hardware wallet — unlock it and open the Ethereum app, then try again"
+            .to_string()
+    } else {
+        format!("sign failed: {raw}")
     }
 }
 
@@ -784,6 +823,26 @@ pub fn account_short_address(account: &AccountDescriptor) -> String {
 mod tests {
     use super::*;
     use alloy::primitives::U256;
+
+    #[test]
+    fn friendly_signer_error_maps_ledger_apdu_codes() {
+        // The exact string a declining / blind-signing-disabled Ledger surfaces.
+        let rejected = friendly_signer_error_text(
+            "Ledger device: APDU Response error `Code 6985 \
+             ([APDU_CODE_CONDITIONS_NOT_SATISFIED] Conditions of use not satisfied)`",
+        );
+        assert!(rejected.contains("Blind signing"), "got: {rejected}");
+        assert!(!rejected.contains("6985"), "raw APDU code leaked: {rejected}");
+
+        // Locked device / no app open → the reach-the-device hint.
+        let unreachable = friendly_signer_error_text("Ledger device: APDU error `Code 6511`");
+        assert!(unreachable.contains("open the Ethereum app"), "got: {unreachable}");
+
+        // Anything we don't recognise is passed through verbatim (prefixed),
+        // so a novel failure is never hidden behind a canned message.
+        let other = friendly_signer_error_text("nonce too low");
+        assert_eq!(other, "sign failed: nonce too low");
+    }
 
     #[test]
     fn account_postcard_roundtrip_local() {

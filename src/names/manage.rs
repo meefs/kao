@@ -160,6 +160,20 @@ impl Registry {
         format!("{label}{}", self.tld())
     }
 
+    /// The contract the registration transaction calls — the ENS/GNS/WNS
+    /// controller (commit, then reveal/register), or the XNS registry. Shown in
+    /// the pre-sign review so a user approving a blind-signing prompt on a
+    /// hardware wallet can verify the destination, since the calldata itself
+    /// isn't device-decodable.
+    pub fn registrar_contract(&self) -> Address {
+        match self {
+            Registry::Ens => registrar::ENS_CONTROLLER,
+            Registry::Gns => Namespace::Gns.nft_contract().expect("nft namespace"),
+            Registry::Wns => Namespace::Wns.nft_contract().expect("nft namespace"),
+            Registry::Xns { .. } => xns::XNS_REGISTRY,
+        }
+    }
+
     /// Commit-reveal registrars support renewal and re-pointing (`setAddr`); XNS
     /// names are permanent + immutable, so neither applies. Gates the Manage
     /// affordance, which offers both.

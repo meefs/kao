@@ -39,6 +39,13 @@ use crate::ui::kao_widgets::{
 const MIN_YEARS: u32 = 1;
 const MAX_YEARS: u32 = 10;
 
+/// Auto-search debounce: poll cadence while there's unsubmitted input, and the
+/// number of quiet polls (each keystroke resets the count) before the search
+/// fires on its own. ~2 × 250ms ⇒ the search lands roughly a third of a second
+/// after the user stops typing.
+const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(250);
+const DEBOUNCE_TICKS: u32 = 2;
+
 // Kaomoji palette for the surface.
 const KAO_MASCOT: &str = "(๑>؂•̀๑)";
 const KAO_AVAILABLE: &str = "(๑ᵔ⤙ᵔ๑)";
@@ -49,6 +56,9 @@ pub enum Message {
     // ── search ──
     QueryChanged(String),
     Search,
+    /// Debounce heartbeat: fires the cross-namespace search automatically once
+    /// typing has settled, so the user doesn't have to press Enter.
+    DebounceTick,
     Refresh,
     // ── owned: manual add ──
     AddInputChanged(String),
@@ -78,10 +88,21 @@ pub enum Message {
 pub enum Outcome {
     /// Discover names that resolve to the active account (reverse lookup).
     ReverseScan,
-    /// Check `label` across `registries` (availability + price).
+    /// Check `label` across `registries` (availability + price). `seq` round-trips
+    /// so a reply for a superseded query can be dropped (see [`NamesApp::on_search`]).
     Search {
+        seq: u64,
         label: String,
         registries: Vec<Registry>,
+    },
+    /// Re-price an ENS registration for a new term (read-only). Only ENS, whose
+    /// rent scales with the duration; the result refreshes the panel's quote so
+    /// the price shown matches the years the user picked. `years` round-trips so
+    /// a result that lands after the user has clicked again can be dropped.
+    Quote {
+        namespace: Namespace,
+        label: String,
+        years: u32,
     },
     /// Verify one manually-entered name's status (for manual add).
     Status { registry: Registry, label: String },
@@ -146,6 +167,9 @@ struct RegisterFlow {
     label: String,
     full: String,
     years: u32,
+    /// An ENS re-quote (after a duration change) is in flight — the price shows
+    /// "calculating…" until [`NamesApp::on_quote`] lands.
+    quoting: bool,
     phase: RegPhase,
 }
 
@@ -159,8 +183,15 @@ pub struct NamesApp {
     // Search
     query: String,
     searching: bool,
-    /// The bare label the current `results` are for (drives "yours" filtering).
-    result_label: Option<String>,
+    /// Monotonic search id, bumped on every edit and per [`NamesApp::run_search`],
+    /// round-tripped through the reply so a slow result for a query the user has
+    /// since changed is dropped instead of painting over the current one.
+    search_seq: u64,
+    /// An auto-search is scheduled: the box has text the user hasn't submitted yet.
+    /// Drives the debounce subscription and the in-progress display.
+    pending_search: bool,
+    /// Quiet [`DEBOUNCE_INTERVAL`] polls since the last keystroke; reset on edit.
+    idle_ticks: u32,
     results: Vec<SearchHit>,
 
     // Owned (reverse lookup + manual add)
@@ -188,7 +219,9 @@ impl NamesApp {
             loaded: false,
             query: String::new(),
             searching: false,
-            result_label: None,
+            search_seq: 0,
+            pending_search: false,
+            idle_ticks: 0,
             results: Vec::new(),
             owned: Vec::new(),
             scanning: false,
@@ -214,18 +247,22 @@ impl NamesApp {
         Some(Outcome::ReverseScan)
     }
 
-    /// A 1-second tick drives the commit→reveal countdown; only subscribed while
-    /// the register flow is in a time-sensitive phase.
+    /// Two independent timers, each subscribed only while it's needed: a 1-second
+    /// tick driving the commit→reveal countdown, and a faster debounce poll that
+    /// auto-fires the search once typing settles.
     pub fn subscription(&self) -> Subscription<Message> {
-        let active = matches!(
+        let reg_active = matches!(
             self.reg.as_ref().map(|r| &r.phase),
             Some(RegPhase::Committing | RegPhase::Waiting { .. } | RegPhase::Registering)
         );
-        if active {
-            iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick)
-        } else {
-            Subscription::none()
+        let mut subs = Vec::new();
+        if reg_active {
+            subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick));
         }
+        if self.pending_search {
+            subs.push(iced::time::every(DEBOUNCE_INTERVAL).map(|_| Message::DebounceTick));
+        }
+        Subscription::batch(subs)
     }
 
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
@@ -235,9 +272,37 @@ impl NamesApp {
             // ── search ──
             Message::QueryChanged(s) => {
                 self.query = s;
+                // Any edit makes the on-screen rows stale: drop them at once (so
+                // the previous query's results can't show under the new text) and
+                // invalidate a search already in flight — its reply is dropped by
+                // the seq guard in `on_search`.
+                self.results.clear();
+                self.searching = false;
+                self.search_seq += 1;
+                self.idle_ticks = 0;
+                // Non-empty box ⇒ schedule an auto-search; empty ⇒ leave search mode.
+                self.pending_search = !self.query.trim().is_empty();
                 None
             }
             Message::Search => self.run_search(),
+            Message::DebounceTick => {
+                if !self.pending_search {
+                    return None;
+                }
+                self.idle_ticks += 1;
+                if self.idle_ticks < DEBOUNCE_TICKS {
+                    return None;
+                }
+                // Typing has settled. Only auto-fire a query that parses cleanly —
+                // a half-typed one (e.g. "cow.") just waits for more input rather
+                // than flashing a parse error the user didn't ask for.
+                self.pending_search = false;
+                if crate::names::manage::parse_query(&self.query).is_ok() {
+                    self.run_search()
+                } else {
+                    None
+                }
+            }
             Message::Refresh => {
                 if self.scanning {
                     return None;
@@ -298,6 +363,7 @@ impl NamesApp {
                         label: hit.label.clone(),
                         full: hit.full.clone(),
                         years: 1,
+                        quoting: false,
                         phase: RegPhase::Ready { quote: *quote },
                     });
                     self.view = View::Register;
@@ -305,16 +371,18 @@ impl NamesApp {
                 None
             }
             Message::YearsDec => {
+                let prev = self.reg.as_ref().map(|r| r.years);
                 if let Some(r) = &mut self.reg {
                     r.years = r.years.saturating_sub(1).max(MIN_YEARS);
                 }
-                None
+                self.requote_if_changed(prev)
             }
             Message::YearsInc => {
+                let prev = self.reg.as_ref().map(|r| r.years);
                 if let Some(r) = &mut self.reg {
                     r.years = (r.years + 1).min(MAX_YEARS);
                 }
-                None
+                self.requote_if_changed(prev)
             }
             Message::StartRegister => self.start_register(),
             Message::CompleteRegister => self.complete_register(),
@@ -381,32 +449,59 @@ impl NamesApp {
         }
     }
 
-    /// Parse the search bar and emit the cross-namespace check.
+    /// Parse the search bar and emit the cross-namespace check. Cancels any
+    /// scheduled auto-search (this *is* the search) and supersedes an in-flight one.
     fn run_search(&mut self) -> Option<Outcome> {
-        match crate::names::manage::parse_query(&self.query) {
-            Ok(Query::Bare(label)) => {
-                self.searching = true;
-                self.notice = None;
-                self.result_label = Some(label.clone());
-                Some(Outcome::Search {
-                    label,
-                    registries: Registry::defaults(),
-                })
-            }
-            Ok(Query::One { registry, label }) => {
-                self.searching = true;
-                self.notice = None;
-                self.result_label = Some(label.clone());
-                Some(Outcome::Search {
-                    label,
-                    registries: vec![registry],
-                })
-            }
+        self.pending_search = false;
+        let parsed = match crate::names::manage::parse_query(&self.query) {
+            Ok(q) => q,
             Err(e) => {
                 self.notice = Some((true, e));
-                None
+                return None;
             }
+        };
+        // Drop the previous run's rows so the in-flight view shows the "checking…"
+        // hint instead of stale results; the bumped seq drops a late reply for an
+        // earlier query.
+        self.results.clear();
+        self.searching = true;
+        self.notice = None;
+        self.search_seq += 1;
+        let seq = self.search_seq;
+        match parsed {
+            Query::Bare(label) => Some(Outcome::Search {
+                seq,
+                label,
+                registries: Registry::defaults(),
+            }),
+            Query::One { registry, label } => Some(Outcome::Search {
+                seq,
+                label,
+                registries: vec![registry],
+            }),
         }
+    }
+
+    /// After the duration stepper moves, kick off a fresh ENS quote so the
+    /// displayed price tracks the chosen term. No-op for non-ENS (only ENS shows
+    /// the stepper and scales with duration) or if the value didn't actually
+    /// change (already at a bound), so a click on a disabled bound doesn't spam
+    /// reads.
+    fn requote_if_changed(&mut self, prev_years: Option<u32>) -> Option<Outcome> {
+        let r = self.reg.as_mut()?;
+        if Some(r.years) == prev_years {
+            return None;
+        }
+        let ns = r.registry.legacy()?;
+        if ns != Namespace::Ens || !matches!(r.phase, RegPhase::Ready { .. }) {
+            return None;
+        }
+        r.quoting = true;
+        Some(Outcome::Quote {
+            namespace: ns,
+            label: r.label.clone(),
+            years: r.years,
+        })
     }
 
     /// Begin registration for the focused name — commit (legacy) or one-shot
@@ -478,7 +573,13 @@ impl NamesApp {
         }
     }
 
-    pub fn on_search(&mut self, result: Result<Vec<SearchHit>, String>) {
+    pub fn on_search(&mut self, seq: u64, result: Result<Vec<SearchHit>, String>) {
+        // Ignore a reply for a search the user has already moved past: it would
+        // otherwise clear the spinner and paint the old query's rows under the
+        // one now in flight (or leave `searching` wrongly false).
+        if seq != self.search_seq {
+            return;
+        }
         self.searching = false;
         match result {
             Ok(hits) => self.results = hits,
@@ -486,6 +587,24 @@ impl NamesApp {
                 self.results.clear();
                 self.notice = Some((true, e));
             }
+        }
+    }
+
+    /// Result of a duration-change re-quote (ENS). Refreshes the panel's price.
+    /// Dropped if the user has since changed the term again (the in-flight
+    /// `years` no longer matches the panel) or has left the Ready phase.
+    pub fn on_quote(
+        &mut self,
+        years: u32,
+        result: Result<crate::names::manage::RegisterQuote, String>,
+    ) {
+        let Some(r) = &mut self.reg else { return };
+        if r.years != years {
+            return;
+        }
+        r.quoting = false;
+        if let RegPhase::Ready { quote } = &mut r.phase {
+            *quote = result.ok();
         }
     }
 
@@ -520,11 +639,60 @@ impl NamesApp {
     }
 
     pub fn on_register(&mut self, result: Result<(String, TxHash), String>) {
-        let Some(r) = &mut self.reg else { return };
-        match result {
-            Ok(_) => r.phase = RegPhase::Done,
-            Err(e) => r.phase = RegPhase::Failed(e),
+        // Pull the registered target out of the flow (and flip its phase) before
+        // touching the rest of `self`, so the success path can update the search
+        // row and owned list without holding the `self.reg` borrow.
+        let registered = match result {
+            Ok(_) => {
+                let Some(r) = &mut self.reg else { return };
+                r.phase = RegPhase::Done;
+                Some((r.registry.clone(), r.label.clone(), r.full.clone(), r.years))
+            }
+            Err(e) => {
+                if let Some(r) = &mut self.reg {
+                    r.phase = RegPhase::Failed(e);
+                }
+                None
+            }
+        };
+        if let Some((registry, label, full, years)) = registered {
+            self.register_succeeded(&registry, &label, &full, years);
         }
+    }
+
+    /// Reflect a just-broadcast registration locally — without a read-back, since
+    /// the tx isn't mined yet and a verified status read would still see the name
+    /// as free. (a) The search row that offered this name flips to "you own this"
+    /// (no more Register button); (b) the name joins "Your names" with the facts
+    /// we just signed: owner + recipient are the signing account (the commit-reveal
+    /// reveal mints to `msg.sender`; XNS binds both to `msg.sender` immutably), and
+    /// the expiry follows the term (ENS scales with the chosen years; GNS/WNS grant
+    /// a fixed 1-year term; XNS names are permanent). A later Refresh re-verifies.
+    fn register_succeeded(&mut self, registry: &Registry, label: &str, full: &str, years: u32) {
+        if let Some(hit) = self
+            .results
+            .iter_mut()
+            .find(|h| &h.registry == registry && h.label == label)
+        {
+            hit.status = HitStatus::Taken {
+                owner: Some(self.owner),
+            };
+        }
+        let now = crate::names::manage::now_secs();
+        let expires_at = match registry {
+            Registry::Ens => Some(now + registrar::ens_duration_secs(years)),
+            Registry::Gns | Registry::Wns => Some(now + registrar::YEAR_SECONDS),
+            Registry::Xns { .. } => None,
+        };
+        self.merge_owned(vec![NameStatus {
+            registry: registry.clone(),
+            label: label.to_string(),
+            full: full.to_string(),
+            expires_at,
+            now,
+            owner: Some(self.owner),
+            recipient: Some(self.owner),
+        }]);
     }
 
     pub fn on_renew(&mut self, result: Result<(String, TxHash), String>) {
@@ -640,15 +808,14 @@ impl NamesApp {
             body = body.push(Space::new().height(8));
         }
 
-        let has_query = self.result_label.is_some() && !self.query.trim().is_empty();
+        // Search mode begins the moment there's text in the box — the rows below
+        // track what's typed now, not the last submitted query.
+        let trimmed = self.query.trim();
+        let has_query = !trimmed.is_empty();
 
-        // ── "Your names" — reverse-discovered + manually added, filtered by the
-        //    active query so the search bar searches over them too.
-        let filter = self
-            .result_label
-            .as_deref()
-            .filter(|_| has_query)
-            .map(str::to_ascii_lowercase);
+        // ── "Your names" — reverse-discovered + manually added, filtered live by
+        //    the typed text so the search bar searches over them too.
+        let filter = has_query.then(|| trimmed.to_ascii_lowercase());
         let owned_rows: Vec<&NameStatus> = self
             .owned
             .iter()
@@ -694,7 +861,10 @@ impl NamesApp {
             body = body.push(Space::new().height(18));
             body = body.push(section_label(t, "ACROSS NAMESPACES"));
             body = body.push(Space::new().height(8));
-            if self.searching && self.results.is_empty() {
+            if self.pending_search || self.searching {
+                // Typing in progress, debounce pending, or a search in flight —
+                // show the progress hint, never the previous query's rows (which
+                // were cleared on the edit anyway).
                 body = body.push(empty_hint(t, "Checking every namespace…"));
             } else {
                 let mut list = column![].spacing(8).width(Length::Fill);
@@ -907,15 +1077,39 @@ impl NamesApp {
     fn reg_phase_view<'a>(&self, t: KaoTheme, r: &'a RegisterFlow) -> Element<'a, Message> {
         match &r.phase {
             RegPhase::Ready { quote } => {
-                let price = match quote {
+                let total = match quote {
                     Some(q) if q.total == U256::ZERO => "free".to_string(),
                     Some(q) => format!("≈ {} ETH", fmt_eth(q.total)),
                     None => "price unavailable".to_string(),
+                };
+                let price = if r.quoting {
+                    "calculating…".to_string()
+                } else {
+                    total.clone()
                 };
                 let btn_label = if r.registry.is_commit_reveal() {
                     "Register — step 1 of 2 (commit)"
                 } else {
                     "Register"
+                };
+                // What the *first* transaction actually moves: the commit step
+                // sends nothing (the fee is attached to the step-2 reveal); the
+                // XNS one-shot sends the price up front.
+                let sends = if r.registry.is_commit_reveal() {
+                    "nothing this step — fee is sent at step 2".to_string()
+                } else if r.quoting {
+                    "calculating…".to_string()
+                } else {
+                    total
+                };
+                let review = self.sign_review(t, r.registry.registrar_contract(), sends);
+                // Hold the action while a re-quote is in flight so a name can't
+                // be committed against a stale price.
+                let btn = primary_button(t, btn_label, !r.quoting);
+                let btn = if r.quoting {
+                    btn
+                } else {
+                    btn.on_press(Message::StartRegister)
                 };
                 column![
                     text(price).size(18).color(t.text).font(bold()),
@@ -924,7 +1118,9 @@ impl NamesApp {
                         .size(11)
                         .color(t.sub),
                     Space::new().height(16),
-                    primary_button(t, btn_label, true).on_press(Message::StartRegister),
+                    review,
+                    Space::new().height(16),
+                    btn,
                 ]
                 .into()
             }
@@ -957,6 +1153,12 @@ impl NamesApp {
                     column![
                         status_line(t, "Ready to finish.", t.up),
                         Space::new().height(10),
+                        self.sign_review(
+                            t,
+                            r.registry.registrar_contract(),
+                            "the registration fee (excess refunded)".to_string(),
+                        ),
+                        Space::new().height(12),
                         primary_button(t, "Complete registration — step 2 of 2", true)
                             .on_press(Message::CompleteRegister),
                     ]
@@ -977,6 +1179,46 @@ impl NamesApp {
             ]
             .into(),
         }
+    }
+
+    /// A compact "what you'll sign" card shown before each on-chain step. The
+    /// registrar calls aren't clear-signable, so a hardware wallet asks the user
+    /// to blind-sign them — this is the only place they can check the destination
+    /// contract and the ETH the step moves before approving on the device.
+    fn sign_review<'a>(
+        &self,
+        t: KaoTheme,
+        contract: Address,
+        sends: String,
+    ) -> Element<'a, Message> {
+        let label_w = Length::Fixed(64.0);
+        column![
+            text("You'll sign — verify on your device before approving")
+                .size(11)
+                .color(t.sub),
+            Space::new().height(8),
+            row![
+                text("Contract").size(12).color(t.sub).width(label_w),
+                colored_address(t, contract),
+            ]
+            .align_y(Alignment::Center),
+            Space::new().height(4),
+            row![
+                text("Sends").size(12).color(t.sub).width(label_w),
+                text(sends).size(12).color(t.text).font(mono()),
+            ]
+            .align_y(Alignment::Center),
+            Space::new().height(8),
+            text(
+                "A hardware wallet can't decode this call — check the contract above matches, \
+                 then approve the blind-signing prompt."
+            )
+            .size(10)
+            .color(t.sub),
+        ]
+        .padding(Padding::from([12, 14]))
+        .width(Length::Fill)
+        .into()
     }
 
     fn years_stepper<'a>(&self, t: KaoTheme, years: u32) -> Element<'a, Message> {
@@ -1348,7 +1590,9 @@ mod tests {
         a.update(Message::QueryChanged("rat".into()));
         let out = a.update(Message::Search);
         match out {
-            Some(Outcome::Search { label, registries }) => {
+            Some(Outcome::Search {
+                label, registries, ..
+            }) => {
                 assert_eq!(label, "rat");
                 assert_eq!(registries.len(), 5);
             }
@@ -1363,7 +1607,9 @@ mod tests {
         a.update(Message::QueryChanged("cow.cheese".into()));
         let out = a.update(Message::Search);
         match out {
-            Some(Outcome::Search { label, registries }) => {
+            Some(Outcome::Search {
+                label, registries, ..
+            }) => {
                 assert_eq!(label, "cow");
                 assert_eq!(
                     registries,
@@ -1402,6 +1648,93 @@ mod tests {
             a.reg.as_ref().unwrap().phase,
             RegPhase::Registering
         ));
+    }
+
+    #[test]
+    fn ens_duration_change_requotes_and_drops_stale_results() {
+        let mut a = app();
+        let one_year = crate::names::manage::RegisterQuote {
+            base: U256::from(100u64),
+            premium: U256::ZERO,
+            total: U256::from(100u64),
+            duration_secs: registrar::YEAR_SECONDS,
+        };
+        a.results = vec![SearchHit {
+            registry: Registry::Ens,
+            label: "vitalik".to_string(),
+            full: "vitalik.eth".to_string(),
+            status: HitStatus::Available {
+                quote: Some(one_year),
+            },
+        }];
+        a.update(Message::PickResult(0));
+        assert_eq!(a.reg.as_ref().unwrap().years, 1);
+
+        // Bumping the term re-quotes for the new duration and marks the panel busy.
+        let out = a.update(Message::YearsInc);
+        match out {
+            Some(Outcome::Quote {
+                namespace,
+                label,
+                years,
+            }) => {
+                assert_eq!(namespace, Namespace::Ens);
+                assert_eq!(label, "vitalik");
+                assert_eq!(years, 2);
+            }
+            _ => panic!("expected Quote, got {out:?}"),
+        }
+        assert!(a.reg.as_ref().unwrap().quoting);
+
+        // A result for the *current* term lands → price refreshes, busy clears.
+        let two_year = crate::names::manage::RegisterQuote {
+            base: U256::from(200u64),
+            premium: U256::ZERO,
+            total: U256::from(200u64),
+            duration_secs: registrar::ens_duration_secs(2),
+        };
+        a.on_quote(2, Ok(two_year));
+        assert!(!a.reg.as_ref().unwrap().quoting);
+        match &a.reg.as_ref().unwrap().phase {
+            RegPhase::Ready { quote: Some(q) } => assert_eq!(q.total, U256::from(200u64)),
+            other => panic!("expected refreshed Ready quote, got {other:?}"),
+        }
+
+        // A late result for a superseded term (years == 1) is ignored.
+        let stale = crate::names::manage::RegisterQuote {
+            base: U256::from(100u64),
+            premium: U256::ZERO,
+            total: U256::from(100u64),
+            duration_secs: registrar::YEAR_SECONDS,
+        };
+        a.on_quote(1, Ok(stale));
+        match &a.reg.as_ref().unwrap().phase {
+            RegPhase::Ready { quote: Some(q) } => {
+                assert_eq!(q.total, U256::from(200u64), "stale re-quote must not win")
+            }
+            other => panic!("expected Ready quote, got {other:?}"),
+        }
+
+        // Clamped at the lower bound: a no-op step doesn't spawn a read.
+        a.update(Message::YearsDec); // 2 -> 1
+        let out = a.update(Message::YearsDec); // already at MIN_YEARS
+        assert!(out.is_none(), "no re-quote when the term didn't change");
+    }
+
+    #[test]
+    fn non_ens_duration_change_does_not_requote() {
+        // GNS grants a fixed term and has no stepper, so a stray YearsInc must
+        // not emit a read.
+        let mut a = app();
+        a.results = vec![SearchHit {
+            registry: Registry::Gns,
+            label: "apoorv".to_string(),
+            full: "apoorv.gwei".to_string(),
+            status: HitStatus::Available { quote: None },
+        }];
+        a.update(Message::PickResult(0));
+        assert!(a.update(Message::YearsInc).is_none());
+        assert!(!a.reg.as_ref().unwrap().quoting);
     }
 
     #[test]
@@ -1470,6 +1803,7 @@ mod tests {
             label: "apoorv".into(),
             full: "apoorv.gwei".into(),
             years: 1,
+            quoting: false,
             phase: RegPhase::Waiting {
                 plan: RegisterPlan {
                     namespace: Namespace::Gns,
@@ -1540,5 +1874,178 @@ mod tests {
         let out = a.update(Message::SetRecipient);
         assert!(matches!(out, Some(Outcome::SetRecipient { .. })));
         assert!(a.manage_busy);
+    }
+
+    #[test]
+    fn editing_query_clears_stale_results_immediately() {
+        let mut a = app();
+        // A prior search's rows are sitting in the pane.
+        a.results = vec![SearchHit {
+            registry: Registry::Ens,
+            label: "old".to_string(),
+            full: "old.eth".to_string(),
+            status: HitStatus::Taken { owner: None },
+        }];
+        // Typing a single char drops them at once (no waiting for Enter) and
+        // schedules an auto-search — so the old rows never show under new text.
+        a.update(Message::QueryChanged("new".into()));
+        assert!(a.results.is_empty(), "stale rows cleared on edit");
+        assert!(!a.searching);
+        assert!(a.pending_search, "auto-search scheduled");
+
+        // Pressing Search (or Enter) fires immediately and cancels the debounce.
+        let out = a.update(Message::Search);
+        assert!(matches!(out, Some(Outcome::Search { .. })));
+        assert!(a.searching);
+        assert!(!a.pending_search, "manual search consumes the debounce");
+    }
+
+    #[test]
+    fn clearing_the_box_leaves_search_mode() {
+        let mut a = app();
+        a.update(Message::QueryChanged("kitty".into()));
+        assert!(a.pending_search);
+        a.update(Message::QueryChanged("   ".into())); // whitespace-only ⇒ empty
+        assert!(!a.pending_search, "no auto-search for an empty box");
+        assert!(a.results.is_empty());
+    }
+
+    #[test]
+    fn auto_search_fires_after_typing_settles() {
+        let mut a = app();
+        a.update(Message::QueryChanged("kitty".into()));
+        assert!(a.pending_search);
+        // One quiet tick isn't enough — the debounce needs the full settle window.
+        assert!(a.update(Message::DebounceTick).is_none());
+        assert!(a.pending_search);
+        // The threshold tick fires the search on its own.
+        match a.update(Message::DebounceTick) {
+            Some(Outcome::Search { label, .. }) => assert_eq!(label, "kitty"),
+            other => panic!("expected auto Search, got {other:?}"),
+        }
+        assert!(!a.pending_search, "debounce consumed");
+        assert!(a.searching);
+    }
+
+    #[test]
+    fn typing_resets_the_debounce() {
+        let mut a = app();
+        a.update(Message::QueryChanged("ki".into()));
+        a.update(Message::DebounceTick); // idle_ticks = 1
+        a.update(Message::QueryChanged("kit".into())); // a keystroke resets it
+        assert!(
+            a.update(Message::DebounceTick).is_none(),
+            "reset — needs another full quiet window"
+        );
+        assert!(matches!(
+            a.update(Message::DebounceTick),
+            Some(Outcome::Search { .. })
+        ));
+    }
+
+    #[test]
+    fn auto_search_waits_on_unparseable_query() {
+        let mut a = app();
+        a.update(Message::QueryChanged("cow.".into())); // half-typed ⇒ parse error
+        a.update(Message::DebounceTick);
+        let out = a.update(Message::DebounceTick);
+        assert!(out.is_none(), "incomplete query doesn't auto-fire");
+        assert!(!a.pending_search, "debounce consumed");
+        assert!(a.notice.is_none(), "no parse error flashed mid-typing");
+    }
+
+    #[test]
+    fn stale_search_reply_is_dropped() {
+        let mut a = app();
+        // First search is in flight (seq 1).
+        a.update(Message::QueryChanged("aaa".into()));
+        let seq1 = match a.update(Message::Search) {
+            Some(Outcome::Search { seq, .. }) => seq,
+            other => panic!("expected Search, got {other:?}"),
+        };
+        // User retypes and searches again before the first lands (seq 2).
+        a.update(Message::QueryChanged("bbb".into()));
+        let seq2 = match a.update(Message::Search) {
+            Some(Outcome::Search { seq, .. }) => seq,
+            other => panic!("expected Search, got {other:?}"),
+        };
+        assert_ne!(seq1, seq2);
+
+        // The slow first reply now arrives — it must be ignored: results stay
+        // empty and the spinner keeps spinning for the in-flight second search.
+        a.on_search(
+            seq1,
+            Ok(vec![SearchHit {
+                registry: Registry::Ens,
+                label: "aaa".to_string(),
+                full: "aaa.eth".to_string(),
+                status: HitStatus::Taken { owner: None },
+            }]),
+        );
+        assert!(a.results.is_empty(), "stale reply must not paint");
+        assert!(a.searching, "still waiting on the current search");
+
+        // The current reply lands and is applied.
+        a.on_search(
+            seq2,
+            Ok(vec![SearchHit {
+                registry: Registry::Ens,
+                label: "bbb".to_string(),
+                full: "bbb.eth".to_string(),
+                status: HitStatus::Available { quote: None },
+            }]),
+        );
+        assert!(!a.searching);
+        assert_eq!(a.results.len(), 1);
+        assert_eq!(a.results[0].full, "bbb.eth");
+    }
+
+    #[test]
+    fn register_success_marks_row_owned_and_lists_it() {
+        let mut a = app();
+        a.results = vec![SearchHit {
+            registry: Registry::Xns {
+                namespace: "crops".to_string(),
+            },
+            label: "cow".to_string(),
+            full: "cow.crops".to_string(),
+            status: HitStatus::Available { quote: None },
+        }];
+        a.update(Message::PickResult(0));
+        a.update(Message::StartRegister); // XNS one-shot → Registering
+        a.on_register(Ok(("cow.crops".to_string(), TxHash::ZERO)));
+
+        assert!(matches!(a.reg.as_ref().unwrap().phase, RegPhase::Done));
+        // The search row no longer offers Register — it reads as ours now.
+        match &a.results[0].status {
+            HitStatus::Taken { owner } => assert_eq!(*owner, Some(a.owner)),
+            other => panic!("expected Taken-by-us, got {other:?}"),
+        }
+        // …and it appears under "Your names" (permanent XNS → no expiry).
+        assert_eq!(a.owned.len(), 1);
+        assert_eq!(a.owned[0].full, "cow.crops");
+        assert!(a.owned[0].owned_by(a.owner));
+        assert_eq!(a.owned[0].expires_at, None);
+        assert_eq!(a.owned[0].state(), NameState::Permanent);
+    }
+
+    #[test]
+    fn legacy_register_success_records_term_expiry() {
+        let mut a = app();
+        a.results = vec![SearchHit {
+            registry: Registry::Ens,
+            label: "vitalik".to_string(),
+            full: "vitalik.eth".to_string(),
+            status: HitStatus::Available { quote: None },
+        }];
+        a.update(Message::PickResult(0)); // years defaults to 1
+        a.on_register(Ok(("vitalik.eth".to_string(), TxHash::ZERO)));
+        // A commit-reveal name lands in the owned list with a future expiry.
+        assert_eq!(a.owned.len(), 1);
+        let exp = a.owned[0]
+            .expires_at
+            .expect("commit-reveal name carries an expiry");
+        assert!(exp > crate::names::manage::now_secs());
+        assert_eq!(a.owned[0].state(), NameState::Active);
     }
 }

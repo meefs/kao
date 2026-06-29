@@ -282,10 +282,19 @@ pub enum Message {
         owner: Address,
         result: Result<NameStatus, String>,
     },
-    /// Names app: cross-namespace availability + price search finished.
+    /// Names app: cross-namespace availability + price search finished. `seq`
+    /// round-trips so the pane can drop a reply the user has since superseded.
     NameSearched {
         owner: Address,
+        seq: u64,
         result: Result<Vec<SearchHit>, String>,
+    },
+    /// Names app: an ENS re-quote (after a duration change) finished. `years`
+    /// round-trips so the pane can drop a result the user has since superseded.
+    NameQuoted {
+        owner: Address,
+        years: u32,
+        result: Result<crate::names::manage::RegisterQuote, String>,
     },
     /// Names app: the commit landed (mined). Carries the plan (with its secret)
     /// for the reveal step, and the parked signer back.
@@ -856,12 +865,14 @@ impl WalletScreen {
     /// the signer can sign directly, or when the active descriptor is
     /// a hardware account (click escalates to reconnect). View-only
     /// accounts return false. In Safe mode: true when at least one
-    /// linked owner is a Local account in this wallet — that owner
-    /// serves as both signer and gas-paying executor, so the active
-    /// EOA's signing capability is irrelevant.
+    /// linked owner is an account this wallet can sign with — `Local`
+    /// **or** hardware. A 1/1 Safe owned by a Ledger/Trezor signs the
+    /// SafeTx on-device and broadcasts its own `execTransaction`, so a
+    /// Local owner is no longer required; the active EOA's signing
+    /// capability stays irrelevant.
     fn can_send(&self) -> bool {
         if let Some(safe) = self.active_safe_descriptor() {
-            return safe.trust.permits_signing() && self.has_local_linked_owner(safe);
+            return safe.trust.permits_signing() && self.has_signable_linked_owner(safe);
         }
         self.signer.can_sign()
             || matches!(
@@ -999,9 +1010,16 @@ impl WalletScreen {
             names_app::Outcome::Status { registry, label } => {
                 spawn_name_status(self.network.clone(), owner, registry, label)
             }
-            names_app::Outcome::Search { label, registries } => {
-                spawn_name_search(self.network.clone(), owner, label, registries)
-            }
+            names_app::Outcome::Search {
+                seq,
+                label,
+                registries,
+            } => spawn_name_search(self.network.clone(), owner, seq, label, registries),
+            names_app::Outcome::Quote {
+                namespace,
+                label,
+                years,
+            } => spawn_name_quote(self.network.clone(), owner, namespace, label, years),
             names_app::Outcome::RegisterXns { namespace, label } => {
                 let handoff = self.park_signer_for_order();
                 spawn_name_register_xns(self.network.clone(), handoff, namespace, label)
@@ -1049,16 +1067,14 @@ impl WalletScreen {
         }
     }
 
-    /// Whether `safe` has at least one linked owner that's a `Local`
-    /// account in this wallet. Determines whether Safe-mode Send is
-    /// reachable.
-    fn has_local_linked_owner(&self, safe: &SafeDescriptor) -> bool {
-        safe.linked_signer_indices.iter().any(|idx| {
-            matches!(
-                self.accounts.get(*idx as usize),
-                Some(AccountDescriptor::Local { .. })
-            )
-        })
+    /// Whether `safe` has at least one linked owner this wallet can
+    /// sign with — `Local` **or** hardware (Ledger / Trezor), excluding
+    /// view-only. Determines whether Safe-mode Send is reachable: the
+    /// solo sign-and-execute path drives the owner signer through
+    /// `KaoSigner::sign_eip712` (hardware-capable) and can use the owner
+    /// itself as gas-paying executor when the wallet holds no Local key.
+    fn has_signable_linked_owner(&self, safe: &SafeDescriptor) -> bool {
+        !signable_owners_of(safe, &self.accounts).is_empty()
     }
 
     /// `(address, descriptor)` for every linked owner this wallet can
@@ -1914,25 +1930,27 @@ impl WalletScreen {
                         warn!("send: confirm dropped — no current plan/quote pair");
                         return (Task::none(), None);
                     }
-                    // Safe mode: collect owner keys and broadcast.
+                    // Safe mode: solo sign-and-execute. Collect the first
+                    // `threshold` signable owners (Local or hardware) and
+                    // pick a gas-paying executor — a Local account if the
+                    // wallet holds one, otherwise the first signing owner
+                    // (a 1/1 Safe's hardware owner pays its own gas).
                     let Some(req) = p.outgoing_request(&self.portfolio) else {
                         warn!("safe-send: confirm dropped — form not ready");
                         return (Task::none(), None);
                     };
-                    let owner_keys =
-                        match collect_owner_keys(&req.linked_local_indices, &self.accounts) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                warn!(error = %e, "safe-send: owner key lookup failed");
-                                let _ = p.update(send::Message::BroadcastDone(Err(e)));
-                                return (Task::none(), None);
-                            }
-                        };
-                    if owner_keys.is_empty() {
-                        let msg = "No local owners available to sign — link a Local account to this Safe before sending.".to_string();
+                    let signer_owners: Vec<AccountDescriptor> = req
+                        .signable_indices
+                        .iter()
+                        .filter_map(|&idx| self.accounts.get(idx as usize).cloned())
+                        .take(req.threshold as usize)
+                        .collect();
+                    if (signer_owners.len() as u32) < req.threshold {
+                        let msg = "Not enough signable owners linked to this Safe to meet its threshold — propose to co-signers instead.".to_string();
                         let _ = p.update(send::Message::BroadcastDone(Err(msg)));
                         return (Task::none(), None);
                     }
+                    let executor_key = first_local_key_of(&self.accounts);
                     info!(
                         chain = %req.chain.label(),
                         chain_id = req.chain.chain_id(),
@@ -1940,11 +1958,17 @@ impl WalletScreen {
                         to = %req.recipient,
                         value_wei = %req.amount_units,
                         threshold = req.threshold,
-                        owners_local = owner_keys.len(),
+                        signers = signer_owners.len(),
+                        local_executor = executor_key.is_some(),
                         "safe-send: spawning broadcast task",
                     );
                     p.mark_busy();
-                    let pre_task = spawn_safe_broadcast_task(self.network.clone(), req, owner_keys);
+                    let pre_task = spawn_safe_broadcast_task(
+                        self.network.clone(),
+                        req,
+                        signer_owners,
+                        executor_key,
+                    );
                     return (pre_task, None);
                 }
 
@@ -2302,9 +2326,18 @@ impl WalletScreen {
                     self.apps.names_pane().on_status(result);
                 }
             }
-            Message::NameSearched { owner, result } => {
+            Message::NameSearched { owner, seq, result } => {
                 if owner == self.address {
-                    self.apps.names_pane().on_search(result);
+                    self.apps.names_pane().on_search(seq, result);
+                }
+            }
+            Message::NameQuoted {
+                owner,
+                years,
+                result,
+            } => {
+                if owner == self.address {
+                    self.apps.names_pane().on_quote(years, result);
                 }
             }
             Message::NameCommitted { result, signer } => {
@@ -3788,35 +3821,6 @@ fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, seq: u64, plan: SendPlan) 
     )
 }
 
-/// Spawn the sign-and-broadcast task. The `handoff` cell carries the
-/// signer in (the dashboard moved it out via `mem::replace`); the task
-/// puts it back when finished. The result message round-trips both the
-/// broadcast result and the handoff so the dashboard reclaims the signer.
-/// Pull the Local key bytes for the given account indices. Bails on
-/// the first non-Local entry rather than silently dropping — by the
-/// time we're spawning a broadcast, the SafeSend pane has already
-/// pre-flighted that all requested indices are Local, so a non-Local
-/// here is a wallet-state mismatch worth surfacing.
-fn collect_owner_keys(
-    indices: &[u32],
-    accounts: &[AccountDescriptor],
-) -> Result<Vec<alloy::primitives::B256>, String> {
-    let mut out = Vec::with_capacity(indices.len());
-    for &idx in indices {
-        match accounts.get(idx as usize) {
-            Some(AccountDescriptor::Local { key_bytes, .. }) => {
-                out.push(key_bytes.to_b256());
-            }
-            Some(_) => {
-                return Err(format!(
-                    "linked owner #{idx} is not a Local account in this wallet",
-                ));
-            }
-            None => return Err(format!("linked owner #{idx} not found in this wallet")),
-        }
-    }
-    Ok(out)
-}
 
 /// `(address, descriptor)` for every linked owner that can sign — Local
 /// or hardware, excluding view-only and dangling indices. Drives the
@@ -3989,26 +3993,30 @@ async fn rebuild_reviewed_safe_tx(
     Ok((tx, domain, local_hash))
 }
 
-/// Spawn the Safe-TX sign-and-broadcast task.
+/// Spawn the Safe-TX solo sign-and-broadcast task.
 ///
-/// 1. Rebuild the SafeTx at the reviewed `(nonce, hash)` pin and re-run
+/// 1. Build a live signer for each of the first `threshold`
+///    `signer_owners` via `build_owner_signer` — `Local` or hardware.
+/// 2. Rebuild the SafeTx at the reviewed `(nonce, hash)` pin and re-run
 ///    the on-chain cross-checks (`rebuild_reviewed_safe_tx`).
-/// 2. For the first `threshold` owner keys (in `owner_keys` order),
-///    derive a Local signer and sign the hash.
-/// 3. Pack signatures Safe-style (ascending by address, 65 B each).
-/// 4. Call `execute_safe_tx` using the first owner as gas payer.
+/// 3. Sign the SafeTx with each owner via `sign_owner` (EIP-712, with an
+///    `eth_sign` fallback for older hardware) and assemble the blobs
+///    Safe-style (ascending by address).
+/// 4. Broadcast `execTransaction` from the executor: a `Local` account
+///    (`local_executor_key`) when the wallet holds one — gas-only, no
+///    extra device prompt — otherwise the first signing owner itself, so
+///    a hardware-only 1/1 Safe pays its own gas.
 ///
-/// The first entry in `owner_keys` doubles as the gas-paying
-/// executor — that way the dashboard's active EOA can be anything
-/// (including view-only), and Safe-mode Send works as long as ≥1
-/// linked owner is `Local` in this wallet. No handoff dance for the
-/// executor needed.
+/// The Safe validates signatures against the owner set, not `msg.sender`,
+/// so the executor need not be an owner. Secret material is derived
+/// inside the task, never carried across the `Task::perform` boundary.
 fn spawn_safe_broadcast_task(
     network: Arc<dyn BalanceFetcher>,
     req: SafeSendRequest,
-    owner_keys: Vec<alloy::primitives::B256>,
+    signer_owners: Vec<AccountDescriptor>,
+    local_executor_key: Option<B256>,
 ) -> Task<Message> {
-    use crate::safe::tx::{execute_safe_tx, pack_owner_signatures};
+    use crate::safe::tx::{assemble_signatures, execute_safe_tx, sign_owner};
     let chain = req.chain;
     Task::perform(
         async move {
@@ -4020,50 +4028,50 @@ fn spawn_safe_broadcast_task(
                 }
             };
 
-            // Executor = first linked Local owner. Derived inside the
-            // task so we never carry secret material across the
-            // Task::perform boundary explicitly.
-            let executor_key = match owner_keys.first().copied() {
-                Some(k) => k,
-                None => {
-                    warn!("safe-broadcast: no owner keys supplied");
-                    return Err("no local owners available".into());
+            // Build one live signer per owner up front. Hardware variants
+            // open a USB transport here; building once lets the same
+            // instance both sign the SafeTx and — when it doubles as the
+            // executor — sign the outer envelope, instead of contending
+            // for the device on a second connection.
+            let needed = req.threshold as usize;
+            let mut owner_signers = Vec::with_capacity(needed);
+            for desc in signer_owners.iter().take(needed) {
+                match crate::wallet::build_owner_signer(desc).await {
+                    Ok(s) => owner_signers.push(s),
+                    Err(e) => {
+                        warn!(error = %e, "safe-broadcast: build owner signer failed");
+                        return Err(format!("build owner signer: {e}"));
+                    }
                 }
-            };
-            let executor_signer = match crate::wallet::signer_from_bytes(&executor_key) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "safe-broadcast: derive executor failed");
-                    return Err(format!("derive executor: {e}"));
-                }
-            };
-            let executor = KaoSigner::Local(executor_signer);
-
-            let (safe_tx, _domain, local_hash) =
-                rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
-            let mut sigs = Vec::with_capacity(req.threshold as usize);
-            for key in owner_keys.into_iter().take(req.threshold as usize) {
-                let local = match crate::wallet::signer_from_bytes(&key) {
-                    Ok(s) => s,
-                    Err(e) => return Err(format!("derive signer: {e}")),
-                };
-                let kao = KaoSigner::Local(local);
-                let sig = match kao.sign_hash(local_hash).await {
-                    Ok(s) => s,
-                    Err(e) => return Err(format!("sign hash: {e}")),
-                };
-                sigs.push((kao.address(), sig));
             }
-            let packed = pack_owner_signatures(sigs)?;
-            execute_safe_tx(
-                &provider,
-                &executor,
-                req.safe_address,
-                chain,
-                safe_tx,
-                packed,
-            )
-            .await
+            if owner_signers.is_empty() || (owner_signers.len() as u32) < req.threshold {
+                return Err("not enough signable owners to meet the Safe threshold".into());
+            }
+
+            let (safe_tx, domain, local_hash) =
+                rebuild_reviewed_safe_tx(network.as_ref(), &req).await?;
+
+            let mut sigs = Vec::with_capacity(owner_signers.len());
+            for signer in &owner_signers {
+                let pair = sign_owner(signer, &safe_tx, &domain, local_hash).await?;
+                sigs.push(pair);
+            }
+            let packed = assemble_signatures(sigs)?;
+
+            // Executor: prefer a Local gas payer (no extra device prompt);
+            // otherwise reuse the first owner signer (hardware self-pay).
+            let local_executor;
+            let executor: &KaoSigner = match local_executor_key {
+                Some(key) => {
+                    let s = crate::wallet::signer_from_bytes(&key)
+                        .map_err(|e| format!("derive executor: {e}"))?;
+                    local_executor = KaoSigner::Local(s);
+                    &local_executor
+                }
+                None => &owner_signers[0],
+            };
+
+            execute_safe_tx(&provider, executor, req.safe_address, chain, safe_tx, packed).await
         },
         Message::SafeSendBroadcastReturn,
     )
@@ -4451,6 +4459,7 @@ fn spawn_name_status(
 fn spawn_name_search(
     network: Arc<dyn BalanceFetcher>,
     owner: Address,
+    seq: u64,
     label: String,
     registries: Vec<Registry>,
 ) -> Task<Message> {
@@ -4458,7 +4467,29 @@ fn spawn_name_search(
         async move {
             Ok::<_, String>(crate::names::manage::search(&*network, &label, registries).await)
         },
-        move |result| Message::NameSearched { owner, result },
+        move |result| Message::NameSearched { owner, seq, result },
+    )
+}
+
+/// Re-price an ENS registration for `years` (read-only) when the user changes
+/// the duration stepper, so the panel's quote tracks the term they'll pay for.
+fn spawn_name_quote(
+    network: Arc<dyn BalanceFetcher>,
+    owner: Address,
+    namespace: crate::names::registrar::Namespace,
+    label: String,
+    years: u32,
+) -> Task<Message> {
+    let duration = crate::names::registrar::ens_duration_secs(years);
+    Task::perform(
+        async move {
+            crate::names::manage::register_quote(&*network, namespace, &label, duration).await
+        },
+        move |result| Message::NameQuoted {
+            owner,
+            years,
+            result,
+        },
     )
 }
 
@@ -5862,54 +5893,6 @@ mod tests {
         assert!(!screen.history_loaded);
     }
 
-    #[test]
-    fn collect_owner_keys_pulls_local_bytes_in_order() {
-        // Mix Local with other variants — collect should only walk
-        // the indices we hand it, in the order given, and return the
-        // matching key bytes verbatim.
-        let accounts = vec![
-            crate::wallet::AccountDescriptor::Local {
-                name: None,
-                key_bytes: crate::wallet::SecretKeyBytes::new([0xaa; 32]),
-            },
-            crate::wallet::AccountDescriptor::ViewOnly {
-                name: None,
-                address: [0u8; 20],
-            },
-            crate::wallet::AccountDescriptor::Local {
-                name: None,
-                key_bytes: crate::wallet::SecretKeyBytes::new([0xbb; 32]),
-            },
-        ];
-        let got = collect_owner_keys(&[2, 0], &accounts).unwrap();
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0], alloy::primitives::B256::repeat_byte(0xbb));
-        assert_eq!(got[1], alloy::primitives::B256::repeat_byte(0xaa));
-    }
-
-    #[test]
-    fn collect_owner_keys_rejects_non_local_index() {
-        let accounts = vec![
-            crate::wallet::AccountDescriptor::Local {
-                name: None,
-                key_bytes: crate::wallet::SecretKeyBytes::new([0xaa; 32]),
-            },
-            crate::wallet::AccountDescriptor::ViewOnly {
-                name: None,
-                address: [0u8; 20],
-            },
-        ];
-        let err = collect_owner_keys(&[1], &accounts).unwrap_err();
-        assert!(err.contains("not a Local account"), "got: {err}");
-    }
-
-    #[test]
-    fn collect_owner_keys_rejects_out_of_bounds_index() {
-        let accounts: Vec<crate::wallet::AccountDescriptor> = Vec::new();
-        let err = collect_owner_keys(&[0], &accounts).unwrap_err();
-        assert!(err.contains("not found"), "got: {err}");
-    }
-
     fn local_with_key(seed: u8) -> AccountDescriptor {
         AccountDescriptor::Local {
             name: None,
@@ -6167,7 +6150,6 @@ mod tests {
             amount_units: U256::from(1_000u64),
             token: SendToken::Native,
             threshold: 1,
-            linked_local_indices: vec![0],
             signable_indices: vec![0],
             prepared,
         }

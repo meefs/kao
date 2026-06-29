@@ -120,6 +120,12 @@ pub fn safe_tx_hash(tx: &SafeTx, domain: &Eip712Domain) -> B256 {
 /// dropping one here would mask the real problem (the caller selected
 /// the same owner twice, e.g. one key imported into two account
 /// slots). Fail loudly before anything leaves the wallet.
+///
+/// The production send/queue paths now pack via [`assemble_signatures`]
+/// (raw blobs, so they also carry `eth_sign` fallbacks); this typed
+/// variant is retained as the reference the equivalence tests pin
+/// `sign_owner`/`sign_eip712` output against.
+#[allow(dead_code)]
 pub fn pack_owner_signatures(mut sigs: Vec<(Address, Signature)>) -> Result<Bytes, String> {
     // `Address` is a `FixedBytes<20>`; its `Ord` impl is lexicographic
     // byte order, which is also numeric big-endian order — matching
@@ -493,7 +499,7 @@ pub async fn execute_safe_tx(
     let sig = executor
         .sign_tx(&mut envelope)
         .await
-        .map_err(|e| format!("sign failed: {e}"))?;
+        .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
     let raw = TxEnvelope::from(envelope.into_signed(sig)).encoded_2718();
     let pending = provider
         .send_raw_transaction(&raw)
