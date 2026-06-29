@@ -241,9 +241,16 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
     body = body.push(Space::new().height(20));
     body = body.push(actions);
 
-    let scroll_body = scrollable(container(body).width(Length::Fill))
-        .height(Length::Shrink)
-        .style(move |_, s| kao_scrollable_style(t, s));
+    // Inset the content from the right so the scrollbar rides in its own gutter
+    // instead of overlapping the cards (notably the full address rows).
+    let scroll_body = scrollable(container(body).width(Length::Fill).padding(Padding {
+        top: 0.0,
+        right: 14.0,
+        bottom: 0.0,
+        left: 0.0,
+    }))
+    .height(Length::Shrink)
+    .style(move |_, s| kao_scrollable_style(t, s));
     let bounded = container(scroll_body).max_height(FORM_MAX_HEIGHT);
 
     modal_wrapper(
@@ -356,13 +363,30 @@ fn kv<'a>(t: KaoTheme, label: &'a str, value: &str) -> Element<'a, Message> {
     .into()
 }
 
+/// An address field: label on top, then the *full* checksummed address in its own
+/// full-width card below. Stacking (rather than right-aligning on the label row)
+/// is what gives the 42-char address the room to render in full instead of being
+/// clipped at the panel edge.
 fn addr_kv<'a>(t: KaoTheme, label: &'a str, addr: Address) -> Element<'a, Message> {
-    row![
+    let inner = container(colored_address(t, addr))
+        .width(Length::Fill)
+        .padding(Padding::from([6, 8]))
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(t.card)),
+            border: iced::Border {
+                color: t.border,
+                width: 1.0,
+                radius: iced::border::Radius::from(8),
+            },
+            text_color: Some(t.text),
+            ..container::Style::default()
+        });
+    column![
         text(label).size(12).color(t.sub),
-        Space::new().width(Length::Fill),
-        colored_address(t, addr),
+        Space::new().height(4),
+        inner,
     ]
-    .align_y(Alignment::Center)
+    .spacing(0)
     .padding(Padding::from([2, 0]))
     .width(Length::Fill)
     .into()
