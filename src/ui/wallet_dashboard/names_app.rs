@@ -410,7 +410,8 @@ impl NamesApp {
                 if self.manage_busy {
                     return None;
                 }
-                self.manage_busy = true;
+                // Busy flag is set on confirm (`begin_manage`), not here — the
+                // review overlay opens first; cancelling leaves the card idle.
                 self.manage_notice = None;
                 Some(Outcome::Renew {
                     namespace: ns,
@@ -438,7 +439,8 @@ impl NamesApp {
                         return None;
                     }
                 };
-                self.manage_busy = true;
+                // Busy flag is set on confirm (`begin_manage`); the review opens
+                // first.
                 self.manage_notice = None;
                 Some(Outcome::SetRecipient {
                     namespace: ns,
@@ -511,18 +513,18 @@ impl NamesApp {
         if !matches!(r.phase, RegPhase::Ready { .. } | RegPhase::Failed(_)) {
             return None;
         }
+        // Don't flip to a busy phase here — the coordinator opens the
+        // clear-signing review first and only drives us into Committing /
+        // Registering (via `begin_commit` / `begin_reveal`) once the user
+        // confirms. A cancel leaves the Ready phase (and its quote) intact.
         match r.registry.legacy() {
-            Some(ns) => {
-                r.phase = RegPhase::Committing;
-                Some(Outcome::Commit {
-                    namespace: ns,
-                    label: r.label.clone(),
-                    years: r.years,
-                })
-            }
+            Some(ns) => Some(Outcome::Commit {
+                namespace: ns,
+                label: r.label.clone(),
+                years: r.years,
+            }),
             None => {
                 let namespace = r.registry.xns_namespace()?.to_string();
-                r.phase = RegPhase::Registering;
                 Some(Outcome::RegisterXns {
                     namespace,
                     label: r.label.clone(),
@@ -547,9 +549,34 @@ impl NamesApp {
                 RegPhase::Failed("commitment expired (waited over 24h) — start over".to_string());
             return None;
         }
+        // Stay in Waiting until the user confirms the review; `begin_reveal`
+        // flips us to Registering at that point.
         let plan = plan.clone();
-        r.phase = RegPhase::Registering;
         Some(Outcome::Register { plan })
+    }
+
+    // ── review-confirmed phase flips (coordinator → pane) ──────────────────────
+    // The coordinator calls these once the user confirms the clear-signing review,
+    // mirroring the phase the pane used to enter the instant its button was
+    // pressed. Splitting it out is what lets a *cancel* leave the pane untouched.
+
+    /// Commit-reveal step 1 confirmed — broadcast in flight.
+    pub fn begin_commit(&mut self) {
+        if let Some(r) = &mut self.reg {
+            r.phase = RegPhase::Committing;
+        }
+    }
+
+    /// Reveal (or XNS one-shot) confirmed — broadcast in flight.
+    pub fn begin_reveal(&mut self) {
+        if let Some(r) = &mut self.reg {
+            r.phase = RegPhase::Registering;
+        }
+    }
+
+    /// A manage write (renew / set-recipient) confirmed — mark the card busy.
+    pub fn begin_manage(&mut self) {
+        self.manage_busy = true;
     }
 
     // ── result callbacks (coordinator → pane) ─────────────────────────────────
@@ -1181,10 +1208,10 @@ impl NamesApp {
         }
     }
 
-    /// A compact "what you'll sign" card shown before each on-chain step. The
-    /// registrar calls aren't clear-signable, so a hardware wallet asks the user
-    /// to blind-sign them — this is the only place they can check the destination
-    /// contract and the ETH the step moves before approving on the device.
+    /// A compact "what you'll sign" preview shown before each on-chain step.
+    /// Continuing opens the full clear-signing review (the decoded call, args and
+    /// value); this card is just an at-a-glance summary of the destination
+    /// contract and the ETH the step moves.
     fn sign_review<'a>(
         &self,
         t: KaoTheme,
@@ -1193,7 +1220,7 @@ impl NamesApp {
     ) -> Element<'a, Message> {
         let label_w = Length::Fixed(64.0);
         column![
-            text("You'll sign — verify on your device before approving")
+            text("You'll sign — full details on the next screen")
                 .size(11)
                 .color(t.sub),
             Space::new().height(8),
@@ -1210,8 +1237,8 @@ impl NamesApp {
             .align_y(Alignment::Center),
             Space::new().height(8),
             text(
-                "A hardware wallet can't decode this call — check the contract above matches, \
-                 then approve the blind-signing prompt."
+                "Continue to review the full decoded transaction before signing. \
+                 A hardware wallet still shows a hash to approve — the decode is shown here."
             )
             .size(10)
             .color(t.sub),
@@ -1635,7 +1662,9 @@ mod tests {
         }];
         a.update(Message::PickResult(0));
         assert_eq!(a.view, View::Register);
-        // XNS register is a single step → StartRegister emits RegisterXns.
+        // XNS register is a single step → StartRegister emits RegisterXns. The
+        // pane stays in Ready until the clear-signing review is confirmed (the
+        // coordinator then calls `begin_reveal`); a cancel leaves it untouched.
         let out = a.update(Message::StartRegister);
         match out {
             Some(Outcome::RegisterXns { namespace, label }) => {
@@ -1644,6 +1673,12 @@ mod tests {
             }
             _ => panic!("expected RegisterXns, got {out:?}"),
         }
+        assert!(matches!(
+            a.reg.as_ref().unwrap().phase,
+            RegPhase::Ready { .. }
+        ));
+        // Confirming the review flips the pane into the broadcast phase.
+        a.begin_reveal();
         assert!(matches!(
             a.reg.as_ref().unwrap().phase,
             RegPhase::Registering
@@ -1761,9 +1796,15 @@ mod tests {
             status: HitStatus::Available { quote: None },
         }];
         a.update(Message::PickResult(0));
-        // Step 1: commit.
+        // Step 1: commit. The pane emits Commit but stays Ready until the
+        // clear-signing review is confirmed (coordinator calls `begin_commit`).
         let out = a.update(Message::StartRegister);
         assert!(matches!(out, Some(Outcome::Commit { .. })));
+        assert!(matches!(
+            a.reg.as_ref().unwrap().phase,
+            RegPhase::Ready { .. }
+        ));
+        a.begin_commit();
         assert!(matches!(
             a.reg.as_ref().unwrap().phase,
             RegPhase::Committing
@@ -1787,8 +1828,15 @@ mod tests {
         {
             *since = crate::names::manage::now_secs() - registrar::MIN_COMMITMENT_AGE - 1;
         }
+        // Step 2: reveal. Again, emits the outcome but stays Waiting until the
+        // review is confirmed.
         let out = a.update(Message::CompleteRegister);
         assert!(matches!(out, Some(Outcome::Register { .. })));
+        assert!(matches!(
+            a.reg.as_ref().unwrap().phase,
+            RegPhase::Waiting { .. }
+        ));
+        a.begin_reveal();
         assert!(matches!(
             a.reg.as_ref().unwrap().phase,
             RegPhase::Registering
@@ -1873,6 +1921,10 @@ mod tests {
         ));
         let out = a.update(Message::SetRecipient);
         assert!(matches!(out, Some(Outcome::SetRecipient { .. })));
+        // The card stays idle until the clear-signing review is confirmed; the
+        // coordinator then calls `begin_manage`.
+        assert!(!a.manage_busy);
+        a.begin_manage();
         assert!(a.manage_busy);
     }
 

@@ -34,6 +34,7 @@ mod safes_settings;
 mod send;
 mod settings_root;
 mod sidebar;
+mod sign_review;
 mod sim_view;
 mod swap;
 mod tx_details;
@@ -271,6 +272,15 @@ pub enum Message {
     },
     /// Child messages from the Apps (swap workspace) pane.
     Apps(apps::Message),
+    /// User interacted with the clear-signing review overlay (confirm/cancel/esc).
+    SignReview(sign_review::Message),
+    /// A sign-review prepare task finished decoding its raw-transaction legs.
+    /// `seq` round-trips so a result for a review the user cancelled or replaced
+    /// is dropped. `Err` carries a build/decode failure to surface to the user.
+    SignReviewPrepared {
+        seq: u64,
+        legs: Result<Vec<sign_review::ReviewLeg>, String>,
+    },
     /// Names app: reverse-lookup discovery finished. `owner` is the account the
     /// scan was spawned for — the handler drops it if the active account changed.
     NameReverseScanned {
@@ -558,6 +568,14 @@ pub struct WalletScreen {
     /// The Apps (swap workspace) pane state — its inline swap composer. The
     /// order list it renders comes from `tracked_orders`, not the pane.
     apps: AppsPane,
+    /// The clear-signing review gate, when one is open. Every in-app signature
+    /// (CoW order/approval/EthFlow/cancel, name commit/register/renew/setAddr)
+    /// routes through this overlay so the user reviews the decoded transaction
+    /// before the key is touched. `None` means no review is pending.
+    sign_review: Option<sign_review::SignReview>,
+    /// Monotonic id for sign-review prepare tasks, so a decode result for a
+    /// review the user has since cancelled/replaced is dropped on arrival.
+    sign_review_seq: u64,
 }
 
 /// Tracks an in-flight clipboard auto-clear: when it lands, what we
@@ -655,6 +673,8 @@ impl WalletScreen {
             tracked_orders: Vec::new(),
             order_op_in_flight: false,
             apps: AppsPane::new(address),
+            sign_review: None,
+            sign_review_seq: 0,
         }
     }
 
@@ -1213,21 +1233,15 @@ impl WalletScreen {
                 label,
                 years,
             } => spawn_name_quote(self.network.clone(), owner, namespace, label, years),
-            names_app::Outcome::RegisterXns { namespace, label } => {
-                let handoff = self.park_signer_for_order();
-                match safe_name {
-                    Some(ctx) => spawn_name_register_xns_safe(
-                        self.network.clone(),
-                        handoff,
-                        ctx,
-                        namespace,
-                        label,
-                    ),
-                    None => {
-                        spawn_name_register_xns(self.network.clone(), handoff, namespace, label)
-                    }
-                }
-            }
+            // ── Write ops: prepare a clear-signing review instead of signing.
+            // Each builds the exact bytes it will authorize, decodes them, and
+            // opens the review overlay; the signer is parked (and the existing
+            // spawn_* task run) only when the user confirms. `safe_name` was
+            // validated above and is re-derived at confirm in `dispatch_name_sign`.
+            names_app::Outcome::RegisterXns { namespace, label } => self.open_name_review(
+                sign_review::NameSign::RegisterXns { namespace, label },
+                owner,
+            ),
             names_app::Outcome::Commit {
                 namespace,
                 label,
@@ -1237,6 +1251,8 @@ impl WalletScreen {
                 // name is registered to `owner` (the active identity): GNS/WNS
                 // reveal to `msg.sender` and ENS takes `owner` as a param, so for
                 // a Safe both the commitment and the reveal's `msg.sender` are it.
+                // Minted here (where the RNG lives) at review time so the reviewed
+                // commitment is the one later revealed.
                 let secret = B256::from(rand::random::<[u8; 32]>());
                 let plan = RegisterPlan {
                     namespace,
@@ -1245,63 +1261,270 @@ impl WalletScreen {
                     duration_secs: crate::names::registrar::ens_duration_secs(years),
                     secret,
                 };
-                let handoff = self.park_signer_for_order();
-                match safe_name {
-                    Some(ctx) => spawn_name_commit_safe(self.network.clone(), handoff, ctx, plan),
-                    None => spawn_name_commit(self.network.clone(), handoff, plan),
-                }
+                self.open_name_review(sign_review::NameSign::Commit(plan), owner)
             }
             names_app::Outcome::Register { plan } => {
-                let handoff = self.park_signer_for_order();
-                match safe_name {
-                    Some(ctx) => spawn_name_register_safe(self.network.clone(), handoff, ctx, plan),
-                    None => spawn_name_register(self.network.clone(), handoff, plan),
-                }
+                self.open_name_review(sign_review::NameSign::Register(plan), owner)
             }
             names_app::Outcome::Renew {
                 namespace,
                 label,
                 years,
-            } => {
-                let handoff = self.park_signer_for_order();
-                match safe_name {
-                    Some(ctx) => spawn_name_renew_safe(
-                        self.network.clone(),
-                        handoff,
-                        ctx,
-                        namespace,
-                        label,
-                        years,
-                    ),
-                    None => {
-                        spawn_name_renew(self.network.clone(), handoff, namespace, label, years)
-                    }
-                }
-            }
+            } => self.open_name_review(
+                sign_review::NameSign::Renew {
+                    namespace,
+                    label,
+                    years,
+                },
+                owner,
+            ),
             names_app::Outcome::SetRecipient {
                 namespace,
                 label,
                 recipient,
-            } => {
-                let handoff = self.park_signer_for_order();
-                match safe_name {
-                    Some(ctx) => spawn_name_set_recipient_safe(
-                        self.network.clone(),
-                        handoff,
-                        ctx,
-                        namespace,
-                        label,
-                        recipient,
-                    ),
-                    None => spawn_name_set_recipient(
-                        self.network.clone(),
-                        handoff,
-                        namespace,
-                        label,
-                        recipient,
-                    ),
-                }
+            } => self.open_name_review(
+                sign_review::NameSign::SetRecipient {
+                    namespace,
+                    label,
+                    recipient,
+                },
+                owner,
+            ),
+        }
+    }
+
+    // ── Clear-signing review gate ─────────────────────────────────────────────
+
+    /// Open the review overlay for a prepared name write and spawn the task that
+    /// builds + decodes its registrar call. The signer is *not* parked yet — that
+    /// happens only when the user confirms (`dispatch_name_sign`).
+    fn open_name_review(&mut self, sign: sign_review::NameSign, from: Address) -> Task<Message> {
+        if self.sign_review.is_some() {
+            return Task::none();
+        }
+        self.sign_review_seq += 1;
+        let seq = self.sign_review_seq;
+        let (title, subtitle, note) = name_review_labels(&sign);
+        let action = sign_review::SignAction::Name { sign: sign.clone() };
+        self.sign_review = Some(sign_review::SignReview::pending(
+            title, subtitle, None, note, seq, action,
+        ));
+        let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
+        spawn_name_prepare(self.network.clone(), seq, from, sign, local_names)
+    }
+
+    /// Open the review overlay for a CoW order and spawn the task that decodes its
+    /// on-chain legs (ERC-20 approval, or the native EthFlow `createOrder`). The
+    /// EIP-712 order itself is shown as a dedicated panel (it's typed data, not
+    /// calldata, so there's nothing for `function_panel` to decode).
+    fn open_cow_review(
+        &mut self,
+        host: CowHost,
+        draft: SwapDraft,
+        quote: crate::cow::api::QuoteResponse,
+    ) -> Task<Message> {
+        if self.sign_review.is_some() {
+            return Task::none();
+        }
+        self.sign_review_seq += 1;
+        let seq = self.sign_review_seq;
+        let user = self.order_owner();
+        let order = build_order_review(&draft, &quote, user);
+        let title = format!(
+            "Swap {} {} → {}",
+            order.sell_amount, order.sell_symbol, order.buy_symbol
+        );
+        let note = Some(
+            if draft.is_native {
+                "Selling native ETH is an on-chain order — you'll also pay gas."
+            } else {
+                "ERC-20 orders are gasless — CoW solvers pay the settlement gas."
             }
+            .to_string(),
+        );
+        let action = sign_review::SignAction::Cow {
+            host,
+            draft: draft.clone(),
+            quote: quote.clone(),
+        };
+        self.sign_review = Some(sign_review::SignReview::pending(
+            title,
+            None,
+            Some(order),
+            note,
+            seq,
+            action,
+        ));
+        let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
+        spawn_cow_prepare(self.network.clone(), seq, draft, quote, user, local_names)
+    }
+
+    /// Open a confirm gate for an off-chain order cancellation. It's an EIP-712
+    /// signature (no calldata, no value), so there are no legs to decode — just a
+    /// "this is what you're cancelling" panel the user confirms.
+    fn open_cow_cancel_review(&mut self, uid: String) -> Task<Message> {
+        if self.sign_review.is_some() {
+            return Task::none();
+        }
+        let Some(o) = self.tracked_orders.iter().find(|o| o.uid == uid) else {
+            return Task::none();
+        };
+        let (sell_s, _) = crate::portfolio::format_token_balance(o.sell_amount, o.sell_decimals);
+        self.sign_review_seq += 1;
+        let seq = self.sign_review_seq;
+        let title = format!(
+            "Cancel order — {} {} → {}",
+            sell_s, o.sell_symbol, o.buy_symbol
+        );
+        let subtitle = Some(format!("Order {}", short_order_uid(&uid)));
+        let note = Some(
+            "Off-chain gasless cancellation — you sign an EIP-712 message; no transaction is sent."
+                .to_string(),
+        );
+        let action = sign_review::SignAction::CowCancel { uid };
+        let mut review = sign_review::SignReview::pending(title, subtitle, None, note, seq, action);
+        // Nothing to prepare/decode — enable Confirm immediately.
+        review.legs_loading = false;
+        self.sign_review = Some(review);
+        Task::none()
+    }
+
+    /// User confirmed the review — run the (unchanged) signing task for the
+    /// prepared action and close the overlay.
+    fn confirm_sign_review(&mut self) -> Task<Message> {
+        let Some(review) = self.sign_review.take() else {
+            return Task::none();
+        };
+        match review.action {
+            sign_review::SignAction::Cow { host, draft, quote } => {
+                // Drive the blocking Swap modal into its "placing" phase now that
+                // signing actually starts; the Apps composer stays put and resets
+                // itself when placement completes.
+                if let CowHost::Modal = host
+                    && let Modal::Swap(p) = &mut self.modal
+                {
+                    p.begin_placing();
+                }
+                self.place_order_task(host, draft, quote)
+            }
+            sign_review::SignAction::CowCancel { uid } => self.cancel_order_task(uid),
+            sign_review::SignAction::Name { sign } => self.dispatch_name_sign(sign),
+        }
+    }
+
+    /// User cancelled (Cancel button / Esc / backdrop). The panes were never
+    /// flipped to a busy phase (that's deferred to confirm), so there's nothing to
+    /// revert — just drop the pending review.
+    fn cancel_sign_review(&mut self) {
+        self.sign_review = None;
+    }
+
+    /// A prepare task failed to build/decode the transaction — abandon the review
+    /// and surface the error on the originating pane.
+    fn fail_sign_review(&mut self, e: String) {
+        let Some(review) = self.sign_review.take() else {
+            return;
+        };
+        match review.action {
+            sign_review::SignAction::Cow { host, .. } => match host {
+                CowHost::Modal => {
+                    if let Modal::Swap(p) = &mut self.modal {
+                        p.placement_failed(e);
+                    }
+                }
+                CowHost::Apps => self.apps.placement_failed(e),
+            },
+            // Cancellation has no prepare step, so this branch is unreachable in
+            // practice; drop the review silently if it ever lands here.
+            sign_review::SignAction::CowCancel { .. } => {}
+            sign_review::SignAction::Name { sign } => self.fail_name_pane(&sign, e),
+        }
+    }
+
+    /// Dispatch a confirmed name write to the existing (unchanged) sign+broadcast
+    /// task. Re-validates the serialization + Safe-context guards at confirm time,
+    /// since state may have shifted while the review was open.
+    fn dispatch_name_sign(&mut self, sign: sign_review::NameSign) -> Task<Message> {
+        if self.is_signing_busy() {
+            self.fail_name_pane(
+                &sign,
+                "another signing operation is in progress — try again in a moment".to_string(),
+            );
+            return Task::none();
+        }
+        let safe_name = self.build_safe_name_ctx();
+        if self.active_safe.is_some() && safe_name.is_none() {
+            self.fail_name_pane(
+                &sign,
+                "Names from this Safe aren't available — they need a Mainnet Safe with a \
+                 signable owner. Switch to an EOA or a Mainnet Safe."
+                    .to_string(),
+            );
+            return Task::none();
+        }
+        // Flip the pane to its busy phase only now that we're really signing.
+        self.begin_name_pane(&sign);
+        let handoff = self.park_signer_for_order();
+        let net = self.network.clone();
+        match sign {
+            sign_review::NameSign::Commit(plan) => match safe_name {
+                Some(ctx) => spawn_name_commit_safe(net, handoff, ctx, plan),
+                None => spawn_name_commit(net, handoff, plan),
+            },
+            sign_review::NameSign::Register(plan) => match safe_name {
+                Some(ctx) => spawn_name_register_safe(net, handoff, ctx, plan),
+                None => spawn_name_register(net, handoff, plan),
+            },
+            sign_review::NameSign::RegisterXns { namespace, label } => match safe_name {
+                Some(ctx) => spawn_name_register_xns_safe(net, handoff, ctx, namespace, label),
+                None => spawn_name_register_xns(net, handoff, namespace, label),
+            },
+            sign_review::NameSign::Renew {
+                namespace,
+                label,
+                years,
+            } => match safe_name {
+                Some(ctx) => spawn_name_renew_safe(net, handoff, ctx, namespace, label, years),
+                None => spawn_name_renew(net, handoff, namespace, label, years),
+            },
+            sign_review::NameSign::SetRecipient {
+                namespace,
+                label,
+                recipient,
+            } => match safe_name {
+                Some(ctx) => {
+                    spawn_name_set_recipient_safe(net, handoff, ctx, namespace, label, recipient)
+                }
+                None => spawn_name_set_recipient(net, handoff, namespace, label, recipient),
+            },
+        }
+    }
+
+    /// Flip the Names pane into the busy phase matching `sign`, mirroring the
+    /// phase the pane used to enter the instant its action button was pressed.
+    fn begin_name_pane(&mut self, sign: &sign_review::NameSign) {
+        let pane = self.apps.names_pane();
+        match sign {
+            sign_review::NameSign::Commit(_) => pane.begin_commit(),
+            sign_review::NameSign::Register(_) | sign_review::NameSign::RegisterXns { .. } => {
+                pane.begin_reveal()
+            }
+            sign_review::NameSign::Renew { .. } | sign_review::NameSign::SetRecipient { .. } => {
+                pane.begin_manage()
+            }
+        }
+    }
+
+    /// Push an error onto the Names pane for the op `sign` would have run.
+    fn fail_name_pane(&mut self, sign: &sign_review::NameSign, msg: String) {
+        let pane = self.apps.names_pane();
+        match sign {
+            sign_review::NameSign::Commit(_) => pane.on_commit(Err(msg)),
+            sign_review::NameSign::Register(_) | sign_review::NameSign::RegisterXns { .. } => {
+                pane.on_register(Err(msg))
+            }
+            sign_review::NameSign::Renew { .. } => pane.on_renew(Err(msg)),
+            sign_review::NameSign::SetRecipient { .. } => pane.on_set_recipient(Err(msg)),
         }
     }
 
@@ -2469,15 +2692,14 @@ impl WalletScreen {
                         return (Task::batch([task, q]), None);
                     }
                     Some(swap::Outcome::RequestPlace { draft, quote }) => {
-                        // EOA: park the EOA signer for the async approve/sign
-                        // path. Safe: route to the EIP-1271 place flow. Either
-                        // way `CowPlaced` restores the parked signer.
-                        let place = self.place_order_task(CowHost::Modal, draft, quote);
-                        return (Task::batch([task, place]), None);
+                        // Don't sign yet — open the clear-signing review. The
+                        // signer is parked and the order placed only on confirm.
+                        let review = self.open_cow_review(CowHost::Modal, draft, quote);
+                        return (Task::batch([task, review]), None);
                     }
                     Some(swap::Outcome::RequestCancel { uid }) => {
-                        let cancel = self.cancel_order_task(uid);
-                        return (Task::batch([task, cancel]), None);
+                        let review = self.open_cow_cancel_review(uid);
+                        return (Task::batch([task, review]), None);
                     }
                     Some(swap::Outcome::CopyText(s)) => {
                         let copy = self.arm_clipboard_clear(s);
@@ -2494,10 +2716,10 @@ impl WalletScreen {
                     );
                 }
                 Some(apps::Outcome::RequestPlace { draft, quote }) => {
-                    return (self.place_order_task(CowHost::Apps, draft, quote), None);
+                    return (self.open_cow_review(CowHost::Apps, draft, quote), None);
                 }
                 Some(apps::Outcome::RequestCancel { uid }) => {
-                    return (self.cancel_order_task(uid), None);
+                    return (self.open_cow_cancel_review(uid), None);
                 }
                 Some(apps::Outcome::RefreshOrders) => {
                     // "Fetch" pulls the address's full CoW order history — this
@@ -2522,6 +2744,41 @@ impl WalletScreen {
                 }
                 None => return (Task::none(), None),
             },
+            Message::SignReview(child) => match child {
+                sign_review::Message::Confirm => {
+                    return (self.confirm_sign_review(), None);
+                }
+                sign_review::Message::Cancel
+                | sign_review::Message::Key(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                    ..
+                }) => {
+                    self.cancel_sign_review();
+                }
+                sign_review::Message::BoxClickIgnored | sign_review::Message::Key(_) => {}
+            },
+            Message::SignReviewPrepared { seq, legs } => {
+                // Drop a decode result for a review the user has since cancelled
+                // or replaced (the seq guard mirrors the Send decode pipeline).
+                let Some(review) = self.sign_review.as_mut() else {
+                    return (Task::none(), None);
+                };
+                if review.seq != seq {
+                    return (Task::none(), None);
+                }
+                match legs {
+                    Ok(legs) => {
+                        review.legs = legs;
+                        review.legs_loading = false;
+                    }
+                    Err(e) => {
+                        // Couldn't build/decode the transaction — abandon the
+                        // review and surface the error on the originating pane
+                        // rather than letting the user confirm a blank gate.
+                        self.fail_sign_review(e);
+                    }
+                }
+            }
             Message::NameReverseScanned { owner, result } => {
                 if owner == self.order_owner() {
                     self.apps.names_pane().on_reverse_scan(result);
@@ -3436,6 +3693,21 @@ impl WalletScreen {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs: Vec<Subscription<Message>> = Vec::new();
+        // The clear-signing overlay owns the keyboard while it's open (Esc =
+        // Cancel) and suppresses the layers beneath it, so Esc can't
+        // simultaneously close the modal/step back in the Apps pane underneath.
+        if self.sign_review.is_some() {
+            subs.push(
+                iced::keyboard::listen().map(|e| Message::SignReview(sign_review::Message::Key(e))),
+            );
+            if self.chrome.is_animating() || self.clipboard_clear.is_some() {
+                subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
+            }
+            if self.tracked_orders.iter().any(|o| !o.status.is_terminal()) {
+                subs.push(iced::time::every(Duration::from_secs(10)).map(|_| Message::CowPollTick));
+            }
+            return Subscription::batch(subs);
+        }
         match &self.modal {
             Modal::AccountDropdown(d) => {
                 subs.push(d.subscription().map(Message::AccountDropdown));
@@ -3575,7 +3847,20 @@ impl WalletScreen {
                 .view(t, &self.portfolio, self.chrome.progress())
                 .map(Message::SafeTxDetail),
         };
-        let composed: Element<'_, Message> = stack![background, modal_layer].into();
+        // Clear-signing review overlay — the top-most app layer, drawn over
+        // whatever modal/pane is active (Swap modal, Apps composer, or Names
+        // pane) so the same gate serves them all without any of them losing
+        // their own state when the user cancels. Constant tree shape (empty
+        // `Space` when no review is pending), like the modal/chip layers below.
+        let sign_review_layer: Element<'_, Message> = match &self.sign_review {
+            None => Space::new().width(0).height(0).into(),
+            // Fully opaque (progress 1.0): the overlay can sit over the Apps
+            // pane where there's no modal-chrome animation to ride, so it just
+            // appears rather than fading with the modal layer beneath it.
+            Some(review) => sign_review::view(t, review, 1.0).map(Message::SignReview),
+        };
+        let composed: Element<'_, Message> =
+            stack![background, modal_layer, sign_review_layer].into();
 
         // Bottom-right clipboard auto-clear chip rides on top of
         // whatever modal layer is currently visible. The chip is a
@@ -3976,6 +4261,275 @@ fn spawn_decode_task(
                 decoded: Box::new(decoded),
             })
         },
+    )
+}
+
+// ── Sign-review prepare helpers ───────────────────────────────────────────────
+
+/// Title / subtitle / trailing-note for a name-write review card.
+fn name_review_labels(sign: &sign_review::NameSign) -> (String, Option<String>, Option<String>) {
+    // A hardware wallet can't decode registrar calldata, so the in-app decode
+    // below is the *only* place the user can read what they're authorizing before
+    // approving the device's blind-sign prompt — call that out everywhere.
+    let blind = Some(
+        "Verify these details here — a hardware wallet can't decode this call and will ask you to \
+         blind-sign the hash."
+            .to_string(),
+    );
+    match sign {
+        sign_review::NameSign::Commit(plan) => (
+            format!("Register {}{} — commit", plan.label, plan.namespace.tld()),
+            Some("Step 1 of 2 · front-run-proof commitment".to_string()),
+            Some(
+                "The commitment is a blinded hash — it reveals nothing on-chain and sends no ETH. \
+                 The fee is paid at step 2."
+                    .to_string(),
+            ),
+        ),
+        sign_review::NameSign::Register(plan) => (
+            format!("Register {}{} — reveal", plan.label, plan.namespace.tld()),
+            Some("Step 2 of 2 · pays the registration fee".to_string()),
+            blind,
+        ),
+        sign_review::NameSign::RegisterXns { namespace, label } => {
+            (format!("Register {label}.{namespace}"), None, blind)
+        }
+        sign_review::NameSign::Renew {
+            namespace,
+            label,
+            years,
+        } => (
+            format!("Renew {}{}", label, namespace.tld()),
+            Some(format!(
+                "+{years} year{}",
+                if *years == 1 { "" } else { "s" }
+            )),
+            blind,
+        ),
+        sign_review::NameSign::SetRecipient {
+            namespace, label, ..
+        } => (
+            format!("Set recipient for {}{}", label, namespace.tld()),
+            Some("Points the name at a resolution address".to_string()),
+            blind,
+        ),
+    }
+}
+
+/// Build the CoW order-review panel from the draft + quote the user is about to
+/// authorize. Mirrors [`crate::cow::order::build_sell_order`] exactly (full sell =
+/// quote sell + fee; min received = slippage-reduced buy), so the review matches
+/// the EIP-712 message that gets signed.
+fn build_order_review(
+    draft: &SwapDraft,
+    quote: &crate::cow::api::QuoteResponse,
+    receiver: Address,
+) -> sign_review::OrderReview {
+    let q = &quote.quote;
+    let full_sell = q.sell_amount.saturating_add(q.fee_amount);
+    let min_raw = crate::cow::order::apply_slippage(q.buy_amount, draft.slippage_bps);
+    let (sell_amount, _) = crate::portfolio::format_token_balance(full_sell, draft.sell_decimals);
+    let (buy_amount, _) = crate::portfolio::format_token_balance(q.buy_amount, draft.buy_decimals);
+    let (min_received, _) = crate::portfolio::format_token_balance(min_raw, draft.buy_decimals);
+    sign_review::OrderReview {
+        chain: draft.chain,
+        sell_amount,
+        sell_symbol: draft.sell_symbol.clone(),
+        buy_amount,
+        buy_symbol: draft.buy_symbol.clone(),
+        min_received,
+        receiver,
+        valid_to: q.valid_to,
+        slippage_bps: draft.slippage_bps,
+        settlement: crate::cow::SETTLEMENT,
+        native: draft.is_native,
+    }
+}
+
+/// `0xabcd…ef01` short form of a 56-byte order UID hex string, for the cancel
+/// review subtitle.
+fn short_order_uid(uid: &str) -> String {
+    if uid.len() <= 14 {
+        return uid.to_string();
+    }
+    format!("{}…{}", &uid[..8], &uid[uid.len() - 6..])
+}
+
+/// Build + decode the registrar call for `sign` without signing it, and route the
+/// decoded leg back into the open review. Mainnet-pinned: every name registry the
+/// wallet supports lives on Ethereum mainnet.
+fn spawn_name_prepare(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    from: Address,
+    sign: sign_review::NameSign,
+    local_names: std::collections::HashMap<Address, String>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let (to, value, calldata, title) = build_name_call(network.as_ref(), &sign).await?;
+            let decoded = crate::decode::clear_sign::decode_transaction(
+                network.as_ref(),
+                crate::chain::Chain::Mainnet,
+                from,
+                to,
+                calldata,
+                value,
+                local_names,
+            )
+            .await;
+            Ok(vec![sign_review::ReviewLeg {
+                title,
+                to,
+                value,
+                chain: crate::chain::Chain::Mainnet,
+                decoded: Box::new(decoded),
+            }])
+        },
+        move |legs| Message::SignReviewPrepared { seq, legs },
+    )
+}
+
+/// Compute the `(to, value, calldata)` + a human title for a name write, reusing
+/// the same `*_call_for` builders the broadcast path uses — so the reviewed bytes
+/// are the bytes that get signed.
+async fn build_name_call(
+    net: &dyn BalanceFetcher,
+    sign: &sign_review::NameSign,
+) -> Result<(Address, U256, alloy::primitives::Bytes, String), String> {
+    use crate::names::manage;
+    match sign {
+        sign_review::NameSign::Commit(plan) => {
+            let (to, value, cd) = manage::commit_call_for(net, plan).await?;
+            Ok((
+                to,
+                value,
+                cd,
+                format!("Commit {}{}", plan.label, plan.namespace.tld()),
+            ))
+        }
+        sign_review::NameSign::Register(plan) => {
+            let (to, value, cd) = manage::register_call_for(net, plan).await?;
+            Ok((
+                to,
+                value,
+                cd,
+                format!("Register {}{}", plan.label, plan.namespace.tld()),
+            ))
+        }
+        sign_review::NameSign::RegisterXns { namespace, label } => {
+            let (to, value, cd) = manage::register_xns_call_for(net, namespace, label).await?;
+            Ok((to, value, cd, format!("Register {label}.{namespace}")))
+        }
+        sign_review::NameSign::Renew {
+            namespace,
+            label,
+            years,
+        } => {
+            let dur = crate::names::registrar::ens_duration_secs(*years);
+            let (to, value, cd) = manage::renew_call_for(net, *namespace, label, dur).await?;
+            Ok((to, value, cd, format!("Renew {}{}", label, namespace.tld())))
+        }
+        sign_review::NameSign::SetRecipient {
+            namespace,
+            label,
+            recipient,
+        } => {
+            let (to, value, cd) = manage::set_recipient_call_for(*namespace, label, *recipient);
+            Ok((
+                to,
+                value,
+                cd,
+                format!("Set recipient for {}{}", label, namespace.tld()),
+            ))
+        }
+    }
+}
+
+/// Decode a CoW order's on-chain legs (ERC-20 approval when allowance is short,
+/// or the native EthFlow `createOrder`) for review, then route them into the open
+/// review. An ERC-20 sell with sufficient allowance has no legs — only the
+/// EIP-712 order panel is shown.
+fn spawn_cow_prepare(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    draft: SwapDraft,
+    quote: crate::cow::api::QuoteResponse,
+    user: Address,
+    local_names: std::collections::HashMap<Address, String>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let chain = draft.chain;
+            let q = &quote.quote;
+            let full_sell = q.sell_amount.saturating_add(q.fee_amount);
+            let mut legs: Vec<sign_review::ReviewLeg> = Vec::new();
+            if draft.is_native {
+                // Native ETH → on-chain EthFlow createOrder (value = full sell).
+                let (_, app_data_hash) = cow::market_app_data(draft.slippage_bps);
+                let data = cow::ethflow::build_ethflow_data(
+                    draft.buy_token,
+                    user,
+                    full_sell,
+                    q.buy_amount,
+                    q.valid_to,
+                    quote.id.unwrap_or_default(),
+                    draft.slippage_bps,
+                    app_data_hash,
+                );
+                let calldata = cow::ethflow::create_order_calldata(&data);
+                let value = cow::ethflow::msg_value(&data);
+                let decoded = crate::decode::clear_sign::decode_transaction(
+                    network.as_ref(),
+                    chain,
+                    user,
+                    cow::ETHFLOW,
+                    calldata,
+                    value,
+                    local_names,
+                )
+                .await;
+                legs.push(sign_review::ReviewLeg {
+                    title: "Place on-chain order — EthFlow createOrder".to_string(),
+                    to: cow::ETHFLOW,
+                    value,
+                    chain,
+                    decoded: Box::new(decoded),
+                });
+            } else {
+                // ERC-20 → only sign the EIP-712 order, unless the vault relayer
+                // still needs an allowance bump first.
+                let provider =
+                    match provider_for(&network, crate::chain::NetworkId::Builtin(chain)).await {
+                        Some(p) => p,
+                        None => return Err("no execution RPC configured".to_string()),
+                    };
+                let allowance =
+                    cow::onchain::read_allowance(&provider, draft.sell_token, user).await?;
+                if allowance < full_sell {
+                    let calldata = cow::onchain::approve_calldata(U256::MAX);
+                    let decoded = crate::decode::clear_sign::decode_transaction(
+                        network.as_ref(),
+                        chain,
+                        user,
+                        draft.sell_token,
+                        calldata,
+                        U256::ZERO,
+                        local_names,
+                    )
+                    .await;
+                    legs.push(sign_review::ReviewLeg {
+                        title: format!("Approve {} for CoW (vault relayer)", draft.sell_symbol),
+                        to: draft.sell_token,
+                        value: U256::ZERO,
+                        chain,
+                        decoded: Box::new(decoded),
+                    });
+                }
+            }
+            Ok(legs)
+        },
+        move |legs| Message::SignReviewPrepared { seq, legs },
     )
 }
 
@@ -6802,8 +7356,10 @@ mod tests {
 
     #[test]
     fn names_available_and_routed_for_mainnet_safe() {
-        // A Mainnet hardware Safe offers Names, and a write routes through the
-        // Safe — parking the signer for the async execTransaction.
+        // A Mainnet hardware Safe offers Names. A write now opens the
+        // clear-signing review *first* (no signer parked yet); confirming it is
+        // what routes through the Safe and parks the signer for the async
+        // execTransaction.
         let mut screen = hardware_safe_screen();
         assert!(
             screen.names_available_for_active(),
@@ -6815,9 +7371,19 @@ mod tests {
             label: "alice".to_string(),
         });
         assert!(
-            screen.order_op_in_flight,
-            "a name write from a Mainnet Safe routes through (signer parked)"
+            screen.sign_review.is_some(),
+            "a name write opens the clear-signing review gate"
         );
+        assert!(
+            !screen.order_op_in_flight,
+            "the signer is parked only when the review is confirmed"
+        );
+        let _ = screen.confirm_sign_review();
+        assert!(
+            screen.order_op_in_flight,
+            "confirming routes through the Safe (signer parked)"
+        );
+        assert!(screen.sign_review.is_none(), "confirm closes the review");
     }
 
     #[test]
@@ -6848,6 +7414,114 @@ mod tests {
         assert!(
             screen.names_available_for_active(),
             "EOA mode always offers Names"
+        );
+    }
+
+    fn sample_swap_draft() -> SwapDraft {
+        SwapDraft {
+            chain: Chain::Mainnet,
+            is_native: false,
+            sell_token: addr(0x11),
+            buy_token: addr(0x22),
+            sell_amount: U256::from(1_000_000u64),
+            slippage_bps: 50,
+            sell_symbol: "USDC".into(),
+            buy_symbol: "DAI".into(),
+            sell_decimals: 6,
+            buy_decimals: 18,
+        }
+    }
+
+    fn sample_quote() -> crate::cow::api::QuoteResponse {
+        crate::cow::api::QuoteResponse {
+            quote: crate::cow::api::QuoteParams {
+                sell_token: addr(0x11),
+                buy_token: addr(0x22),
+                receiver: None,
+                sell_amount: U256::from(1_000_000u64),
+                buy_amount: U256::from(990_000_000_000_000_000u64),
+                valid_to: 1_900_000_000,
+                app_data: "{}".into(),
+                fee_amount: U256::ZERO,
+                kind: "sell".into(),
+                partially_fillable: false,
+            },
+            from: None,
+            expiration: None,
+            id: Some(1),
+            verified: Some(true),
+        }
+    }
+
+    #[test]
+    fn cow_place_opens_review_then_confirm_parks_signer() {
+        // Placing a swap must open the clear-signing review (showing the EIP-712
+        // order panel) *before* any signing. The signer parks only on confirm.
+        let me = addr(0xAB);
+        let mut screen = screen_for(me, new_cache());
+        assert!(screen.sign_review.is_none());
+        assert!(!screen.order_op_in_flight);
+
+        let _ = screen.open_cow_review(CowHost::Apps, sample_swap_draft(), sample_quote());
+        let review = screen.sign_review.as_ref().expect("place opens a review");
+        let order = review
+            .order
+            .as_ref()
+            .expect("swap review shows the order panel");
+        assert_eq!(order.receiver, me, "receiver is the active account");
+        assert_eq!(order.sell_symbol, "USDC");
+        assert_eq!(order.buy_symbol, "DAI");
+        assert!(
+            !screen.order_op_in_flight,
+            "the signer is not parked until the user confirms"
+        );
+
+        // Cancelling drops the review and parks nothing.
+        screen.cancel_sign_review();
+        assert!(screen.sign_review.is_none());
+        assert!(!screen.order_op_in_flight);
+
+        // Re-open and confirm → places the order, parking the signer.
+        let _ = screen.open_cow_review(CowHost::Apps, sample_swap_draft(), sample_quote());
+        let _ = screen.confirm_sign_review();
+        assert!(
+            screen.order_op_in_flight,
+            "confirming places the order (signer parked)"
+        );
+        assert!(screen.sign_review.is_none(), "confirm closes the review");
+    }
+
+    #[test]
+    fn cow_cancel_opens_gasless_review() {
+        // Cancelling an order opens a confirm gate (an off-chain EIP-712 message),
+        // with no legs to decode and no order panel.
+        let me = addr(0xAB);
+        let mut screen = screen_for(me, new_cache());
+        screen.tracked_orders.push(TrackedOrder {
+            uid: "0xdeadbeef".repeat(7),
+            chain: Chain::Mainnet,
+            owner: me,
+            kind: crate::cow::order::OrderKind::Sell,
+            sell_token: addr(0x11),
+            buy_token: addr(0x22),
+            sell_symbol: "USDC".into(),
+            buy_symbol: "DAI".into(),
+            sell_amount: U256::from(1_000_000u64),
+            buy_amount: U256::from(990_000_000_000_000_000u64),
+            sell_decimals: 6,
+            buy_decimals: 18,
+            valid_to: 1_900_000_000,
+            status: OrderStatus::Open,
+            executed: None,
+            is_ethflow: false,
+        });
+        let uid = screen.tracked_orders[0].uid.clone();
+        let _ = screen.open_cow_cancel_review(uid);
+        let review = screen.sign_review.as_ref().expect("cancel opens a review");
+        assert!(review.order.is_none(), "a cancellation has no order panel");
+        assert!(
+            !review.legs_loading,
+            "a cancellation has nothing to decode — Confirm is enabled immediately"
         );
     }
 
