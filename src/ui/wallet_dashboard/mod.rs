@@ -861,35 +861,207 @@ impl WalletScreen {
         self.nav
     }
 
-    /// Whether the Send button should be live. In EOA mode: true when
-    /// the signer can sign directly, or when the active descriptor is
-    /// a hardware account (click escalates to reconnect). View-only
-    /// accounts return false. In Safe mode: true when at least one
-    /// linked owner is an account this wallet can sign with — `Local`
-    /// **or** hardware. A 1/1 Safe owned by a Ledger/Trezor signs the
-    /// SafeTx on-device and broadcasts its own `execTransaction`, so a
-    /// Local owner is no longer required; the active EOA's signing
-    /// capability stays irrelevant.
+    /// Whether to show the Send button at all — it's **hidden**, not just
+    /// disabled, when this is false. In EOA mode: true only when the active
+    /// signer can sign right now, so a view-only account or a hardware account
+    /// whose device is disconnected hides Send (reconnect the device via the
+    /// sidebar's hardware card to bring it back). In Safe mode: true when the
+    /// Safe is trusted and at least one linked owner is signable (`Local` **or**
+    /// hardware) — the owner signer is built on demand at execute time, so the
+    /// active EOA's connection is irrelevant.
     fn can_send(&self) -> bool {
         if let Some(safe) = self.active_safe_descriptor() {
             return safe.trust.permits_signing() && self.has_signable_linked_owner(safe);
         }
         self.signer.can_sign()
-            || matches!(
-                self.accounts.get(self.active_index),
-                Some(AccountDescriptor::Ledger { .. } | AccountDescriptor::Trezor { .. })
-            )
     }
 
-    /// Whether the Swap quick action / modal should be live. Needs a signer
-    /// that can actually sign (orders are EIP-712-signed; ERC-20 sells and the
-    /// EthFlow path also broadcast on-chain) and an EOA identity — there's no
-    /// Safe-TX swap path in v1, so Safe mode disables it. CoW only runs on
-    /// Mainnet/Base, but that's surfaced inside the modal (the composer lists
-    /// only swappable balances) rather than gating the button, so a user with
-    /// no L1/Base balance still sees why nothing's available.
+    /// Whether the Swap quick action / modal should be live. In EOA mode:
+    /// needs a signer that can actually sign (orders are EIP-712-signed;
+    /// ERC-20 sells and the EthFlow path also broadcast on-chain). In Safe
+    /// mode: true when we can build a valid Safe-swap context — a recognized
+    /// Safe on a CoW-supported chain with ≥`threshold` signable owners — in
+    /// which case orders are placed via EIP-1271 (see [`Self::build_safe_swap_ctx`]).
+    /// CoW only runs on Mainnet/Base; for an EOA the composer surfaces that by
+    /// listing only swappable balances, while a Safe is pinned to one chain so
+    /// the gate checks it directly.
     fn can_swap(&self) -> bool {
-        self.active_safe.is_none() && self.signer.can_sign()
+        if self.active_safe.is_some() {
+            return self.build_safe_swap_ctx().is_some();
+        }
+        self.signer.can_sign()
+    }
+
+    /// The address that owns / receives CoW orders for the active identity —
+    /// the Safe in Safe mode, otherwise the active EOA. Used as the quote
+    /// `from`, the order `receiver`, and the scope for the order list / "Fetch".
+    fn order_owner(&self) -> Address {
+        self.active_safe_descriptor()
+            .map(|s| s.address())
+            .unwrap_or(self.address)
+    }
+
+    /// Tracked CoW orders owned by the active identity ([`Self::order_owner`]),
+    /// newest-first (by `valid_to`, UID as tiebreak). Drives the Apps order
+    /// list: scoping by the owner keeps a Safe's orders from leaking into the
+    /// EOA's view and — crucially — makes a Safe order placed via EIP-1271
+    /// (owner = the Safe, not the active EOA) actually appear in Safe mode.
+    fn active_cow_orders(&self) -> Vec<&TrackedOrder> {
+        let owner = self.order_owner();
+        let mut orders: Vec<&TrackedOrder> = self
+            .tracked_orders
+            .iter()
+            .filter(|o| o.owner == owner)
+            .collect();
+        orders.sort_by(|a, b| b.valid_to.cmp(&a.valid_to).then_with(|| b.uid.cmp(&a.uid)));
+        orders
+    }
+
+    /// Assemble the context needed to place a CoW order from the active Safe,
+    /// or `None` when Safe swaps aren't possible: not in Safe mode, an
+    /// unrecognized implementation (signing disabled), a chain CoW doesn't
+    /// serve, or fewer signable owners than the threshold. The signer owners
+    /// are descriptors (built into live signers inside the place task, like the
+    /// Safe send flow); the executor preference is any Local key for gas, else
+    /// the first signing owner pays its own.
+    fn build_safe_swap_ctx(&self) -> Option<SafeSwapCtx> {
+        let safe = self.active_safe_descriptor()?;
+        if !safe.trust.permits_signing() {
+            return None;
+        }
+        let chain = crate::chain::Chain::ALL
+            .into_iter()
+            .find(|c| c.chain_id() == safe.chain_id)?;
+        if !crate::cow::supported(chain) {
+            return None;
+        }
+        let signer_owners: Vec<AccountDescriptor> = signable_owners_of(safe, &self.accounts)
+            .into_iter()
+            .map(|(_, desc)| desc)
+            .take(safe.threshold as usize)
+            .collect();
+        if (signer_owners.len() as u32) < safe.threshold {
+            return None;
+        }
+        Some(SafeSwapCtx {
+            safe: safe.address(),
+            chain,
+            version: safe.version.clone(),
+            trust: safe.trust.clone(),
+            signer_owners,
+            local_executor_key: first_local_key_of(&self.accounts),
+        })
+    }
+
+    /// Context for routing a name write through the active Safe, or `None` when
+    /// names-from-Safe isn't possible: not in Safe mode, an unrecognized
+    /// implementation, fewer signable owners than the threshold, or — because
+    /// the name registries are Mainnet-pinned — a Safe that isn't a **Mainnet**
+    /// deployment. The name is owned by the Safe, so the Safe's address is the
+    /// registrant and the inner `execTransaction` `msg.sender`.
+    fn build_safe_name_ctx(&self) -> Option<SafeNameCtx> {
+        let safe = self.active_safe_descriptor()?;
+        if !safe.trust.permits_signing() {
+            return None;
+        }
+        if safe.chain_id != crate::chain::Chain::Mainnet.chain_id() {
+            return None;
+        }
+        let owners: Vec<AccountDescriptor> = signable_owners_of(safe, &self.accounts)
+            .into_iter()
+            .map(|(_, desc)| desc)
+            .take(safe.threshold as usize)
+            .collect();
+        if (owners.len() as u32) < safe.threshold {
+            return None;
+        }
+        Some(SafeNameCtx {
+            safe: safe.address(),
+            owners,
+            executor_key: first_local_key_of(&self.accounts),
+        })
+    }
+
+    /// Whether the Apps launcher should offer the Names app for the active
+    /// identity. EOA: always (reads work; writes gate at sign time, matching
+    /// the pre-Safe behavior). Safe: only a Mainnet Safe with a signable owner,
+    /// since names register/resolve against the Safe via `execTransaction`.
+    fn names_available_for_active(&self) -> bool {
+        match self.active_safe {
+            Some(_) => self.build_safe_name_ctx().is_some(),
+            None => true,
+        }
+    }
+
+    /// Spawn the right order-placement task for the active identity, parking
+    /// the active signer for the async path (Safe swaps don't use it, but
+    /// parking keeps `order_op_in_flight` / the Apps reprieve consistent and
+    /// the same `CowPlaced` handler restores it). Surfaces a clear error on the
+    /// host pane if a Safe swap is somehow no longer placeable.
+    fn place_order_task(
+        &mut self,
+        host: CowHost,
+        draft: SwapDraft,
+        quote: crate::cow::api::QuoteResponse,
+    ) -> Task<Message> {
+        if self.active_safe.is_some() {
+            let Some(ctx) = self.build_safe_swap_ctx() else {
+                let msg = "This Safe can't place swaps — it needs a recognized \
+                           implementation, a signable owner, and a CoW-supported chain."
+                    .to_string();
+                match host {
+                    CowHost::Modal => {
+                        if let Modal::Swap(p) = &mut self.modal {
+                            p.placement_failed(msg);
+                        }
+                    }
+                    CowHost::Apps => self.apps.placement_failed(msg),
+                }
+                return Task::none();
+            };
+            let handoff = self.park_signer_for_order();
+            spawn_cow_place_safe(self.network.clone(), host, handoff, draft, quote, ctx)
+        } else {
+            let handoff = self.park_signer_for_order();
+            spawn_cow_place(
+                self.network.clone(),
+                host,
+                handoff,
+                draft,
+                quote,
+                self.address,
+            )
+        }
+    }
+
+    /// Spawn the right off-chain cancel task for `uid`. A Safe-owned order
+    /// cancels via EIP-1271 (the active Safe's owners sign the cancellation
+    /// digest); an EOA order cancels with the parked EOA signer. Either path
+    /// resolves through the same `CowCancel` handler. No-op if the order isn't
+    /// tracked, or (for a Safe order) if a valid signing context can't be built.
+    fn cancel_order_task(&mut self, uid: String) -> Task<Message> {
+        let Some((chain, owner)) = self
+            .tracked_orders
+            .iter()
+            .find(|o| o.uid == uid)
+            .map(|o| (o.chain, o.owner))
+        else {
+            return Task::none();
+        };
+        if self
+            .active_safe_descriptor()
+            .is_some_and(|s| s.address() == owner)
+        {
+            let Some(ctx) = self.build_safe_swap_ctx() else {
+                warn!(%uid, "cow: cannot cancel Safe order — no valid signing context");
+                return Task::none();
+            };
+            let handoff = self.park_signer_for_order();
+            spawn_cow_cancel_safe(self.network.clone(), handoff, chain, uid, ctx)
+        } else {
+            let handoff = self.park_signer_for_order();
+            spawn_cow_cancel(handoff, chain, uid)
+        }
     }
 
     /// Whether the Apps (Swap) surface should be available for the active
@@ -1001,10 +1173,31 @@ impl WalletScreen {
             }
             return Task::none();
         }
-        // Every async result is tagged with `self.address` and dropped on arrival
-        // if the active account has since changed (see the `Name*` handlers), so
-        // an op spawned for one account can't populate another's view.
-        let owner = self.address;
+        // A name write from a Safe routes through the Safe (the registries are
+        // Mainnet-pinned and the name is owned by the Safe). If we're in Safe
+        // mode but can't build that context — a non-Mainnet Safe, or no signable
+        // owner — refuse rather than silently registering against the active EOA.
+        let safe_name = self.build_safe_name_ctx();
+        if is_write && self.active_safe.is_some() && safe_name.is_none() {
+            let msg = "Names from this Safe aren't available — they need a Mainnet \
+                       Safe with a signable owner. Switch to an EOA or a Mainnet Safe."
+                .to_string();
+            let pane = self.apps.names_pane();
+            match o {
+                names_app::Outcome::Commit { .. } => pane.on_commit(Err(msg)),
+                names_app::Outcome::Register { .. } | names_app::Outcome::RegisterXns { .. } => {
+                    pane.on_register(Err(msg))
+                }
+                names_app::Outcome::Renew { .. } => pane.on_renew(Err(msg)),
+                names_app::Outcome::SetRecipient { .. } => pane.on_set_recipient(Err(msg)),
+                _ => {}
+            }
+            return Task::none();
+        }
+        // Reads and the registrant are scoped to the active identity ([`order_owner`])
+        // — the Safe in Safe mode, else the EOA. Async results are tagged with
+        // this owner and dropped on arrival if the identity has since changed.
+        let owner = self.order_owner();
         match o {
             names_app::Outcome::ReverseScan => spawn_name_reverse_scan(self.network.clone(), owner),
             names_app::Outcome::Status { registry, label } => {
@@ -1022,7 +1215,18 @@ impl WalletScreen {
             } => spawn_name_quote(self.network.clone(), owner, namespace, label, years),
             names_app::Outcome::RegisterXns { namespace, label } => {
                 let handoff = self.park_signer_for_order();
-                spawn_name_register_xns(self.network.clone(), handoff, namespace, label)
+                match safe_name {
+                    Some(ctx) => spawn_name_register_xns_safe(
+                        self.network.clone(),
+                        handoff,
+                        ctx,
+                        namespace,
+                        label,
+                    ),
+                    None => {
+                        spawn_name_register_xns(self.network.clone(), handoff, namespace, label)
+                    }
+                }
             }
             names_app::Outcome::Commit {
                 namespace,
@@ -1030,23 +1234,29 @@ impl WalletScreen {
                 years,
             } => {
                 // Fresh commit/reveal nonce — never reused, kept in the plan. The
-                // name is registered to the signing account (`self.address`): the
-                // GNS/WNS reveal mints to msg.sender and binds the commitment to
-                // it, so owner must equal the signer.
+                // name is registered to `owner` (the active identity): GNS/WNS
+                // reveal to `msg.sender` and ENS takes `owner` as a param, so for
+                // a Safe both the commitment and the reveal's `msg.sender` are it.
                 let secret = B256::from(rand::random::<[u8; 32]>());
                 let plan = RegisterPlan {
                     namespace,
                     label,
-                    owner: self.address,
+                    owner,
                     duration_secs: crate::names::registrar::ens_duration_secs(years),
                     secret,
                 };
                 let handoff = self.park_signer_for_order();
-                spawn_name_commit(self.network.clone(), handoff, plan)
+                match safe_name {
+                    Some(ctx) => spawn_name_commit_safe(self.network.clone(), handoff, ctx, plan),
+                    None => spawn_name_commit(self.network.clone(), handoff, plan),
+                }
             }
             names_app::Outcome::Register { plan } => {
                 let handoff = self.park_signer_for_order();
-                spawn_name_register(self.network.clone(), handoff, plan)
+                match safe_name {
+                    Some(ctx) => spawn_name_register_safe(self.network.clone(), handoff, ctx, plan),
+                    None => spawn_name_register(self.network.clone(), handoff, plan),
+                }
             }
             names_app::Outcome::Renew {
                 namespace,
@@ -1054,7 +1264,19 @@ impl WalletScreen {
                 years,
             } => {
                 let handoff = self.park_signer_for_order();
-                spawn_name_renew(self.network.clone(), handoff, namespace, label, years)
+                match safe_name {
+                    Some(ctx) => spawn_name_renew_safe(
+                        self.network.clone(),
+                        handoff,
+                        ctx,
+                        namespace,
+                        label,
+                        years,
+                    ),
+                    None => {
+                        spawn_name_renew(self.network.clone(), handoff, namespace, label, years)
+                    }
+                }
             }
             names_app::Outcome::SetRecipient {
                 namespace,
@@ -1062,7 +1284,23 @@ impl WalletScreen {
                 recipient,
             } => {
                 let handoff = self.park_signer_for_order();
-                spawn_name_set_recipient(self.network.clone(), handoff, namespace, label, recipient)
+                match safe_name {
+                    Some(ctx) => spawn_name_set_recipient_safe(
+                        self.network.clone(),
+                        handoff,
+                        ctx,
+                        namespace,
+                        label,
+                        recipient,
+                    ),
+                    None => spawn_name_set_recipient(
+                        self.network.clone(),
+                        handoff,
+                        namespace,
+                        label,
+                        recipient,
+                    ),
+                }
             }
         }
     }
@@ -2227,34 +2465,18 @@ impl WalletScreen {
                         return (task, None);
                     }
                     Some(swap::Outcome::RequestQuote(draft)) => {
-                        let q = spawn_cow_quote(CowHost::Modal, draft, self.address);
+                        let q = spawn_cow_quote(CowHost::Modal, draft, self.order_owner());
                         return (Task::batch([task, q]), None);
                     }
                     Some(swap::Outcome::RequestPlace { draft, quote }) => {
-                        // Park the signer for the async approve/sign path,
-                        // exactly like the Send broadcast; `CowPlaced` returns it.
-                        let handoff = self.park_signer_for_order();
-                        let place = spawn_cow_place(
-                            self.network.clone(),
-                            CowHost::Modal,
-                            handoff,
-                            draft,
-                            quote,
-                            self.address,
-                        );
+                        // EOA: park the EOA signer for the async approve/sign
+                        // path. Safe: route to the EIP-1271 place flow. Either
+                        // way `CowPlaced` restores the parked signer.
+                        let place = self.place_order_task(CowHost::Modal, draft, quote);
                         return (Task::batch([task, place]), None);
                     }
                     Some(swap::Outcome::RequestCancel { uid }) => {
-                        let Some(chain) = self
-                            .tracked_orders
-                            .iter()
-                            .find(|o| o.uid == uid)
-                            .map(|o| o.chain)
-                        else {
-                            return (task, None);
-                        };
-                        let handoff = self.park_signer_for_order();
-                        let cancel = spawn_cow_cancel(handoff, chain, uid);
+                        let cancel = self.cancel_order_task(uid);
                         return (Task::batch([task, cancel]), None);
                     }
                     Some(swap::Outcome::CopyText(s)) => {
@@ -2266,41 +2488,25 @@ impl WalletScreen {
             }
             Message::Apps(child) => match self.apps.update(child) {
                 Some(apps::Outcome::RequestQuote(draft)) => {
-                    return (spawn_cow_quote(CowHost::Apps, draft, self.address), None);
-                }
-                Some(apps::Outcome::RequestPlace { draft, quote }) => {
-                    let handoff = self.park_signer_for_order();
                     return (
-                        spawn_cow_place(
-                            self.network.clone(),
-                            CowHost::Apps,
-                            handoff,
-                            draft,
-                            quote,
-                            self.address,
-                        ),
+                        spawn_cow_quote(CowHost::Apps, draft, self.order_owner()),
                         None,
                     );
                 }
+                Some(apps::Outcome::RequestPlace { draft, quote }) => {
+                    return (self.place_order_task(CowHost::Apps, draft, quote), None);
+                }
                 Some(apps::Outcome::RequestCancel { uid }) => {
-                    let Some(chain) = self
-                        .tracked_orders
-                        .iter()
-                        .find(|o| o.uid == uid)
-                        .map(|o| o.chain)
-                    else {
-                        return (Task::none(), None);
-                    };
-                    let handoff = self.park_signer_for_order();
-                    return (spawn_cow_cancel(handoff, chain, uid), None);
+                    return (self.cancel_order_task(uid), None);
                 }
                 Some(apps::Outcome::RefreshOrders) => {
                     // "Fetch" pulls the address's full CoW order history — this
                     // session's orders plus any from past sessions — from every
                     // chain CoW runs on, upserting each page into
                     // `tracked_orders`. (The 10s background tick still does the
-                    // lightweight per-order status poll between fetches.)
-                    let address = self.address;
+                    // lightweight per-order status poll between fetches.) Scoped
+                    // to the active identity — the Safe in Safe mode, else the EOA.
+                    let address = self.order_owner();
                     let tasks: Vec<Task<Message>> = crate::chain::Chain::ALL
                         .into_iter()
                         .filter(|c| crate::cow::supported(*c))
@@ -2317,17 +2523,17 @@ impl WalletScreen {
                 None => return (Task::none(), None),
             },
             Message::NameReverseScanned { owner, result } => {
-                if owner == self.address {
+                if owner == self.order_owner() {
                     self.apps.names_pane().on_reverse_scan(result);
                 }
             }
             Message::NameStatusLoaded { owner, result } => {
-                if owner == self.address {
+                if owner == self.order_owner() {
                     self.apps.names_pane().on_status(result);
                 }
             }
             Message::NameSearched { owner, seq, result } => {
-                if owner == self.address {
+                if owner == self.order_owner() {
                     self.apps.names_pane().on_search(seq, result);
                 }
             }
@@ -2336,7 +2542,7 @@ impl WalletScreen {
                 years,
                 result,
             } => {
-                if owner == self.address {
+                if owner == self.order_owner() {
                     self.apps.names_pane().on_quote(years, result);
                 }
             }
@@ -3458,19 +3664,14 @@ impl WalletScreen {
                 self.safe_pending_error.as_deref(),
             ),
             Nav::Apps => {
-                // Scoped to the active account so a switch never shows another
-                // account's orders, then sorted newest-first by `valid_to`
-                // (≈ creation order) so a fetched history page interleaves
-                // correctly with this session's freshly-placed orders. UID is
-                // the tiebreak for a stable order.
-                let mut orders: Vec<&TrackedOrder> = self
-                    .tracked_orders
-                    .iter()
-                    .filter(|o| o.owner == self.address)
-                    .collect();
-                orders.sort_by(|a, b| b.valid_to.cmp(&a.valid_to).then_with(|| b.uid.cmp(&a.uid)));
+                // Scoped to the active identity (the Safe in Safe mode, else the
+                // EOA) so a switch never shows another identity's orders and a
+                // Safe's EIP-1271 orders surface in Safe mode. Names is hidden
+                // for Safes — it operates on the active EOA, not the Safe.
+                let orders = self.active_cow_orders();
+                let names_available = self.names_available_for_active();
                 self.apps
-                    .view(t, &self.portfolio, &orders)
+                    .view(t, &self.portfolio, &orders, names_available)
                     .map(Message::Apps)
             }
             Nav::Activity => {
@@ -3821,7 +4022,6 @@ fn spawn_quote_task(network: Arc<dyn BalanceFetcher>, seq: u64, plan: SendPlan) 
     )
 }
 
-
 /// `(address, descriptor)` for every linked owner that can sign — Local
 /// or hardware, excluding view-only and dangling indices. Drives the
 /// detail modal's Confirm/Reject signer selection. Free function so it's
@@ -4071,7 +4271,15 @@ fn spawn_safe_broadcast_task(
                 None => &owner_signers[0],
             };
 
-            execute_safe_tx(&provider, executor, req.safe_address, chain, safe_tx, packed).await
+            execute_safe_tx(
+                &provider,
+                executor,
+                req.safe_address,
+                chain,
+                safe_tx,
+                packed,
+            )
+            .await
         },
         Message::SafeSendBroadcastReturn,
     )
@@ -4960,6 +5168,510 @@ async fn cow_place_order(
     }
 }
 
+/// Everything the Safe-swap place task needs that isn't in the draft/quote:
+/// the Safe identity + chain, the version/trust gate inputs, the owner
+/// descriptors to sign with (built into live signers inside the task), and a
+/// preferred Local gas-payer (else the first owner self-pays the approval).
+/// Assembled on the UI thread by [`WalletScreen::build_safe_swap_ctx`].
+struct SafeSwapCtx {
+    safe: Address,
+    chain: crate::chain::Chain,
+    version: String,
+    trust: crate::wallet::SafeTrust,
+    signer_owners: Vec<AccountDescriptor>,
+    local_executor_key: Option<B256>,
+}
+
+/// What a Safe name-write task needs: the Safe address, the owner descriptors to
+/// sign with (built into live signers inside the task), and a preferred Local
+/// gas-payer (else the first owner self-pays). Mainnet is implied — the name
+/// registries are Mainnet-pinned, and [`WalletScreen::build_safe_name_ctx`]
+/// only yields a context for a Mainnet Safe.
+#[derive(Clone)]
+struct SafeNameCtx {
+    safe: Address,
+    owners: Vec<AccountDescriptor>,
+    executor_key: Option<B256>,
+}
+
+/// Build, sign (with the Safe's owners), and broadcast `(to, value, calldata)`
+/// as a Safe `execTransaction` on `chain`; returns the execTransaction hash.
+/// The generic Safe-call executor behind the name-write tasks — same shape as
+/// the swap approval / EthFlow legs (build at the live nonce, cross-check the
+/// hash, sign every owner, execute via the gas-paying executor).
+#[allow(clippy::too_many_arguments)]
+async fn execute_call_as_safe_tx(
+    network: &Arc<dyn BalanceFetcher>,
+    provider: &alloy::providers::RootProvider<alloy::network::Ethereum>,
+    owners: &[KaoSigner],
+    executor: &KaoSigner,
+    safe: Address,
+    chain: crate::chain::Chain,
+    to: Address,
+    value: U256,
+    calldata: Bytes,
+) -> Result<TxHash, String> {
+    use crate::safe::tx::{
+        Operation, SafeTxInput, assemble_signatures, build_safe_tx_with_nonce, current_safe_nonce,
+        execute_safe_tx, safe_domain, safe_tx_hash, sign_owner, verify_safe_tx_before_signing,
+    };
+    let nonce = current_safe_nonce(network.as_ref(), safe, chain).await?;
+    let tx = build_safe_tx_with_nonce(
+        SafeTxInput {
+            to,
+            value,
+            data: calldata,
+            operation: Operation::Call,
+        },
+        nonce,
+    );
+    let domain = safe_domain(safe, chain);
+    let local_hash = safe_tx_hash(&tx, &domain);
+    verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local_hash).await?;
+    let mut sigs = Vec::with_capacity(owners.len());
+    for owner in owners {
+        sigs.push(sign_owner(owner, &tx, &domain, local_hash).await?);
+    }
+    let packed = assemble_signatures(sigs)?;
+    execute_safe_tx(provider, executor, safe, chain, tx, packed).await
+}
+
+/// Build the Safe's owner signers + executor and run a single Mainnet name
+/// `execTransaction` carrying `call` = `(to, value, calldata)`, waiting for it
+/// to mine. Shared by every `spawn_name_*_safe`.
+async fn run_name_write_as_safe(
+    network: &Arc<dyn BalanceFetcher>,
+    ctx: &SafeNameCtx,
+    call: (Address, U256, Bytes),
+) -> Result<TxHash, String> {
+    let chain = crate::chain::Chain::Mainnet;
+    let provider = network
+        .provider(chain)
+        .await
+        .ok_or_else(|| "no Ethereum mainnet RPC configured".to_string())?;
+    let mut owners = Vec::with_capacity(ctx.owners.len());
+    for desc in &ctx.owners {
+        owners.push(crate::wallet::build_owner_signer(desc).await?);
+    }
+    if owners.is_empty() {
+        return Err("no signable owners for this Safe".into());
+    }
+    let local_exec;
+    let executor: &KaoSigner = match ctx.executor_key {
+        Some(key) => {
+            let s = crate::wallet::signer_from_bytes(&key).map_err(|e| e.to_string())?;
+            local_exec = KaoSigner::Local(s);
+            &local_exec
+        }
+        None => &owners[0],
+    };
+    let (to, value, cd) = call;
+    let hash = execute_call_as_safe_tx(
+        network, &provider, &owners, executor, ctx.safe, chain, to, value, cd,
+    )
+    .await?;
+    await_mined(network, hash).await?;
+    Ok(hash)
+}
+
+/// Commit-reveal step 1 from a Safe (the commitment bakes `plan.owner` = the
+/// Safe). Mirrors [`spawn_name_commit`] but executes as a Safe tx; the parked
+/// active signer rides back via the `handoff` untouched.
+fn spawn_name_commit_safe(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    ctx: SafeNameCtx,
+    plan: RegisterPlan,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let call = crate::names::manage::commit_call_for(&*network, &plan).await?;
+            let hash = run_name_write_as_safe(&network, &ctx, call).await?;
+            Ok::<_, String>((plan.clone(), hash))
+        },
+        move |result| Message::NameCommitted {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Commit-reveal step 2 (reveal/register) from a Safe.
+fn spawn_name_register_safe(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    ctx: SafeNameCtx,
+    plan: RegisterPlan,
+) -> Task<Message> {
+    let name = format!("{}{}", plan.label, plan.namespace.tld());
+    Task::perform(
+        async move {
+            let call = crate::names::manage::register_call_for(&*network, &plan).await?;
+            let hash = run_name_write_as_safe(&network, &ctx, call).await?;
+            Ok::<_, String>((name, hash))
+        },
+        move |result| Message::NameRegistered {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// XNS one-shot registration from a Safe — the Safe becomes the permanent owner
+/// (XNS binds to the inner `msg.sender`).
+fn spawn_name_register_xns_safe(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    ctx: SafeNameCtx,
+    namespace: String,
+    label: String,
+) -> Task<Message> {
+    let name = format!("{label}.{namespace}");
+    Task::perform(
+        async move {
+            let call =
+                crate::names::manage::register_xns_call_for(&*network, &namespace, &label).await?;
+            let hash = run_name_write_as_safe(&network, &ctx, call).await?;
+            Ok::<_, String>((name, hash))
+        },
+        move |result| Message::NameRegistered {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Renew an owned name from a Safe.
+fn spawn_name_renew_safe(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    ctx: SafeNameCtx,
+    namespace: Namespace,
+    label: String,
+    years: u32,
+) -> Task<Message> {
+    let name = format!("{label}{}", namespace.tld());
+    Task::perform(
+        async move {
+            let duration = crate::names::registrar::ens_duration_secs(years);
+            let call = crate::names::manage::renew_call_for(&*network, namespace, &label, duration)
+                .await?;
+            let hash = run_name_write_as_safe(&network, &ctx, call).await?;
+            Ok::<_, String>((name, hash))
+        },
+        move |result| Message::NameRenewed {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Repoint an owned name from a Safe (the resolver authorizes the Safe owner).
+fn spawn_name_set_recipient_safe(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    ctx: SafeNameCtx,
+    namespace: Namespace,
+    label: String,
+    recipient: Address,
+) -> Task<Message> {
+    let name = format!("{label}{}", namespace.tld());
+    Task::perform(
+        async move {
+            let call = crate::names::manage::set_recipient_call_for(namespace, &label, recipient);
+            let hash = run_name_write_as_safe(&network, &ctx, call).await?;
+            Ok::<_, String>((name, hash))
+        },
+        move |result| Message::NameRecipientSet {
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// Place a CoW order *from a Safe* via EIP-1271. Builds live signers for the
+/// Safe's owners (software or hardware), then runs [`cow_place_order_safe`].
+/// Reuses the `CowPlaced` result message — the `handoff` carries the parked
+/// active signer straight back through untouched (the Safe path signs with
+/// freshly-built owner signers, not the active one).
+fn spawn_cow_place_safe(
+    network: Arc<dyn BalanceFetcher>,
+    host: CowHost,
+    handoff: SignerHandoff,
+    draft: SwapDraft,
+    quote: crate::cow::api::QuoteResponse,
+    ctx: SafeSwapCtx,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let provider = match provider_for(&network, crate::chain::NetworkId::Builtin(ctx.chain))
+                .await
+            {
+                Some(p) => p,
+                None => return Err::<TrackedOrder, String>("no execution RPC configured".into()),
+            };
+            // Build one signer per owner up front (hardware opens a transport
+            // once), reused for both the approval SafeTx and the EIP-1271 order.
+            let mut owners = Vec::with_capacity(ctx.signer_owners.len());
+            for desc in &ctx.signer_owners {
+                match crate::wallet::build_owner_signer(desc).await {
+                    Ok(s) => owners.push(s),
+                    Err(e) => return Err(format!("build owner signer: {e}")),
+                }
+            }
+            if owners.is_empty() {
+                return Err("no signable owners for this Safe".into());
+            }
+            // Executor: prefer a Local gas-payer; else the first owner self-pays.
+            let local_exec;
+            let executor: &KaoSigner = match ctx.local_executor_key {
+                Some(key) => {
+                    let s = crate::wallet::signer_from_bytes(&key)
+                        .map_err(|e| format!("derive executor: {e}"))?;
+                    local_exec = KaoSigner::Local(s);
+                    &local_exec
+                }
+                None => &owners[0],
+            };
+            cow_place_order_safe(&network, &provider, &owners, executor, &draft, &quote, &ctx).await
+        },
+        move |result| Message::CowPlaced {
+            host,
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// The Safe variant of [`cow_place_order`] — ERC-20 sells only. Every signature
+/// is a Safe owner action: the vault-relayer approval (when the Safe's
+/// allowance is short) is an on-chain `execTransaction`, and the order itself
+/// carries an EIP-1271 signature the orderbook validates against the Safe's
+/// `isValidSignature`. We verify that signature against the live contract
+/// before POSTing, so a bad derivation fails closed. Native-ETH (EthFlow) sells
+/// aren't supported from a Safe yet — EthFlow's `createOrder` is a separate
+/// on-chain Safe-tx mechanism — so they're rejected up front.
+#[allow(clippy::too_many_arguments)]
+/// Build the Safe transaction that places a native-ETH EthFlow order: a
+/// value-bearing `Call` to `ETHFLOW.createOrder`, the ETH (`msg_value` = the
+/// sell amount) forwarded from the Safe's balance by `execTransaction`. Pure —
+/// no network/signer — so the `(to, value, selector)` wrapping is unit-testable.
+fn ethflow_safe_tx(data: &cow::ethflow::EthFlowData, nonce: u64) -> crate::safe::SafeTx {
+    use crate::safe::tx::{Operation, SafeTxInput, build_safe_tx_with_nonce};
+    build_safe_tx_with_nonce(
+        SafeTxInput {
+            to: cow::ETHFLOW,
+            value: cow::ethflow::msg_value(data),
+            data: cow::ethflow::create_order_calldata(data),
+            operation: Operation::Call,
+        },
+        nonce,
+    )
+}
+
+async fn cow_place_order_safe(
+    network: &Arc<dyn BalanceFetcher>,
+    provider: &alloy::providers::RootProvider<alloy::network::Ethereum>,
+    owners: &[KaoSigner],
+    executor: &KaoSigner,
+    draft: &SwapDraft,
+    quote: &crate::cow::api::QuoteResponse,
+    ctx: &SafeSwapCtx,
+) -> Result<TrackedOrder, String> {
+    use crate::safe::tx::{
+        Operation, SafeTxInput, assemble_signatures, build_safe_tx_with_nonce, current_safe_nonce,
+        ensure_signable_version, execute_safe_tx, safe_domain as safe_tx_domain, safe_tx_hash,
+        sign_owner, verify_safe_tx_before_signing,
+    };
+    if let Some(reason) = ctx.trust.signing_block_reason() {
+        return Err(reason.to_string());
+    }
+    ensure_signable_version(&ctx.version)?;
+
+    let chain = ctx.chain;
+    let safe = ctx.safe;
+    let q = &quote.quote;
+    let full_sell = q.sell_amount.saturating_add(q.fee_amount);
+    let (full_app_data, app_data_hash) = cow::market_app_data(draft.slippage_bps);
+
+    if draft.is_native {
+        // Native ETH → the Safe calls `ETHFLOW.createOrder` as a value-bearing
+        // `execTransaction`. The EthFlow contract becomes the GPv2 order owner
+        // and signs the WETH order via its own EIP-1271, so — unlike the ERC-20
+        // path — there's no order signature to build and no relayer approval:
+        // the Safe's ETH rides along as the inner-call value. The Safe is the
+        // `createOrder` caller, so an expiry refund returns to the Safe, and
+        // `receiver = safe` sends the bought tokens to the Safe.
+        let data = cow::ethflow::build_ethflow_data(
+            draft.buy_token,
+            safe,
+            full_sell,
+            q.buy_amount,
+            q.valid_to,
+            quote.id.unwrap_or_default(),
+            draft.slippage_bps,
+            app_data_hash,
+        );
+        // The native path never POSTs an order body, so the orderbook learns the
+        // appData (and thus `orderClass = market`) only from this upload.
+        let app_data_hex = format!("{app_data_hash:#x}");
+        if let Err(e) = cow::api::upload_app_data(chain, &app_data_hex, &full_app_data).await {
+            warn!(error = %e, "cow(safe): appData upload failed (native order may book as limit)");
+        }
+        let nonce = current_safe_nonce(network.as_ref(), safe, chain).await?;
+        let tx = ethflow_safe_tx(&data, nonce);
+        // revm-preflight the inner `createOrder` the Safe will make — native gas
+        // is real ETH, so catch a revert (wrong params, underfunded) before
+        // spending it. Advisory: an unrunnable sim doesn't block.
+        cow_preflight_sim(network, chain, safe, tx.to, tx.value, tx.data.clone()).await?;
+        let domain = safe_tx_domain(safe, chain);
+        let local_hash = safe_tx_hash(&tx, &domain);
+        verify_safe_tx_before_signing(network.as_ref(), &tx, safe, chain, local_hash).await?;
+        let mut sigs = Vec::with_capacity(owners.len());
+        for owner in owners {
+            sigs.push(sign_owner(owner, &tx, &domain, local_hash).await?);
+        }
+        let packed = assemble_signatures(sigs)?;
+        let hash = execute_safe_tx(provider, executor, safe, chain, tx, packed).await?;
+        cow::onchain::wait_for_receipt(provider, hash, 40).await?;
+        let uid = cow::ethflow::ethflow_uid(&data, chain)?;
+        return Ok(TrackedOrder {
+            uid: cow::order::uid_hex(&uid),
+            chain,
+            owner: safe,
+            kind: cow::order::OrderKind::Sell,
+            sell_token: draft.sell_token,
+            buy_token: draft.buy_token,
+            sell_symbol: draft.sell_symbol.clone(),
+            buy_symbol: draft.buy_symbol.clone(),
+            sell_amount: draft.sell_amount,
+            buy_amount: cow::order::apply_slippage(q.buy_amount, draft.slippage_bps),
+            sell_decimals: draft.sell_decimals,
+            buy_decimals: draft.buy_decimals,
+            valid_to: q.valid_to,
+            status: OrderStatus::Open,
+            executed: None,
+            is_ethflow: true,
+        });
+    }
+
+    // ── ERC-20 path: approve the vault relayer (if short), then place an
+    //    EIP-1271-signed order. ──
+    // 1. Approve the vault relayer if the Safe's allowance is short — as a Safe
+    //    `execTransaction` signed by the owners, mined before we sign the order.
+    let allowance = cow::onchain::read_allowance(provider, draft.sell_token, safe).await?;
+    let needs_approve = allowance < full_sell;
+    info!(
+        chain_id = chain.chain_id(),
+        safe = %safe,
+        token = %draft.sell_token,
+        allowance = %allowance,
+        full_sell = %full_sell,
+        needs_approve,
+        "cow(safe): erc20 allowance check",
+    );
+    if needs_approve {
+        let nonce = current_safe_nonce(network.as_ref(), safe, chain).await?;
+        let approve_tx = build_safe_tx_with_nonce(
+            SafeTxInput {
+                to: draft.sell_token,
+                value: U256::ZERO,
+                data: cow::onchain::approve_calldata(U256::MAX),
+                operation: Operation::Call,
+            },
+            nonce,
+        );
+        let domain = safe_tx_domain(safe, chain);
+        let local_hash = safe_tx_hash(&approve_tx, &domain);
+        verify_safe_tx_before_signing(network.as_ref(), &approve_tx, safe, chain, local_hash)
+            .await?;
+        let mut sigs = Vec::with_capacity(owners.len());
+        for owner in owners {
+            sigs.push(sign_owner(owner, &approve_tx, &domain, local_hash).await?);
+        }
+        let packed = assemble_signatures(sigs)?;
+        let hash = execute_safe_tx(provider, executor, safe, chain, approve_tx, packed).await?;
+        cow::onchain::wait_for_receipt(provider, hash, 40).await?;
+    }
+
+    // 2. Build the order (receiver = the Safe), sign EIP-1271, and verify the
+    //    blob against the live Safe before it leaves the wallet.
+    let order = cow::order::build_sell_order(
+        draft.sell_token,
+        draft.buy_token,
+        safe,
+        full_sell,
+        q.buy_amount,
+        q.valid_to,
+        draft.slippage_bps,
+        app_data_hash,
+    );
+    let order_domain = cow::order::cow_domain(chain);
+    let order_digest = cow::order::order_digest(&order, &order_domain);
+    let signature = cow::safe_sig::sign_eip1271_digest(owners, order_digest, safe, chain).await?;
+    cow::safe_sig::verify_eip1271_on_chain(network.as_ref(), safe, chain, order_digest, &signature)
+        .await?;
+
+    // 3. Upload the appData pre-image, then POST the eip1271 order.
+    let app_data_hex = format!("{app_data_hash:#x}");
+    if let Err(e) = cow::api::upload_app_data(chain, &app_data_hex, &full_app_data).await {
+        warn!(error = %e, "cow(safe): appData upload failed (proceeding; order carries the pre-image)");
+    }
+    let body = cow::api::OrderCreation {
+        sell_token: order.sellToken,
+        buy_token: order.buyToken,
+        receiver: order.receiver,
+        sell_amount: order.sellAmount,
+        buy_amount: order.buyAmount,
+        valid_to: order.validTo,
+        app_data: full_app_data,
+        app_data_hash: app_data_hex,
+        fee_amount: order.feeAmount,
+        kind: "sell".to_string(),
+        partially_fillable: false,
+        sell_token_balance: "erc20".to_string(),
+        buy_token_balance: "erc20".to_string(),
+        signing_scheme: "eip1271".to_string(),
+        signature: format!("0x{}", alloy::hex::encode(&signature)),
+        from: safe,
+        quote_id: quote.id,
+    };
+    // Same fresh-approval indexing race as the EOA path: after our approval
+    // mines, the orderbook may not see the Safe's allowance for a few seconds.
+    let mut uid_result = cow::api::post_order(chain, &body).await;
+    if needs_approve {
+        let mut attempt = 0u32;
+        while let Err(e) = &uid_result {
+            if attempt >= 5 || !e.to_lowercase().contains("allowance") {
+                break;
+            }
+            attempt += 1;
+            warn!(attempt, error = %e, "cow(safe): orderbook hasn't indexed the fresh approval yet; retrying POST");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            uid_result = cow::api::post_order(chain, &body).await;
+        }
+    }
+    let uid = uid_result?;
+    Ok(TrackedOrder {
+        uid,
+        chain,
+        owner: safe,
+        kind: cow::order::OrderKind::Sell,
+        sell_token: draft.sell_token,
+        buy_token: draft.buy_token,
+        sell_symbol: draft.sell_symbol.clone(),
+        buy_symbol: draft.buy_symbol.clone(),
+        sell_amount: draft.sell_amount,
+        buy_amount: order.buyAmount,
+        sell_decimals: draft.sell_decimals,
+        buy_decimals: draft.buy_decimals,
+        valid_to: q.valid_to,
+        status: OrderStatus::Open,
+        executed: None,
+        is_ethflow: false,
+    })
+}
+
 /// Off-chain cancel an ERC-20 order (signed `DELETE /orders`). EthFlow orders
 /// cancel on-chain (deferred) and never reach here — the Apps pane hides their
 /// cancel affordance.
@@ -5002,6 +5714,67 @@ async fn cow_cancel(
         order_uids: vec![uid.to_string()],
         signature: format!("0x{}", alloy::hex::encode(sig.as_bytes())),
         signing_scheme: "eip712".to_string(),
+    };
+    cow::api::delete_orders(chain, &body).await
+}
+
+/// EIP-1271 off-chain cancel of a Safe-owned order. No gas / executor — the
+/// cancellation is a signed `DELETE /orders`; CoW derives the order's owner
+/// (the Safe) from the UID and validates the signature via the Safe's
+/// `isValidSignature`. Builds the Safe's owner signers (software or hardware)
+/// and reuses the same `CowCancel` result handler (the `handoff` carries the
+/// parked active signer straight back, untouched).
+fn spawn_cow_cancel_safe(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    chain: crate::chain::Chain,
+    uid: String,
+    ctx: SafeSwapCtx,
+) -> Task<Message> {
+    let uid_for_msg = uid.clone();
+    Task::perform(
+        async move {
+            let mut owners = Vec::with_capacity(ctx.signer_owners.len());
+            for desc in &ctx.signer_owners {
+                match crate::wallet::build_owner_signer(desc).await {
+                    Ok(s) => owners.push(s),
+                    Err(e) => return Err::<(), String>(format!("build owner signer: {e}")),
+                }
+            }
+            if owners.is_empty() {
+                return Err("no signable owners for this Safe".into());
+            }
+            cow_cancel_safe(&network, &owners, ctx.safe, chain, &uid).await
+        },
+        move |result| Message::CowCancel {
+            uid: uid_for_msg.clone(),
+            result,
+            signer: handoff,
+        },
+    )
+}
+
+/// The Safe variant of [`cow_cancel`]: sign the `OrderCancellations` digest as
+/// an EIP-1271 Safe message (owner signatures over the Safe-wrapped digest),
+/// verify it against the live Safe, then `DELETE /orders` with
+/// `signingScheme: eip1271`.
+async fn cow_cancel_safe(
+    network: &Arc<dyn BalanceFetcher>,
+    owners: &[KaoSigner],
+    safe: Address,
+    chain: crate::chain::Chain,
+    uid: &str,
+) -> Result<(), String> {
+    let bytes = parse_order_uid(uid)?;
+    let domain = cow::order::cow_domain(chain);
+    let digest = cow::order::cancellations_digest(&[bytes], &domain);
+    let signature = cow::safe_sig::sign_eip1271_digest(owners, digest, safe, chain).await?;
+    cow::safe_sig::verify_eip1271_on_chain(network.as_ref(), safe, chain, digest, &signature)
+        .await?;
+    let body = cow::api::CancellationBody {
+        order_uids: vec![uid.to_string()],
+        signature: format!("0x{}", alloy::hex::encode(&signature)),
+        signing_scheme: "eip1271".to_string(),
     };
     cow::api::delete_orders(chain, &body).await
 }
@@ -5745,6 +6518,336 @@ mod tests {
         assert!(
             !screen.can_send(),
             "unrecognized Safe implementations must not expose Send"
+        );
+    }
+
+    #[test]
+    fn can_send_in_safe_mode_true_for_hardware_owner() {
+        // 1/1 Safe whose only linked owner is a Ledger, and the wallet
+        // holds no Local key at all. The old gate required a Local owner;
+        // now the hardware owner signs on-device and broadcasts its own
+        // execTransaction, so Send must be live.
+        let accounts = vec![view_only_account(addr(1)), ledger_acct(addr(0xab))];
+        let mut safe = safe_descriptor(0x99, 1);
+        safe.linked_signer_indices = vec![1];
+        let mut screen = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            accounts,
+            vec![safe],
+            0,
+            Arc::new(MockFetcher::new()),
+            crate::portfolio::new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        screen.active_safe = Some(0);
+        assert!(
+            screen.can_send(),
+            "a 1/1 hardware-owned Safe must expose Send"
+        );
+    }
+
+    #[test]
+    fn can_send_in_safe_mode_false_for_view_only_owner() {
+        // The only linked owner is view-only — no key material anywhere,
+        // so Send must stay blocked even though trust is Canonical.
+        let accounts = vec![view_only_account(addr(1)), view_only_account(addr(2))];
+        let mut safe = safe_descriptor(0x99, 1);
+        safe.linked_signer_indices = vec![1];
+        let mut screen = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            accounts,
+            vec![safe],
+            0,
+            Arc::new(MockFetcher::new()),
+            crate::portfolio::new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        screen.active_safe = Some(0);
+        assert!(
+            !screen.can_send(),
+            "a Safe with only a view-only owner cannot send"
+        );
+    }
+
+    #[test]
+    fn send_hidden_for_view_only_and_disconnected_hardware_eoa() {
+        // EOA mode: Send shows only when the active signer can sign right now.
+        let local_signer =
+            KaoSigner::Local(crate::wallet::signer_from_bytes(&B256::repeat_byte(0x11)).unwrap());
+        let mut screen = WalletScreen::new(
+            local_signer,
+            vec![local_with_key(0x11)],
+            Vec::new(),
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        assert!(screen.can_send(), "a live Local signer shows Send");
+
+        // Both a view-only account and a hardware account with a disconnected
+        // device present as a view-only placeholder signer (no live signer), so
+        // Send is hidden in either case.
+        screen.signer = KaoSigner::ViewOnly(addr(0xCC));
+        assert!(
+            !screen.can_send(),
+            "view-only / disconnected hardware (no live signer) hides Send"
+        );
+    }
+
+    /// The canonical hardware-multisig these features target: a 1/1 Safe on
+    /// Mainnet (CoW-supported) whose only owner is a Ledger, and the wallet
+    /// holds no Local key. Active in Safe mode.
+    fn hardware_safe_screen() -> WalletScreen {
+        let accounts = vec![view_only_account(addr(1)), ledger_acct(addr(0xab))];
+        let mut safe = safe_descriptor(0x99, 1); // chain_id 1 = Mainnet
+        safe.linked_signer_indices = vec![1];
+        let mut screen = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            accounts,
+            vec![safe],
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        screen.active_safe = Some(0);
+        screen
+    }
+
+    #[test]
+    fn order_owner_tracks_active_identity() {
+        let mut screen = hardware_safe_screen();
+        let safe_addr = screen.safes[0].address();
+        assert_eq!(
+            screen.order_owner(),
+            safe_addr,
+            "Safe mode → CoW orders owned by the Safe"
+        );
+        screen.active_safe = None;
+        assert_eq!(
+            screen.order_owner(),
+            screen.address,
+            "EOA mode → CoW orders owned by the EOA"
+        );
+    }
+
+    #[test]
+    fn can_swap_true_for_hardware_safe() {
+        assert!(
+            hardware_safe_screen().can_swap(),
+            "a hardware-owned Safe on a CoW chain can swap via EIP-1271"
+        );
+    }
+
+    #[test]
+    fn can_swap_false_for_view_only_safe() {
+        let accounts = vec![view_only_account(addr(1)), view_only_account(addr(2))];
+        let mut safe = safe_descriptor(0x99, 1);
+        safe.linked_signer_indices = vec![1];
+        let mut screen = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            accounts,
+            vec![safe],
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        screen.active_safe = Some(0);
+        assert!(
+            !screen.can_swap(),
+            "a view-only Safe has no signer for an EIP-1271 order"
+        );
+    }
+
+    #[test]
+    fn can_swap_false_for_unrecognized_safe() {
+        let mut screen = hardware_safe_screen();
+        screen.safes[0].trust = crate::wallet::SafeTrust::UnrecognizedImpl;
+        assert!(
+            !screen.can_swap(),
+            "an unrecognized Safe implementation blocks signing"
+        );
+    }
+
+    #[test]
+    fn can_swap_false_for_safe_on_unsupported_chain() {
+        let mut screen = hardware_safe_screen();
+        screen.safes[0].chain_id = 10; // Optimism — CoW serves only Mainnet/Base
+        assert!(
+            !screen.can_swap(),
+            "CoW doesn't serve this Safe's chain, so no swap"
+        );
+    }
+
+    #[test]
+    fn build_safe_swap_ctx_uses_hardware_owner_and_no_local_executor() {
+        let screen = hardware_safe_screen();
+        let ctx = screen
+            .build_safe_swap_ctx()
+            .expect("a valid hardware Safe must yield a swap context");
+        assert_eq!(ctx.safe, screen.safes[0].address());
+        assert_eq!(ctx.chain, Chain::Mainnet);
+        assert_eq!(ctx.signer_owners.len(), 1, "one signable (hardware) owner");
+        assert!(matches!(
+            ctx.signer_owners[0],
+            AccountDescriptor::Ledger { .. }
+        ));
+        assert!(
+            ctx.local_executor_key.is_none(),
+            "no Local key in wallet → the hardware owner self-pays gas"
+        );
+    }
+
+    #[test]
+    fn ethflow_safe_tx_targets_ethflow_with_eth_value() {
+        // The native-ETH Safe swap is a value-bearing Call to ETHFLOW.createOrder
+        // — the Safe forwards its own ETH as the inner-call value, no approval,
+        // no EIP-1271 order signature (the EthFlow contract signs the order).
+        let sell = U256::from(2_000_000_000_000_000_000u64); // 2 ETH
+        let data = cow::ethflow::build_ethflow_data(
+            addr(0xB0), // buy token
+            addr(0x99), // receiver = the Safe
+            sell,
+            U256::from(5_000_000_000u64),
+            1_900_000_000,
+            7,
+            50,
+            cow::market_app_data(50).1,
+        );
+        let tx = ethflow_safe_tx(&data, 11);
+        assert_eq!(tx.to, cow::ETHFLOW, "calls the EthFlow contract");
+        assert_eq!(
+            tx.value, sell,
+            "forwards the full ETH sell as the inner value"
+        );
+        assert_eq!(
+            &tx.data.as_ref()[0..4],
+            &[0x32, 0x2b, 0xba, 0x21],
+            "createOrder selector"
+        );
+        assert_eq!(tx.operation, 0, "Call, never DelegateCall");
+        assert_eq!(tx.nonce, U256::from(11u64), "pinned nonce");
+        assert_eq!(tx.gasPrice, U256::ZERO, "gas-refund fields zeroed");
+    }
+
+    #[test]
+    fn active_cow_orders_scope_to_active_identity() {
+        let mut screen = hardware_safe_screen();
+        let safe_addr = screen.safes[0].address();
+        let eoa = screen.address;
+        screen.tracked_orders = vec![
+            tracked_order("0xsafe_new", safe_addr, OrderStatus::Open, 200),
+            tracked_order("0xsafe_old", safe_addr, OrderStatus::Open, 100),
+            tracked_order("0xeoa", eoa, OrderStatus::Open, 300),
+        ];
+        // Safe mode: only the Safe's orders, newest-first by valid_to.
+        let got: Vec<&str> = screen
+            .active_cow_orders()
+            .iter()
+            .map(|o| o.uid.as_str())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["0xsafe_new", "0xsafe_old"],
+            "Safe mode shows the Safe's EIP-1271 orders, not the EOA's"
+        );
+        // EOA mode: only the EOA's order.
+        screen.active_safe = None;
+        let got: Vec<&str> = screen
+            .active_cow_orders()
+            .iter()
+            .map(|o| o.uid.as_str())
+            .collect();
+        assert_eq!(got, vec!["0xeoa"]);
+    }
+
+    /// Like `hardware_safe_screen` but the Safe is on a non-Mainnet chain —
+    /// where the Mainnet-pinned name registries can't reach it.
+    fn hardware_safe_screen_on_chain(chain_id: u64) -> WalletScreen {
+        let accounts = vec![view_only_account(addr(1)), ledger_acct(addr(0xab))];
+        let mut safe = safe_descriptor(0x99, chain_id);
+        safe.linked_signer_indices = vec![1];
+        let mut screen = WalletScreen::new(
+            KaoSigner::ViewOnly(addr(1)),
+            accounts,
+            vec![safe],
+            0,
+            Arc::new(MockFetcher::new()),
+            new_cache(),
+            Arc::new(RwLock::new(ContactsBook::new())),
+            None,
+        );
+        screen.active_safe = Some(0);
+        screen
+    }
+
+    #[test]
+    fn build_safe_name_ctx_uses_hardware_owner_and_no_local_executor() {
+        let screen = hardware_safe_screen(); // Mainnet
+        let ctx = screen
+            .build_safe_name_ctx()
+            .expect("a Mainnet hardware Safe yields a name context");
+        assert_eq!(ctx.safe, screen.safes[0].address());
+        assert_eq!(ctx.owners.len(), 1);
+        assert!(matches!(ctx.owners[0], AccountDescriptor::Ledger { .. }));
+        assert!(ctx.executor_key.is_none(), "hardware owner self-pays gas");
+    }
+
+    #[test]
+    fn names_available_and_routed_for_mainnet_safe() {
+        // A Mainnet hardware Safe offers Names, and a write routes through the
+        // Safe — parking the signer for the async execTransaction.
+        let mut screen = hardware_safe_screen();
+        assert!(
+            screen.names_available_for_active(),
+            "a Mainnet Safe offers Names"
+        );
+        assert!(!screen.order_op_in_flight);
+        let _ = screen.handle_name_outcome(super::names_app::Outcome::RegisterXns {
+            namespace: "xns".to_string(),
+            label: "alice".to_string(),
+        });
+        assert!(
+            screen.order_op_in_flight,
+            "a name write from a Mainnet Safe routes through (signer parked)"
+        );
+    }
+
+    #[test]
+    fn names_refused_for_non_mainnet_safe() {
+        // Names are Mainnet-pinned: a Safe on Base can't register, so Names is
+        // hidden and a write is refused without parking the signer.
+        let mut screen = hardware_safe_screen_on_chain(8453); // Base
+        assert!(
+            !screen.names_available_for_active(),
+            "a non-Mainnet Safe hides Names"
+        );
+        assert!(screen.build_safe_name_ctx().is_none());
+        assert!(!screen.order_op_in_flight);
+        let _ = screen.handle_name_outcome(super::names_app::Outcome::RegisterXns {
+            namespace: "xns".to_string(),
+            label: "alice".to_string(),
+        });
+        assert!(
+            !screen.order_op_in_flight,
+            "a name write from a non-Mainnet Safe is refused (not parked)"
+        );
+    }
+
+    #[test]
+    fn names_available_for_eoa() {
+        let mut screen = hardware_safe_screen();
+        screen.active_safe = None; // EOA mode
+        assert!(
+            screen.names_available_for_active(),
+            "EOA mode always offers Names"
         );
     }
 

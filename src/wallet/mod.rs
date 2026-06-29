@@ -832,11 +832,17 @@ mod tests {
              ([APDU_CODE_CONDITIONS_NOT_SATISFIED] Conditions of use not satisfied)`",
         );
         assert!(rejected.contains("Blind signing"), "got: {rejected}");
-        assert!(!rejected.contains("6985"), "raw APDU code leaked: {rejected}");
+        assert!(
+            !rejected.contains("6985"),
+            "raw APDU code leaked: {rejected}"
+        );
 
         // Locked device / no app open → the reach-the-device hint.
         let unreachable = friendly_signer_error_text("Ledger device: APDU error `Code 6511`");
-        assert!(unreachable.contains("open the Ethereum app"), "got: {unreachable}");
+        assert!(
+            unreachable.contains("open the Ethereum app"),
+            "got: {unreachable}"
+        );
 
         // Anything we don't recognise is passed through verbatim (prefixed),
         // so a novel failure is never hidden behind a canned message.

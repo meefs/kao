@@ -325,27 +325,31 @@ fn status_badge<'a>(t: KaoTheme, state: SafeTxState) -> Element<'a, Message> {
 }
 
 fn quick_actions<'a>(t: KaoTheme, can_send: bool, can_swap: bool) -> Element<'a, Message> {
-    // View-only accounts can't sign, so Send is disabled. Receive still works
-    // because it just shows the address. Hardware accounts whose device is
-    // not currently attached are *still* sendable here — clicking Send
-    // escalates to a reconnect flow rather than being a no-op.
-    let send_press = can_send.then_some(Message::OpenSend);
-    let mut actions = row![
-        quick_action(t, "Send", "ᕕ( ᐛ )ᕗ", t.ab1, t.a1, send_press),
-        Space::new().width(10),
-        quick_action(
+    // Send and Swap are hidden entirely (not just disabled) for identities that
+    // can't perform them. Send is hidden for view-only accounts and hardware
+    // accounts whose device is disconnected (reconnect via the sidebar's
+    // hardware card); Swap is hidden for view-only accounts and non-swappable
+    // Safes. Receive always shows — it just displays the address.
+    let mut actions = row![].width(Length::Fill);
+    if can_send {
+        actions = actions.push(quick_action(
             t,
-            "Receive",
-            "(っ◕‿◕)っ",
-            t.ab2,
-            t.a2,
-            Some(Message::OpenReceive),
-        ),
-    ]
-    .width(Length::Fill);
-
-    // Swap is hidden entirely (not just disabled) for identities that can't
-    // swap — view-only accounts and Safe mode (no Safe-TX swap path in v1).
+            "Send",
+            "ᕕ( ᐛ )ᕗ",
+            t.ab1,
+            t.a1,
+            Some(Message::OpenSend),
+        ));
+        actions = actions.push(Space::new().width(10));
+    }
+    actions = actions.push(quick_action(
+        t,
+        "Receive",
+        "(っ◕‿◕)っ",
+        t.ab2,
+        t.a2,
+        Some(Message::OpenReceive),
+    ));
     if can_swap {
         actions = actions.push(Space::new().width(10));
         actions = actions.push(quick_action(
