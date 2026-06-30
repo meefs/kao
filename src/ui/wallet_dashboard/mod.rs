@@ -1474,9 +1474,7 @@ impl WalletScreen {
                 }
                 self.place_order_task(host, draft, quote)
             }
-            sign_review::SignAction::CowCancel { host, uid } => {
-                self.cancel_order_task(host, uid)
-            }
+            sign_review::SignAction::CowCancel { host, uid } => self.cancel_order_task(host, uid),
             sign_review::SignAction::Name { sign } => self.dispatch_name_sign(sign),
         }
     }
