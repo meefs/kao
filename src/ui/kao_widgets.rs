@@ -2,13 +2,22 @@
 //! wallet dashboard. Generic over the message type so each screen can use them
 //! with its own local `Message` enum.
 
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use alloy::primitives::{Address, B256};
+use iced::advanced::clipboard::Kind as ClipboardKind;
+use iced::advanced::widget::{Tree, tree};
+use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::border::Radius;
 use iced::widget::text::Wrapping;
 use iced::widget::{
     Space, button, column, container, mouse_area, row, scrollable, stack, svg, text, text_input,
 };
-use iced::{Alignment, Background, Border, Color, ContentFit, Element, Length, Padding};
+use iced::{
+    Alignment, Background, Border, Color, ContentFit, Element, Event, Length, Padding, Rectangle,
+    Size, mouse, touch,
+};
 
 use crate::chain::Chain;
 use crate::net::VerificationStatus;
@@ -753,7 +762,39 @@ pub fn thin_divider<'a, M: 'a>(t: KaoTheme) -> Element<'a, M> {
 ///
 /// Address bytes are rendered as the EIP-55 checksum form
 /// (`addr.to_checksum(None)`).
-pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> {
+/// The address is interactive: **hovering** greys the whole thing (a clear
+/// "this does something" affordance) and the cursor turns into a pointer;
+/// **clicking** copies the EIP-55 checksum address to the clipboard.
+///
+/// The clipboard write happens inside the widget, but on click it also publishes
+/// `M::copy_kick()` (see [`CopyKick`]) — a no-op message whose only job is to run
+/// the host's update loop so the bottom-right "Copied!" toast's animation
+/// subscription starts. Without it the click would change no app state and iced
+/// would never re-evaluate the subscription, leaving the toast frozen invisible.
+pub fn colored_address<'a, M: CopyKick + 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> {
+    CopyableAddress::new(
+        address_row(t, addr, false),
+        address_row(t, addr, true),
+        addr.to_checksum(None),
+    )
+    .into()
+}
+
+/// Implemented by every screen `Message` that hosts a [`colored_address`]. The
+/// widget publishes `copy_kick()` after a click-to-copy purely to wake the host's
+/// update loop (a click otherwise produces no message, so the toast-animation
+/// subscription would never start). The default is `None` (no kick) for screens
+/// that don't show the toast; the dashboard panes override it with a no-op
+/// variant they ignore in `update`.
+pub trait CopyKick: Sized {
+    fn copy_kick() -> Option<Self> {
+        None
+    }
+}
+
+/// Build the chunked-address row. `grey` paints every chunk in the muted colour
+/// (the hover state); otherwise each 4-char chunk gets its palette colour.
+fn address_row<'a, M: 'a>(t: KaoTheme, addr: Address, grey: bool) -> Element<'a, M> {
     let checksum = addr.to_checksum(None); // "0xAbCd...EF01" (42 chars)
     debug_assert_eq!(checksum.len(), 42);
     // `.get()` rather than `[2..]` / `[start..start + 4]`: the lengths above are
@@ -768,7 +809,8 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
     for (i, color) in chunk_colors.iter().enumerate() {
         let start = i * 4;
         let chunk = body.get(start..start + 4).unwrap_or("").to_string();
-        spans = spans.push(text(chunk).size(14).color(*color).font(mono_bold()));
+        let color = if grey { t.sub } else { *color };
+        spans = spans.push(text(chunk).size(14).color(color).font(mono_bold()));
     }
 
     container(spans)
@@ -776,6 +818,198 @@ pub fn colored_address<'a, M: 'a>(t: KaoTheme, addr: Address) -> Element<'a, M> 
         .center_x(Length::Fill)
         .padding(Padding::from([2, 0]))
         .into()
+}
+
+/// How long the bottom-right "Copied!" toast stays up after an address copy.
+pub const COPY_TOAST: Duration = Duration::from_millis(1400);
+
+/// Wall-clock instant of the most recent address copy, set by [`CopyableAddress`]
+/// when it writes to the clipboard. The dashboard reads it to drive a transient
+/// "Copied!" toast. It's a process-global rather than threaded UI state because
+/// the copy happens inside a leaf widget that writes the clipboard directly and
+/// has no message channel to the app — this is the matching direct signal back.
+static LAST_COPY: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Record that an address was just copied — drives the "Copied!" toast.
+pub fn mark_copied() {
+    if let Ok(mut g) = LAST_COPY.lock() {
+        *g = Some(Instant::now());
+    }
+}
+
+/// Progress (`0.0 → 1.0`) through the [`COPY_TOAST`] window since the last copy,
+/// or `None` once the window has elapsed (or nothing has been copied). Drives
+/// both the toast's fade and the redraw tick that dismisses it.
+pub fn copy_toast_progress() -> Option<f32> {
+    let at = (*LAST_COPY.lock().ok()?)?;
+    let elapsed = at.elapsed();
+    (elapsed < COPY_TOAST)
+        .then(|| (elapsed.as_secs_f32() / COPY_TOAST.as_secs_f32()).clamp(0.0, 1.0))
+}
+
+/// Per-instance hover state for [`CopyableAddress`]. Tracked so a hover
+/// transition can request a single repaint (the widget derives its drawn colour
+/// from the cursor, so it must repaint when the cursor enters/leaves).
+#[derive(Default)]
+struct AddressHoverState {
+    hovered: bool,
+}
+
+/// A clickable, hover-greying address. Holds two pre-built rows — `children[0]`
+/// in palette colours, `children[1]` all-grey — and draws the grey one while the
+/// cursor is over it. A left click copies `to_copy` to the system clipboard via
+/// the widget's own `Clipboard` handle, so callers don't thread a copy message.
+struct CopyableAddress<'a, Message, Theme, Renderer> {
+    /// `[normal, grey]` — identical layout, so either can be drawn under the
+    /// single layout node this widget produces.
+    children: [Element<'a, Message, Theme, Renderer>; 2],
+    to_copy: String,
+}
+
+impl<'a, Message, Theme, Renderer> CopyableAddress<'a, Message, Theme, Renderer> {
+    fn new(
+        normal: Element<'a, Message, Theme, Renderer>,
+        grey: Element<'a, Message, Theme, Renderer>,
+        to_copy: String,
+    ) -> Self {
+        Self {
+            children: [normal, grey],
+            to_copy,
+        }
+    }
+}
+
+impl<Message, Theme, Renderer> Widget<Message, Theme, Renderer>
+    for CopyableAddress<'_, Message, Theme, Renderer>
+where
+    Renderer: renderer::Renderer,
+    Message: CopyKick,
+{
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<AddressHoverState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(AddressHoverState::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        self.children.iter().map(Tree::new).collect()
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(&self.children);
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.children[0].as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        // Lay out both rows (so each row's text state is populated for drawing);
+        // they're identical, so the normal row's node positions either.
+        let (normal, grey) = self.children.split_at_mut(1);
+        let node = normal[0]
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        let _ = grey[0]
+            .as_widget_mut()
+            .layout(&mut tree.children[1], renderer, limits);
+        node
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        _viewport: &Rectangle,
+    ) {
+        let is_over = cursor.is_over(layout.bounds());
+        let state = tree.state.downcast_mut::<AddressHoverState>();
+        if state.hovered != is_over {
+            state.hovered = is_over;
+            // Cursor crossed the boundary — repaint so the grey/normal swap shows.
+            shell.request_redraw();
+        }
+        if is_over
+            && matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                    | Event::Touch(touch::Event::FingerPressed { .. })
+            )
+        {
+            clipboard.write(ClipboardKind::Standard, self.to_copy.clone());
+            mark_copied();
+            shell.capture_event();
+            shell.request_redraw();
+            // Publish the host's no-op kick message so its update loop runs and
+            // the "Copied!" toast's animation subscription starts — a click on
+            // its own changes no app state, so nothing would otherwise wake it.
+            if let Some(kick) = Message::copy_kick() {
+                shell.publish(kick);
+            }
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        _tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        _viewport: &Rectangle,
+        _renderer: &Renderer,
+    ) -> mouse::Interaction {
+        if cursor.is_over(layout.bounds()) {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::None
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        // Grey row while hovered, palette row otherwise — both share `layout`.
+        let idx = usize::from(cursor.is_over(layout.bounds()));
+        self.children[idx].as_widget().draw(
+            &tree.children[idx],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+}
+
+impl<'a, Message, Theme, Renderer> From<CopyableAddress<'a, Message, Theme, Renderer>>
+    for Element<'a, Message, Theme, Renderer>
+where
+    Message: CopyKick + 'a,
+    Theme: 'a,
+    Renderer: 'a + renderer::Renderer,
+{
+    fn from(widget: CopyableAddress<'a, Message, Theme, Renderer>) -> Self {
+        Element::new(widget)
+    }
 }
 
 /// Ten distinct accent colours for 4-hex-char chunks. Each adjacent

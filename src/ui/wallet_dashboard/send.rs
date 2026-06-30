@@ -158,6 +158,9 @@ fn picker_entry_from_contact(c: &crate::wallet::Contact) -> PickerEntry {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// No-op published by a copyable address click so the dashboard's "Copied!"
+    /// toast animation starts (a click changes no state otherwise). Ignored.
+    AddressCopied,
     SetTo(String),
     PickRecipient {
         address: Address,
@@ -747,6 +750,8 @@ impl SendPane {
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
+            // Copy-toast kick — the widget already copied + marked the toast.
+            Message::AddressCopied => (Task::none(), None),
             Message::SetTo(s) => {
                 self.set_to(s);
                 self.invalidate_eoa_quote();

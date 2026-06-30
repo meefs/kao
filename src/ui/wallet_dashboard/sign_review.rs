@@ -50,6 +50,9 @@ pub enum Message {
     Cancel,
     BoxClickIgnored,
     Key(keyboard::Event),
+    /// No-op published by a copyable address click so the dashboard's "Copied!"
+    /// toast animation starts (a click changes no state otherwise). Ignored.
+    AddressCopied,
 }
 
 /// A single raw transaction the user will sign, decoded for review through the

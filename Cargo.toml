@@ -101,7 +101,9 @@ helios-ethereum = { git = "https://github.com/a16z/helios", rev = "204c998a92734
 # coherence-conflicting `op-alloy-network 0.20.0`. See the patch entries
 # for the full story.
 helios-opstack = { git = "https://github.com/a16z/helios", rev = "204c998a927348e1c000a664f08d5b37b1b0d924" }
-iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg"] }
+# `advanced` exposes the custom-widget API (Widget/Tree/Clipboard), used by
+# `colored_address`'s hover-grey + click-to-copy widget in src/ui/kao_widgets.rs.
+iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg", "advanced"] }
 rand = "0.8"
 redb = "4.1.0"
 # Local EVM for transaction preflight. Pinned to the same version helios

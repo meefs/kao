@@ -32,6 +32,9 @@ use crate::wallet::{SafeTrust, short_address};
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// No-op published by a copyable address click so the dashboard's "Copied!"
+    /// toast animation starts (a click changes no state otherwise). Ignored.
+    AddressCopied,
     Close,
     BoxClickIgnored,
     Confirm,
@@ -295,6 +298,8 @@ impl SafeTxDetailPane {
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
+            // Copy-toast kick — the widget already copied + marked the toast.
+            Message::AddressCopied => (Task::none(), None),
             Message::Close => (Task::none(), Some(Outcome::Closed)),
             Message::BoxClickIgnored => (Task::none(), None),
             // Swallow action presses while one is already in flight so a

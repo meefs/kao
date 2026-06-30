@@ -53,6 +53,9 @@ const KAO_TAKEN: &str = "(*ᴗ͈ˬᴗ͈)ꕤ*.ﾟ";
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// No-op published by a copyable address click so the dashboard's "Copied!"
+    /// toast animation starts (a click changes no state otherwise). Ignored.
+    AddressCopied,
     // ── search ──
     QueryChanged(String),
     Search,
@@ -268,6 +271,8 @@ impl NamesApp {
     pub fn update(&mut self, msg: Message) -> Option<Outcome> {
         match msg {
             Message::Tick => None,
+            // Copy-toast kick — the widget already copied + marked the toast.
+            Message::AddressCopied => None,
 
             // ── search ──
             Message::QueryChanged(s) => {

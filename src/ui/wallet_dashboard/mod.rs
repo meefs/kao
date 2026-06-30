@@ -88,14 +88,61 @@ use crate::portfolio::{DiscoveredToken, LiveToken, PortfolioCache};
 use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
-use crate::ui::kao_widgets::{fill_style, mono};
+use crate::ui::kao_widgets::{bold, copy_toast_progress, fill_style, mono};
 use crate::ui::network_setup::{self, NetworkSetupScreen, WizardMode};
 use crate::wallet::sim::SimulationResult;
 use crate::wallet::tx::SendPlan;
 use crate::wallet::{
     AccountDescriptor, Contact, ContactsBook, KaoSigner, SafeDescriptor, SignerHandoff,
-    account_address, handoff_with, short_address,
+    account_address, ensure_connected, handoff_with, short_address,
 };
+
+// ── colored_address copy-toast kicks ──────────────────────────────────────────
+// Each screen that renders a `colored_address` implements `CopyKick` so a
+// click-to-copy publishes a no-op message that wakes this screen's update loop
+// and starts the bottom-right "Copied!" toast animation (see
+// `kao_widgets::CopyKick` — a click changes no app state, so nothing would
+// otherwise re-evaluate the toast's tick subscription). The dashboard panes
+// return their `AddressCopied` variant (ignored in `update`); the standalone
+// Safe-onboarding screen shows no toast and keeps the `None` default.
+use crate::ui::kao_widgets::CopyKick;
+
+impl CopyKick for send::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(send::Message::AddressCopied)
+    }
+}
+impl CopyKick for tx_details::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(tx_details::Message::AddressCopied)
+    }
+}
+impl CopyKick for sign_review::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(sign_review::Message::AddressCopied)
+    }
+}
+impl CopyKick for names_app::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(names_app::Message::AddressCopied)
+    }
+}
+impl CopyKick for contacts_settings::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(contacts_settings::Message::AddressCopied)
+    }
+}
+impl CopyKick for safes_settings::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(safes_settings::Message::AddressCopied)
+    }
+}
+impl CopyKick for safe_tx_detail::Message {
+    fn copy_kick() -> Option<Self> {
+        Some(safe_tx_detail::Message::AddressCopied)
+    }
+}
+impl CopyKick for crate::ui::safe_onboarding::Message {}
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
@@ -1042,11 +1089,13 @@ impl WalletScreen {
             let handoff = self.park_signer_for_order();
             spawn_cow_place_safe(self.network.clone(), host, handoff, draft, quote, ctx)
         } else {
+            let desc = self.active_signer_descriptor();
             let handoff = self.park_signer_for_order();
             spawn_cow_place(
                 self.network.clone(),
                 host,
                 handoff,
+                desc,
                 draft,
                 quote,
                 self.address,
@@ -1079,8 +1128,9 @@ impl WalletScreen {
             let handoff = self.park_signer_for_order();
             spawn_cow_cancel_safe(self.network.clone(), handoff, chain, uid, ctx)
         } else {
+            let desc = self.active_signer_descriptor();
             let handoff = self.park_signer_for_order();
-            spawn_cow_cancel(handoff, chain, uid)
+            spawn_cow_cancel(handoff, desc, chain, uid)
         }
     }
 
@@ -1110,6 +1160,20 @@ impl WalletScreen {
             Some(AccountDescriptor::Trezor { .. }) => Some(HardwareStatus::Trezor { connected }),
             _ => None,
         }
+    }
+
+    /// The active account's descriptor — the reconnect source for EOA hardware
+    /// signing (`ensure_connected` rebuilds a dropped Ledger/Trezor from its HD
+    /// path). Falls back to a view-only descriptor (which makes `ensure_connected`
+    /// a no-op) if the index is ever out of range.
+    fn active_signer_descriptor(&self) -> AccountDescriptor {
+        self.accounts
+            .get(self.active_index)
+            .cloned()
+            .unwrap_or(AccountDescriptor::ViewOnly {
+                name: None,
+                address: self.address.into_array(),
+            })
     }
 
     /// Park the live EOA signer for an in-flight CoW order op (place/cancel),
@@ -1464,20 +1528,23 @@ impl WalletScreen {
         }
         // Flip the pane to its busy phase only now that we're really signing.
         self.begin_name_pane(&sign);
+        // EOA hardware reconnect source (Safe paths rebuild owner signers
+        // themselves, so they don't need it).
+        let desc = self.active_signer_descriptor();
         let handoff = self.park_signer_for_order();
         let net = self.network.clone();
         match sign {
             sign_review::NameSign::Commit(plan) => match safe_name {
                 Some(ctx) => spawn_name_commit_safe(net, handoff, ctx, plan),
-                None => spawn_name_commit(net, handoff, plan),
+                None => spawn_name_commit(net, handoff, desc, plan),
             },
             sign_review::NameSign::Register(plan) => match safe_name {
                 Some(ctx) => spawn_name_register_safe(net, handoff, ctx, plan),
-                None => spawn_name_register(net, handoff, plan),
+                None => spawn_name_register(net, handoff, desc, plan),
             },
             sign_review::NameSign::RegisterXns { namespace, label } => match safe_name {
                 Some(ctx) => spawn_name_register_xns_safe(net, handoff, ctx, namespace, label),
-                None => spawn_name_register_xns(net, handoff, namespace, label),
+                None => spawn_name_register_xns(net, handoff, desc, namespace, label),
             },
             sign_review::NameSign::Renew {
                 namespace,
@@ -1485,7 +1552,7 @@ impl WalletScreen {
                 years,
             } => match safe_name {
                 Some(ctx) => spawn_name_renew_safe(net, handoff, ctx, namespace, label, years),
-                None => spawn_name_renew(net, handoff, namespace, label, years),
+                None => spawn_name_renew(net, handoff, desc, namespace, label, years),
             },
             sign_review::NameSign::SetRecipient {
                 namespace,
@@ -1495,7 +1562,7 @@ impl WalletScreen {
                 Some(ctx) => {
                     spawn_name_set_recipient_safe(net, handoff, ctx, namespace, label, recipient)
                 }
-                None => spawn_name_set_recipient(net, handoff, namespace, label, recipient),
+                None => spawn_name_set_recipient(net, handoff, desc, namespace, label, recipient),
             },
         }
     }
@@ -2379,11 +2446,25 @@ impl WalletScreen {
                                 nonce = quote.nonce,
                                 "send: spawning broadcast task",
                             );
+                            // Disjoint-field access (not `active_signer_descriptor`,
+                            // which borrows all of `self`) because the Send pane
+                            // `p` still holds `&mut self.modal` here.
+                            let desc = self.accounts.get(self.active_index).cloned().unwrap_or(
+                                AccountDescriptor::ViewOnly {
+                                    name: None,
+                                    address: self.address.into_array(),
+                                },
+                            );
                             let signer =
                                 mem::replace(&mut self.signer, KaoSigner::ViewOnly(self.address));
                             let handoff = handoff_with(signer);
-                            let pre_task =
-                                spawn_broadcast_task(self.network.clone(), handoff, plan, quote);
+                            let pre_task = spawn_broadcast_task(
+                                self.network.clone(),
+                                handoff,
+                                desc,
+                                plan,
+                                quote,
+                            );
                             let (task, _outcome) = p.update(child_msg);
                             let task = task.map(Message::Send);
                             return (Task::batch([pre_task, task]), None);
@@ -2756,6 +2837,9 @@ impl WalletScreen {
                     self.cancel_sign_review();
                 }
                 sign_review::Message::BoxClickIgnored | sign_review::Message::Key(_) => {}
+                // Copy-toast kick — the widget already copied + marked the toast;
+                // processing this message is enough to start its animation tick.
+                sign_review::Message::AddressCopied => {}
             },
             Message::SignReviewPrepared { seq, legs } => {
                 // Drop a decode result for a review the user has since cancelled
@@ -3700,7 +3784,10 @@ impl WalletScreen {
             subs.push(
                 iced::keyboard::listen().map(|e| Message::SignReview(sign_review::Message::Key(e))),
             );
-            if self.chrome.is_animating() || self.clipboard_clear.is_some() {
+            if self.chrome.is_animating()
+                || self.clipboard_clear.is_some()
+                || copy_toast_progress().is_some()
+            {
                 subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
             }
             if self.tracked_orders.iter().any(|o| !o.status.is_terminal()) {
@@ -3742,15 +3829,21 @@ impl WalletScreen {
         if matches!(self.modal, Modal::None) && matches!(self.nav, Nav::Apps) {
             subs.push(self.apps.subscription().map(Message::Apps));
         }
-        if self.chrome.is_animating() || self.clipboard_clear.is_some() {
+        if self.chrome.is_animating()
+            || self.clipboard_clear.is_some()
+            || copy_toast_progress().is_some()
+        {
             // `time::every` actively drives ticks (and therefore redraws)
             // on a timer; `window::frames()` only observes redraws the
             // runtime already decided to do, which left the animation idle
             // between unrelated events. 16 ms (~60 Hz) is plenty for the
             // 220 ms ease — going faster just burns CPU during the modal
-            // open/close transition. The clipboard countdown chip rides
-            // the same subscription so its progress bar animates smoothly
-            // for the 10-second auto-clear window.
+            // open/close transition. The clipboard countdown chip and the
+            // transient "Copied!" toast ride the same subscription so they
+            // animate and dismiss smoothly. The toast's window is started by
+            // the address widget's `copy_kick` message (which re-runs `update`
+            // and thus re-evaluates this subscription); the tick then drives
+            // the fade until `copy_toast_progress` returns `None`.
             subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
         }
         // Poll open CoW orders every 10s while any is non-terminal. This is the
@@ -3879,7 +3972,15 @@ impl WalletScreen {
             None => Space::new().width(0).height(0).into(),
             Some(state) => clipboard_clear_chip(t, state),
         };
-        stack![composed, chip_layer].into()
+        // Transient bottom-right "Copied!" toast, shown briefly after an address
+        // is click-copied. Top-most layer (above the clipboard chip and any
+        // sign-review overlay) and a constant `Space` placeholder otherwise, so
+        // the tree shape stays stable (same reasoning as the chip layer).
+        let copied_layer: Element<'_, Message> = match copy_toast_progress() {
+            Some(progress) => copied_toast(t, progress),
+            None => Space::new().width(0).height(0).into(),
+        };
+        stack![composed, chip_layer, copied_layer].into()
     }
 
     // ── Send-flow helpers used by the broadcast Tasks ──────────────────────
@@ -4005,6 +4106,61 @@ impl WalletScreen {
         .height(Length::Fill)
         .into()
     }
+}
+
+// ── "Copied!" toast ─────────────────────────────────────────────────────────
+
+/// Small bottom-right "✓ Copied!" pill shown briefly after an address is
+/// click-copied (see [`crate::ui::kao_widgets::copy_toast_progress`]). `progress`
+/// runs 0→1 across the toast window; it fades in, holds, then fades out.
+fn copied_toast<'a>(t: KaoTheme, progress: f32) -> Element<'a, Message> {
+    // Quick fade-in over the first 12%, hold, fade-out over the final 30%.
+    let alpha = if progress < 0.12 {
+        progress / 0.12
+    } else if progress > 0.70 {
+        ((1.0 - progress) / 0.30).max(0.0)
+    } else {
+        1.0
+    };
+
+    let card = container(
+        row![
+            text("✓").size(12).color(with_alpha(t.up, alpha)),
+            Space::new().width(6),
+            text("Copied!")
+                .size(12)
+                .color(with_alpha(t.text, alpha))
+                .font(bold()),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([8, 14]))
+    .style(move |_| container::Style {
+        background: Some(Background::Color(with_alpha(t.card_alt, alpha))),
+        border: Border {
+            color: with_alpha(t.up, 0.4 * alpha),
+            width: 1.0,
+            radius: Radius::from(10),
+        },
+        text_color: Some(with_alpha(t.text, alpha)),
+        ..container::Style::default()
+    });
+
+    // Pin to bottom-right, matching the clipboard chip's 16 px insets.
+    let bottom_row = row![
+        Space::new().width(Length::Fill),
+        card,
+        Space::new().width(16),
+    ]
+    .width(Length::Fill);
+    column![
+        Space::new().height(Length::Fill),
+        bottom_row,
+        Space::new().height(16),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 // ── Clipboard auto-clear chip ──────────────────────────────────────────────
@@ -4183,6 +4339,33 @@ fn spawn_contacts_ens_resolve_task(
             Message::Contacts(contacts_settings::Message::EnsResolved { seq, name, result })
         },
     )
+}
+
+/// Take the parked signer out of `handoff` and make sure its hardware device is
+/// still reachable before signing — reconnecting a dropped Ledger/Trezor from
+/// `desc`. The shared front half of every EOA signing task.
+///
+/// On any failure (no signer, or a reconnect that didn't take) it restores a
+/// usable signer to the handoff so the result handler's reclaim still finds it,
+/// then returns the error — the task aborts before touching the key.
+async fn take_live_signer(
+    handoff: &SignerHandoff,
+    desc: &AccountDescriptor,
+) -> Result<KaoSigner, String> {
+    let signer = handoff
+        .lock()
+        .ok()
+        .and_then(|mut g| g.take())
+        .ok_or_else(|| "signer not available".to_string())?;
+    match ensure_connected(signer, desc).await {
+        Ok(live) => Ok(live),
+        Err((orig, msg)) => {
+            if let Ok(mut g) = handoff.lock() {
+                *g = Some(orig);
+            }
+            Err(msg)
+        }
+    }
 }
 
 /// Build a snapshot of locally-known address → name mappings for the
@@ -5114,6 +5297,7 @@ fn spawn_safe_reject_task(
 fn spawn_broadcast_task(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
+    desc: AccountDescriptor,
     plan: SendPlan,
     quote: crate::wallet::tx::TxQuote,
 ) -> Task<Message> {
@@ -5131,21 +5315,13 @@ fn spawn_broadcast_task(
                     return Err::<TxHash, String>("no execution RPCs configured".into());
                 }
             };
-            let signer_taken = {
-                let mut g = match inner.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        warn!(error = %e, "broadcast: signer cell poisoned");
-                        return Err(format!("signer cell poisoned: {e}"));
-                    }
-                };
-                g.take()
-            };
-            let signer = match signer_taken {
-                Some(s) => s,
-                None => {
-                    warn!("broadcast: signer cell empty at task entry");
-                    return Err("signer not available".into());
+            // Take the parked signer and make sure its hardware device is still
+            // reachable (reconnecting a dropped Ledger/Trezor) before signing.
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(error = %e, "broadcast: signer unavailable / hardware unreachable");
+                    return Err(e);
                 }
             };
             let result = crate::wallet::tx::sign_and_send(&provider, &signer, plan, quote).await;
@@ -5269,16 +5445,15 @@ async fn await_mined(network: &Arc<dyn BalanceFetcher>, hash: TxHash) -> Result<
 fn spawn_name_commit(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
+    desc: AccountDescriptor,
     plan: RegisterPlan,
 ) -> Task<Message> {
     let inner = handoff.clone();
     Task::perform(
         async move {
-            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
-                Some(s) => s,
-                None => {
-                    return Err::<(RegisterPlan, TxHash), String>("signer not available".into());
-                }
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => return Err::<(RegisterPlan, TxHash), String>(e),
             };
             let result = async {
                 let hash = crate::names::manage::submit_commit(&*network, &signer, &plan).await?;
@@ -5302,15 +5477,16 @@ fn spawn_name_commit(
 fn spawn_name_register(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
+    desc: AccountDescriptor,
     plan: RegisterPlan,
 ) -> Task<Message> {
     let inner = handoff.clone();
     let name = format!("{}{}", plan.label, plan.namespace.tld());
     Task::perform(
         async move {
-            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
-                Some(s) => s,
-                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => return Err::<(String, TxHash), String>(e),
             };
             let result = async {
                 let hash = crate::names::manage::submit_register(&*network, &signer, &plan).await?;
@@ -5336,6 +5512,7 @@ fn spawn_name_register(
 fn spawn_name_register_xns(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
+    desc: AccountDescriptor,
     namespace: String,
     label: String,
 ) -> Task<Message> {
@@ -5343,9 +5520,9 @@ fn spawn_name_register_xns(
     let name = format!("{label}.{namespace}");
     Task::perform(
         async move {
-            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
-                Some(s) => s,
-                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => return Err::<(String, TxHash), String>(e),
             };
             let result = async {
                 let hash = crate::names::manage::submit_register_xns(
@@ -5372,6 +5549,7 @@ fn spawn_name_register_xns(
 fn spawn_name_renew(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
+    desc: AccountDescriptor,
     namespace: Namespace,
     label: String,
     years: u32,
@@ -5380,9 +5558,9 @@ fn spawn_name_renew(
     let name = format!("{label}{}", namespace.tld());
     Task::perform(
         async move {
-            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
-                Some(s) => s,
-                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => return Err::<(String, TxHash), String>(e),
             };
             let result = async {
                 let duration = crate::names::registrar::ens_duration_secs(years);
@@ -5410,6 +5588,7 @@ fn spawn_name_renew(
 fn spawn_name_set_recipient(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
+    desc: AccountDescriptor,
     namespace: Namespace,
     label: String,
     recipient: Address,
@@ -5418,9 +5597,9 @@ fn spawn_name_set_recipient(
     let name = format!("{label}{}", namespace.tld());
     Task::perform(
         async move {
-            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
-                Some(s) => s,
-                None => return Err::<(String, TxHash), String>("signer not available".into()),
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => return Err::<(String, TxHash), String>(e),
             };
             let result = async {
                 let hash = crate::names::manage::submit_set_recipient(
@@ -5461,6 +5640,7 @@ fn spawn_cow_place(
     network: Arc<dyn BalanceFetcher>,
     host: CowHost,
     handoff: SignerHandoff,
+    desc: AccountDescriptor,
     draft: SwapDraft,
     quote: crate::cow::api::QuoteResponse,
     user: Address,
@@ -5476,9 +5656,9 @@ fn spawn_cow_place(
                         return Err::<TrackedOrder, String>("no execution RPC configured".into());
                     }
                 };
-            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
-                Some(s) => s,
-                None => return Err("signer not available".into()),
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => return Err::<TrackedOrder, String>(e),
             };
             let result = cow_place_order(&network, &provider, &signer, &draft, &quote, user).await;
             if let Ok(mut g) = inner.lock() {
@@ -6231,6 +6411,7 @@ async fn cow_place_order_safe(
 /// cancel affordance.
 fn spawn_cow_cancel(
     handoff: SignerHandoff,
+    desc: AccountDescriptor,
     chain: crate::chain::Chain,
     uid: String,
 ) -> Task<Message> {
@@ -6238,9 +6419,9 @@ fn spawn_cow_cancel(
     let uid_for_msg = uid.clone();
     Task::perform(
         async move {
-            let signer = match inner.lock().ok().and_then(|mut g| g.take()) {
-                Some(s) => s,
-                None => return Err::<(), String>("signer not available".into()),
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => return Err::<(), String>(e),
             };
             let res = cow_cancel(&signer, chain, &uid).await;
             if let Ok(mut g) = inner.lock() {
