@@ -387,7 +387,10 @@ pub enum Message {
         signer: SignerHandoff,
     },
     /// An off-chain order cancellation finished. Signer handed back as above.
+    /// `host` records which surface (Swap modal / Apps) raised the cancel so a
+    /// failure can be reported back there instead of being swallowed.
     CowCancel {
+        host: CowHost,
         uid: String,
         result: Result<(), String>,
         signer: SignerHandoff,
@@ -1108,7 +1111,7 @@ impl WalletScreen {
     /// digest); an EOA order cancels with the parked EOA signer. Either path
     /// resolves through the same `CowCancel` handler. No-op if the order isn't
     /// tracked, or (for a Safe order) if a valid signing context can't be built.
-    fn cancel_order_task(&mut self, uid: String) -> Task<Message> {
+    fn cancel_order_task(&mut self, host: CowHost, uid: String) -> Task<Message> {
         let Some((chain, owner)) = self
             .tracked_orders
             .iter()
@@ -1126,11 +1129,11 @@ impl WalletScreen {
                 return Task::none();
             };
             let handoff = self.park_signer_for_order();
-            spawn_cow_cancel_safe(self.network.clone(), handoff, chain, uid, ctx)
+            spawn_cow_cancel_safe(self.network.clone(), handoff, host, chain, uid, ctx)
         } else {
             let desc = self.active_signer_descriptor();
             let handoff = self.park_signer_for_order();
-            spawn_cow_cancel(handoff, desc, chain, uid)
+            spawn_cow_cancel(handoff, desc, host, chain, uid)
         }
     }
 
@@ -1426,7 +1429,7 @@ impl WalletScreen {
     /// Open a confirm gate for an off-chain order cancellation. It's an EIP-712
     /// signature (no calldata, no value), so there are no legs to decode — just a
     /// "this is what you're cancelling" panel the user confirms.
-    fn open_cow_cancel_review(&mut self, uid: String) -> Task<Message> {
+    fn open_cow_cancel_review(&mut self, host: CowHost, uid: String) -> Task<Message> {
         if self.sign_review.is_some() {
             return Task::none();
         }
@@ -1445,7 +1448,7 @@ impl WalletScreen {
             "Off-chain gasless cancellation — you sign an EIP-712 message; no transaction is sent."
                 .to_string(),
         );
-        let action = sign_review::SignAction::CowCancel { uid };
+        let action = sign_review::SignAction::CowCancel { host, uid };
         let mut review = sign_review::SignReview::pending(title, subtitle, None, note, seq, action);
         // Nothing to prepare/decode — enable Confirm immediately.
         review.legs_loading = false;
@@ -1471,7 +1474,9 @@ impl WalletScreen {
                 }
                 self.place_order_task(host, draft, quote)
             }
-            sign_review::SignAction::CowCancel { uid } => self.cancel_order_task(uid),
+            sign_review::SignAction::CowCancel { host, uid } => {
+                self.cancel_order_task(host, uid)
+            }
             sign_review::SignAction::Name { sign } => self.dispatch_name_sign(sign),
         }
     }
@@ -2779,7 +2784,7 @@ impl WalletScreen {
                         return (Task::batch([task, review]), None);
                     }
                     Some(swap::Outcome::RequestCancel { uid }) => {
-                        let review = self.open_cow_cancel_review(uid);
+                        let review = self.open_cow_cancel_review(CowHost::Modal, uid);
                         return (Task::batch([task, review]), None);
                     }
                     Some(swap::Outcome::CopyText(s)) => {
@@ -2800,7 +2805,7 @@ impl WalletScreen {
                     return (self.open_cow_review(CowHost::Apps, draft, quote), None);
                 }
                 Some(apps::Outcome::RequestCancel { uid }) => {
-                    return (self.open_cow_cancel_review(uid), None);
+                    return (self.open_cow_cancel_review(CowHost::Apps, uid), None);
                 }
                 Some(apps::Outcome::RefreshOrders) => {
                     // "Fetch" pulls the address's full CoW order history — this
@@ -2954,6 +2959,7 @@ impl WalletScreen {
                 }
             }
             Message::CowCancel {
+                host,
                 uid,
                 result,
                 signer,
@@ -2966,7 +2972,20 @@ impl WalletScreen {
                             o.status = OrderStatus::Cancelled;
                         }
                     }
-                    Err(e) => warn!(error = %e, "cow: cancel failed"),
+                    Err(e) => {
+                        warn!(error = %e, "cow: cancel failed");
+                        // Surface the failure on the originating pane instead of
+                        // swallowing it — otherwise a locked-Ledger cancel looks
+                        // like a no-op. Reuses the placement-error channel.
+                        match host {
+                            CowHost::Modal => {
+                                if let Modal::Swap(p) = &mut self.modal {
+                                    p.placement_failed(e);
+                                }
+                            }
+                            CowHost::Apps => self.apps.placement_failed(e),
+                        }
+                    }
                 }
             }
             Message::CowStatus { uid, result } => {
@@ -4977,7 +4996,9 @@ fn spawn_safe_broadcast_task(
                     Ok(s) => owner_signers.push(s),
                     Err(e) => {
                         warn!(error = %e, "safe-broadcast: build owner signer failed");
-                        return Err(format!("build owner signer: {e}"));
+                        // `e` is already friendly (build_owner_signer routes hardware
+                        // failures through friendly_signer_error_text) — surface as-is.
+                        return Err(e);
                     }
                 }
             }
@@ -6150,7 +6171,7 @@ fn spawn_cow_place_safe(
             for desc in &ctx.signer_owners {
                 match crate::wallet::build_owner_signer(desc).await {
                     Ok(s) => owners.push(s),
-                    Err(e) => return Err(format!("build owner signer: {e}")),
+                    Err(e) => return Err(e), // already friendly (see build_owner_signer)
                 }
             }
             if owners.is_empty() {
@@ -6412,6 +6433,7 @@ async fn cow_place_order_safe(
 fn spawn_cow_cancel(
     handoff: SignerHandoff,
     desc: AccountDescriptor,
+    host: CowHost,
     chain: crate::chain::Chain,
     uid: String,
 ) -> Task<Message> {
@@ -6430,6 +6452,7 @@ fn spawn_cow_cancel(
             res
         },
         move |result| Message::CowCancel {
+            host,
             uid: uid_for_msg.clone(),
             result,
             signer: handoff,
@@ -6462,6 +6485,7 @@ async fn cow_cancel(
 fn spawn_cow_cancel_safe(
     network: Arc<dyn BalanceFetcher>,
     handoff: SignerHandoff,
+    host: CowHost,
     chain: crate::chain::Chain,
     uid: String,
     ctx: SafeSwapCtx,
@@ -6473,7 +6497,7 @@ fn spawn_cow_cancel_safe(
             for desc in &ctx.signer_owners {
                 match crate::wallet::build_owner_signer(desc).await {
                     Ok(s) => owners.push(s),
-                    Err(e) => return Err::<(), String>(format!("build owner signer: {e}")),
+                    Err(e) => return Err::<(), String>(e), // already friendly (see build_owner_signer)
                 }
             }
             if owners.is_empty() {
@@ -6482,6 +6506,7 @@ fn spawn_cow_cancel_safe(
             cow_cancel_safe(&network, &owners, ctx.safe, chain, &uid).await
         },
         move |result| Message::CowCancel {
+            host,
             uid: uid_for_msg.clone(),
             result,
             signer: handoff,
@@ -7697,7 +7722,7 @@ mod tests {
             is_ethflow: false,
         });
         let uid = screen.tracked_orders[0].uid.clone();
-        let _ = screen.open_cow_cancel_review(uid);
+        let _ = screen.open_cow_cancel_review(CowHost::Modal, uid);
         let review = screen.sign_review.as_ref().expect("cancel opens a review");
         assert!(review.order.is_none(), "a cancellation has no order panel");
         assert!(

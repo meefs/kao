@@ -100,6 +100,7 @@ pub enum SignAction {
         quote: QuoteResponse,
     },
     CowCancel {
+        host: CowHost,
         uid: String,
     },
     Name {

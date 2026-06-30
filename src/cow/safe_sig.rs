@@ -90,15 +90,15 @@ pub async fn sign_eip1271_digest(
             Err(eip712_err) => {
                 // eth_sign fallback: sign the message hash as an EIP-191
                 // personal message and bump v by 4 (`{27,28}` → `{31,32}`),
-                // matching Safe's eth_sign branch in `checkSignatures`.
+                // matching Safe's eth_sign branch in `checkSignatures`. EIP-712
+                // failing is the expected fallback trigger (older Ledger apps), so
+                // surface the eth_sign attempt's (already-friendly) error if that
+                // also fails rather than leaking both raw status words.
+                tracing::debug!(error = %eip712_err, "eip1271 owner eip712 sign failed; falling back to eth_sign");
                 let sig = owner
                     .sign_eth_message(message_hash.as_slice())
                     .await
-                    .map_err(|eth_err| {
-                        format!(
-                            "eip1271 sign: eip712 ({eip712_err}) and eth_sign ({eth_err}) both failed"
-                        )
-                    })?;
+                    .map_err(|eth_err| crate::wallet::friendly_signer_error(&eth_err))?;
                 let mut b = sig.as_bytes().to_vec();
                 b[64] += 4;
                 Bytes::from(b)

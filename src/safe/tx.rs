@@ -366,7 +366,7 @@ pub async fn eip712_owner_sig(
     let sig = signer
         .sign_eip712(tx, domain)
         .await
-        .map_err(|e| format!("eip712 sign: {e}"))?;
+        .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
     Ok((signer.address(), Bytes::from(sig.as_bytes().to_vec())))
 }
 
@@ -383,11 +383,15 @@ pub async fn sign_owner(
 ) -> Result<(Address, Bytes), String> {
     match eip712_owner_sig(signer, tx, domain).await {
         Ok(v) => Ok(v),
-        Err(eip712_err) => eth_sign_owner_sig(signer, safe_tx_hash)
-            .await
-            .map_err(|eth_err| {
-                format!("eip712 ({eip712_err}) and eth_sign ({eth_err}) both failed")
-            }),
+        // EIP-712 failing is the *expected* trigger for the fallback (older Ledger
+        // app versions reject typed data), so its error isn't the actionable one.
+        // Surface the eth_sign attempt's (already-friendly) error if that also
+        // fails, rather than a confusing "both failed" carrying the raw status word
+        // twice — a locked / declined device fails both the same way.
+        Err(eip712_err) => {
+            tracing::debug!(error = %eip712_err, "safe owner eip712 sign failed; falling back to eth_sign");
+            eth_sign_owner_sig(signer, safe_tx_hash).await
+        }
     }
 }
 
@@ -403,7 +407,7 @@ pub async fn eth_sign_owner_sig(
     let sig = signer
         .sign_eth_message(safe_tx_hash.as_slice())
         .await
-        .map_err(|e| format!("eth_sign: {e}"))?;
+        .map_err(|e| crate::wallet::friendly_signer_error(&e))?;
     let mut bytes = sig.as_bytes().to_vec();
     // 65-byte r‖s‖v; `as_bytes` writes v = 27 + parity. Safe reads
     // v∈{31,32} as "eth_sign over the hash", so +4.
