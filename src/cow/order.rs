@@ -167,18 +167,30 @@ pub async fn sign_order(
         .map_err(|e| format!("sign order: {e}"))
 }
 
-/// EIP-712-sign an off-chain cancellation of one or more orders. ECDSA-only
-/// (eip712 / ethsign) — EthFlow orders are cancelled on-chain instead.
+/// The `OrderCancellations` EIP-712 message for a set of 56-byte order UIDs.
+fn build_cancellations(uids: &[[u8; 56]]) -> OrderCancellations {
+    OrderCancellations {
+        orderUids: uids.iter().map(|u| Bytes::copy_from_slice(u)).collect(),
+    }
+}
+
+/// Local EIP-712 signing hash of an off-chain bulk cancellation: the digest an
+/// EOA recovers against directly, and — for a Safe — the digest wrapped in a
+/// `SafeMessage` for an EIP-1271 cancellation (see [`crate::cow::safe_sig`]).
+pub fn cancellations_digest(uids: &[[u8; 56]], domain: &Eip712Domain) -> B256 {
+    build_cancellations(uids).eip712_signing_hash(domain)
+}
+
+/// EIP-712-sign an off-chain cancellation of one or more orders with an EOA key
+/// (eip712 / ethsign). Safe-owned orders cancel via EIP-1271 instead (see
+/// [`crate::cow::safe_sig`]); EthFlow orders cancel on-chain.
 pub async fn sign_cancellations(
     signer: &KaoSigner,
     uids: &[[u8; 56]],
     domain: &Eip712Domain,
 ) -> Result<Signature, String> {
-    let c = OrderCancellations {
-        orderUids: uids.iter().map(|u| Bytes::copy_from_slice(u)).collect(),
-    };
     signer
-        .sign_eip712(&c, domain)
+        .sign_eip712(&build_cancellations(uids), domain)
         .await
         .map_err(|e| format!("sign cancellation: {e}"))
 }
@@ -269,6 +281,25 @@ mod tests {
         assert_eq!(&uid[52..56], &[0x12, 0x34, 0x56, 0x78]);
         assert_eq!(uid_hex(&uid).len(), 2 + 112);
         assert!(uid_hex(&uid).starts_with("0x"));
+    }
+
+    #[test]
+    fn cancellations_digest_is_stable_and_chain_specific() {
+        // The digest a Safe wraps in a SafeMessage for an EIP-1271 cancellation.
+        // It must be deterministic for a given (uids, chain) and bind the chain.
+        let uid = order_uid(
+            B256::repeat_byte(0x11),
+            address!("0x2222222222222222222222222222222222222222"),
+            123,
+        );
+        let m = cancellations_digest(&[uid], &cow_domain(Chain::Mainnet));
+        let b = cancellations_digest(&[uid], &cow_domain(Chain::Base));
+        assert_ne!(m, b, "cancellation digest must bind the chain id");
+        assert_eq!(
+            m,
+            cancellations_digest(&[uid], &cow_domain(Chain::Mainnet)),
+            "digest must be deterministic"
+        );
     }
 
     #[test]

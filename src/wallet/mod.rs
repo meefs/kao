@@ -530,17 +530,18 @@ impl KaoSigner {
         }
     }
 
-    /// Sign a precomputed 32-byte hash. Used by the Safe-TX flow,
-    /// which computes the EIP-712 signing hash locally (and
-    /// cross-checks it against the Safe's `getTransactionHash`)
-    /// then signs the bare hash as `r ‖ s ‖ v` with `v ∈ {27, 28}`.
+    /// Sign a precomputed 32-byte hash as bare `r ‖ s ‖ v` with
+    /// `v ∈ {27, 28}`. The Safe flow no longer calls this directly — it
+    /// drives every owner through [`Self::sign_eip712`] so software and
+    /// hardware share one path — but it's retained as the reference the
+    /// `local_eip712_matches_sign_hash` test pins that path against.
     ///
     /// Hardware variants return `UnsupportedOperation` on purpose:
     /// Ledger's Ethereum app refuses bare-hash signing under its
     /// blind-signing policy, and Trezor likewise. Device EIP-712
     /// signing needs the structured-fields APDU path
-    /// (`sign_typed_data_v4`) — a separate slice. `ViewOnly` has no
-    /// key.
+    /// (`sign_typed_data_v4`). `ViewOnly` has no key.
+    #[allow(dead_code)]
     pub async fn sign_hash(&self, hash: B256) -> Result<Signature, alloy::signers::Error> {
         match self {
             KaoSigner::Local(s) => s.sign_hash(&hash).await,
@@ -604,6 +605,58 @@ impl KaoSigner {
     }
 }
 
+/// Turn a raw signer error into a line a human can act on.
+///
+/// Hardware wallets surface the bare APDU status word from the device, which is
+/// opaque ("APDU Response error `Code 6985 …`"). The two cases users actually
+/// hit on a contract call both come back as `6985 CONDITIONS_NOT_SATISFIED`:
+/// declining the on-device prompt, and having **Blind signing** disabled in the
+/// Ledger Ethereum app (it refuses calldata it can't decode). Since our name /
+/// swap / Safe calls can't be clear-signed, those collapse into one actionable
+/// message instead of leaking the status word. A locked device (`6804`) or a
+/// wrong / closed app (`6e00`, `6d00`) gets a reach-the-device hint, as does a
+/// locked Trezor (whose PIN request the client mis-surfaces as a "network not
+/// supported" error); everything else falls back to the raw text so we never
+/// hide a genuinely novel failure.
+pub fn friendly_signer_error(e: &alloy::signers::Error) -> String {
+    friendly_signer_error_text(&e.to_string())
+}
+
+/// Inner string-matcher for [`friendly_signer_error`], split out so the APDU
+/// classification is unit-testable without fabricating an `alloy` error.
+fn friendly_signer_error_text(raw: &str) -> String {
+    let low = raw.to_lowercase();
+    let has = |needle: &str| low.contains(needle);
+    if has("6985")
+        || has("conditions_not_satisfied")
+        || has("conditions of use")
+        || has("denied")
+        || has("rejected")
+        || has("cancel")
+    {
+        "rejected on your hardware wallet — approve the transaction on the device, and make sure \
+         \"Blind signing\" is enabled in its Ethereum app"
+            .to_string()
+    } else if has("given network is not supported") // Trezor mis-maps a PIN request to this
+        || has("pinexpected")
+        || has("pinmatrix")
+    {
+        "couldn't reach your Trezor — unlock it by entering your PIN, then try again".to_string()
+    } else if has("6804") // device locked (coins-ledger UnlockDeviceError)
+        || has("device is locked")
+        || has("unlock_device")
+        || has("6e00") // wrong / no app open (CLA / INS not supported)
+        || has("6d00")
+        || has("no device")
+        || has("not found")
+    {
+        "couldn't reach your hardware wallet — unlock it and open the Ethereum app, then try again"
+            .to_string()
+    } else {
+        format!("sign failed: {raw}")
+    }
+}
+
 /// Construct a *live* signer for an arbitrary linked owner — used when a
 /// Safe owner this wallet controls is **not** the currently-active
 /// account (confirm/execute/propose from the queue). Software owners
@@ -623,7 +676,7 @@ pub async fn build_owner_signer(desc: &AccountDescriptor) -> Result<KaoSigner, S
         AccountDescriptor::Ledger { path, address, .. } => {
             let s = LedgerSigner::new(path.to_alloy(), None)
                 .await
-                .map_err(|e| format!("ledger: {e}"))?;
+                .map_err(|e| friendly_signer_error_text(&e.to_string()))?;
             let got = Signer::address(&s);
             let want = Address::from(*address);
             if got != want {
@@ -642,7 +695,7 @@ pub async fn build_owner_signer(desc: &AccountDescriptor) -> Result<KaoSigner, S
         AccountDescriptor::Trezor { path, address, .. } => {
             let s = TrezorSigner::new(path.to_alloy(), None)
                 .await
-                .map_err(|e| format!("trezor: {e}"))?;
+                .map_err(|e| friendly_signer_error_text(&e.to_string()))?;
             let got = Signer::address(&s);
             let want = Address::from(*address);
             if got != want {
@@ -656,6 +709,60 @@ pub async fn build_owner_signer(desc: &AccountDescriptor) -> Result<KaoSigner, S
         }
         AccountDescriptor::ViewOnly { .. } => {
             Err("view-only account has no signing key".to_string())
+        }
+    }
+}
+
+/// Make sure a hardware signer's device is still reachable right before we ask it
+/// to sign, reconnecting it if the live transport has gone away (the device was
+/// unplugged, auto-locked, or its Ethereum app closed since it was connected).
+///
+/// A `LedgerSigner` holds a *persistent* USB transport, so a dropped device
+/// leaves a stale signer that still reports `can_sign()` — we catch that with a
+/// **silent** `get_address` probe (Ledger's `NON_CONFIRM` APDU; no on-device
+/// prompt) and, if it fails, rebuild the signer from its descriptor via
+/// [`build_owner_signer`] (which also re-verifies the derived address). A
+/// `TrezorSigner` re-finds the device on every call already, so it self-heals and
+/// is passed through untouched (probing it could trigger an on-device prompt).
+/// Software / view-only signers have nothing to check.
+///
+/// On reconnect failure the **original** signer is handed back alongside the
+/// error, so the caller restores it to its handoff rather than stranding the
+/// wallet as view-only — exactly the pre-existing behaviour, just after one
+/// automatic reconnect attempt.
+pub async fn ensure_connected(
+    signer: KaoSigner,
+    desc: &AccountDescriptor,
+) -> Result<KaoSigner, (KaoSigner, String)> {
+    // Only a Ledger can hold a stale transport; everything else either
+    // self-reconnects (Trezor) or has no device (Local / ViewOnly).
+    let KaoSigner::Ledger(ref s) = signer else {
+        return Ok(signer);
+    };
+    let want = signer.address();
+    match s.get_address().await {
+        Ok(got) if got == want => Ok(signer), // device present, unlocked, app open
+        probe => {
+            match &probe {
+                Ok(got) => {
+                    tracing::warn!(%got, expected = %want, "ledger probe: wrong address, reconnecting")
+                }
+                Err(e) => tracing::debug!(error = %e, "ledger probe failed, reconnecting"),
+            }
+            // The held transport is (almost certainly) dead — rebuild from the
+            // descriptor. `build_owner_signer` re-derives + checks the address, so
+            // a wrong-device swap fails loudly rather than signing under it.
+            match build_owner_signer(desc).await {
+                Ok(fresh) => Ok(fresh),
+                Err(e) => {
+                    // `e` is already a friendly, human-readable line — build_owner_signer
+                    // routes hardware-connect failures through friendly_signer_error_text
+                    // (a locked device becomes "couldn't reach your hardware wallet …") —
+                    // so surface it directly rather than nesting raw crate text in parens.
+                    tracing::debug!(error = %e, "ledger reconnect failed");
+                    Err((signer, e))
+                }
+            }
         }
     }
 }
@@ -784,6 +891,51 @@ pub fn account_short_address(account: &AccountDescriptor) -> String {
 mod tests {
     use super::*;
     use alloy::primitives::U256;
+
+    #[test]
+    fn friendly_signer_error_maps_ledger_apdu_codes() {
+        // The exact string a declining / blind-signing-disabled Ledger surfaces.
+        let rejected = friendly_signer_error_text(
+            "Ledger device: APDU Response error `Code 6985 \
+             ([APDU_CODE_CONDITIONS_NOT_SATISFIED] Conditions of use not satisfied)`",
+        );
+        assert!(rejected.contains("Blind signing"), "got: {rejected}");
+        assert!(
+            !rejected.contains("6985"),
+            "raw APDU code leaked: {rejected}"
+        );
+
+        // Locked device → the reach-the-device hint. 0x6804 is the *real*
+        // "device is locked" status word (coins-ledger `UnlockDeviceError`); the
+        // fictitious 6511 this used to assert on never reaches the device.
+        let locked = friendly_signer_error_text(
+            "Ledger device: APDU Response error `Code 6804 \
+             ([APDU_CODE_UNLOCK_DEVICE_ERROR] Device is locked)`",
+        );
+        assert!(locked.contains("open the Ethereum app"), "got: {locked}");
+        assert!(!locked.contains("6804"), "raw APDU code leaked: {locked}");
+
+        // Wrong / closed app (CLA-not-supported) → same reach-the-device hint.
+        let wrong_app = friendly_signer_error_text("Ledger device: APDU error `Code 6e00`");
+        assert!(
+            wrong_app.contains("open the Ethereum app"),
+            "got: {wrong_app}"
+        );
+
+        // A locked Trezor's PIN request surfaces (mis-mapped) as a network error;
+        // it collapses into a PIN hint rather than leaking the jargon.
+        let trezor_locked = friendly_signer_error_text("given network is not supported");
+        assert!(trezor_locked.contains("PIN"), "got: {trezor_locked}");
+        assert!(
+            !trezor_locked.contains("network is not supported"),
+            "raw Trezor jargon leaked: {trezor_locked}"
+        );
+
+        // Anything we don't recognise is passed through verbatim (prefixed),
+        // so a novel failure is never hidden behind a canned message.
+        let other = friendly_signer_error_text("nonce too low");
+        assert_eq!(other, "sign failed: nonce too low");
+    }
 
     #[test]
     fn account_postcard_roundtrip_local() {
@@ -1192,6 +1344,39 @@ mod tests {
         assert_eq!(ks.address(), signer.address());
         let s = format!("{ks:?}");
         assert!(s.contains("Local"));
+    }
+
+    #[tokio::test]
+    async fn ensure_connected_passes_software_signer_through() {
+        // A software signer has no device to probe — `ensure_connected` returns
+        // it untouched (no network/device interaction), regardless of descriptor.
+        let parent = derive_parent_key(HARDHAT_PHRASE).unwrap();
+        let (_, signer) = &derive_accounts_from(&parent, 0, 1).unwrap()[0];
+        let addr = signer.address();
+        let ks = KaoSigner::Local(signer.clone());
+        let desc = local_account(signer);
+        let out = ensure_connected(ks, &desc)
+            .await
+            .expect("software passes through");
+        assert!(matches!(out, KaoSigner::Local(_)));
+        assert_eq!(out.address(), addr);
+    }
+
+    #[tokio::test]
+    async fn ensure_connected_passes_view_only_through() {
+        // View-only can't sign and has no device; it's returned as-is (the sign
+        // call itself still errors UnsupportedOperation downstream).
+        let addr: Address = "0x000000000000000000000000000000000000dEaD"
+            .parse()
+            .unwrap();
+        let desc = AccountDescriptor::ViewOnly {
+            name: None,
+            address: addr.into_array(),
+        };
+        let out = ensure_connected(KaoSigner::ViewOnly(addr), &desc)
+            .await
+            .expect("view-only passes through");
+        assert!(matches!(out, KaoSigner::ViewOnly(a) if a == addr));
     }
 
     #[tokio::test]

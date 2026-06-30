@@ -26,6 +26,9 @@ use crate::wallet::SafeDescriptor;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// No-op published by a copyable address click so the dashboard's "Copied!"
+    /// toast animation starts (a click changes no state otherwise). Ignored.
+    AddressCopied,
     Back,
     UrlChanged(usize, String),
     Save(usize),
@@ -70,6 +73,8 @@ impl SafesPane {
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
+            // Copy-toast kick — the widget already copied + marked the toast.
+            Message::AddressCopied => (Task::none(), None),
             Message::Back => (Task::none(), Some(Outcome::Closed)),
             Message::UrlChanged(i, s) => {
                 if let Some(r) = self.rows.get_mut(i) {

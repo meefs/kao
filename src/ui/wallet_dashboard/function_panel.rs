@@ -22,6 +22,7 @@
 
 use alloy::primitives::Address;
 use iced::border::Radius;
+use iced::widget::text::Wrapping;
 use iced::widget::{Space, column, container, row, text};
 use iced::{Background, Border, Element, Length, Padding};
 
@@ -244,20 +245,13 @@ fn push_display_entry<'a, M: 'a>(
 
 fn display_item_row<'a, M: 'a>(t: KaoTheme, item: &'a DisplayItem, indent: f32) -> Element<'a, M> {
     let value_display = truncate(&item.value, 48);
-    row![
-        Space::new().width(Length::Fixed(indent)),
-        text(format!("· {}", item.label))
-            .size(11)
-            .color(t.sub)
-            .font(mono()),
-        Space::new().width(Length::Fill),
-        text(value_display.into_owned())
-            .size(12)
-            .color(t.text)
-            .font(mono()),
-    ]
-    .width(Length::Fill)
-    .into()
+    labeled_value(
+        t,
+        indent,
+        format!("· {}", item.label),
+        value_display.into_owned(),
+        t.text,
+    )
 }
 
 /// A tinted caution band — the shared styling for diagnostics, heuristic
@@ -399,13 +393,7 @@ fn arg_row<'a, M: 'a>(t: KaoTheme, arg: &'a DecodedArg) -> Element<'a, M> {
         ArgDisplay::Raw(s) => truncate(s, 48).into_owned(),
     };
 
-    row![
-        text(label).size(11).color(t.sub).font(mono()),
-        Space::new().width(Length::Fill),
-        text(value).size(12).color(t.text).font(mono()),
-    ]
-    .width(Length::Fill)
-    .into()
+    labeled_value(t, 0.0, label, value, t.text)
 }
 
 fn unknown_call_body<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, M> {
@@ -413,14 +401,57 @@ fn unknown_call_body<'a, M: 'a>(t: KaoTheme, d: &'a DecodedCall) -> Element<'a, 
     // eyeball when no decoder applied.
     let hex = alloy::hex::encode(&d.raw_calldata);
     let display = format!("0x{}", truncate(&hex, 64));
-    row![
-        text("· raw").size(11).color(t.sub).font(mono()),
-        Space::new().width(Length::Fill),
-        text(display).size(11).color(t.sub).font(mono()),
-    ]
-    .width(Length::Fill)
-    .into()
+    labeled_value(t, 0.0, "· raw".to_string(), display, t.sub)
 }
+
+/// A `label … value` arg row. Short values sit on the same line as the label,
+/// right-aligned; values too long for that (big `uint256`s, long hex) drop onto
+/// their own full-width line and **wrap by glyph** so a 77-digit number breaks
+/// across rows instead of overflowing the panel edge.
+fn labeled_value<'a, M: 'a>(
+    t: KaoTheme,
+    indent: f32,
+    label: String,
+    value: String,
+    value_color: iced::Color,
+) -> Element<'a, M> {
+    let label_el = text(label).size(11).color(t.sub).font(mono());
+    if value.chars().count() <= VALUE_INLINE_MAX {
+        row![
+            Space::new().width(Length::Fixed(indent)),
+            label_el,
+            Space::new().width(Length::Fill),
+            text(value).size(12).color(value_color).font(mono()),
+        ]
+        .width(Length::Fill)
+        .into()
+    } else {
+        // Stacked: label, then the value wrapping across the full width. The
+        // value row must be `Fill` (a Row defaults to Shrink) so the text has a
+        // width bound to glyph-wrap within instead of overflowing.
+        column![
+            row![Space::new().width(Length::Fixed(indent)), label_el],
+            row![
+                Space::new().width(Length::Fixed(indent + 8.0)),
+                text(value)
+                    .size(12)
+                    .color(value_color)
+                    .font(mono())
+                    .wrapping(Wrapping::Glyph)
+                    .width(Length::Fill),
+            ]
+            .width(Length::Fill),
+        ]
+        .width(Length::Fill)
+        .spacing(2)
+        .into()
+    }
+}
+
+/// Values longer than this won't fit on the shared label row (the panel is ~45
+/// mono chars wide once the label and gap are subtracted), so they wrap onto
+/// their own line instead.
+const VALUE_INLINE_MAX: usize = 20;
 
 fn warning_strip<'a, M: 'a>(t: KaoTheme, w: &'a Warning) -> Element<'a, M> {
     let line: String = match w {

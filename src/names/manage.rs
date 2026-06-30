@@ -34,7 +34,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::network::Ethereum;
-use alloy::primitives::{Address, B256, TxHash, U256};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use alloy::providers::RootProvider;
 
 use crate::chain::Chain;
@@ -158,6 +158,20 @@ impl Registry {
     /// `label` + this registry's TLD, e.g. `"vitalik.eth"` / `"rat.cheese"`.
     pub fn full_name(&self, label: &str) -> String {
         format!("{label}{}", self.tld())
+    }
+
+    /// The contract the registration transaction calls — the ENS/GNS/WNS
+    /// controller (commit, then reveal/register), or the XNS registry. Shown in
+    /// the pre-sign review so a user approving a blind-signing prompt on a
+    /// hardware wallet can verify the destination, since the calldata itself
+    /// isn't device-decodable.
+    pub fn registrar_contract(&self) -> Address {
+        match self {
+            Registry::Ens => registrar::ENS_CONTROLLER,
+            Registry::Gns => Namespace::Gns.nft_contract().expect("nft namespace"),
+            Registry::Wns => Namespace::Wns.nft_contract().expect("nft namespace"),
+            Registry::Xns { .. } => xns::XNS_REGISTRY,
+        }
     }
 
     /// Commit-reveal registrars support renewal and re-pointing (`setAddr`); XNS
@@ -706,6 +720,82 @@ async fn mainnet_provider(net: &dyn BalanceFetcher) -> Result<RootProvider<Ether
         .ok_or_else(|| "no Ethereum mainnet RPC configured".to_string())
 }
 
+// The `*_call_for` builders compute the `(to, value, calldata)` for each write
+// (including any verified price/commitment read) WITHOUT broadcasting. The
+// `submit_*` wrappers broadcast from an EOA via `send_contract_call`; the
+// Safe-mode flow wraps the same tuple in a Mainnet `execTransaction` instead, so
+// a name registered/renewed/repointed from a Safe is owned by the Safe (its
+// address is the registrant baked into the commitment / the `msg.sender` the
+// registrars and the resolver authorize against).
+
+/// `(to, value, calldata)` for commit-reveal step 1: computes the commitment
+/// on-chain (verified) and returns the `commit(commitment)` call.
+pub async fn commit_call_for(
+    net: &dyn BalanceFetcher,
+    plan: &RegisterPlan,
+) -> Result<(Address, U256, Bytes), String> {
+    let (mto, mcd) = plan.namespace.make_commitment_call(plan);
+    let commitment = registrar::decode_b256(&verified_call_raw(net, mto, mcd).await?);
+    if commitment == B256::ZERO {
+        return Err("could not compute commitment".to_string());
+    }
+    Ok(plan.namespace.commit_call(commitment))
+}
+
+/// `(to, value, calldata)` for commit-reveal step 2: reads the price (verified),
+/// adds the safety buffer, and returns the reveal/register call with the value.
+pub async fn register_call_for(
+    net: &dyn BalanceFetcher,
+    plan: &RegisterPlan,
+) -> Result<(Address, U256, Bytes), String> {
+    let quote = register_quote(net, plan.namespace, &plan.label, plan.duration_secs).await?;
+    let value = with_buffer(quote.total, PRICE_BUFFER_BPS);
+    Ok(plan.namespace.register_call(plan, value))
+}
+
+/// `(to, value, calldata)` for a one-shot XNS registration: confirms the
+/// namespace is public + open and reads its exact price. XNS binds the name and
+/// its resolution to `msg.sender`, immutably — so from a Safe the inner call's
+/// `msg.sender` (the Safe) becomes the permanent owner.
+pub async fn register_xns_call_for(
+    net: &dyn BalanceFetcher,
+    namespace: &str,
+    label: &str,
+) -> Result<(Address, U256, Bytes), String> {
+    let (ito, icd) = xns::namespace_info_call(namespace);
+    let info = xns::decode_namespace_info(&verified_call_raw(net, ito, icd).await?)
+        .ok_or_else(|| "namespace not found".to_string())?;
+    if !info.public_open(now_secs()) {
+        return Err("this namespace isn't open for public registration".to_string());
+    }
+    // XNS price is a fixed storage value (no oracle) and excess is refunded —
+    // send it exactly.
+    Ok(xns::register_call(label, namespace, info.price))
+}
+
+/// `(to, value, calldata)` to renew ("prolong") a commit-reveal name.
+pub async fn renew_call_for(
+    net: &dyn BalanceFetcher,
+    ns: Namespace,
+    label: &str,
+    duration_secs: u64,
+) -> Result<(Address, U256, Bytes), String> {
+    let cost = renew_quote(net, ns, label, duration_secs).await?;
+    let value = with_buffer(cost, PRICE_BUFFER_BPS);
+    Ok(ns.renew_call(label, duration_secs, value))
+}
+
+/// `(to, value, calldata)` to point a commit-reveal name at `recipient`. No
+/// network read, no value — the resolver authorizes the caller against the
+/// name's owner, so from a Safe the inner `msg.sender` must be that owner Safe.
+pub fn set_recipient_call_for(
+    ns: Namespace,
+    label: &str,
+    recipient: Address,
+) -> (Address, U256, Bytes) {
+    ns.set_addr_call(label, recipient)
+}
+
 /// Step 1 of commit-reveal registration: compute the commitment on-chain
 /// (verified) and broadcast `commit(commitment)`. Returns the commit tx hash.
 pub async fn submit_commit(
@@ -714,12 +804,7 @@ pub async fn submit_commit(
     plan: &RegisterPlan,
 ) -> Result<TxHash, String> {
     let provider = mainnet_provider(net).await?;
-    let (mto, mcd) = plan.namespace.make_commitment_call(plan);
-    let commitment = registrar::decode_b256(&verified_call_raw(net, mto, mcd).await?);
-    if commitment == B256::ZERO {
-        return Err("could not compute commitment".to_string());
-    }
-    let (to, value, cd) = plan.namespace.commit_call(commitment);
+    let (to, value, cd) = commit_call_for(net, plan).await?;
     send_contract_call(&provider, signer, Chain::Mainnet, to, value, cd).await
 }
 
@@ -731,9 +816,7 @@ pub async fn submit_register(
     plan: &RegisterPlan,
 ) -> Result<TxHash, String> {
     let provider = mainnet_provider(net).await?;
-    let quote = register_quote(net, plan.namespace, &plan.label, plan.duration_secs).await?;
-    let value = with_buffer(quote.total, PRICE_BUFFER_BPS);
-    let (to, v, cd) = plan.namespace.register_call(plan, value);
+    let (to, v, cd) = register_call_for(net, plan).await?;
     send_contract_call(&provider, signer, Chain::Mainnet, to, v, cd).await
 }
 
@@ -748,15 +831,7 @@ pub async fn submit_register_xns(
     label: &str,
 ) -> Result<TxHash, String> {
     let provider = mainnet_provider(net).await?;
-    let (ito, icd) = xns::namespace_info_call(namespace);
-    let info = xns::decode_namespace_info(&verified_call_raw(net, ito, icd).await?)
-        .ok_or_else(|| "namespace not found".to_string())?;
-    if !info.public_open(now_secs()) {
-        return Err("this namespace isn't open for public registration".to_string());
-    }
-    // XNS price is a fixed storage value (no oracle) and excess is refunded —
-    // send it exactly.
-    let (to, value, cd) = xns::register_call(label, namespace, info.price);
+    let (to, value, cd) = register_xns_call_for(net, namespace, label).await?;
     send_contract_call(&provider, signer, Chain::Mainnet, to, value, cd).await
 }
 
@@ -769,9 +844,7 @@ pub async fn submit_renew(
     duration_secs: u64,
 ) -> Result<TxHash, String> {
     let provider = mainnet_provider(net).await?;
-    let cost = renew_quote(net, ns, label, duration_secs).await?;
-    let value = with_buffer(cost, PRICE_BUFFER_BPS);
-    let (to, v, cd) = ns.renew_call(label, duration_secs, value);
+    let (to, v, cd) = renew_call_for(net, ns, label, duration_secs).await?;
     send_contract_call(&provider, signer, Chain::Mainnet, to, v, cd).await
 }
 
@@ -784,7 +857,7 @@ pub async fn submit_set_recipient(
     recipient: Address,
 ) -> Result<TxHash, String> {
     let provider = mainnet_provider(net).await?;
-    let (to, v, cd) = ns.set_addr_call(label, recipient);
+    let (to, v, cd) = set_recipient_call_for(ns, label, recipient);
     send_contract_call(&provider, signer, Chain::Mainnet, to, v, cd).await
 }
 

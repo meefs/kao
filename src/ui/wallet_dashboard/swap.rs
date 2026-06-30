@@ -99,6 +99,12 @@ impl SwapPane {
         self.composer.update(composer::Message::QuoteResult(result));
     }
 
+    /// The user confirmed the clear-signing review — enter the blocking
+    /// "placing" phase while the coordinator signs + submits the order.
+    pub fn begin_placing(&mut self) {
+        self.phase = Phase::Placing;
+    }
+
     /// Placement succeeded — switch to blocking status tracking.
     pub fn begin_tracking(&mut self, uid: String) {
         self.phase = Phase::Tracking(uid);
@@ -121,7 +127,10 @@ impl SwapPane {
                         (Task::none(), Some(Outcome::RequestQuote(draft)))
                     }
                     Some(composer::Outcome::RequestPlace { draft, quote }) => {
-                        self.phase = Phase::Placing;
+                        // Stay in Compose: the coordinator opens the clear-signing
+                        // review first, and only drives us into `Placing` (via
+                        // `begin_placing`) once the user confirms the order. A
+                        // cancel leaves the composer untouched.
                         (Task::none(), Some(Outcome::RequestPlace { draft, quote }))
                     }
                     None => (Task::none(), None),

@@ -181,10 +181,15 @@ impl AppsPane {
         t: KaoTheme,
         portfolio: &'a [LiveToken],
         orders: &[&'a TrackedOrder],
+        names_available: bool,
     ) -> Element<'a, Message> {
         let content = match self.view {
-            AppsView::Launcher => self.launcher_view(t, orders),
+            AppsView::Launcher => self.launcher_view(t, orders, names_available),
             AppsView::Swap => self.swap_view(t, portfolio, orders),
+            // Names is unavailable for a non-Mainnet Safe (the launcher hides the
+            // card). Fall back to the launcher if we landed on the Names view
+            // before switching to such an identity.
+            AppsView::Names if !names_available => self.launcher_view(t, orders, names_available),
             AppsView::Names => self.names.view(t).map(Message::Names),
         };
 
@@ -208,34 +213,45 @@ impl AppsPane {
             .into()
     }
 
-    /// The app launcher: a card per available app (just Swap for now). The order
-    /// list lives inside the Swap app; the card shows a count of open orders.
-    fn launcher_view<'a>(&self, t: KaoTheme, orders: &[&'a TrackedOrder]) -> Element<'a, Message> {
+    /// The app launcher: a card per available app. The order list lives inside
+    /// the Swap app; the card shows a count of open orders. `names_available`
+    /// gates the Names card — names register/resolve against the active identity
+    /// (an EOA, or a Mainnet Safe), so it's hidden for a non-Mainnet Safe.
+    fn launcher_view<'a>(
+        &self,
+        t: KaoTheme,
+        orders: &[&'a TrackedOrder],
+        names_available: bool,
+    ) -> Element<'a, Message> {
         let open_count = orders.iter().filter(|o| !o.status.is_terminal()).count();
         let swap_sub = if open_count > 0 {
             format!("Trade via CoW Protocol · {open_count} open")
         } else {
             "Trade tokens via CoW Protocol".to_string()
         };
+        let subtitle = if names_available {
+            "On-chain apps — swaps and name registration"
+        } else {
+            "On-chain apps — swaps"
+        };
 
-        column![
+        let mut col = column![
             screen_title(t, "Apps"),
             Space::new().height(6),
-            screen_subtitle(t, "On-chain apps — swaps and name registration"),
+            screen_subtitle(t, subtitle),
             Space::new().height(20),
             app_card(t, "(⇌ω⇌)", "Swap", &swap_sub, Message::OpenSwapApp),
-            Space::new().height(10),
-            app_card(
+        ];
+        if names_available {
+            col = col.push(Space::new().height(10)).push(app_card(
                 t,
                 "(✎ω✎)",
                 "Names",
                 "Search & register .eth / .gwei / .wei / .xns names",
                 Message::OpenNamesApp,
-            ),
-        ]
-        .width(Length::Fill)
-        .max_width(560)
-        .into()
+            ));
+        }
+        col.width(Length::Fill).max_width(560).into()
     }
 
     /// The Swap app: a back link, the inline composer, and the live order list

@@ -51,6 +51,14 @@ ignore = [
     # ── alloy/build-time ──────────────────────────────────────────────────
     { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 unmaintained. Build-time proc-macro used by alloy-primitives via alloy-chains. No known vuln, no runtime surface." },
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 2.0.1 unmaintained (fork of proc-macro-error, see RUSTSEC-2024-0370 above). Build-time proc-macro diagnostics used by alloy-sol-macro. No known vuln, no runtime surface. Revisit when alloy-sol-macro migrates off it upstream." },
+
+    # ── iced GUI font/glyph subtree (cosmic-text + usvg → fontdb → ttf-parser) ─
+    # The only non-helios, non-alloy entry: it enters through the GUI, not the
+    # chain/signing path. ttf-parser parses font files and SVG glyph outlines for
+    # on-screen text rendering only — it never sees keys, encrypted storage,
+    # signed payloads, or verified chain state, and the fonts/SVG assets it reads
+    # ship with the app.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 unmaintained (author won't ship further fixes; no known vuln). Reaches the tree via iced's text/SVG rendering (cosmic-text + usvg → fontdb). Glyph/font parsing for rendering only — disjoint from signing, storage, and chain verification. Revisit when iced/cosmic-text/usvg migrate to skrifa." },
 ]
 
 [licenses]

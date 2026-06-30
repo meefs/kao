@@ -168,7 +168,7 @@ pub async fn send_contract_call(
 
     let sig = signer.sign_tx(&mut tx).await.map_err(|e| {
         warn!(error = %e, "cow: sign failed");
-        format!("sign failed: {e}")
+        crate::wallet::friendly_signer_error(&e)
     })?;
     let envelope: TxEnvelope = tx.into_signed(sig).into();
     let raw = envelope.encoded_2718();

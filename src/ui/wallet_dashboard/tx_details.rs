@@ -24,6 +24,9 @@ use crate::wallet::ContactsBook;
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// No-op published by a copyable address click so the dashboard's "Copied!"
+    /// toast animation starts (a click changes no state otherwise). Ignored.
+    AddressCopied,
     CopyHash,
     CopyExplorerUrl,
     CopyFrom,
@@ -70,6 +73,8 @@ impl TxDetailsPane {
 
     pub fn update(&mut self, msg: Message) -> (Task<Message>, Option<Outcome>) {
         match msg {
+            // Copy-toast kick — the widget already copied + marked the toast.
+            Message::AddressCopied => (Task::none(), None),
             Message::CopyHash => (
                 Task::none(),
                 Some(Outcome::CopyText(format!("{:#x}", self.tx.hash))),

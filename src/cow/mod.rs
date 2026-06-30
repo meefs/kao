@@ -33,6 +33,7 @@ pub mod composer;
 pub mod ethflow;
 pub mod onchain;
 pub mod order;
+pub mod safe_sig;
 pub mod tracked;
 
 // ── Canonical contract addresses (same CREATE2 address on every CoW chain) ───
