@@ -1084,7 +1084,15 @@ impl PoolApp {
         let mut col = column![
             exit_link(t),
             vspace(10),
+            // Centered title with Refresh pinned right: an invisible copy of the
+            // Refresh label on the left balances its width, so the two Fill
+            // spacers center "Privacy Pools ヾ(⌐■_■)ノ♪" across the whole row.
             row![
+                text("⟳ Refresh")
+                    .size(12)
+                    .font(bold())
+                    .color(Color::TRANSPARENT),
+                Space::new().width(Length::Fill),
                 text("Privacy Pools").size(22).color(t.text).font(black()),
                 Space::new().width(8),
                 text("ヾ(⌐■_■)ノ♪").size(15).color(t.a3).font(mono()),
@@ -1313,29 +1321,36 @@ impl PoolApp {
             } else {
                 small_action(t, "Withdraw", Message::OpenWithdraw(pool_index, i))
             };
-            body = body.push(thin_divider(t)).push(
-                // Label on the left, actions pushed to the right by a fill
-                // spacer — mirrors the header's Deposit button.
-                row![
-                    text(format!("PA-{}", i + 1))
-                        .size(12)
-                        .color(t.text)
-                        .font(mono_bold()),
-                    Space::new().width(8),
-                    text(format!("{} {}", trim_zeros(&bs), info.symbol))
-                        .size(12)
-                        .color(t.text)
-                        .font(bold()),
-                    Space::new().width(8),
-                    approval_badge(t, approved),
-                    Space::new().width(Length::Fill),
-                    withdraw_btn,
-                    Space::new().width(6),
-                    small_muted(t, "Ragequit", Message::Ragequit(pool_index, i)),
-                ]
-                .align_y(Alignment::Center)
-                .width(Length::Fill),
-            );
+            // Stacked layout — the half-width card is too narrow to fit the
+            // identity, balance and both action buttons on one row (the buttons
+            // spill past the edge). So: identity + balance, then (if known) the
+            // approval status, then the buttons right-aligned on their own line.
+            let label_line = row![
+                text(format!("PA-{}", i + 1))
+                    .size(12)
+                    .color(t.text)
+                    .font(mono_bold()),
+                Space::new().width(8),
+                text(format!("{} {}", trim_zeros(&bs), info.symbol))
+                    .size(12)
+                    .color(t.text)
+                    .font(bold()),
+            ]
+            .align_y(Alignment::Center);
+            let buttons = row![
+                Space::new().width(Length::Fill),
+                withdraw_btn,
+                Space::new().width(6),
+                small_muted(t, "Ragequit", Message::Ragequit(pool_index, i)),
+            ]
+            .align_y(Alignment::Center)
+            .width(Length::Fill);
+            let mut acct = column![label_line].spacing(5).width(Length::Fill);
+            if let Some(ok) = approved {
+                acct = acct.push(approval_badge(t, ok));
+            }
+            acct = acct.push(buttons);
+            body = body.push(thin_divider(t)).push(acct);
         }
 
         if depositing {
@@ -1888,7 +1903,9 @@ fn loading_pools_view<'a>(t: KaoTheme, elapsed: f32) -> Element<'a, Message> {
     .spacing(12)
     .width(Length::Fill);
 
-    column![head, vspace(14), cards].width(Length::Fill).into()
+    column![container(head).center_x(Length::Fill), vspace(14), cards]
+        .width(Length::Fill)
+        .into()
 }
 
 /// A placeholder pool card mimicking `pool_card`'s shape (avatar + three text
@@ -2074,15 +2091,19 @@ fn small_muted<'a>(t: KaoTheme, label: &str, msg: Message) -> Element<'a, Messag
         .into()
 }
 
-/// The per-account ASP approval badge: green "approved" once the deposit's label
-/// is in the association set, muted "pending review" while 0xbow is still vetting
-/// it (withdrawal is blocked until then), nothing when the feed wasn't consulted.
-fn approval_badge<'a>(t: KaoTheme, approved: Option<bool>) -> Element<'a, Message> {
-    match approved {
-        Some(true) => text("✓ approved").size(10).color(t.up).font(mono()).into(),
-        Some(false) => text("⏱ pending").size(10).color(t.sub).font(mono()).into(),
-        None => Space::new().width(0).into(),
-    }
+/// The per-account ASP approval badge line: green "approved" once the deposit's
+/// label is in the association set, muted "pending review" while 0xbow is still
+/// vetting it (withdrawal is blocked until then). Rendered on its own line under
+/// the action row, so it never collides with the buttons on a narrow card. The
+/// "not consulted" case (feed off / not yet fetched) is handled by the caller,
+/// which simply omits the line.
+fn approval_badge<'a>(t: KaoTheme, approved: bool) -> Element<'a, Message> {
+    let (label, color) = if approved {
+        ("✓ approved", t.up)
+    } else {
+        ("⏱ pending review", t.sub)
+    };
+    text(label).size(10).color(color).font(mono()).into()
 }
 
 /// A one-line resolution hint under the target field, in `color`.
