@@ -420,6 +420,14 @@ pub enum Message {
     PoolQuoted {
         result: Result<crate::pool::relayer::QuoteResponse, String>,
     },
+    /// Forward name resolution for the Privacy Pools withdrawal target finished
+    /// (`.eth` / `.gwei` / `.wei` / `.xns`, or a picked contact's pinned name).
+    /// `seq` drops stale lookups; `name` disambiguates when the input changed.
+    PoolTargetResolved {
+        seq: u64,
+        name: String,
+        result: Result<Option<Address>, String>,
+    },
     /// A pool tx (deposit / self-relay withdraw / ragequit) or a relayed
     /// withdrawal finished. On success carries an optional tx hash. `signer` is
     /// `Some` for EOA paths (parked, needs reclaim), `None` for the relayed path
@@ -3160,45 +3168,51 @@ impl WalletScreen {
                     None => return (task, None),
                 }
             }
-            Message::Apps(child) => match self.apps.update(child) {
-                Some(apps::Outcome::RequestQuote(draft)) => {
-                    return (
+            Message::Apps(child) => {
+                let outcome = self.apps.update(child);
+                // After pumping the pane, dispatch a forward name resolution if
+                // the Privacy Pools withdrawal target now points at a name-shaped
+                // value not yet looked up. `take_pending_resolve` returns Some
+                // exactly once per change, so a no-op repaint won't refire it
+                // (mirrors the Send flow's post-pump `take_pending_ens`).
+                let resolve_task = match self.apps.pool_pane().take_pending_resolve() {
+                    Some((seq, name)) => spawn_pool_resolve_task(self.network.clone(), seq, name),
+                    None => Task::none(),
+                };
+                let (task, out): (Task<Message>, Option<Outcome>) = match outcome {
+                    Some(apps::Outcome::RequestQuote(draft)) => (
                         spawn_cow_quote(CowHost::Apps, draft, self.order_owner()),
                         None,
-                    );
-                }
-                Some(apps::Outcome::RequestPlace { draft, quote }) => {
-                    return (self.open_cow_review(CowHost::Apps, draft, quote), None);
-                }
-                Some(apps::Outcome::RequestCancel { uid }) => {
-                    return (self.open_cow_cancel_review(CowHost::Apps, uid), None);
-                }
-                Some(apps::Outcome::RefreshOrders) => {
-                    // "Fetch" pulls the address's full CoW order history — this
-                    // session's orders plus any from past sessions — from every
-                    // chain CoW runs on, upserting each page into
-                    // `tracked_orders`. (The 10s background tick still does the
-                    // lightweight per-order status poll between fetches.) Scoped
-                    // to the active identity — the Safe in Safe mode, else the EOA.
-                    let address = self.order_owner();
-                    let tasks: Vec<Task<Message>> = crate::chain::Chain::ALL
-                        .into_iter()
-                        .filter(|c| crate::cow::supported(*c))
-                        .map(|chain| spawn_cow_account_orders(chain, address))
-                        .collect();
-                    return (Task::batch(tasks), None);
-                }
-                Some(apps::Outcome::CopyText(s)) => {
-                    return (self.arm_clipboard_clear(s), None);
-                }
-                Some(apps::Outcome::Name(o)) => {
-                    return (self.handle_name_outcome(o), None);
-                }
-                Some(apps::Outcome::Pool(o)) => {
-                    return self.handle_pool_outcome(o);
-                }
-                None => return (Task::none(), None),
-            },
+                    ),
+                    Some(apps::Outcome::RequestPlace { draft, quote }) => {
+                        (self.open_cow_review(CowHost::Apps, draft, quote), None)
+                    }
+                    Some(apps::Outcome::RequestCancel { uid }) => {
+                        (self.open_cow_cancel_review(CowHost::Apps, uid), None)
+                    }
+                    Some(apps::Outcome::RefreshOrders) => {
+                        // "Fetch" pulls the address's full CoW order history —
+                        // this session's orders plus any from past sessions —
+                        // from every chain CoW runs on, upserting each page into
+                        // `tracked_orders`. (The 10s background tick still does
+                        // the lightweight per-order status poll between fetches.)
+                        // Scoped to the active identity — the Safe in Safe mode,
+                        // else the EOA.
+                        let address = self.order_owner();
+                        let tasks: Vec<Task<Message>> = crate::chain::Chain::ALL
+                            .into_iter()
+                            .filter(|c| crate::cow::supported(*c))
+                            .map(|chain| spawn_cow_account_orders(chain, address))
+                            .collect();
+                        (Task::batch(tasks), None)
+                    }
+                    Some(apps::Outcome::CopyText(s)) => (self.arm_clipboard_clear(s), None),
+                    Some(apps::Outcome::Name(o)) => (self.handle_name_outcome(o), None),
+                    Some(apps::Outcome::Pool(o)) => self.handle_pool_outcome(o),
+                    None => (Task::none(), None),
+                };
+                return (Task::batch([resolve_task, task]), out);
+            }
             Message::SignReview(child) => match child {
                 sign_review::Message::Confirm => {
                     return (self.confirm_sign_review(), None);
@@ -3433,6 +3447,12 @@ impl WalletScreen {
                         pane.set_error(Some(e));
                     }
                 }
+                return (Task::none(), None);
+            }
+            Message::PoolTargetResolved { seq, name, result } => {
+                self.apps
+                    .pool_pane()
+                    .set_target_resolution(seq, name, result);
                 return (Task::none(), None);
             }
             Message::PoolSubmitted {
@@ -4614,8 +4634,19 @@ impl WalletScreen {
                 // for Safes — it operates on the active EOA, not the Safe.
                 let orders = self.active_cow_orders();
                 let names_available = self.names_available_for_active();
+                // The Privacy Pools withdrawal picker lists contacts only (no own
+                // accounts/Safes — withdrawing to a self-owned, visible account
+                // would de-anonymize the recipient). Built from the already-held
+                // guard rather than re-locking.
+                let pool_recipients = send::ContactsView::merged(contacts, &[], &[], None, None);
                 self.apps
-                    .view(t, &self.portfolio, &orders, names_available)
+                    .view(
+                        t,
+                        &self.portfolio,
+                        &orders,
+                        names_available,
+                        pool_recipients,
+                    )
                     .map(Message::Apps)
             }
             Nav::Activity => {
@@ -4896,6 +4927,24 @@ fn spawn_contacts_ens_resolve_task(
         |(seq, name, result)| {
             Message::Contacts(contacts_settings::Message::EnsResolved { seq, name, result })
         },
+    )
+}
+
+/// Forward name resolution for the Privacy Pools withdrawal target. Same shape
+/// as `spawn_ens_resolve_task`; the resolved address becomes the relayer-signed
+/// withdrawal recipient, so an unverified RPC answer fails closed rather than
+/// being trusted.
+fn spawn_pool_resolve_task(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    name: String,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let result = crate::names::resolve_name(network.as_ref(), &name).await;
+            (seq, name, result)
+        },
+        |(seq, name, result)| Message::PoolTargetResolved { seq, name, result },
     )
 }
 

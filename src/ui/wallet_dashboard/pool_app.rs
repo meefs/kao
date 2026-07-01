@@ -18,20 +18,25 @@ use std::time::{Duration, Instant};
 use alloy::primitives::utils::format_units;
 use alloy::primitives::{Address, U256};
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
-use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription, keyboard};
+use iced::{
+    Alignment, Background, Border, Color, Element, Length, Padding, Subscription, keyboard,
+};
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, warn};
 
+use super::send::{ContactsView, PickerEntry};
 use crate::chain::Chain;
+use crate::names;
 use crate::pool::PoolInfo;
 use crate::pool::relayer::{QuoteResponse, Relayer};
 use crate::pool::sync::PoolState;
 use crate::portfolio::{LiveToken, format_token_balance};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
-    black, bold, bullet_wave, ghost_button, hint_pill, kao_scrollable_style, kao_toggle, mono,
-    mono_bold, primary_button, progress_bar, screen_subtitle, screen_title, secondary_button,
-    text_input_style, thin_divider, token_avatar, vspace,
+    black, bold, bullet_wave, ghost_button, hint_pill, hover_tint, kao_fit_size,
+    kao_scrollable_style, kao_toggle, mono, mono_bold, primary_button, progress_bar,
+    screen_subtitle, screen_title, secondary_button, text_input_style, thin_divider, token_avatar,
+    vspace,
 };
 
 /// The chains Privacy Pools runs on, in display order.
@@ -67,6 +72,14 @@ pub enum Message {
     // withdraw
     OpenWithdraw(usize, usize),
     WithdrawTarget(String),
+    /// Recipient chosen from the contacts picker (address + optional pinned name).
+    PickTarget {
+        address: Address,
+        ens: Option<String>,
+    },
+    /// Accept a name that now re-resolves to a different address than the one
+    /// pinned on the picked contact (the ENS-divergence banner's action).
+    AcceptTargetDivergence,
     WithdrawAmount(String),
     WithdrawPercent(u8),
     SelectRelayer(usize),
@@ -96,6 +109,64 @@ pub struct WithdrawRequest {
     pub amount: U256,
     /// Relayer base URL, or `None` for a self-relayed (direct) withdrawal.
     pub relayer: Option<String>,
+}
+
+/// Resolution state of the withdrawal target field — the same address-or-name
+/// state machine the Send flow uses, so a `.eth` / `.gwei` / `.wei` / `.xns`
+/// name (or a picked contact) resolves to a verified address before it can be
+/// baked into a withdrawal proof. The coordinator drives the async half through
+/// [`PoolApp::take_pending_resolve`] / [`PoolApp::set_target_resolution`].
+#[derive(Debug, Clone)]
+enum TargetResolution {
+    Empty,
+    /// Not a valid address and not name-shaped (or the zero address).
+    Invalid,
+    /// A directly-typed / pasted hex address.
+    Address(Address),
+    /// A name-shaped input awaiting forward resolution.
+    Resolving {
+        name: String,
+    },
+    /// A picked contact carrying a pinned ENS name — the address is usable now,
+    /// but the pinned name is being re-resolved to catch a hijacked record.
+    AddressVerifying {
+        pinned: Address,
+        name: String,
+    },
+    /// A name that resolved to a verified address.
+    Resolved {
+        name: String,
+        addr: Address,
+    },
+    /// A name-shaped input with no on-chain address record.
+    NotFound {
+        name: String,
+    },
+    /// The verified name lookup failed (fail-closed — no address trusted).
+    Error {
+        name: String,
+        msg: String,
+    },
+    /// A pinned contact name now resolves to a *different* address than pinned;
+    /// the user must explicitly accept the new one before it's used.
+    EnsDivergence {
+        name: String,
+        pinned: Address,
+        fresh: Address,
+    },
+}
+
+impl TargetResolution {
+    /// The usable recipient address, if the current state has one. `Resolving`,
+    /// `NotFound`, `Error`, `EnsDivergence`, `Invalid` and `Empty` yield `None`.
+    fn recipient(&self) -> Option<Address> {
+        match self {
+            TargetResolution::Address(a)
+            | TargetResolution::Resolved { addr: a, .. }
+            | TargetResolution::AddressVerifying { pinned: a, .. } => Some(*a),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +274,13 @@ pub struct PoolApp {
     withdraw_pool: usize,
     withdraw_account: usize,
     withdraw_target: String,
+    /// Resolution state of `withdraw_target` (address / name / picked contact).
+    withdraw_resolution: TargetResolution,
+    /// Bumped on every target change so a stale resolution result is dropped.
+    withdraw_resolution_seq: u64,
+    /// The last seq the coordinator was handed for resolution — stops a repaint
+    /// from re-dispatching the same lookup (mirrors Send's `last_dispatched_seq`).
+    last_dispatched_resolve_seq: Option<u64>,
     withdraw_amount: String,
     relayers: Vec<Relayer>,
     relayer_sel: usize,
@@ -254,6 +332,9 @@ impl PoolApp {
             withdraw_pool: 0,
             withdraw_account: 0,
             withdraw_target: String::new(),
+            withdraw_resolution: TargetResolution::Empty,
+            withdraw_resolution_seq: 0,
+            last_dispatched_resolve_seq: None,
             withdraw_amount: String::new(),
             relayers: crate::pool::relayer::default_relayers(),
             relayer_sel: 0,
@@ -359,6 +440,97 @@ impl PoolApp {
     pub fn set_quote(&mut self, quote: QuoteResponse) {
         self.quote = Some(quote);
         self.view = View::Review;
+    }
+
+    /// Whether the withdrawal target field currently needs a forward name
+    /// resolution dispatched. Returns the `(seq, name)` to resolve exactly once
+    /// per change (a no-op repaint won't refire), mirroring Send's
+    /// `take_pending_ens`. The coordinator calls this after pumping the pane and
+    /// feeds the result back through [`set_target_resolution`].
+    pub fn take_pending_resolve(&mut self) -> Option<(u64, String)> {
+        match &self.withdraw_resolution {
+            TargetResolution::Resolving { name }
+            | TargetResolution::AddressVerifying { name, .. }
+                if self.last_dispatched_resolve_seq != Some(self.withdraw_resolution_seq) =>
+            {
+                let seq = self.withdraw_resolution_seq;
+                self.last_dispatched_resolve_seq = Some(seq);
+                Some((seq, name.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Apply a forward-resolution result to the withdrawal target. Stale results
+    /// (a superseded `seq`, or a name that no longer matches the pending input)
+    /// are ignored. A picked contact's pinned name that re-resolves to a
+    /// different address surfaces an [`TargetResolution::EnsDivergence`] the user
+    /// must accept; an unverifiable re-resolution keeps the pinned address.
+    pub fn set_target_resolution(
+        &mut self,
+        seq: u64,
+        name: String,
+        result: Result<Option<Address>, String>,
+    ) {
+        if seq != self.withdraw_resolution_seq {
+            return;
+        }
+        let before = self.withdraw_resolution.recipient();
+        match &self.withdraw_resolution {
+            TargetResolution::Resolving { name: pending } if pending == &name => {
+                self.withdraw_resolution = match result {
+                    Ok(Some(addr)) => TargetResolution::Resolved { name, addr },
+                    Ok(None) => TargetResolution::NotFound { name },
+                    Err(msg) => TargetResolution::Error { name, msg },
+                };
+            }
+            TargetResolution::AddressVerifying {
+                pinned,
+                name: pending,
+            } if pending == &name => {
+                let pinned = *pinned;
+                self.withdraw_resolution = match result {
+                    Ok(Some(fresh)) if fresh == pinned => TargetResolution::Address(pinned),
+                    Ok(Some(fresh)) => TargetResolution::EnsDivergence {
+                        name,
+                        pinned,
+                        fresh,
+                    },
+                    // Couldn't re-verify — keep the pinned address rather than
+                    // discarding a recipient the user explicitly picked.
+                    Ok(None) | Err(_) => TargetResolution::Address(pinned),
+                };
+            }
+            _ => {}
+        }
+        // A changed recipient invalidates any fetched quote (it binds the target).
+        if before != self.withdraw_resolution.recipient() {
+            self.quote = None;
+        }
+    }
+
+    /// Set the withdrawal target from raw input, updating the resolution state.
+    fn set_target(&mut self, raw: String) {
+        self.withdraw_target = raw;
+        self.withdraw_resolution_seq = self.withdraw_resolution_seq.wrapping_add(1);
+        self.quote = None;
+        let trimmed = self.withdraw_target.trim();
+        self.withdraw_resolution = if trimmed.is_empty() {
+            TargetResolution::Empty
+        } else if let Ok(addr) = trimmed.parse::<Address>() {
+            // The zero address is a burn hole, never a real recipient.
+            if addr.is_zero() {
+                TargetResolution::Invalid
+            } else {
+                TargetResolution::Address(addr)
+            }
+        } else if names::looks_like_name(trimmed) {
+            TargetResolution::Resolving {
+                name: trimmed.to_string(),
+            }
+        } else {
+            TargetResolution::Invalid
+        };
     }
 
     /// Enter the proving screen. `label` is the op headline; the animation is
@@ -508,14 +680,36 @@ impl PoolApp {
             Message::OpenWithdraw(pool, account) => {
                 self.withdraw_pool = pool;
                 self.withdraw_account = account;
-                self.withdraw_target.clear();
                 self.withdraw_amount.clear();
-                self.quote = None;
+                self.set_target(String::new());
                 self.view = View::Withdraw;
                 None
             }
             Message::WithdrawTarget(v) => {
-                self.withdraw_target = v;
+                self.set_target(v);
+                None
+            }
+            Message::PickTarget { address, ens } => {
+                self.withdraw_resolution_seq = self.withdraw_resolution_seq.wrapping_add(1);
+                self.withdraw_target = address.to_checksum(None);
+                self.withdraw_resolution = match ens {
+                    // A pinned contact name is re-verified before it's trusted.
+                    Some(name) => TargetResolution::AddressVerifying {
+                        pinned: address,
+                        name,
+                    },
+                    None => TargetResolution::Address(address),
+                };
+                self.quote = None;
+                None
+            }
+            Message::AcceptTargetDivergence => {
+                if let TargetResolution::EnsDivergence { fresh, .. } =
+                    self.withdraw_resolution.clone()
+                {
+                    self.withdraw_resolution = TargetResolution::Address(fresh);
+                    self.quote = None;
+                }
                 None
             }
             Message::WithdrawAmount(v) => {
@@ -580,12 +774,14 @@ impl PoolApp {
     }
 
     fn build_withdraw_request(&mut self) -> Option<WithdrawRequest> {
-        let info = self.pools.get(self.withdraw_pool)?;
-        let target = match self.withdraw_target.trim().parse::<Address>() {
+        // Clone up front so the `self.error` writes below don't clash with the
+        // `self.pools` borrow.
+        let info = self.pools.get(self.withdraw_pool)?.clone();
+        let target = match self.resolved_target() {
             Ok(a) => a,
-            Err(_) => {
-                debug!("privacy pools: withdraw target address invalid");
-                self.error = Some("Enter a valid target address".into());
+            Err(msg) => {
+                debug!("privacy pools: withdraw target unresolved");
+                self.error = Some(msg);
                 return None;
             }
         };
@@ -603,12 +799,45 @@ impl PoolApp {
             return None;
         };
         Some(WithdrawRequest {
-            info: info.clone(),
+            info,
             account: self.withdraw_account,
             target,
             amount,
             relayer: Some(relayer),
         })
+    }
+
+    /// The resolved recipient address, or a user-facing reason it isn't usable
+    /// yet — so a half-typed name or a diverged record can't ride into a proof.
+    fn resolved_target(&self) -> Result<Address, String> {
+        match &self.withdraw_resolution {
+            TargetResolution::Address(a)
+            | TargetResolution::Resolved { addr: a, .. }
+            | TargetResolution::AddressVerifying { pinned: a, .. } => {
+                if a.is_zero() {
+                    Err("Recipient can't be the zero address".into())
+                } else {
+                    Ok(*a)
+                }
+            }
+            TargetResolution::Resolving { .. } => {
+                Err("Still resolving that name — try again in a moment".into())
+            }
+            TargetResolution::EnsDivergence { .. } => {
+                Err("That name now resolves to a different address — confirm it first".into())
+            }
+            TargetResolution::NotFound { name } => Err(format!("“{name}” has no address record")),
+            TargetResolution::Error { name, .. } => Err(format!("Name lookup for “{name}” failed")),
+            TargetResolution::Empty | TargetResolution::Invalid => {
+                Err("Enter a valid recipient address or name".into())
+            }
+        }
+    }
+
+    /// Whether the "Get quote" button should read as enabled — a usable recipient
+    /// (not mid-resolution, not a pending divergence) plus a non-empty amount.
+    fn can_get_quote(&self) -> bool {
+        self.withdraw_resolution.recipient().is_some() && !self.withdraw_amount.trim().is_empty()
     }
 
     fn selected_account_balance(&self) -> Option<U256> {
@@ -644,14 +873,19 @@ impl PoolApp {
 
     // ── view ─────────────────────────────────────────────────────────────────
 
-    pub fn view<'a>(&'a self, t: KaoTheme, portfolio: &'a [LiveToken]) -> Element<'a, Message> {
+    pub fn view<'a>(
+        &'a self,
+        t: KaoTheme,
+        portfolio: &'a [LiveToken],
+        recipients: ContactsView,
+    ) -> Element<'a, Message> {
         let content = match self.view {
             View::Setup => self.setup_view(t),
             View::Restore => self.restore_view(t),
             View::Backup => self.backup_view(t),
             View::Overview => self.overview_view(t),
             View::Deposit => self.deposit_view(t, portfolio),
-            View::Withdraw => self.withdraw_view(t),
+            View::Withdraw => self.withdraw_view(t, recipients),
             View::Review => self.review_view(t),
             View::Proving => self.proving_view(t),
             View::Success => self.success_view(t),
@@ -1075,10 +1309,17 @@ impl PoolApp {
             .map(|tk| tk.balance_raw)
     }
 
-    fn withdraw_view<'a>(&'a self, t: KaoTheme) -> Element<'a, Message> {
+    fn withdraw_view<'a>(&'a self, t: KaoTheme, recipients: ContactsView) -> Element<'a, Message> {
         let Some(info) = self.pools.get(self.withdraw_pool) else {
             return empty_hint(t, "Pool unavailable.");
         };
+        // The contact name for a resolved recipient, if it's in the book — shown
+        // in the hint so a picked/typed address reads as a known payee.
+        let recipient_name = self
+            .withdraw_resolution
+            .recipient()
+            .and_then(|a| recipients.name_for(a).map(str::to_string));
+
         let mut relayer_row = row![].spacing(8);
         for (i, r) in self.relayers.iter().enumerate() {
             let active = i == self.relayer_sel;
@@ -1094,10 +1335,13 @@ impl PoolApp {
             vspace(18),
             text("Target address").size(11).color(t.sub).font(mono_bold()),
             vspace(4),
-            text_input("0x… recipient", &self.withdraw_target)
+            text_input("0x… address or a name (.eth / .gwei / .wei / .xns)", &self.withdraw_target)
                 .on_input(Message::WithdrawTarget)
                 .padding(12)
+                .font(mono())
                 .style(move |_theme, s| text_input_style(t, s)),
+            self.target_hint(t, recipient_name),
+            self.recipients_picker(t, recipients),
             vspace(14),
             amount_field(t, &self.withdraw_amount, &info.symbol, Message::WithdrawAmount),
             vspace(8),
@@ -1107,7 +1351,113 @@ impl PoolApp {
             vspace(6),
             relayer_row,
             vspace(16),
-            primary_button(t, "Get quote", true).on_press(Message::WithdrawGetQuote),
+            primary_button(t, "Get quote", self.can_get_quote()).on_press(Message::WithdrawGetQuote),
+        ]
+        .width(Length::Fill)
+        .into()
+    }
+
+    /// The address-or-name resolution hint rendered under the target field —
+    /// green when a recipient is locked in, a warning banner on ENS divergence,
+    /// red on a bad/missing name. Mirrors the Send recipient hint.
+    fn target_hint<'a>(&self, t: KaoTheme, recipient_name: Option<String>) -> Element<'a, Message> {
+        let short = |a: &Address| shorten(&format!("{a:#x}"));
+        match &self.withdraw_resolution {
+            TargetResolution::Empty => Space::new().height(0).into(),
+            TargetResolution::Address(addr) => {
+                let line = match &recipient_name {
+                    Some(name) => format!("✓ {name}  ·  {}", short(addr)),
+                    None => format!("✓ valid address  ·  {}", short(addr)),
+                };
+                hint_line(line, t.up)
+            }
+            TargetResolution::AddressVerifying { pinned, name } => container(
+                column![
+                    text(format!("✓ {name}  ·  {}", short(pinned)))
+                        .size(11)
+                        .color(t.up)
+                        .font(bold()),
+                    text("(verifying name…)").size(10).color(t.sub).font(mono()),
+                ]
+                .spacing(2),
+            )
+            .padding(Padding::from([6, 0]))
+            .into(),
+            TargetResolution::Resolved { name, addr } => {
+                hint_line(format!("✓ {name}  →  {}", short(addr)), t.up)
+            }
+            TargetResolution::Resolving { name } => {
+                hint_line(format!("(；・∀・) resolving {name}…"), t.sub)
+            }
+            TargetResolution::NotFound { name } => {
+                hint_line(format!("“{name}” has no address record"), t.down)
+            }
+            TargetResolution::Error { name, .. } => {
+                hint_line(format!("Name lookup for “{name}” failed"), t.down)
+            }
+            TargetResolution::EnsDivergence {
+                name,
+                pinned,
+                fresh,
+            } => container(
+                column![
+                    text(format!("⚠ “{name}” now resolves to a different address"))
+                        .size(12)
+                        .color(t.down)
+                        .font(bold()),
+                    vspace(4),
+                    text(format!("pinned: {}", short(pinned)))
+                        .size(11)
+                        .color(t.sub)
+                        .font(mono()),
+                    text(format!("now:    {}", short(fresh)))
+                        .size(11)
+                        .color(t.text)
+                        .font(mono()),
+                    vspace(6),
+                    secondary_button(t, "Use new address")
+                        .on_press(Message::AcceptTargetDivergence),
+                ]
+                .spacing(2),
+            )
+            .padding(Padding::from([8, 10]))
+            .style(move |_| container::Style {
+                background: Some(Background::Color(t.card_alt)),
+                border: Border {
+                    color: t.down,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                text_color: Some(t.text),
+                ..Default::default()
+            })
+            .into(),
+            TargetResolution::Invalid => {
+                hint_line("Not a valid 0x… address or name".to_string(), t.down)
+            }
+        }
+    }
+
+    /// The saved-contacts picker under the target field. Withdrawing to a
+    /// self-owned, already-visible account would link the recipient back to the
+    /// depositor, so this intentionally lists *contacts only* — own accounts and
+    /// Safes are omitted (paste or a name still reaches any address).
+    fn recipients_picker<'a>(&self, t: KaoTheme, recipients: ContactsView) -> Element<'a, Message> {
+        if recipients.entries.is_empty() {
+            return Space::new().height(0).into();
+        }
+        let mut list = column![].spacing(2);
+        for entry in recipients.entries.into_iter() {
+            list = list.push(picker_row(t, entry, &self.withdraw_target));
+        }
+        column![
+            vspace(12),
+            text("CONTACTS").size(11).color(t.sub).font(bold()),
+            vspace(4),
+            scrollable(list)
+                .height(Length::Fixed(150.0))
+                .width(Length::Fill)
+                .style(move |_, s| kao_scrollable_style(t, s)),
         ]
         .width(Length::Fill)
         .into()
@@ -1554,6 +1904,89 @@ fn small_muted<'a>(t: KaoTheme, label: &str, msg: Message) -> Element<'a, Messag
         .into()
 }
 
+/// A one-line resolution hint under the target field, in `color`.
+fn hint_line<'a>(msg: String, color: Color) -> Element<'a, Message> {
+    container(text(msg).size(11).color(color).font(bold()))
+        .padding(Padding::from([6, 0]))
+        .into()
+}
+
+/// A single contacts-picker row: kaomoji avatar, name (+ optional ENS badge),
+/// short address, and a check when it matches the current input. Emits
+/// [`Message::PickTarget`] carrying the address and any pinned name.
+fn picker_row<'a>(t: KaoTheme, entry: PickerEntry, current_input: &str) -> Element<'a, Message> {
+    let addr = entry.address;
+    let checksum = addr.to_checksum(None);
+    let selected = current_input.eq_ignore_ascii_case(&checksum);
+    let bg = if selected { t.ab2 } else { Color::TRANSPARENT };
+    let short = shorten(&format!("{addr:#x}"));
+
+    let mut name_row = row![text(entry.name.clone()).size(14).color(t.text).font(bold())]
+        .align_y(Alignment::Center);
+    if let Some(ens) = &entry.ens {
+        name_row = name_row
+            .push(Space::new().width(8))
+            .push(text(ens.clone()).size(10).color(t.a1).font(mono()));
+    }
+
+    let check = if selected { "✓" } else { " " };
+    let row_content = row![
+        picker_avatar(t, entry.kaomoji.clone(), 34.0),
+        Space::new().width(12),
+        column![name_row, text(short).size(11).color(t.sub).font(mono())]
+            .spacing(0)
+            .width(Length::Fill),
+        text(check).size(16).color(t.a3),
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    button(row_content)
+        .padding(Padding::from([9, 10]))
+        .width(Length::Fill)
+        .on_press(Message::PickTarget {
+            address: addr,
+            ens: entry.ens.clone(),
+        })
+        .style(move |_theme, status| button::Style {
+            background: Some(Background::Color(match status {
+                button::Status::Hovered | button::Status::Pressed => hover_tint(bg, t.text),
+                _ => bg,
+            })),
+            text_color: t.text,
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: 11.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// An owned-string kaomoji avatar for a picker row (wide kaomojis shrink to fit).
+fn picker_avatar<'a>(t: KaoTheme, kao: String, size: f32) -> Element<'a, Message> {
+    let inner_pad = 4.0;
+    let budget = (size - 2.0 * inner_pad).max(8.0);
+    let font_size = kao_fit_size(&kao, budget, (size * 0.40).max(10.0));
+    container(text(kao).size(font_size).color(t.text))
+        .width(Length::Fixed(size))
+        .height(Length::Fixed(size))
+        .center_x(Length::Fixed(size))
+        .center_y(Length::Fixed(size))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.ab2)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: (size / 2.0).into(),
+            },
+            text_color: Some(t.text),
+            ..Default::default()
+        })
+        .into()
+}
+
 fn kv<'a>(t: KaoTheme, k: &str, v: &str) -> Element<'a, Message> {
     row![
         text(k.to_string()).size(12).color(t.sub).font(mono()),
@@ -1635,6 +2068,126 @@ mod tests {
         assert_eq!(parse_amount("", 18), None);
         assert_eq!(parse_amount("1.2345678", 6), None); // too many decimals
         assert_eq!(parse_amount("abc", 18), None);
+    }
+
+    #[test]
+    fn set_target_classifies_input() {
+        let mut app = PoolApp::new();
+
+        app.set_target("   ".into());
+        assert!(matches!(app.withdraw_resolution, TargetResolution::Empty));
+
+        let addr = Address::from([0x11; 20]);
+        app.set_target(addr.to_checksum(None));
+        assert!(matches!(app.withdraw_resolution, TargetResolution::Address(a) if a == addr));
+
+        // The zero address is a burn hole — never a real recipient.
+        app.set_target(Address::ZERO.to_checksum(None));
+        assert!(matches!(app.withdraw_resolution, TargetResolution::Invalid));
+
+        app.set_target("vitalik.eth".into());
+        assert!(
+            matches!(&app.withdraw_resolution, TargetResolution::Resolving { name } if name == "vitalik.eth")
+        );
+
+        // Not hex and not name-shaped (no dot).
+        app.set_target("hello".into());
+        assert!(matches!(app.withdraw_resolution, TargetResolution::Invalid));
+    }
+
+    #[test]
+    fn resolve_dispatches_once_and_drops_stale() {
+        let mut app = PoolApp::new();
+        app.set_target("vitalik.eth".into());
+        let seq = app.withdraw_resolution_seq;
+
+        // Fires exactly once per change — a repaint must not refire it.
+        assert_eq!(
+            app.take_pending_resolve(),
+            Some((seq, "vitalik.eth".into()))
+        );
+        assert!(app.take_pending_resolve().is_none());
+
+        // A stale seq is ignored (input changed under the in-flight lookup).
+        let addr = Address::from([0x22; 20]);
+        app.set_target_resolution(seq.wrapping_sub(1), "vitalik.eth".into(), Ok(Some(addr)));
+        assert!(matches!(
+            app.withdraw_resolution,
+            TargetResolution::Resolving { .. }
+        ));
+
+        // The matching seq lands the address.
+        app.set_target_resolution(seq, "vitalik.eth".into(), Ok(Some(addr)));
+        assert_eq!(app.resolved_target(), Ok(addr));
+    }
+
+    #[test]
+    fn unresolved_names_block_the_quote() {
+        let mut app = PoolApp::new();
+
+        app.set_target("ghost.eth".into());
+        let seq = app.withdraw_resolution_seq;
+        app.set_target_resolution(seq, "ghost.eth".into(), Ok(None));
+        assert!(matches!(
+            app.withdraw_resolution,
+            TargetResolution::NotFound { .. }
+        ));
+        assert!(app.resolved_target().is_err());
+        assert!(app.withdraw_resolution.recipient().is_none());
+
+        // A half-typed name (still resolving) can't ride into a proof either.
+        app.set_target("half.eth".into());
+        assert!(app.resolved_target().is_err());
+    }
+
+    #[test]
+    fn picked_contact_reverifies_pinned_name() {
+        let mut app = PoolApp::new();
+        let pinned = Address::from([0x33; 20]);
+        let _ = app.update(Message::PickTarget {
+            address: pinned,
+            ens: Some("vitalik.eth".into()),
+        });
+        // Usable immediately off the pinned address while the name re-verifies.
+        assert!(matches!(
+            app.withdraw_resolution,
+            TargetResolution::AddressVerifying { .. }
+        ));
+        assert_eq!(app.withdraw_resolution.recipient(), Some(pinned));
+        assert_eq!(
+            app.take_pending_resolve().map(|(_, n)| n),
+            Some("vitalik.eth".into())
+        );
+        let seq = app.withdraw_resolution_seq;
+
+        // A matching re-resolution collapses to a plain trusted address.
+        app.set_target_resolution(seq, "vitalik.eth".into(), Ok(Some(pinned)));
+        assert!(matches!(app.withdraw_resolution, TargetResolution::Address(a) if a == pinned));
+    }
+
+    #[test]
+    fn diverged_pinned_name_blocks_until_accepted() {
+        let mut app = PoolApp::new();
+        let pinned = Address::from([0x33; 20]);
+        let _ = app.update(Message::PickTarget {
+            address: pinned,
+            ens: Some("vitalik.eth".into()),
+        });
+        let seq = app.withdraw_resolution_seq;
+
+        // The pinned name now points elsewhere — surface it, don't silently send.
+        let fresh = Address::from([0x44; 20]);
+        app.set_target_resolution(seq, "vitalik.eth".into(), Ok(Some(fresh)));
+        assert!(matches!(
+            app.withdraw_resolution,
+            TargetResolution::EnsDivergence { .. }
+        ));
+        assert!(app.withdraw_resolution.recipient().is_none());
+        assert!(app.resolved_target().is_err());
+
+        // Explicit acceptance switches to the fresh address.
+        let _ = app.update(Message::AcceptTargetDivergence);
+        assert_eq!(app.withdraw_resolution.recipient(), Some(fresh));
     }
 
     #[test]

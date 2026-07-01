@@ -223,6 +223,7 @@ impl AppsPane {
         portfolio: &'a [LiveToken],
         orders: &[&'a TrackedOrder],
         names_available: bool,
+        recipients: super::send::ContactsView,
     ) -> Element<'a, Message> {
         let content = match self.view {
             AppsView::Launcher => self.launcher_view(t, orders, names_available),
@@ -232,7 +233,7 @@ impl AppsPane {
             // before switching to such an identity.
             AppsView::Names if !names_available => self.launcher_view(t, orders, names_available),
             AppsView::Names => self.names.view(t).map(Message::Names),
-            AppsView::PrivacyPools => self.pool.view(t, portfolio).map(Message::Pool),
+            AppsView::PrivacyPools => self.pool.view(t, portfolio, recipients).map(Message::Pool),
         };
 
         // Center the bounded (max-width 560) content within the full-width
