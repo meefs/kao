@@ -8,7 +8,9 @@
 //! behind a Settings toggle (default endpoint `https://api.0xbow.io`), disclosed
 //! to the user, and requested through the shared proxied client.
 //!
-//! Public endpoints (no auth), per-chain:
+//! Public endpoints (no auth), per-chain. Both require the pool's scope in an
+//! `X-Pool-Scope` header (decimal) — without it the API replies `400 Bad
+//! Request` — since one chain hosts many pools (ETH, USDC, USDT, …):
 //!   GET /{chainId}/public/mt-leaves  → { aspLeaves, stateTreeLeaves }
 //!   GET /{chainId}/public/mt-roots   → { mtRoot, onchainMtRoot }
 
@@ -68,12 +70,18 @@ fn trim(url: &str) -> &str {
 /// Fetch the ASP + state-tree leaves for `chain_id` (decimal-encoded field
 /// elements). `asp_leaves` builds the Association-Set Merkle tree the withdrawal
 /// proof needs; `state_leaves` is a convenience cross-check for the log-derived
-/// state tree.
-pub async fn fetch_mt_leaves(base_url: &str, chain_id: u64) -> Result<AspLeaves, PoolError> {
+/// state tree. `scope` is the pool's scope (decimal) — required by the API's
+/// `X-Pool-Scope` header to select which pool's leaves to serve.
+pub async fn fetch_mt_leaves(
+    base_url: &str,
+    chain_id: u64,
+    scope: &str,
+) -> Result<AspLeaves, PoolError> {
     let client = http_client_or_err().map_err(PoolError::Asp)?;
     let url = format!("{}/{chain_id}/public/mt-leaves", trim(base_url));
     let resp = client
         .get(&url)
+        .header("X-Pool-Scope", scope)
         .send()
         .await
         .map_err(|e| PoolError::Asp(format!("mt-leaves: {}", redact_url_in_err(e))))?;
@@ -90,12 +98,41 @@ pub async fn fetch_mt_leaves(base_url: &str, chain_id: u64) -> Result<AspLeaves,
     })
 }
 
-/// Fetch the ASP roots for `chain_id`.
-pub async fn fetch_mt_roots(base_url: &str, chain_id: u64) -> Result<AspRoots, PoolError> {
+/// Which of the caller's note `labels` are in the pool's approved Association
+/// Set, as `[u8;32]` big-endian keys. A deposit is "approved" (withdrawable)
+/// exactly when its label is a member — the same membership the withdrawal proof
+/// requires. There is no on-chain per-label approval read: only the set's Merkle
+/// *root* is anchored on-chain (`Entrypoint.latestRoot()`), so the leaf list must
+/// come from this feed. Returns only the approved subset (small) rather than the
+/// full ~4.5k-leaf set.
+pub async fn fetch_approved_labels(
+    base_url: &str,
+    chain_id: u64,
+    scope: &str,
+    labels: &[Field],
+) -> Result<std::collections::HashSet<[u8; 32]>, PoolError> {
+    let leaves = fetch_mt_leaves(base_url, chain_id, scope).await?;
+    let approved: std::collections::HashSet<[u8; 32]> =
+        leaves.asp_leaves.iter().map(Field::to_bytes_be).collect();
+    Ok(labels
+        .iter()
+        .map(Field::to_bytes_be)
+        .filter(|b| approved.contains(b))
+        .collect())
+}
+
+/// Fetch the ASP roots for `chain_id`. `scope` (decimal) selects the pool via
+/// the API's required `X-Pool-Scope` header.
+pub async fn fetch_mt_roots(
+    base_url: &str,
+    chain_id: u64,
+    scope: &str,
+) -> Result<AspRoots, PoolError> {
     let client = http_client_or_err().map_err(PoolError::Asp)?;
     let url = format!("{}/{chain_id}/public/mt-roots", trim(base_url));
     let resp = client
         .get(&url)
+        .header("X-Pool-Scope", scope)
         .send()
         .await
         .map_err(|e| PoolError::Asp(format!("mt-roots: {}", redact_url_in_err(e))))?;

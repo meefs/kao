@@ -12,7 +12,7 @@
 // lands next; until that call site exists it reads as dead code. Removed then.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use alloy::primitives::utils::format_units;
@@ -24,7 +24,7 @@ use iced::{
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, warn};
 
-use super::send::{ContactsView, PickerEntry};
+use super::send::{ContactsView, PickerEntry, PickerKind};
 use crate::chain::Chain;
 use crate::names;
 use crate::pool::PoolInfo;
@@ -261,6 +261,19 @@ pub struct PoolApp {
     pool_cache: HashMap<Chain, Vec<PoolInfo>>,
     /// Synced state keyed by pool address (20 bytes).
     states: BTreeMap<[u8; 20], PoolState>,
+    /// Per-pool set of the user's note labels that are in the approved
+    /// Association Set (opt-in ASP feed), keyed by pool address. A pool with an
+    /// entry has been checked → each account is "approved" iff its label is in
+    /// the set, else "pending review". A pool with no entry hasn't been checked
+    /// (ASP off, or the fetch hasn't landed) → no badge.
+    approvals: HashMap<[u8; 20], HashSet<[u8; 32]>>,
+    /// Pools with a deposit broadcast but not yet confirmed on-chain. Each such
+    /// pool's card animates a "depositing…" indicator until its post-mining
+    /// re-sync lands (set/cleared by the coordinator via `set_pool_depositing`).
+    depositing_pools: HashSet<[u8; 20]>,
+    /// Animation clock for the depositing cards — `Some` while any pool is
+    /// depositing (a shared time source, like `syncing_started`).
+    deposit_started: Option<Instant>,
     // backup
     backup_phrase: Option<SecretString>,
     revealed: bool,
@@ -323,6 +336,9 @@ impl PoolApp {
             pools: Vec::new(),
             pool_cache: HashMap::new(),
             states: BTreeMap::new(),
+            approvals: HashMap::new(),
+            depositing_pools: HashSet::new(),
+            deposit_started: None,
             backup_phrase: None,
             revealed: false,
             did_copy: false,
@@ -360,6 +376,12 @@ impl PoolApp {
             self.view = View::Overview;
         } else if !has {
             self.view = View::Setup;
+            // A removed identity (lock / reset / switch) invalidates any
+            // in-flight deposit markers + approval status — they belong to the
+            // old identity's notes.
+            self.depositing_pools.clear();
+            self.deposit_started = None;
+            self.approvals.clear();
         }
     }
 
@@ -391,6 +413,32 @@ impl PoolApp {
 
     pub fn set_state(&mut self, pool: Address, state: PoolState) {
         self.states.insert(pool.into_array(), state);
+    }
+
+    /// Record which of a pool's note labels are ASP-approved (from the opt-in
+    /// feed). Presence of an entry means "checked" → the overview badges each
+    /// account approved / pending review by membership.
+    pub fn set_pool_approvals(&mut self, pool: Address, approved: HashSet<[u8; 32]>) {
+        self.approvals.insert(pool.into_array(), approved);
+    }
+
+    /// Mark (or clear) a pool as having a deposit in flight. The coordinator
+    /// sets this the moment a deposit broadcasts and clears it once that
+    /// deposit's confirmation re-sync lands, so precisely that pool's card
+    /// animates a "depositing…" indicator in the meantime.
+    pub fn set_pool_depositing(&mut self, pool: Address, on: bool) {
+        let key = pool.into_array();
+        if on {
+            self.depositing_pools.insert(key);
+            if self.deposit_started.is_none() {
+                self.deposit_started = Some(Instant::now());
+            }
+        } else {
+            self.depositing_pools.remove(&key);
+            if self.depositing_pools.is_empty() {
+                self.deposit_started = None;
+            }
+        }
     }
 
     /// The next unused deposit index for a pool from its **synced** state, or
@@ -631,7 +679,15 @@ impl PoolApp {
             Message::ExitApp => Some(Outcome::Close),
             Message::ToggleAsp(on) => {
                 self.asp_enabled = on;
-                None
+                if on {
+                    // Re-sync so the per-account approval status loads now that
+                    // the feed is allowed.
+                    Some(Outcome::Sync(self.chain))
+                } else {
+                    // Can't check approval without the feed — drop stale badges.
+                    self.approvals.clear();
+                    None
+                }
             }
             Message::AspUrlInput(v) => {
                 self.asp_url = v;
@@ -853,7 +909,10 @@ impl PoolApp {
         // screen, and the "loading pools" skeleton on the overview — since
         // nothing else drives redraws, without this the spinner/bars would
         // freeze.
-        if matches!(self.view, View::Proving) || self.is_loading_pools() {
+        if matches!(self.view, View::Proving)
+            || self.is_loading_pools()
+            || self.is_animating_deposit()
+        {
             return Subscription::batch([
                 keyboard::listen().map(Message::Key),
                 iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
@@ -869,6 +928,12 @@ impl PoolApp {
     /// state the loading skeleton animates through.
     fn is_loading_pools(&self) -> bool {
         matches!(self.view, View::Overview) && self.syncing && self.pools.is_empty()
+    }
+
+    /// On the overview with at least one pool mid-deposit — the state the
+    /// per-card "depositing…" indicator animates through.
+    fn is_animating_deposit(&self) -> bool {
+        matches!(self.view, View::Overview) && !self.depositing_pools.is_empty()
     }
 
     // ── view ─────────────────────────────────────────────────────────────────
@@ -1152,6 +1217,14 @@ impl PoolApp {
         let state = self.states.get(&info.pool.into_array());
         let (min_s, _) = format_token_balance(info.min_deposit, info.decimals);
 
+        // A deposit to this exact pool is in flight — the card animates until
+        // its confirmation re-sync lands (shared clock across depositing cards).
+        let depositing = self.depositing_pools.contains(&info.pool.into_array());
+        let anim = self
+            .deposit_started
+            .map(|s| s.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
+
         let meta = row![
             text(format!("anon set {}", info.anonymity_set))
                 .size(11)
@@ -1174,13 +1247,16 @@ impl PoolApp {
             .color(t.sub)
             .font(mono());
 
-        let info_col = column![
+        let mut info_col = column![
             text(&info.symbol).size(16).color(t.text).font(bold()),
             meta,
             min_line,
         ]
         .spacing(4)
         .width(Length::Fill);
+        if depositing {
+            info_col = info_col.push(depositing_indicator(t, anim));
+        }
 
         // Bundled token logo (SVG); tokens without one fall back to the kaomoji
         // avatar. Native ETH uses the `0xEeee…` sentinel, so map it to `None` for
@@ -1205,21 +1281,38 @@ impl PoolApp {
 
         let mut body = column![header].spacing(6).width(Length::Fill);
 
-        // The user's own pool accounts (from the background account sync).
-        let spendable: Vec<(usize, U256)> = state
+        // The user's own pool accounts (from the background account sync), each
+        // tagged with its ASP approval status (`Some(true)` approved, `Some(false)`
+        // pending review, `None` when the feed wasn't consulted).
+        let approvals = self.approvals.get(&info.pool.into_array());
+        let spendable: Vec<(usize, U256, Option<bool>)> = state
             .map(|s| {
                 s.accounts
                     .iter()
                     .enumerate()
                     .filter_map(|(i, a)| {
-                        a.spendable()
-                            .map(|c| (i, privacy_pools::field_to_u256(c.value)))
+                        a.spendable().map(|c| {
+                            let approved =
+                                approvals.map(|set| set.contains(&a.label.to_bytes_be()));
+                            (i, privacy_pools::field_to_u256(c.value), approved)
+                        })
                     })
                     .collect()
             })
             .unwrap_or_default();
-        for (i, bal) in spendable {
+        for (i, bal, approved) in spendable {
             let (bs, _) = format_token_balance(bal, info.decimals);
+            // Withdraw is unclickable only while the deposit is *confirmed*
+            // pending ASP review — a click would just lead to a doomed
+            // quote→prove→"not in the approved set" error. Unknown status
+            // (`None`: feed off, or not fetched yet) stays clickable so we never
+            // block a legitimate withdrawal on uncertainty; Ragequit stays
+            // available regardless (the ASP-free exit).
+            let withdraw_btn = if approved == Some(false) {
+                small_action_disabled(t, "Withdraw")
+            } else {
+                small_action(t, "Withdraw", Message::OpenWithdraw(pool_index, i))
+            };
             body = body.push(thin_divider(t)).push(
                 // Label on the left, actions pushed to the right by a fill
                 // spacer — mirrors the header's Deposit button.
@@ -1233,8 +1326,10 @@ impl PoolApp {
                         .size(12)
                         .color(t.text)
                         .font(bold()),
+                    Space::new().width(8),
+                    approval_badge(t, approved),
                     Space::new().width(Length::Fill),
-                    small_action(t, "Withdraw", Message::OpenWithdraw(pool_index, i)),
+                    withdraw_btn,
                     Space::new().width(6),
                     small_muted(t, "Ragequit", Message::Ragequit(pool_index, i)),
                 ]
@@ -1243,7 +1338,11 @@ impl PoolApp {
             );
         }
 
-        card(t, body.into())
+        if depositing {
+            deposit_pulse_card(t, body.into(), anim)
+        } else {
+            card(t, body.into())
+        }
     }
 
     fn deposit_view<'a>(&'a self, t: KaoTheme, portfolio: &'a [LiveToken]) -> Element<'a, Message> {
@@ -1313,8 +1412,9 @@ impl PoolApp {
         let Some(info) = self.pools.get(self.withdraw_pool) else {
             return empty_hint(t, "Pool unavailable.");
         };
-        // The contact name for a resolved recipient, if it's in the book — shown
-        // in the hint so a picked/typed address reads as a known payee.
+        // The saved name for a resolved recipient, if it matches a contact or
+        // one of the wallet's own accounts — shown in the hint so a picked/typed
+        // address reads as a known payee.
         let recipient_name = self
             .withdraw_resolution
             .recipient()
@@ -1438,10 +1538,10 @@ impl PoolApp {
         }
     }
 
-    /// The saved-contacts picker under the target field. Withdrawing to a
-    /// self-owned, already-visible account would link the recipient back to the
-    /// depositor, so this intentionally lists *contacts only* — own accounts and
-    /// Safes are omitted (paste or a name still reaches any address).
+    /// The recipient picker under the target field — saved contacts plus the
+    /// wallet's own Kao accounts and Safes, so a withdrawal can target another
+    /// of your accounts or a known payee in one tap (paste or a name still
+    /// reaches any address).
     fn recipients_picker<'a>(&self, t: KaoTheme, recipients: ContactsView) -> Element<'a, Message> {
         if recipients.entries.is_empty() {
             return Space::new().height(0).into();
@@ -1452,7 +1552,7 @@ impl PoolApp {
         }
         column![
             vspace(12),
-            text("CONTACTS").size(11).color(t.sub).font(bold()),
+            text("RECIPIENTS").size(11).color(t.sub).font(bold()),
             vspace(4),
             scrollable(list)
                 .height(Length::Fixed(150.0))
@@ -1671,6 +1771,52 @@ fn card<'a>(t: KaoTheme, inner: Element<'a, Message>) -> Element<'a, Message> {
         .into()
 }
 
+/// A pool card whose border breathes in the deposit accent while a deposit to
+/// it is confirming — same geometry as `card` (keeps the 1px border width so the
+/// grid doesn't reflow), only the border colour animates.
+fn deposit_pulse_card<'a>(
+    t: KaoTheme,
+    inner: Element<'a, Message>,
+    elapsed: f32,
+) -> Element<'a, Message> {
+    // Ease the accent alpha over a ~2 s sine so the border pulses gently.
+    let pulse = 0.4 + 0.6 * (0.5 + 0.5 * (elapsed * 3.0).sin());
+    let border = with_alpha(t.a1, pulse);
+    container(inner)
+        .padding(Padding::from([16, 18]))
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(t.card)),
+            border: Border {
+                color: border,
+                width: 1.0,
+                radius: 16.0.into(),
+            },
+            text_color: Some(t.text),
+            ..Default::default()
+        })
+        .into()
+}
+
+/// An animated "depositing…" status line for a pool card mid-deposit: a
+/// back-and-forth bullet spinner plus a cycling ellipsis, in the deposit accent.
+fn depositing_indicator<'a>(t: KaoTheme, elapsed: f32) -> Element<'a, Message> {
+    let dots = ".".repeat(1 + (elapsed * 2.0) as usize % 3);
+    row![
+        text(bullet_wave(elapsed))
+            .size(11)
+            .color(t.a1)
+            .font(mono_bold()),
+        Space::new().width(6),
+        text(format!("depositing{dots}"))
+            .size(11)
+            .color(t.a1)
+            .font(bold()),
+    ]
+    .align_y(Alignment::Center)
+    .into()
+}
+
 fn back_link<'a>(t: KaoTheme) -> Element<'a, Message> {
     ghost_button(t, text("← Back").size(13).color(t.sub).font(bold()))
         .on_press(Message::Back)
@@ -1887,6 +2033,30 @@ fn small_action<'a>(t: KaoTheme, label: &str, msg: Message) -> Element<'a, Messa
         .into()
 }
 
+/// A disabled (unclickable) `small_action` — no `on_press`, so iced won't fire
+/// it — greyed to read as inert. Used for Withdraw on a deposit still pending
+/// ASP review.
+fn small_action_disabled<'a>(t: KaoTheme, label: &str) -> Element<'a, Message> {
+    button(
+        text(label.to_string())
+            .size(12)
+            .color(with_alpha(t.sub, 0.6))
+            .font(bold()),
+    )
+    .padding(Padding::from([4, 10]))
+    .style(move |_, _| button::Style {
+        background: Some(Background::Color(with_alpha(t.sub, 0.06))),
+        text_color: with_alpha(t.sub, 0.6),
+        border: Border {
+            color: with_alpha(t.border, 0.6),
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        ..Default::default()
+    })
+    .into()
+}
+
 fn small_muted<'a>(t: KaoTheme, label: &str, msg: Message) -> Element<'a, Message> {
     button(text(label.to_string()).size(12).color(t.sub).font(bold()))
         .padding(Padding::from([4, 10]))
@@ -1902,6 +2072,17 @@ fn small_muted<'a>(t: KaoTheme, label: &str, msg: Message) -> Element<'a, Messag
             ..Default::default()
         })
         .into()
+}
+
+/// The per-account ASP approval badge: green "approved" once the deposit's label
+/// is in the association set, muted "pending review" while 0xbow is still vetting
+/// it (withdrawal is blocked until then), nothing when the feed wasn't consulted.
+fn approval_badge<'a>(t: KaoTheme, approved: Option<bool>) -> Element<'a, Message> {
+    match approved {
+        Some(true) => text("✓ approved").size(10).color(t.up).font(mono()).into(),
+        Some(false) => text("⏱ pending").size(10).color(t.sub).font(mono()).into(),
+        None => Space::new().width(0).into(),
+    }
 }
 
 /// A one-line resolution hint under the target field, in `color`.
@@ -1927,6 +2108,17 @@ fn picker_row<'a>(t: KaoTheme, entry: PickerEntry, current_input: &str) -> Eleme
         name_row = name_row
             .push(Space::new().width(8))
             .push(text(ens.clone()).size(10).color(t.a1).font(mono()));
+    }
+    // A kind badge for the wallet's own entries (e.g. "Local" / "Ledger") — the
+    // colour distinguishes a Safe from a plain account, matching the Send picker.
+    if let Some(chip) = entry.chip {
+        let chip_color = match entry.kind {
+            PickerKind::OwnSafe => t.a2,
+            _ => t.sub,
+        };
+        name_row = name_row
+            .push(Space::new().width(8))
+            .push(text(chip).size(10).color(chip_color).font(mono()));
     }
 
     let check = if selected { "✓" } else { " " };
@@ -2188,6 +2380,68 @@ mod tests {
         // Explicit acceptance switches to the fresh address.
         let _ = app.update(Message::AcceptTargetDivergence);
         assert_eq!(app.withdraw_resolution.recipient(), Some(fresh));
+    }
+
+    #[test]
+    fn depositing_marker_tracks_pools_and_clock() {
+        let mut app = PoolApp::new();
+        let a = Address::from([0xaa; 20]);
+        let b = Address::from([0xbb; 20]);
+        assert!(app.deposit_started.is_none());
+
+        app.set_pool_depositing(a, true);
+        assert!(app.depositing_pools.contains(&a.into_array()));
+        let started = app.deposit_started;
+        assert!(started.is_some());
+
+        // A second pool joins without resetting the shared animation clock.
+        app.set_pool_depositing(b, true);
+        assert_eq!(app.deposit_started, started);
+
+        // Clearing one keeps the clock running while the other is still pending.
+        app.set_pool_depositing(a, false);
+        assert!(!app.depositing_pools.contains(&a.into_array()));
+        assert!(app.deposit_started.is_some());
+
+        // Clearing the last one stops the clock.
+        app.set_pool_depositing(b, false);
+        assert!(app.depositing_pools.is_empty());
+        assert!(app.deposit_started.is_none());
+    }
+
+    #[test]
+    fn removing_identity_clears_depositing_markers() {
+        let mut app = PoolApp::new();
+        app.set_pool_depositing(Address::from([0xaa; 20]), true);
+        app.set_identity(false);
+        assert!(app.depositing_pools.is_empty());
+        assert!(app.deposit_started.is_none());
+    }
+
+    #[test]
+    fn asp_toggle_manages_approval_badges() {
+        let mut app = PoolApp::new();
+        let pool = Address::from([0x55; 20]);
+        app.set_pool_approvals(pool, HashSet::from([[0x01u8; 32]]));
+        assert!(app.approvals.contains_key(&pool.into_array()));
+
+        // Off → can't check without the feed, so drop stale badges.
+        assert!(app.update(Message::ToggleAsp(false)).is_none());
+        assert!(app.approvals.is_empty());
+
+        // On → ask for a re-sync so approval status reloads.
+        assert!(matches!(
+            app.update(Message::ToggleAsp(true)),
+            Some(Outcome::Sync(_))
+        ));
+    }
+
+    #[test]
+    fn removing_identity_clears_approvals() {
+        let mut app = PoolApp::new();
+        app.set_pool_approvals(Address::from([0x55; 20]), HashSet::from([[0x02u8; 32]]));
+        app.set_identity(false);
+        assert!(app.approvals.is_empty());
     }
 
     #[test]

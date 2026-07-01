@@ -428,6 +428,13 @@ pub enum Message {
         name: String,
         result: Result<Option<Address>, String>,
     },
+    /// ASP approval status for a pool's accounts (opt-in feed) finished: the
+    /// subset of the account labels that are in the approved Association Set.
+    /// Drives the per-account "approved / pending review" badges.
+    PoolApproval {
+        pool: Address,
+        result: Result<std::collections::HashSet<[u8; 32]>, String>,
+    },
     /// A pool tx (deposit / self-relay withdraw / ragequit) or a relayed
     /// withdrawal finished. On success carries an optional tx hash. `signer` is
     /// `Some` for EOA paths (parked, needs reclaim), `None` for the relayed path
@@ -447,8 +454,11 @@ pub enum Message {
     /// account + anonymity set appear. The immediate re-sync `set_submitted`
     /// fires runs before the deposit is on-chain, so this second pass (gated on
     /// the receipt) is what actually reflects it, without a manual refresh.
+    /// `pool` is the deposited pool (if known), so its "depositing…" card
+    /// animation is cleared exactly when its confirmation lands.
     PoolResync {
         chain: crate::chain::Chain,
+        pool: Option<Address>,
     },
     /// Poll tick: refresh every non-terminal tracked order. Only fires while at
     /// least one such order exists (see `subscription`).
@@ -697,6 +707,15 @@ pub struct WalletScreen {
     /// when the review opens, committed to `pool_session_deposits` only when the
     /// user confirms, so a cancelled review never burns an index.
     pending_pool_deposit: Option<(Address, u64)>,
+    /// The pool of a deposit that has been dispatched to broadcast — carried
+    /// from `dispatch_pool_sign` to `PoolSubmitted` (whose message doesn't name
+    /// the pool) so that exact pool's card can animate until the deposit
+    /// confirms. Taken on every `PoolSubmitted`.
+    pool_deposit_in_flight: Option<Address>,
+    /// Pool address → scope (decimal), populated at discovery. Lets the post-sync
+    /// ASP approval fetch (which needs the `X-Pool-Scope` header) find a pool's
+    /// scope from the `PoolSynced` message, which only names the pool by address.
+    pool_scopes: std::collections::HashMap<Address, String>,
     /// Persisted note cache per `(chain_id, pool)` — the incremental-sync cursor
     /// and this account's recovered logs, loaded on identity set and refreshed
     /// on every sync so a re-open scans only new blocks (not from the deploy block).
@@ -806,6 +825,8 @@ impl WalletScreen {
             pp_account: None,
             pool_session_deposits: std::collections::HashMap::new(),
             pending_pool_deposit: None,
+            pool_deposit_in_flight: None,
+            pool_scopes: std::collections::HashMap::new(),
             pool_note_cache: std::collections::HashMap::new(),
             pool_notes_key: None,
         }
@@ -820,6 +841,10 @@ impl WalletScreen {
         // session deposit counters so they never cross identities.
         self.pool_session_deposits.clear();
         self.pending_pool_deposit = None;
+        self.pool_deposit_in_flight = None;
+        // Scopes are identity-independent (pool metadata), but re-populated on
+        // the next discovery — clearing keeps the map from unbounded growth.
+        self.pool_scopes.clear();
 
         // Refresh the note-cache key + in-memory cache for this identity. If a
         // *different* identity is now active (a real switch, not the first load
@@ -1520,6 +1545,9 @@ impl WalletScreen {
         {
             let next = self.pool_session_deposits.entry(pool).or_insert(0);
             *next = (*next).max(index + 1);
+            // Remember which pool this deposit is for; `PoolSubmitted` reads it
+            // back to animate that exact card until the deposit confirms.
+            self.pool_deposit_in_flight = Some(pool);
         }
         // Keep the review overlay up in its "waiting for a signature" phase for
         // the duration of the sign + broadcast; `PoolSubmitted` clears it once
@@ -3391,6 +3419,11 @@ impl WalletScreen {
                         crate::pool::relayer::default_relayers(),
                     );
                 }
+                // Remember each pool's scope so the post-sync ASP approval fetch
+                // can find it from the pool address alone.
+                for p in &pools {
+                    self.pool_scopes.insert(p.pool, p.scope_decimal());
+                }
                 // Fill in each pool's account state in the background (getLogs
                 // scan) so the pools + their metadata show immediately.
                 let Some(account) = self.pp_account else {
@@ -3415,6 +3448,10 @@ impl WalletScreen {
             } => {
                 match result {
                     Ok((state, notes)) => {
+                        // The account labels for the ASP approval check, captured
+                        // before `state` is handed to the pane.
+                        let labels: Vec<privacy_pools::Field> =
+                            state.accounts.iter().map(|a| a.label).collect();
                         self.apps.pool_pane().set_state(pool, state);
                         // Persist only when the cache actually changed (first
                         // scan, or new activity) — a routine re-open finds
@@ -3433,8 +3470,30 @@ impl WalletScreen {
                                 warn!(%pool, error = %e, "privacy pools: persisting note cache failed");
                             }
                         }
+                        // Once balances are shown, chase them with the per-account
+                        // ASP approval status (opt-in feed only, and only for a
+                        // pool the user actually holds notes in). Decoupled so a
+                        // slow/down feed never delays the balance display.
+                        if !labels.is_empty()
+                            && let Some(asp_url) = self.apps.pool_pane().asp_url()
+                            && let Some(scope) = self.pool_scopes.get(&pool).cloned()
+                        {
+                            return (
+                                spawn_pool_approval(asp_url, chain.chain_id(), scope, pool, labels),
+                                None,
+                            );
+                        }
                     }
                     Err(e) => warn!(%pool, error = %e, "privacy pools: pool account sync failed"),
+                }
+                return (Task::none(), None);
+            }
+            Message::PoolApproval { pool, result } => {
+                match result {
+                    Ok(approved) => self.apps.pool_pane().set_pool_approvals(pool, approved),
+                    Err(e) => {
+                        warn!(%pool, error = %e, "privacy pools: ASP approval-status fetch failed")
+                    }
                 }
                 return (Task::none(), None);
             }
@@ -3484,6 +3543,10 @@ impl WalletScreen {
                     .then(|| result.as_ref().ok().and_then(|h| h.clone()))
                     .flatten()
                     .and_then(|h| h.parse::<TxHash>().ok());
+                // Which pool the just-dispatched deposit funded (set in
+                // `dispatch_pool_sign`). Always taken so it can't leak into a
+                // later op; used below to animate that exact card until it mines.
+                let deposit_pool = self.pool_deposit_in_flight.take();
                 let next = {
                     let pane = self.apps.pool_pane();
                     match result {
@@ -3514,10 +3577,20 @@ impl WalletScreen {
                     // one gated on the deposit mining, so the new note + anonymity
                     // set show up automatically once it's on-chain.
                     if let (Some(hash), Some(chain)) = (deposit_hash, sync_chain) {
+                        // Animate exactly this pool's card until that gated
+                        // re-sync lands and clears the marker (`PoolResync`).
+                        if let Some(pool) = deposit_pool {
+                            self.apps.pool_pane().set_pool_depositing(pool, true);
+                        }
                         return (
                             Task::batch([
                                 task,
-                                spawn_pool_wait_and_resync(self.network.clone(), chain, hash),
+                                spawn_pool_wait_and_resync(
+                                    self.network.clone(),
+                                    chain,
+                                    hash,
+                                    deposit_pool,
+                                ),
                             ]),
                             out,
                         );
@@ -3537,10 +3610,14 @@ impl WalletScreen {
                     }
                 }
             }
-            Message::PoolResync { chain } => {
-                // The deposit has mined — re-discover + re-scan so its note +
-                // anonymity set land. Safe under the success screen: sync only
-                // mutates pool/account state, never `view` (see `set_submitted`).
+            Message::PoolResync { chain, pool } => {
+                // The deposit has mined — stop that pool's "depositing…"
+                // animation, then re-discover + re-scan so its note + anonymity
+                // set land. Safe under the success screen: sync only mutates
+                // pool/account state, never `view` (see `set_submitted`).
+                if let Some(pool) = pool {
+                    self.apps.pool_pane().set_pool_depositing(pool, false);
+                }
                 return self.handle_pool_outcome(pool_app::Outcome::Sync(chain));
             }
             Message::CowStatus { uid, result } => {
@@ -4634,11 +4711,11 @@ impl WalletScreen {
                 // for Safes — it operates on the active EOA, not the Safe.
                 let orders = self.active_cow_orders();
                 let names_available = self.names_available_for_active();
-                // The Privacy Pools withdrawal picker lists contacts only (no own
-                // accounts/Safes — withdrawing to a self-owned, visible account
-                // would de-anonymize the recipient). Built from the already-held
-                // guard rather than re-locking.
-                let pool_recipients = send::ContactsView::merged(contacts, &[], &[], None, None);
+                // The Privacy Pools withdrawal picker lists saved contacts plus
+                // the wallet's own Kao accounts and Safes. Built from the
+                // already-held guard rather than re-locking.
+                let pool_recipients =
+                    send::ContactsView::merged(contacts, &self.accounts, &self.safes, None, None);
                 self.apps
                     .view(
                         t,
@@ -6299,6 +6376,26 @@ fn spawn_pool_account_sync(
     )
 }
 
+/// Fetch which of `labels` are in the pool's approved Association Set (opt-in
+/// 0xbow feed), for the per-account approval badges. Uses the shared proxied
+/// HTTP client (not the RPC provider), so it takes no `network`.
+fn spawn_pool_approval(
+    asp_url: String,
+    chain_id: u64,
+    scope: String,
+    pool: Address,
+    labels: Vec<privacy_pools::Field>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            crate::pool::asp::fetch_approved_labels(&asp_url, chain_id, &scope, &labels)
+                .await
+                .map_err(|e| e.to_string())
+        },
+        move |result| Message::PoolApproval { pool, result },
+    )
+}
+
 /// Fetch a relayer fee quote for a withdrawal.
 fn spawn_pool_quote(
     network: Arc<dyn BalanceFetcher>,
@@ -6527,15 +6624,16 @@ fn spawn_pool_wait_and_resync(
     network: Arc<dyn BalanceFetcher>,
     chain: crate::chain::Chain,
     hash: TxHash,
+    pool: Option<Address>,
 ) -> Task<Message> {
     Task::perform(
         async move {
             if let Some(provider) = network.provider(chain).await {
                 let _ = crate::cow::onchain::wait_for_receipt(&provider, hash, 60).await;
             }
-            chain
+            (chain, pool)
         },
-        |chain| Message::PoolResync { chain },
+        |(chain, pool)| Message::PoolResync { chain, pool },
     )
 }
 
@@ -6578,10 +6676,14 @@ fn spawn_pool_relayed_withdraw(
                 .ok_or_else(|| "pool account not found — re-sync and retry".to_string())?;
 
             // Association set (compliance) + the state-tree leaves, both from the
-            // single ASP fetch.
-            let asp = crate::pool::asp::fetch_mt_leaves(&asp_url, info.chain.chain_id())
-                .await
-                .map_err(|e| e.to_string())?;
+            // single ASP fetch. The scope selects this pool (X-Pool-Scope header).
+            let asp = crate::pool::asp::fetch_mt_leaves(
+                &asp_url,
+                info.chain.chain_id(),
+                &info.scope_decimal(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             // State tree from the API, Helios-verified against the on-chain root.
             // If it's stale or unverifiable, fall back to a fresh full leaf scan.
             let (state_leaves, state_tree) = match crate::pool::sync::verified_state_tree(
