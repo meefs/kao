@@ -435,6 +435,13 @@ pub enum Message {
     PoolRagequitReady {
         result: Result<sign_review::PoolSign, String>,
     },
+    /// A broadcast pool deposit finished mining — re-sync so its new pool
+    /// account + anonymity set appear. The immediate re-sync `set_submitted`
+    /// fires runs before the deposit is on-chain, so this second pass (gated on
+    /// the receipt) is what actually reflects it, without a manual refresh.
+    PoolResync {
+        chain: crate::chain::Chain,
+    },
     /// Poll tick: refresh every non-terminal tracked order. Only fires while at
     /// least one such order exists (see `subscription`).
     CowPollTick,
@@ -3448,6 +3455,15 @@ impl WalletScreen {
                     // and never parked, so they leave the flag untouched.
                     self.order_op_in_flight = false;
                 }
+                // A just-broadcast deposit is one leg, sent-and-forgotten (unlike
+                // the ragequit/withdraw the pane can't reflect it until it mines).
+                // Capture its hash before `result` is consumed so we can re-sync
+                // once it lands — the immediate re-sync below scans a chain that
+                // doesn't include it yet.
+                let deposit_hash = matches!(kind, pool_app::PoolTxKind::Deposit)
+                    .then(|| result.as_ref().ok().and_then(|h| h.clone()))
+                    .flatten()
+                    .and_then(|h| h.parse::<TxHash>().ok());
                 let next = {
                     let pane = self.apps.pool_pane();
                     match result {
@@ -3467,7 +3483,26 @@ impl WalletScreen {
                     }
                 };
                 if let Some(o) = next {
-                    return self.handle_pool_outcome(o);
+                    // The chain the immediate re-sync targets (Chain is Copy),
+                    // captured before `o` is consumed.
+                    let sync_chain = match &o {
+                        pool_app::Outcome::Sync(c) => Some(*c),
+                        _ => None,
+                    };
+                    let (task, out) = self.handle_pool_outcome(o);
+                    // For a deposit, chase that immediate (premature) re-sync with
+                    // one gated on the deposit mining, so the new note + anonymity
+                    // set show up automatically once it's on-chain.
+                    if let (Some(hash), Some(chain)) = (deposit_hash, sync_chain) {
+                        return (
+                            Task::batch([
+                                task,
+                                spawn_pool_wait_and_resync(self.network.clone(), chain, hash),
+                            ]),
+                            out,
+                        );
+                    }
+                    return (task, out);
                 }
                 return (Task::none(), None);
             }
@@ -3481,6 +3516,12 @@ impl WalletScreen {
                         return (Task::none(), None);
                     }
                 }
+            }
+            Message::PoolResync { chain } => {
+                // The deposit has mined — re-discover + re-scan so its note +
+                // anonymity set land. Safe under the success screen: sync only
+                // mutates pool/account state, never `view` (see `set_submitted`).
+                return self.handle_pool_outcome(pool_app::Outcome::Sync(chain));
             }
             Message::CowStatus { uid, result } => {
                 // A just-filled order's legs, captured so the borrow on
@@ -6424,6 +6465,28 @@ fn spawn_pool_send(
             signer: Some(handoff),
             kind,
         },
+    )
+}
+
+/// Wait for a broadcast pool deposit to mine, then re-sync `chain`. The deposit
+/// is one fire-and-forget leg, so the immediate re-sync `set_submitted` requests
+/// scans a chain that doesn't include it yet; this second pass — gated on the
+/// receipt — is what makes the new note + anonymity set appear automatically. A
+/// revert or a poll timeout still re-syncs (harmless: it just re-reads the
+/// unchanged state), so a slow/failed mine never strands the pane on stale data.
+fn spawn_pool_wait_and_resync(
+    network: Arc<dyn BalanceFetcher>,
+    chain: crate::chain::Chain,
+    hash: TxHash,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            if let Some(provider) = network.provider(chain).await {
+                let _ = crate::cow::onchain::wait_for_receipt(&provider, hash, 60).await;
+            }
+            chain
+        },
+        |chain| Message::PoolResync { chain },
     )
 }
 

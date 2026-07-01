@@ -179,6 +179,9 @@ pub struct PoolApp {
     has_identity: bool,
     chain: Chain,
     syncing: bool,
+    /// When the current sync began — drives the "loading pools" skeleton
+    /// animation (a time source, like `proving_started`). `None` when idle.
+    syncing_started: Option<Instant>,
     error: Option<String>,
     /// Discovered pools for the active chain.
     pools: Vec<PoolInfo>,
@@ -237,6 +240,7 @@ impl PoolApp {
             has_identity: false,
             chain: Chain::Mainnet,
             syncing: false,
+            syncing_started: None,
             error: None,
             pools: Vec::new(),
             pool_cache: HashMap::new(),
@@ -279,6 +283,13 @@ impl PoolApp {
     }
 
     pub fn set_syncing(&mut self, syncing: bool) {
+        // Start the animation clock on the leading edge, clear it when the sync
+        // finishes (so a fresh sync restarts the wave from zero).
+        match (syncing, self.syncing_started) {
+            (true, None) => self.syncing_started = Some(Instant::now()),
+            (false, _) => self.syncing_started = None,
+            _ => {}
+        }
         self.syncing = syncing;
     }
 
@@ -609,9 +620,11 @@ impl PoolApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        // The proving screen animates off a ~60 Hz timer tick — nothing else in
-        // the app drives redraws, so without this the spinner/bar would freeze.
-        if matches!(self.view, View::Proving) {
+        // Two indeterminate waits animate off a ~60 Hz timer tick — the proving
+        // screen, and the "loading pools" skeleton on the overview — since
+        // nothing else drives redraws, without this the spinner/bars would
+        // freeze.
+        if matches!(self.view, View::Proving) || self.is_loading_pools() {
             return Subscription::batch([
                 keyboard::listen().map(Message::Key),
                 iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick),
@@ -621,6 +634,12 @@ impl PoolApp {
             View::Setup | View::Overview => Subscription::none(),
             _ => keyboard::listen().map(Message::Key),
         }
+    }
+
+    /// On the overview with a sync in flight and no pools yet to show — the
+    /// state the loading skeleton animates through.
+    fn is_loading_pools(&self) -> bool {
+        matches!(self.view, View::Overview) && self.syncing && self.pools.is_empty()
     }
 
     // ── view ─────────────────────────────────────────────────────────────────
@@ -782,7 +801,11 @@ impl PoolApp {
         .width(Length::Fill);
 
         if self.syncing && self.pools.is_empty() {
-            col = col.push(empty_hint(t, "Loading pools from 0xbow…"));
+            let elapsed = self
+                .syncing_started
+                .map(|s| s.elapsed().as_secs_f32())
+                .unwrap_or(0.0);
+            col = col.push(loading_pools_view(t, elapsed));
         } else if self.pools.is_empty() {
             col = col.push(empty_hint(t, "No pools found on this chain."));
         } else {
@@ -1338,6 +1361,79 @@ fn empty_hint<'a>(t: KaoTheme, msg: &str) -> Element<'a, Message> {
     container(text(msg.to_string()).size(12).color(t.sub).font(mono()))
         .padding(20)
         .width(Length::Fill)
+        .into()
+}
+
+/// The "loading pools" state: a bouncing bullet spinner + label over two
+/// breathing skeleton cards laid out in the same 2-column grid the real pools
+/// land in, so the overview doesn't jump when discovery returns. `elapsed` is
+/// seconds since the sync began (drives the wave + pulse).
+fn loading_pools_view<'a>(t: KaoTheme, elapsed: f32) -> Element<'a, Message> {
+    let dots = ".".repeat(1 + (elapsed * 2.0) as usize % 3);
+    let head = row![
+        text(bullet_wave(elapsed))
+            .size(14)
+            .color(t.a3)
+            .font(mono_bold()),
+        Space::new().width(10),
+        text(format!("Loading pools from 0xbow{dots}"))
+            .size(12)
+            .color(t.sub)
+            .font(mono()),
+    ]
+    .align_y(Alignment::Center);
+
+    // The two cards pulse a half-cycle out of phase so the shimmer reads as
+    // motion rather than a single global blink.
+    let cards = row![
+        skeleton_card(t, elapsed, 0.0),
+        skeleton_card(t, elapsed, std::f32::consts::PI),
+    ]
+    .spacing(12)
+    .width(Length::Fill);
+
+    column![head, vspace(14), cards].width(Length::Fill).into()
+}
+
+/// A placeholder pool card mimicking `pool_card`'s shape (avatar + three text
+/// lines), its fills breathing between two alphas. `phase` offsets the pulse.
+fn skeleton_card<'a>(t: KaoTheme, elapsed: f32, phase: f32) -> Element<'a, Message> {
+    // 0.16–0.42 alpha, a gentle sine breath (~0.9 s period).
+    let pulse = 0.29 + 0.13 * (elapsed * 2.2 + phase).sin();
+
+    let lines = column![
+        skeleton_bar(t, 88.0, 13.0, 7.0, pulse),
+        skeleton_bar(t, 128.0, 9.0, 5.0, pulse),
+        skeleton_bar(t, 64.0, 9.0, 5.0, pulse),
+    ]
+    .spacing(7)
+    .width(Length::Fill);
+
+    let header = row![
+        skeleton_bar(t, 34.0, 34.0, 17.0, pulse),
+        Space::new().width(12),
+        lines,
+    ]
+    .align_y(Alignment::Center)
+    .width(Length::Fill);
+
+    card(t, header.into())
+}
+
+/// A rounded, solid-alpha placeholder rectangle for the loading skeletons.
+fn skeleton_bar<'a>(t: KaoTheme, w: f32, h: f32, radius: f32, alpha: f32) -> Element<'a, Message> {
+    container(Space::new())
+        .width(Length::Fixed(w))
+        .height(Length::Fixed(h))
+        .style(move |_| container::Style {
+            background: Some(Background::Color(with_alpha(t.sub, alpha))),
+            border: Border {
+                color: with_alpha(t.sub, 0.0),
+                width: 0.0,
+                radius: radius.into(),
+            },
+            ..Default::default()
+        })
         .into()
 }
 
