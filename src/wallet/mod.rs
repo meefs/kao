@@ -19,7 +19,10 @@ pub mod tx;
 
 pub use contacts::{Contact, ContactEns, ContactsBook};
 pub use store::db_exists as wallet_exists;
-pub use store::{load_contacts, load_descriptor, save_contacts, save_descriptor};
+pub use store::{
+    clear_pp_notes, load_all_pp_notes, load_contacts, load_descriptor, load_pp_seed, save_contacts,
+    save_descriptor, save_pp_notes, save_pp_seed,
+};
 
 /// Errors that can occur during wallet operations.
 #[derive(Debug)]
@@ -792,6 +795,19 @@ pub fn generate_mnemonic() -> Result<(SecretString, PrivateKeySigner), WalletErr
         .build()
         .map_err(|e| WalletError::Mnemonic(e.to_string()))?;
     Ok((SecretString::new(phrase.into_boxed_str()), signer))
+}
+
+/// Generate a fresh random **24-word** BIP39 mnemonic for Privacy Pools.
+///
+/// This is a *dedicated* pool seed, independent of the wallet's own seed (which
+/// Kao never persists). One phrase derives every pool account, so it is a
+/// keyring root, not a per-account key. Returned wrapped in `SecretString`; keep
+/// it inside `SecretString`/`Zeroizing` for its whole lifetime.
+pub fn generate_pp_mnemonic() -> Result<SecretString, WalletError> {
+    let mut rng = rand::thread_rng();
+    let mnemonic = coins_bip39::Mnemonic::<English>::new_with_count(&mut rng, 24)
+        .map_err(|e: coins_bip39::MnemonicError| WalletError::Mnemonic(e.to_string()))?;
+    Ok(SecretString::new(mnemonic.to_phrase().into_boxed_str()))
 }
 
 /// Validate that a string is a well-formed BIP39 mnemonic (12 or 24 words).

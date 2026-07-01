@@ -9,6 +9,7 @@ mod indexer;
 mod names;
 mod net;
 mod paths;
+mod pool;
 mod portfolio;
 mod safe;
 mod sanitize;

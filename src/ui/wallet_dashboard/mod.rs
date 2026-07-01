@@ -14,7 +14,7 @@ use iced::border::Radius;
 use iced::widget::operation::focus as focus_widget;
 use iced::widget::{Space, column, container, row, stack, text};
 use iced::{Alignment, Background, Border, Element, Length, Padding, Subscription, Task};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod account_dropdown;
 mod activity;
@@ -28,6 +28,7 @@ mod modal_chrome;
 mod names_app;
 mod nav;
 mod networks;
+mod pool_app;
 mod receive;
 mod safe_tx_detail;
 mod safes_settings;
@@ -88,7 +89,7 @@ use crate::portfolio::{DiscoveredToken, LiveToken, PortfolioCache};
 use crate::settings::{self, IndexerProvider};
 use crate::ui::kao_theme::with_alpha;
 use crate::ui::kao_theme::{KaoTheme, ThemeKind};
-use crate::ui::kao_widgets::{bold, copy_toast_progress, fill_style, mono};
+use crate::ui::kao_widgets::{bold, copy_toast_progress, fill_style, mark_copied, mono};
 use crate::ui::network_setup::{self, NetworkSetupScreen, WizardMode};
 use crate::wallet::sim::SimulationResult;
 use crate::wallet::tx::SendPlan;
@@ -401,6 +402,39 @@ pub enum Message {
         uid: String,
         result: Result<crate::cow::api::OrderStatusResponse, String>,
     },
+    /// Pool discovery finished for `chain` (API list verified via Helios). Shown
+    /// immediately; per-pool account state then syncs in the background.
+    PoolsDiscovered {
+        chain: crate::chain::Chain,
+        result: Result<Vec<crate::pool::PoolInfo>, String>,
+    },
+    /// One pool's account state finished syncing (errors are ignored so the pool
+    /// still shows, just without balances). Carries the refreshed note cache to
+    /// persist, and `chain` so it can be keyed/stored per network.
+    PoolSynced {
+        pool: Address,
+        chain: crate::chain::Chain,
+        result: Result<(crate::pool::sync::PoolState, crate::pool::sync::CachedNotes), String>,
+    },
+    /// A relayer fee quote for a withdrawal returned.
+    PoolQuoted {
+        result: Result<crate::pool::relayer::QuoteResponse, String>,
+    },
+    /// A pool tx (deposit / self-relay withdraw / ragequit) or a relayed
+    /// withdrawal finished. On success carries an optional tx hash. `signer` is
+    /// `Some` for EOA paths (parked, needs reclaim), `None` for the relayed path
+    /// (the relayer submits, the user signs nothing). `kind` labels the success
+    /// screen (all three ops share this one result message).
+    PoolSubmitted {
+        result: Result<Option<String>, String>,
+        signer: Option<SignerHandoff>,
+        kind: pool_app::PoolTxKind,
+    },
+    /// A ragequit commitment proof + calldata finished building; on success the
+    /// coordinator opens the clear-sign review for the `Pool.ragequit` tx.
+    PoolRagequitReady {
+        result: Result<sign_review::PoolSign, String>,
+    },
     /// Poll tick: refresh every non-terminal tracked order. Only fires while at
     /// least one such order exists (see `subscription`).
     CowPollTick,
@@ -456,6 +490,15 @@ pub enum Outcome {
         index: usize,
         url: Option<String>,
     },
+    /// Generate a fresh 24-word Privacy Pools mnemonic, persist it under the
+    /// wallet passphrase, derive the account, and push it back via
+    /// `WalletScreen::set_pp_account` + `show_pool_backup`. Needs the App's
+    /// held passphrase, which the dashboard doesn't have.
+    PoolCreateIdentity,
+    /// Persist + adopt a restored Privacy Pools mnemonic.
+    PoolRestoreIdentity(secrecy::SecretString),
+    /// Re-load the pool seed and hand its phrase to the backup view.
+    PoolRevealBackup,
 }
 
 /// Connection state of the active account's hardware device, surfaced as a
@@ -626,6 +669,26 @@ pub struct WalletScreen {
     /// Monotonic id for sign-review prepare tasks, so a decode result for a
     /// review the user has since cancelled/replaced is dropped on arrival.
     sign_review_seq: u64,
+    /// The Privacy Pools account (dedicated pool mnemonic → master keys),
+    /// derived by the App from the encrypted `pp` seed and pushed down here so
+    /// the pool app can sync/prove. `None` until an identity exists + is loaded.
+    pp_account: Option<privacy_pools::Account>,
+    /// Next deposit index implied by deposits **confirmed this session**, keyed
+    /// by pool address. Combined with the synced state's index so a second
+    /// deposit never reuses one the chain scan hasn't caught up to — the pool
+    /// contract rejects a reused precommitment with `PrecommitmentAlreadyUsed`.
+    pool_session_deposits: std::collections::HashMap<Address, u64>,
+    /// `(pool, index)` of the deposit currently under clear-sign review — set
+    /// when the review opens, committed to `pool_session_deposits` only when the
+    /// user confirms, so a cancelled review never burns an index.
+    pending_pool_deposit: Option<(Address, u64)>,
+    /// Persisted note cache per `(chain_id, pool)` — the incremental-sync cursor
+    /// and this account's recovered logs, loaded on identity set and refreshed
+    /// on every sync so a re-open scans only new blocks (not from the deploy block).
+    pool_note_cache: std::collections::HashMap<(u64, Address), crate::pool::sync::CachedNotes>,
+    /// The account-derived key the note cache is encrypted under (see
+    /// `pool::sync::notes_cipher_key`); `None` until an identity is loaded.
+    pool_notes_key: Option<[u8; 32]>,
 }
 
 /// Tracks an in-flight clipboard auto-clear: when it lands, what we
@@ -725,7 +788,60 @@ impl WalletScreen {
             apps: AppsPane::new(address),
             sign_review: None,
             sign_review_seq: 0,
+            pp_account: None,
+            pool_session_deposits: std::collections::HashMap::new(),
+            pending_pool_deposit: None,
+            pool_note_cache: std::collections::HashMap::new(),
+            pool_notes_key: None,
         }
+    }
+
+    /// Push the Privacy Pools account (or `None`) down from the App after it
+    /// loads/creates/restores the pool seed. Also flips the pool pane between its
+    /// Setup and Overview states.
+    pub fn set_pp_account(&mut self, account: Option<privacy_pools::Account>) {
+        self.pp_account = account;
+        // A different identity has its own per-scope index space — drop any
+        // session deposit counters so they never cross identities.
+        self.pool_session_deposits.clear();
+        self.pending_pool_deposit = None;
+
+        // Refresh the note-cache key + in-memory cache for this identity. If a
+        // *different* identity is now active (a real switch, not the first load
+        // of the session), wipe both the persisted rows and memory — the old
+        // account's notes are permanently stale.
+        let new_key = account.and_then(|a| crate::pool::sync::notes_cipher_key(&a).ok());
+        if let (Some(old), Some(new)) = (self.pool_notes_key, new_key)
+            && old != new
+        {
+            if let Err(e) = crate::wallet::clear_pp_notes() {
+                warn!(error = %e, "privacy pools: clearing stale note cache failed");
+            }
+            self.pool_note_cache.clear();
+        }
+        self.pool_notes_key = new_key;
+        if let Some(key) = new_key {
+            match crate::wallet::load_all_pp_notes(&key) {
+                Ok(cache) => self.pool_note_cache = cache,
+                Err(e) => warn!(error = %e, "privacy pools: loading note cache failed"),
+            }
+        } else {
+            self.pool_note_cache.clear();
+        }
+
+        self.apps.pool_pane().set_identity(account.is_some());
+    }
+
+    /// Show the pool recovery phrase in the pool app's masked backup view (the
+    /// App owns the seed and hands the phrase in only for display).
+    pub fn show_pool_backup(&mut self, phrase: secrecy::SecretString) {
+        self.apps.pool_pane().show_backup(phrase);
+    }
+
+    /// Surface an App-side error (e.g. seed save failed) on the pool pane.
+    pub fn set_pool_error(&mut self, e: String) {
+        warn!(error = %e, "privacy pools: identity/seed error");
+        self.apps.pool_pane().set_error(Some(e));
     }
 
     /// Move the live signer out of the dashboard. Used by the App when it
@@ -877,6 +993,12 @@ impl WalletScreen {
     /// deadline passes — the ownership check happens at that point, not
     /// here.
     fn arm_clipboard_clear(&mut self, text: String) -> Task<Message> {
+        // Fire the "Copied!" toast for button-driven copies too (Copy hash,
+        // explorer link, Send/Swap/TxDetails). `colored_address` clicks call
+        // `mark_copied` themselves; this is the matching signal for every copy
+        // that routes through here. NOT in the `ClipboardWritten` handler —
+        // that also fires for the 10s auto-clear write, which must stay silent.
+        mark_copied();
         self.clipboard_clear_gen = self.clipboard_clear_gen.wrapping_add(1);
         let generation = self.clipboard_clear_gen;
         self.clipboard_clear = Some(ClipboardClearState {
@@ -1227,6 +1349,210 @@ impl WalletScreen {
     /// verified-read task; write ones park the signer first (so the Apps surface
     /// survives the in-flight window) and mint the commit secret here, where the
     /// RNG lives.
+    /// Service a Privacy Pools app request. Identity ops (create/restore/backup)
+    /// need the App's passphrase, so they bubble up as an [`Outcome`]; everything
+    /// else is serviced here with the network client + pool account.
+    fn handle_pool_outcome(&mut self, o: pool_app::Outcome) -> (Task<Message>, Option<Outcome>) {
+        use pool_app::Outcome as O;
+        match o {
+            O::CreateIdentity => (Task::none(), Some(Outcome::PoolCreateIdentity)),
+            O::RestoreIdentity(phrase) => {
+                (Task::none(), Some(Outcome::PoolRestoreIdentity(phrase)))
+            }
+            O::RevealBackup => (Task::none(), Some(Outcome::PoolRevealBackup)),
+            O::CopyText(s) => (self.arm_clipboard_clear(s), None),
+            O::Sync(chain) => {
+                let base_url = self.apps.pool_pane().asp_endpoint();
+                self.apps.pool_pane().set_syncing(true);
+                self.apps.pool_pane().set_error(None);
+                (
+                    spawn_pool_discover(self.network.clone(), base_url, chain),
+                    None,
+                )
+            }
+            O::Quote(req) => (spawn_pool_quote(self.network.clone(), req), None),
+            O::Deposit { info, amount } => (self.open_pool_deposit_review(info, amount), None),
+            O::Submit { req, quote } => (self.pool_submit(req, quote), None),
+            O::Ragequit { info, account } => (self.pool_ragequit(info, account), None),
+            // Handled inside the Apps pane (steps back to the launcher); never
+            // reaches the dashboard, but the match must stay exhaustive.
+            O::Close => (Task::none(), None),
+        }
+    }
+
+    /// Build a deposit transaction and route it through the clear-sign gate.
+    /// Native deposits are one leg; ERC-20 deposits prepend an `approve`. The
+    /// calldata is final (deposits need no proof), so the reviewed bytes are
+    /// exactly what gets signed.
+    fn open_pool_deposit_review(
+        &mut self,
+        info: crate::pool::PoolInfo,
+        amount: U256,
+    ) -> Task<Message> {
+        if self.sign_review.is_some() {
+            return Task::none();
+        }
+        let Some(account) = self.pp_account else {
+            warn!("privacy pools: deposit blocked — no pool identity");
+            self.apps
+                .pool_pane()
+                .set_error(Some("create a pool identity first".into()));
+            return Task::none();
+        };
+        if amount < info.min_deposit {
+            warn!(
+                symbol = %info.symbol,
+                "privacy pools: deposit below the pool minimum"
+            );
+            self.apps
+                .pool_pane()
+                .set_error(Some("amount is below this pool's minimum deposit".into()));
+            return Task::none();
+        }
+        // The deposit index must be strictly beyond every index already on-chain
+        // for this (account, scope) — reusing one reverts with
+        // `PrecommitmentAlreadyUsed`. Take the max of the synced history and any
+        // deposit already confirmed this session (the log scan can lag a
+        // just-sent deposit). If neither is known we don't have the history yet:
+        // block and kick a sync rather than guess index 0 over an existing note.
+        let synced = self.apps.pool_pane().next_deposit_index(info.pool);
+        let session = self.pool_session_deposits.get(&info.pool).copied();
+        let index = match (synced, session) {
+            (None, None) => {
+                warn!(
+                    symbol = %info.symbol,
+                    "privacy pools: deposit blocked — pool history not synced yet"
+                );
+                self.apps.pool_pane().set_error(Some(
+                    "still syncing this pool's history — try again in a moment".into(),
+                ));
+                let cached = self
+                    .pool_note_cache
+                    .get(&(info.chain.chain_id(), info.pool))
+                    .cloned();
+                return spawn_pool_account_sync(self.network.clone(), account, info, cached);
+            }
+            (s, se) => s.unwrap_or(0).max(se.unwrap_or(0)),
+        };
+        let dep = if info.is_native {
+            crate::pool::flow::native_deposit(&account, &info, index, amount)
+        } else {
+            crate::pool::flow::erc20_deposit(&account, &info, index, amount)
+        };
+        let dep = match dep {
+            Ok(d) => d,
+            Err(e) => {
+                error!(symbol = %info.symbol, error = %e, "privacy pools: building deposit failed");
+                self.apps.pool_pane().set_error(Some(e.to_string()));
+                return Task::none();
+            }
+        };
+        let approve = (!info.is_native).then(|| {
+            (
+                info.asset,
+                crate::pool::flow::erc20_approve_calldata(&info, amount),
+            )
+        });
+        let sign = sign_review::PoolSign::Deposit {
+            chain: info.chain,
+            symbol: info.symbol.clone(),
+            to: dep.to,
+            value: dep.value,
+            calldata: dep.calldata,
+            approve,
+        };
+        // Remember which index this review is for; committed on confirm (see
+        // `dispatch_pool_sign`) so a later deposit advances past it.
+        self.pending_pool_deposit = Some((info.pool, index));
+        self.open_pool_review(sign)
+    }
+
+    /// Open the clear-sign overlay for a pool EOA tx and spawn the decode.
+    fn open_pool_review(&mut self, sign: sign_review::PoolSign) -> Task<Message> {
+        if self.sign_review.is_some() {
+            return Task::none();
+        }
+        self.sign_review_seq += 1;
+        let seq = self.sign_review_seq;
+        let (title, subtitle, note) = pool_review_labels(&sign);
+        let action = sign_review::SignAction::PrivacyPool { sign: sign.clone() };
+        self.sign_review = Some(sign_review::SignReview::pending(
+            title, subtitle, None, note, seq, action,
+        ));
+        let from = self.order_owner();
+        let local_names = build_local_names(&self.accounts, &self.safes, &self.contacts);
+        spawn_pool_prepare(self.network.clone(), seq, from, sign, local_names)
+    }
+
+    /// User confirmed a pool EOA tx — park the signer and broadcast.
+    fn dispatch_pool_sign(&mut self, sign: sign_review::PoolSign) -> Task<Message> {
+        if self.is_signing_busy() {
+            warn!("privacy pools: sign dispatch blocked — another signing op in progress");
+            // We won't run this signature, so close the overlay (rather than
+            // leaving it stuck waiting) and surface the refusal on the pane.
+            self.sign_review = None;
+            self.apps.pool_pane().set_error(Some(
+                "another signing operation is in progress — try again in a moment".into(),
+            ));
+            return Task::none();
+        }
+        // The user confirmed — commit the reviewed deposit's index so a
+        // subsequent deposit advances past it even before the re-scan lands.
+        // (Ragequits carry no deposit index; a failed broadcast at worst leaves a
+        // one-index gap, which note recovery tolerates.)
+        if matches!(sign, sign_review::PoolSign::Deposit { .. })
+            && let Some((pool, index)) = self.pending_pool_deposit.take()
+        {
+            let next = self.pool_session_deposits.entry(pool).or_insert(0);
+            *next = (*next).max(index + 1);
+        }
+        // Keep the review overlay up in its "waiting for a signature" phase for
+        // the duration of the sign + broadcast; `PoolSubmitted` clears it once
+        // the task resolves (success, rejected tx, or error).
+        if let Some(review) = self.sign_review.as_mut() {
+            review.signing_since = Some(Instant::now());
+        }
+        let desc = self.active_signer_descriptor();
+        let handoff = self.park_signer_for_order();
+        spawn_pool_send(self.network.clone(), handoff, desc, sign)
+    }
+
+    /// Prove + submit a withdrawal through the relayer: it POSTs the proof, the
+    /// relayer submits on-chain and pays the gas — the user signs nothing.
+    fn pool_submit(
+        &mut self,
+        req: pool_app::WithdrawRequest,
+        quote: crate::pool::relayer::QuoteResponse,
+    ) -> Task<Message> {
+        let Some(account) = self.pp_account else {
+            self.apps
+                .pool_pane()
+                .set_error(Some("create a pool identity first".into()));
+            return Task::none();
+        };
+        let asp = self.apps.pool_pane().asp_url();
+        let cached = self
+            .pool_note_cache
+            .get(&(req.info.chain.chain_id(), req.info.pool))
+            .cloned();
+        self.apps.pool_pane().set_proving("Private withdrawal");
+        spawn_pool_relayed_withdraw(self.network.clone(), account, req, quote, asp, cached)
+    }
+
+    /// Ragequit a deposit — the original-depositor exit (no ASP needed): prove
+    /// the commitment off-thread, then route the `Pool.ragequit` tx through the
+    /// clear-sign gate as an EOA transaction.
+    fn pool_ragequit(&mut self, info: crate::pool::PoolInfo, account: usize) -> Task<Message> {
+        let Some(pp) = self.pp_account else {
+            self.apps
+                .pool_pane()
+                .set_error(Some("create a pool identity first".into()));
+            return Task::none();
+        };
+        self.apps.pool_pane().set_proving("Ragequit exit");
+        spawn_pool_ragequit_prove(self.network.clone(), pp, info, account)
+    }
+
     fn handle_name_outcome(&mut self, o: names_app::Outcome) -> Task<Message> {
         // Serialize signing: refuse a new write-op while one is already in
         // flight, so a second park can't strand the real signer in the first
@@ -1457,8 +1783,26 @@ impl WalletScreen {
     }
 
     /// User confirmed the review — run the (unchanged) signing task for the
-    /// prepared action and close the overlay.
+    /// prepared action. Most actions close the overlay here and drive their own
+    /// originating surface (Swap modal / Apps composer / Names pane) into a busy
+    /// phase; Privacy Pools has no such surface, so its overlay is kept open in a
+    /// "waiting for a signature" state (cleared by the `PoolSubmitted` handler).
     fn confirm_sign_review(&mut self) -> Task<Message> {
+        // Ignore a stray re-confirm once a signature is already in flight.
+        if self
+            .sign_review
+            .as_ref()
+            .is_some_and(|r| r.signing_since.is_some())
+        {
+            return Task::none();
+        }
+        // Privacy Pools keeps its overlay open across the sign + broadcast.
+        if let Some(review) = self.sign_review.as_ref()
+            && let sign_review::SignAction::PrivacyPool { sign } = &review.action
+        {
+            let sign = sign.clone();
+            return self.dispatch_pool_sign(sign);
+        }
         let Some(review) = self.sign_review.take() else {
             return Task::none();
         };
@@ -1476,6 +1820,9 @@ impl WalletScreen {
             }
             sign_review::SignAction::CowCancel { host, uid } => self.cancel_order_task(host, uid),
             sign_review::SignAction::Name { sign } => self.dispatch_name_sign(sign),
+            // Normally handled above (overlay kept open); the take() fallback here
+            // keeps the match exhaustive and still signs if the guard ever moves.
+            sign_review::SignAction::PrivacyPool { sign } => self.dispatch_pool_sign(sign),
         }
     }
 
@@ -1483,6 +1830,16 @@ impl WalletScreen {
     /// flipped to a busy phase (that's deferred to confirm), so there's nothing to
     /// revert — just drop the pending review.
     fn cancel_sign_review(&mut self) {
+        // Once a signature is in flight the overlay can't be dismissed — it can't
+        // be aborted from here, so keep the "waiting for a signature" notice up
+        // until the task resolves and clears it.
+        if self
+            .sign_review
+            .as_ref()
+            .is_some_and(|r| r.signing_since.is_some())
+        {
+            return;
+        }
         self.sign_review = None;
     }
 
@@ -1505,6 +1862,10 @@ impl WalletScreen {
             // practice; drop the review silently if it ever lands here.
             sign_review::SignAction::CowCancel { .. } => {}
             sign_review::SignAction::Name { sign } => self.fail_name_pane(&sign, e),
+            sign_review::SignAction::PrivacyPool { .. } => {
+                error!(error = %e, "privacy pools: clear-sign review failed");
+                self.apps.pool_pane().set_error(Some(e));
+            }
         }
     }
 
@@ -2826,6 +3187,9 @@ impl WalletScreen {
                 Some(apps::Outcome::Name(o)) => {
                     return (self.handle_name_outcome(o), None);
                 }
+                Some(apps::Outcome::Pool(o)) => {
+                    return self.handle_pool_outcome(o);
+                }
                 None => return (Task::none(), None),
             },
             Message::SignReview(child) => match child {
@@ -2983,6 +3347,138 @@ impl WalletScreen {
                             }
                             CowHost::Apps => self.apps.placement_failed(e),
                         }
+                    }
+                }
+            }
+            Message::PoolsDiscovered { chain, result } => {
+                let pools = match result {
+                    Ok(pools) => pools,
+                    Err(e) => {
+                        warn!(%chain, error = %e, "privacy pools: pool discovery failed");
+                        let pane = self.apps.pool_pane();
+                        pane.set_syncing(false);
+                        pane.set_error(Some(e));
+                        return (Task::none(), None);
+                    }
+                };
+                {
+                    let pane = self.apps.pool_pane();
+                    pane.set_syncing(false);
+                    pane.set_pools(
+                        chain,
+                        pools.clone(),
+                        crate::pool::relayer::default_relayers(),
+                    );
+                }
+                // Fill in each pool's account state in the background (getLogs
+                // scan) so the pools + their metadata show immediately.
+                let Some(account) = self.pp_account else {
+                    return (Task::none(), None);
+                };
+                let tasks: Vec<Task<Message>> = pools
+                    .into_iter()
+                    .map(|info| {
+                        let cached = self
+                            .pool_note_cache
+                            .get(&(chain.chain_id(), info.pool))
+                            .cloned();
+                        spawn_pool_account_sync(self.network.clone(), account, info, cached)
+                    })
+                    .collect();
+                return (Task::batch(tasks), None);
+            }
+            Message::PoolSynced {
+                pool,
+                chain,
+                result,
+            } => {
+                match result {
+                    Ok((state, notes)) => {
+                        self.apps.pool_pane().set_state(pool, state);
+                        // Persist only when the cache actually changed (first
+                        // scan, or new activity) — a routine re-open finds
+                        // nothing new, so most syncs skip the encrypt+write.
+                        let key = (chain.chain_id(), pool);
+                        if self.pool_note_cache.get(&key) != Some(&notes) {
+                            self.pool_note_cache.insert(key, notes.clone());
+                            if let Some(cipher_key) = &self.pool_notes_key
+                                && let Err(e) = crate::wallet::save_pp_notes(
+                                    chain.chain_id(),
+                                    pool,
+                                    &notes,
+                                    cipher_key,
+                                )
+                            {
+                                warn!(%pool, error = %e, "privacy pools: persisting note cache failed");
+                            }
+                        }
+                    }
+                    Err(e) => warn!(%pool, error = %e, "privacy pools: pool account sync failed"),
+                }
+                return (Task::none(), None);
+            }
+            Message::PoolQuoted { result } => {
+                let pane = self.apps.pool_pane();
+                match result {
+                    Ok(q) => pane.set_quote(q),
+                    Err(e) => {
+                        warn!(error = %e, "privacy pools: relayer fee quote failed");
+                        pane.set_error(Some(e));
+                    }
+                }
+                return (Task::none(), None);
+            }
+            Message::PoolSubmitted {
+                result,
+                signer,
+                kind,
+            } => {
+                // The signing task resolved — drop the "waiting for a signature"
+                // overlay that was kept open across the whole sign + broadcast.
+                // Relayed withdrawals carry no overlay, so this is a no-op there.
+                self.sign_review = None;
+                if let Some(s) = &signer {
+                    self.install_reclaimed_signer(s);
+                    // The parked EOA signer is back — clear the in-flight flag,
+                    // exactly like `reclaim_order_signer` / `CowPlaced`. Without
+                    // this the flag stays stuck `true` after the first pool sign
+                    // (success, failure, or a rejected tx), and the next
+                    // `dispatch_pool_sign` is wrongly blocked as "another signing
+                    // op in progress". Relayed withdrawals carry `signer: None`
+                    // and never parked, so they leave the flag untouched.
+                    self.order_op_in_flight = false;
+                }
+                let next = {
+                    let pane = self.apps.pool_pane();
+                    match result {
+                        // Land on the durable success screen (tx hash + explorer
+                        // link) and kick a background re-sync so balances are
+                        // fresh whichever way the user leaves it.
+                        Ok(tx) => pane.set_submitted(kind, tx),
+                        Err(e) => {
+                            error!(error = %e, "privacy pools: withdrawal/deposit submission failed");
+                            // Leave the proving screen first (the relayed-withdraw
+                            // path is still on it) so the error isn't shown under a
+                            // still-animating "Generating the ZK proof" spinner.
+                            pane.reset_to_overview();
+                            pane.set_error(Some(e));
+                            None
+                        }
+                    }
+                };
+                if let Some(o) = next {
+                    return self.handle_pool_outcome(o);
+                }
+                return (Task::none(), None);
+            }
+            Message::PoolRagequitReady { result } => {
+                self.apps.pool_pane().reset_to_overview();
+                match result {
+                    Ok(sign) => return (self.open_pool_review(sign), None),
+                    Err(e) => {
+                        error!(error = %e, "privacy pools: ragequit proof failed");
+                        self.apps.pool_pane().set_error(Some(e));
+                        return (Task::none(), None);
                     }
                 }
             }
@@ -3804,6 +4300,10 @@ impl WalletScreen {
             if self.chrome.is_animating()
                 || self.clipboard_clear.is_some()
                 || copy_toast_progress().is_some()
+                || self
+                    .sign_review
+                    .as_ref()
+                    .is_some_and(|r| r.signing_since.is_some())
             {
                 subs.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Tick));
             }
@@ -5651,6 +6151,447 @@ fn spawn_cow_quote(host: CowHost, draft: SwapDraft, user: Address) -> Task<Messa
     )
 }
 
+/// Discover a chain's pools from the 0xbow API and verify each via Helios. Fast
+/// (one HTTP GET + a few verified `eth_call`s per pool) — the per-pool account
+/// scan is decoupled into [`spawn_pool_account_sync`] so pools show immediately.
+fn spawn_pool_discover(
+    network: Arc<dyn BalanceFetcher>,
+    base_url: String,
+    chain: crate::chain::Chain,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            debug!(%chain, "privacy pools: discovering pools from the 0xbow API");
+            let pools = crate::pool::discover::discover_pools(network.as_ref(), &base_url, chain)
+                .await
+                .map_err(|e| e.to_string())?;
+            info!(%chain, count = pools.len(), "privacy pools: discovered + verified pools");
+            Ok::<_, String>(pools)
+        },
+        move |result| Message::PoolsDiscovered { chain, result },
+    )
+}
+
+/// Sync one pool's state (chunked `getLogs` scan + note recovery + Helios root
+/// check) for the active account. Slow (historical scan) — runs in the
+/// background after discovery so the pool list isn't blocked on it.
+fn spawn_pool_account_sync(
+    network: Arc<dyn BalanceFetcher>,
+    account: privacy_pools::Account,
+    info: crate::pool::PoolInfo,
+    cached: Option<crate::pool::sync::CachedNotes>,
+) -> Task<Message> {
+    let pool = info.pool;
+    let chain = info.chain;
+    Task::perform(
+        async move {
+            let provider = network
+                .provider(info.chain)
+                .await
+                .ok_or_else(|| "no RPC configured for this chain".to_string())?;
+            let (state, notes) =
+                crate::pool::sync::sync_state(&provider, &info, &account, cached.as_ref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            debug!(
+                symbol = %info.symbol,
+                accounts = state.accounts.len(),
+                to_block = state.to_block,
+                "privacy pools: synced pool"
+            );
+            Ok::<_, String>((state, notes))
+        },
+        move |result| Message::PoolSynced {
+            pool,
+            chain,
+            result,
+        },
+    )
+}
+
+/// Fetch a relayer fee quote for a withdrawal.
+fn spawn_pool_quote(
+    network: Arc<dyn BalanceFetcher>,
+    req: pool_app::WithdrawRequest,
+) -> Task<Message> {
+    let _ = &network; // relayer client uses the shared proxied HTTP client, not the provider
+    Task::perform(
+        async move {
+            let relayer = req
+                .relayer
+                .clone()
+                .ok_or_else(|| "self-relay needs no quote".to_string())?;
+            crate::pool::relayer::fetch_quote(
+                &relayer,
+                req.info.chain.chain_id(),
+                req.amount,
+                req.info.asset,
+                req.target,
+            )
+            .await
+            .map_err(|e| e.to_string())
+        },
+        move |result| Message::PoolQuoted { result },
+    )
+}
+
+/// Title / subtitle / note for a pool sign-review overlay.
+fn pool_review_labels(sign: &sign_review::PoolSign) -> (String, Option<String>, Option<String>) {
+    match sign {
+        sign_review::PoolSign::Deposit {
+            symbol, approve, ..
+        } => (
+            format!("Deposit into the {symbol} pool"),
+            Some("Funds join the pool's anonymity set.".to_string()),
+            Some(
+                if approve.is_some() {
+                    "Two transactions: an ERC-20 approval, then the deposit. You pay gas; the \
+                     deposit is public, withdrawals are private."
+                } else {
+                    "You pay gas from this account. The deposit is public; withdrawals are private."
+                }
+                .to_string(),
+            ),
+        ),
+        sign_review::PoolSign::Ragequit { symbol, .. } => (
+            format!("Ragequit the {symbol} deposit"),
+            Some("Original-depositor exit — no relayer, no ASP.".to_string()),
+            Some(
+                "Ragequit returns your funds directly to this account and reveals that you \
+                 deposited — it is NOT private. Use it only to recover funds."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+/// Decode a pool EOA transaction's legs through the same clear-sign pipeline the
+/// Send screen uses, so the review shows exactly what will be signed.
+fn spawn_pool_prepare(
+    network: Arc<dyn BalanceFetcher>,
+    seq: u64,
+    from: Address,
+    sign: sign_review::PoolSign,
+    local_names: std::collections::HashMap<Address, String>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            match sign {
+                sign_review::PoolSign::Deposit {
+                    chain,
+                    symbol,
+                    to,
+                    value,
+                    calldata,
+                    approve,
+                } => {
+                    let mut legs = Vec::new();
+                    if let Some((token, appr)) = approve {
+                        let decoded = crate::decode::clear_sign::decode_transaction(
+                            network.as_ref(),
+                            chain,
+                            from,
+                            token,
+                            appr,
+                            U256::ZERO,
+                            local_names.clone(),
+                        )
+                        .await;
+                        legs.push(sign_review::ReviewLeg {
+                            title: format!("Approve {symbol}"),
+                            to: token,
+                            value: U256::ZERO,
+                            chain,
+                            decoded: Box::new(decoded),
+                        });
+                    }
+                    let decoded = crate::decode::clear_sign::decode_transaction(
+                        network.as_ref(),
+                        chain,
+                        from,
+                        to,
+                        calldata,
+                        value,
+                        local_names,
+                    )
+                    .await;
+                    legs.push(sign_review::ReviewLeg {
+                        title: format!("Deposit {symbol}"),
+                        to,
+                        value,
+                        chain,
+                        decoded: Box::new(decoded),
+                    });
+                    Ok::<_, String>(legs)
+                }
+                sign_review::PoolSign::Ragequit {
+                    chain,
+                    symbol,
+                    pool,
+                    calldata,
+                } => {
+                    let decoded = crate::decode::clear_sign::decode_transaction(
+                        network.as_ref(),
+                        chain,
+                        from,
+                        pool,
+                        calldata,
+                        U256::ZERO,
+                        local_names,
+                    )
+                    .await;
+                    Ok::<_, String>(vec![sign_review::ReviewLeg {
+                        title: format!("Ragequit {symbol}"),
+                        to: pool,
+                        value: U256::ZERO,
+                        chain,
+                        decoded: Box::new(decoded),
+                    }])
+                }
+            }
+        },
+        move |legs| Message::SignReviewPrepared { seq, legs },
+    )
+}
+
+/// Broadcast a confirmed pool EOA tx: an ERC-20 deposit sends + mines its
+/// approval first, then the Entrypoint deposit; native deposits and ragequits
+/// are a single tx. The parked signer is handed back for reclaim regardless.
+fn spawn_pool_send(
+    network: Arc<dyn BalanceFetcher>,
+    handoff: SignerHandoff,
+    desc: AccountDescriptor,
+    sign: sign_review::PoolSign,
+) -> Task<Message> {
+    let inner = handoff.clone();
+    let kind = match &sign {
+        sign_review::PoolSign::Deposit { .. } => pool_app::PoolTxKind::Deposit,
+        sign_review::PoolSign::Ragequit { .. } => pool_app::PoolTxKind::Ragequit,
+    };
+    Task::perform(
+        async move {
+            let signer = match take_live_signer(&inner, &desc).await {
+                Ok(s) => s,
+                Err(e) => return Err::<Option<String>, String>(e),
+            };
+            let result = async {
+                let (chain, to, value, calldata, approve) = match sign {
+                    sign_review::PoolSign::Deposit {
+                        chain,
+                        to,
+                        value,
+                        calldata,
+                        approve,
+                        ..
+                    } => (chain, to, value, calldata, approve),
+                    sign_review::PoolSign::Ragequit {
+                        chain,
+                        pool,
+                        calldata,
+                        ..
+                    } => (chain, pool, U256::ZERO, calldata, None),
+                };
+                let provider = network
+                    .provider(chain)
+                    .await
+                    .ok_or_else(|| "no RPC configured for this chain".to_string())?;
+                if let Some((token, appr)) = approve {
+                    let h = crate::cow::onchain::send_contract_call(
+                        &provider,
+                        &signer,
+                        chain,
+                        token,
+                        U256::ZERO,
+                        appr,
+                    )
+                    .await?;
+                    crate::cow::onchain::wait_for_receipt(&provider, h, 60).await?;
+                }
+                let hash = crate::cow::onchain::send_contract_call(
+                    &provider, &signer, chain, to, value, calldata,
+                )
+                .await?;
+                Ok::<Option<String>, String>(Some(hash.to_string()))
+            }
+            .await;
+            if let Ok(mut g) = inner.lock() {
+                *g = Some(signer);
+            }
+            result
+        },
+        move |result| Message::PoolSubmitted {
+            result,
+            signer: Some(handoff),
+            kind,
+        },
+    )
+}
+
+/// Re-sync the pool, fetch the ASP set, assemble + prove the withdrawal, and POST
+/// it to the relayer (which submits on-chain and pays gas). The user signs
+/// nothing on-chain, so no signer is parked.
+fn spawn_pool_relayed_withdraw(
+    network: Arc<dyn BalanceFetcher>,
+    account: privacy_pools::Account,
+    req: pool_app::WithdrawRequest,
+    quote: crate::pool::relayer::QuoteResponse,
+    asp_url: Option<String>,
+    cached: Option<crate::pool::sync::CachedNotes>,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let info = req.info.clone();
+            let relayer = req
+                .relayer
+                .clone()
+                .ok_or_else(|| "no relayer selected".to_string())?;
+            let asp_url = asp_url.ok_or_else(|| {
+                "enable the 0xbow association-set feed in Settings to withdraw privately"
+                    .to_string()
+            })?;
+            let provider = network
+                .provider(info.chain)
+                .await
+                .ok_or_else(|| "no RPC configured for this chain".to_string())?;
+
+            // Recover this account's notes incrementally (cache + tail scan) —
+            // not a from-deploy-block rescan.
+            let (state, _notes) =
+                crate::pool::sync::sync_state(&provider, &info, &account, cached.as_ref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let pa = state
+                .accounts
+                .get(req.account)
+                .ok_or_else(|| "pool account not found — re-sync and retry".to_string())?;
+
+            // Association set (compliance) + the state-tree leaves, both from the
+            // single ASP fetch.
+            let asp = crate::pool::asp::fetch_mt_leaves(&asp_url, info.chain.chain_id())
+                .await
+                .map_err(|e| e.to_string())?;
+            // State tree from the API, Helios-verified against the on-chain root.
+            // If it's stale or unverifiable, fall back to a fresh full leaf scan.
+            let (state_leaves, state_tree) = match crate::pool::sync::verified_state_tree(
+                network.as_ref(),
+                &info,
+                &asp.state_leaves,
+            )
+            .await
+            {
+                Ok(tree) => (asp.state_leaves.clone(), tree),
+                Err(e) => {
+                    warn!(error = %e, "privacy pools: API state tree unusable — scanning leaves");
+                    let logs = crate::pool::sync::scan(
+                        &provider,
+                        &info,
+                        crate::pool::scan_from_block(info.chain),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                    // Verify the *scanned* tree too — the raw-RPC log set isn't
+                    // Helios-verified, so anchor it in `currentRoot()` just like
+                    // the API path rather than trusting it blindly (fail closed;
+                    // a bad/stale tree errors here instead of reverting on-chain).
+                    let leaves = logs.state_leaves();
+                    let tree =
+                        crate::pool::sync::verified_state_tree(network.as_ref(), &info, &leaves)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    (leaves, tree)
+                }
+            };
+            let dest = crate::pool::flow::destination_from_quote(&info, &quote, req.target)
+                .map_err(|e| e.to_string())?;
+            let plan = crate::pool::flow::plan_withdrawal(
+                &account,
+                &info,
+                pa,
+                &state_leaves,
+                &state_tree,
+                &asp.asp_leaves,
+                req.amount,
+                &dest,
+            )
+            .map_err(|e| e.to_string())?;
+            crate::pool::flow::matches_quote(&plan, &quote).map_err(|e| e.to_string())?;
+
+            // Prove off the async runtime (CPU-bound, seconds).
+            let inputs = plan.inputs.clone();
+            let proof =
+                tokio::task::spawn_blocking(move || crate::pool::prover::prove_withdraw(&inputs))
+                    .await
+                    .map_err(|e| format!("prove task: {e}"))?
+                    .map_err(|e| e.to_string())?;
+
+            // Hand the proof to the relayer to submit + pay gas.
+            let res = crate::pool::relayer::submit(
+                &relayer,
+                info.chain.chain_id(),
+                &info.scope_decimal(),
+                plan.withdrawal.processooor,
+                &plan.withdrawal.data,
+                crate::pool::flow::snarkjs_proof(&proof),
+                crate::pool::flow::public_signals(&proof),
+                quote.fee_commitment.clone(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok::<Option<String>, String>(res.tx_hash)
+        },
+        move |result| Message::PoolSubmitted {
+            result,
+            signer: None,
+            kind: pool_app::PoolTxKind::Withdrawal,
+        },
+    )
+}
+
+/// Re-sync, prove the ragequit (commitment) off-thread, and build the
+/// `Pool.ragequit` calldata; the result opens the clear-sign review.
+fn spawn_pool_ragequit_prove(
+    network: Arc<dyn BalanceFetcher>,
+    account: privacy_pools::Account,
+    info: crate::pool::PoolInfo,
+    account_index: usize,
+) -> Task<Message> {
+    Task::perform(
+        async move {
+            let provider = network
+                .provider(info.chain)
+                .await
+                .ok_or_else(|| "no RPC configured for this chain".to_string())?;
+            let logs =
+                crate::pool::sync::scan(&provider, &info, crate::pool::scan_from_block(info.chain))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let accounts = privacy_pools::recover_accounts(&account, info.scope, &logs, 10)
+                .map_err(|e| e.to_string())?;
+            let pa = accounts
+                .get(account_index)
+                .ok_or_else(|| "pool account not found — re-sync and retry".to_string())?;
+            let note = pa
+                .spendable()
+                .ok_or_else(|| "nothing to ragequit in this pool account".to_string())?;
+            let inputs = crate::pool::flow::ragequit_plan(note);
+            let proof =
+                tokio::task::spawn_blocking(move || crate::pool::prover::prove_ragequit(&inputs))
+                    .await
+                    .map_err(|e| format!("prove task: {e}"))?
+                    .map_err(|e| e.to_string())?;
+            let calldata =
+                crate::pool::flow::ragequit_calldata(&proof).map_err(|e| e.to_string())?;
+            Ok::<sign_review::PoolSign, String>(sign_review::PoolSign::Ragequit {
+                chain: info.chain,
+                symbol: info.symbol.clone(),
+                pool: info.pool,
+                calldata,
+            })
+        },
+        move |result| Message::PoolRagequitReady { result },
+    )
+}
+
 /// Place an order: ERC-20 (allowance → approve → sign → POST) or native ETH
 /// (EthFlow `createOrder`). Runs the whole sequence in one task; the modal shows
 /// a "Placing…" phase meanwhile. The signer rides in via `handoff` and back out
@@ -6990,6 +7931,69 @@ mod tests {
         );
         assert!(s.can_swap(), "signer reclaimed after the op resolves");
         assert!(s.apps_available());
+    }
+
+    #[test]
+    fn pool_sign_keeps_overlay_open_until_the_signature_resolves() {
+        use crate::wallet::handoff_with;
+
+        let active = addr(0xAA);
+        let mut s = screen_for(active, new_cache());
+
+        // A prepared pool deposit, sitting in the clear-sign review overlay.
+        let sign = sign_review::PoolSign::Deposit {
+            chain: Chain::Mainnet,
+            symbol: "ETH".into(),
+            to: addr(0x10),
+            value: U256::from(1u64),
+            calldata: alloy::primitives::Bytes::new(),
+            approve: None,
+        };
+        s.sign_review = Some(sign_review::SignReview::pending(
+            "Deposit".into(),
+            None,
+            None,
+            None,
+            1,
+            sign_review::SignAction::PrivacyPool { sign },
+        ));
+
+        // Confirm enters the "waiting for a signature" state: unlike the CoW /
+        // Names paths (which tear the overlay down and drive their own busy
+        // phase), the pool overlay stays open and the signer parks.
+        let _task = s.confirm_sign_review();
+        let review = s
+            .sign_review
+            .as_ref()
+            .expect("pool overlay stays open across the signature");
+        assert!(
+            review.signing_since.is_some(),
+            "confirm flips the overlay into its waiting state",
+        );
+        assert!(
+            s.order_op_in_flight,
+            "the signer is parked for the in-flight tx",
+        );
+
+        // A signature in flight can't be dismissed (Cancel / Esc / backdrop).
+        s.cancel_sign_review();
+        assert!(
+            s.sign_review.is_some(),
+            "a signature in flight can't be cancelled from the overlay",
+        );
+
+        // The signing task resolving (here a rejected tx) clears the overlay and
+        // the in-flight flag; the pane surfaces the error underneath.
+        s.update(Message::PoolSubmitted {
+            result: Err("user rejected on device".into()),
+            signer: Some(handoff_with(KaoSigner::ViewOnly(active))),
+            kind: pool_app::PoolTxKind::Deposit,
+        });
+        assert!(
+            s.sign_review.is_none(),
+            "PoolSubmitted clears the waiting overlay",
+        );
+        assert!(!s.order_op_in_flight, "in-flight flag clears on resolve");
     }
 
     #[test]

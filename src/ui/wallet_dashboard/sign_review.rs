@@ -23,7 +23,9 @@
 //!   through `function_panel`; it gets a purpose-built panel spelling out every
 //!   signed field (sell/buy/receiver/min-received/expiry/kind/fee/settlement).
 
-use alloy::primitives::{Address, U256};
+use std::time::Instant;
+
+use alloy::primitives::{Address, Bytes, U256};
 use iced::keyboard;
 use iced::widget::{Space, column, container, row, scrollable, text};
 use iced::{Alignment, Element, Length, Padding};
@@ -35,8 +37,8 @@ use crate::decode::clear_sign::DecodeResult;
 use crate::names::registrar::{Namespace, RegisterPlan};
 use crate::ui::kao_theme::KaoTheme;
 use crate::ui::kao_widgets::{
-    bold, colored_address, kao_scrollable_style, modal_wrapper, mono, mono_bold, primary_button,
-    secondary_button,
+    bold, bullet_wave, colored_address, kao_scrollable_style, modal_wrapper, mono, mono_bold,
+    primary_button, secondary_button,
 };
 
 use super::CowHost;
@@ -106,6 +108,35 @@ pub enum SignAction {
     Name {
         sign: NameSign,
     },
+    PrivacyPool {
+        sign: PoolSign,
+    },
+}
+
+/// A prepared Privacy Pools EOA transaction to sign. A deposit carries an
+/// optional ERC-20 approve leg then the Entrypoint deposit; the calldata is
+/// final (deposits need no proof), so the reviewed bytes == the signed bytes.
+#[derive(Debug, Clone)]
+pub enum PoolSign {
+    Deposit {
+        chain: Chain,
+        symbol: String,
+        /// The Entrypoint the deposit targets.
+        to: Address,
+        /// ETH sent for a native deposit, `0` for an ERC-20 deposit.
+        value: U256,
+        calldata: Bytes,
+        /// `(token, approve calldata)` sent to the token before an ERC-20 deposit.
+        approve: Option<(Address, Bytes)>,
+    },
+    /// Ragequit (original-depositor exit) — the commitment proof is already
+    /// generated, so `calldata` is the final `Pool.ragequit(proof)`.
+    Ragequit {
+        chain: Chain,
+        symbol: String,
+        pool: Address,
+        calldata: Bytes,
+    },
 }
 
 /// A prepared name-registry write. Commit/Register carry the *minted* plan so the
@@ -147,6 +178,11 @@ pub struct SignReview {
     /// Drops stale prepare results after the user has moved on.
     pub seq: u64,
     pub action: SignAction,
+    /// Set once the user confirms and the signing task is in flight: the overlay
+    /// stays open showing a "waiting for a signature" notice (so a hardware
+    /// wallet prompt isn't left facing a blank screen) until the broadcast
+    /// resolves. `None` before confirm; the elapsed time drives the animation.
+    pub signing_since: Option<Instant>,
 }
 
 impl SignReview {
@@ -168,6 +204,7 @@ impl SignReview {
             note,
             seq,
             action,
+            signing_since: None,
         }
     }
 }
@@ -226,24 +263,31 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
     }
 
     // ── Actions ───────────────────────────────────────────────────────────
-    // Confirm stays disabled while legs are still decoding so the user can't
-    // approve bytes they haven't been shown yet.
-    let confirm = primary_button(t, "Confirm & sign", !review.legs_loading);
-    let confirm = if review.legs_loading {
-        confirm
-    } else {
-        confirm.on_press(Message::Confirm)
-    };
-    let actions = row![
-        container(secondary_button(t, "Cancel").on_press(Message::Cancel))
-            .width(Length::FillPortion(1)),
-        Space::new().width(10),
-        container(confirm).width(Length::FillPortion(1)),
-    ]
-    .width(Length::Fill);
-
+    // Once confirmed, the overlay swaps its buttons for a live "waiting for a
+    // signature" notice and stays open until the signing task resolves — so a
+    // hardware-wallet prompt isn't left facing a blank screen, and the reviewed
+    // bytes stay visible above it. Otherwise show the Confirm / Cancel gate.
     body = body.push(Space::new().height(20));
-    body = body.push(actions);
+    if let Some(since) = review.signing_since {
+        body = body.push(waiting_card(t, since.elapsed().as_secs_f32()));
+    } else {
+        // Confirm stays disabled while legs are still decoding so the user can't
+        // approve bytes they haven't been shown yet.
+        let confirm = primary_button(t, "Confirm & sign", !review.legs_loading);
+        let confirm = if review.legs_loading {
+            confirm
+        } else {
+            confirm.on_press(Message::Confirm)
+        };
+        let actions = row![
+            container(secondary_button(t, "Cancel").on_press(Message::Cancel))
+                .width(Length::FillPortion(1)),
+            Space::new().width(10),
+            container(confirm).width(Length::FillPortion(1)),
+        ]
+        .width(Length::Fill);
+        body = body.push(actions);
+    }
 
     // Inset the content from the right so the scrollbar rides in its own gutter
     // instead of overlapping the cards (notably the full address rows).
@@ -257,13 +301,51 @@ pub fn view<'a>(t: KaoTheme, review: &'a SignReview, progress: f32) -> Element<'
     .style(move |_, s| kao_scrollable_style(t, s));
     let bounded = container(scroll_body).max_height(FORM_MAX_HEIGHT);
 
+    // While the signing task is in flight the review can't be dismissed (a
+    // hardware signature can't be aborted from here), so a backdrop click is a
+    // no-op; before confirm it cancels as usual.
+    let on_backdrop = if review.signing_since.is_some() {
+        Message::BoxClickIgnored
+    } else {
+        Message::Cancel
+    };
     modal_wrapper(
         t,
         MODAL_WIDTH,
         progress,
-        Message::Cancel,
+        on_backdrop,
         Message::BoxClickIgnored,
         bounded.into(),
+    )
+}
+
+/// The post-confirm "waiting for a signature" panel: a font-safe bouncing-bullet
+/// animator (shared with the ZK proving screen) over a short notice. Shown in
+/// place of the Confirm / Cancel gate while the signing task runs.
+fn waiting_card<'a>(t: KaoTheme, elapsed: f32) -> Element<'a, Message> {
+    card(
+        t,
+        column![
+            text(bullet_wave(elapsed))
+                .size(15)
+                .color(t.a3)
+                .font(mono_bold()),
+            Space::new().height(8),
+            text("Waiting for a signature")
+                .size(14)
+                .color(t.text)
+                .font(bold()),
+            Space::new().height(4),
+            text(
+                "Confirm the transaction on your device — this window stays open until it's signed."
+            )
+            .size(12)
+            .color(t.sub)
+            .font(mono()),
+        ]
+        .align_x(Alignment::Center)
+        .width(Length::Fill)
+        .into(),
     )
 }
 

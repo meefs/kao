@@ -35,10 +35,27 @@ use zeroize::Zeroizing;
 
 use super::{AccountDescriptor, Contact, SafeDescriptor, WalletDescriptor, WalletError};
 
+use std::collections::HashMap;
+use std::str::FromStr;
+
+use alloy::primitives::Address;
+
+use crate::pool::sync::CachedNotes;
+
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const ACCOUNTS_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("accounts");
 const CONTACTS_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("contacts");
 const SAFES_TABLE: TableDefinition<u32, &[u8]> = TableDefinition::new("safes");
+// Single-row table holding the dedicated Privacy Pools 24-word mnemonic. It is
+// a keyring root shared by every pool account (not a per-account entry), so it
+// lives in its own table rather than in `accounts`. The wallet's own BIP39 seed
+// is never persisted (only derived keys), so this is an independent secret.
+const PP_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pp");
+// Per-pool Privacy Pools note cache (the recovered-note logs + a `to_block`
+// cursor), one row per `(chain, pool)` keyed `"{chain_id}:{pool:#x}"`. A cache,
+// not a source of truth — cleared on identity change and self-healed on any
+// inconsistency, so it never has to be migrated.
+const PP_NOTES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("pp_notes");
 
 const NONCE_LEN: usize = 24;
 const TAG_LEN: usize = 16;
@@ -46,10 +63,18 @@ const SALT_LEN: usize = 16;
 
 const HEADER_KEY: &str = "header";
 const ACTIVE_INDEX_KEY: &str = "active_index";
+const PP_SEED_KEY: &str = "seed";
 const HEADER_AAD: &[u8] = b"header:auth_check";
 const ACCOUNT_AAD_PREFIX: &[u8] = b"accounts:";
 const CONTACT_AAD_PREFIX: &[u8] = b"contacts:";
 const SAFE_AAD_PREFIX: &[u8] = b"safes:";
+// Single fixed AAD (the table has exactly one row), namespacing the Privacy
+// Pools seed against accounts/contacts/safes so its ciphertext can't be swapped
+// into another table.
+const PP_SEED_AAD: &[u8] = b"pp:seed";
+// Per-row AAD prefix for the note cache; the row key is appended so a blob is
+// bound to its exact `(chain, pool)` slot and can't be swapped across rows/tables.
+const PP_NOTES_AAD_PREFIX: &[u8] = b"pp_notes:";
 
 const AUTH_CONSTANT: &[u8] = b"KAO_AUTH";
 
@@ -80,6 +105,15 @@ struct Header {
     argon2_t_cost: u32,
     argon2_p_cost: u32,
     auth_check: Vec<u8>,
+}
+
+/// The persisted Privacy Pools secret. A struct (not a bare string) so future
+/// fields — e.g. a deposit "birthday" block to bound the sync scan — can be
+/// appended without a format break (postcard is not self-describing; new fields
+/// MUST append and get a legacy fallback, exactly like `SafeDescriptor`).
+#[derive(Serialize, Deserialize)]
+struct PpSeedRecord {
+    phrase: String,
 }
 
 pub fn db_path() -> PathBuf {
@@ -607,6 +641,247 @@ fn load_contacts_from(path: &Path, pw: &SecretString) -> Result<Vec<Contact>, Wa
     }
     entries.sort_by_key(|(i, _)| *i);
     Ok(entries.into_iter().map(|(_, c)| c).collect())
+}
+
+/// Persist the Privacy Pools mnemonic under the existing wallet's master key.
+///
+/// Same per-row AEAD + password-recheck pattern as `save_contacts`, in its own
+/// `pp` table with a `pp:seed` AAD so the record can't be swapped into
+/// accounts/contacts/safes. Only ever called on an unlocked wallet.
+pub fn save_pp_seed(phrase: &SecretString, passphrase: &SecretString) -> Result<(), WalletError> {
+    save_pp_seed_to(&db_path(), phrase, passphrase)
+}
+
+pub fn load_pp_seed(passphrase: &SecretString) -> Result<Option<SecretString>, WalletError> {
+    load_pp_seed_from(&db_path(), passphrase)
+}
+
+// ── Privacy Pools note cache ────────────────────────────────────────────────
+//
+// Encrypted under a **32-byte key the caller derives from the pool account**
+// (see `pool::sync::notes_cipher_key`), NOT the wallet passphrase — the coordinator
+// holds the account but not the passphrase, and per-pool-sync saves must not pay
+// Argon2. The key is as strong as the mnemonic (which is itself stored under the
+// passphrase), so cracking the passphrase is still the only path in. A row from a
+// different identity simply won't decrypt and is skipped.
+
+/// Persist one pool's note cache, encrypted under an account-derived `key`. The
+/// cache is advisory — losing or clearing it just forces a full re-scan — so
+/// there's no migration story to maintain.
+pub fn save_pp_notes(
+    chain_id: u64,
+    pool: Address,
+    notes: &CachedNotes,
+    key: &[u8; 32],
+) -> Result<(), WalletError> {
+    save_pp_notes_to(&db_path(), chain_id, pool, notes, key)
+}
+
+/// Load every note cache decryptable with `key`, keyed by `(chain_id, pool)`.
+/// Rows from other identities (or a missing table) collapse to nothing.
+pub fn load_all_pp_notes(
+    key: &[u8; 32],
+) -> Result<HashMap<(u64, Address), CachedNotes>, WalletError> {
+    load_all_pp_notes_from(&db_path(), key)
+}
+
+/// Drop every persisted note cache — a different mnemonic derives a different
+/// note set, so the cache is invalidated wholesale on identity change.
+pub fn clear_pp_notes() -> Result<(), WalletError> {
+    clear_pp_notes_at(&db_path())
+}
+
+fn pp_notes_key(chain_id: u64, pool: Address) -> String {
+    format!("{chain_id}:{pool:#x}")
+}
+
+fn parse_pp_notes_key(key: &str) -> Option<(u64, Address)> {
+    let (cid, addr) = key.split_once(':')?;
+    Some((cid.parse().ok()?, Address::from_str(addr).ok()?))
+}
+
+fn pp_notes_aad(key: &str) -> Vec<u8> {
+    [PP_NOTES_AAD_PREFIX, key.as_bytes()].concat()
+}
+
+fn save_pp_notes_to(
+    path: &Path,
+    chain_id: u64,
+    pool: Address,
+    notes: &CachedNotes,
+    key: &[u8; 32],
+) -> Result<(), WalletError> {
+    let db = Database::create(path).map_err(redb_err)?;
+    restrict_to_owner(path, 0o600)?;
+    let txn = db.begin_write().map_err(redb_err)?;
+    {
+        let row_key = pp_notes_key(chain_id, pool);
+        let plaintext = Zeroizing::new(
+            postcard::to_stdvec(notes)
+                .map_err(|e| WalletError::Encryption(format!("serialize pp notes: {e}")))?,
+        );
+        let aad = pp_notes_aad(&row_key);
+        let blob = encrypt_blob(key, &aad, &plaintext)?;
+        let mut tbl = txn.open_table(PP_NOTES_TABLE).map_err(redb_err)?;
+        tbl.insert(row_key.as_str(), blob.as_slice())
+            .map_err(redb_err)?;
+    }
+    txn.commit().map_err(redb_err)?;
+    Ok(())
+}
+
+fn load_all_pp_notes_from(
+    path: &Path,
+    key: &[u8; 32],
+) -> Result<HashMap<(u64, Address), CachedNotes>, WalletError> {
+    let db = match Database::open(path) {
+        Ok(db) => db,
+        Err(redb::DatabaseError::Storage(redb::StorageError::Io(e)))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(HashMap::new());
+        }
+        Err(e) => return Err(redb_err(e)),
+    };
+    let txn = db.begin_read().map_err(redb_err)?;
+
+    let tbl = match txn.open_table(PP_NOTES_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
+        Err(e) => return Err(redb_err(e)),
+    };
+    let mut out = HashMap::new();
+    for entry in tbl.iter().map_err(redb_err)? {
+        let (k, v) = entry.map_err(redb_err)?;
+        let row_key = k.value();
+        let Some(id) = parse_pp_notes_key(row_key) else {
+            continue; // unrecognized key shape — skip rather than fail the load
+        };
+        let aad = pp_notes_aad(row_key);
+        // A row written by a *different* identity won't decrypt under this key —
+        // skip it (and any undecodable payload) rather than failing the load.
+        let Ok(plaintext) = decrypt_blob(key, &aad, v.value()) else {
+            continue;
+        };
+        if let Ok(notes) = postcard::from_bytes::<CachedNotes>(&plaintext) {
+            out.insert(id, notes);
+        }
+    }
+    Ok(out)
+}
+
+fn clear_pp_notes_at(path: &Path) -> Result<(), WalletError> {
+    let db = match Database::open(path) {
+        Ok(db) => db,
+        Err(redb::DatabaseError::Storage(redb::StorageError::Io(e)))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(());
+        }
+        Err(e) => return Err(redb_err(e)),
+    };
+    let txn = db.begin_write().map_err(redb_err)?;
+    match txn.delete_table(PP_NOTES_TABLE) {
+        Ok(_) => {}
+        Err(redb::TableError::TableDoesNotExist(_)) => {}
+        Err(e) => return Err(redb_err(e)),
+    }
+    txn.commit().map_err(redb_err)?;
+    Ok(())
+}
+
+fn save_pp_seed_to(
+    path: &Path,
+    phrase: &SecretString,
+    pw: &SecretString,
+) -> Result<(), WalletError> {
+    let db = Database::create(path).map_err(redb_err)?;
+    restrict_to_owner(path, 0o600)?;
+    let txn = db.begin_write().map_err(redb_err)?;
+
+    // The PP seed only lives alongside an existing wallet — a save without a
+    // header is a logic error (the App must never dispatch this before unlock).
+    let header = {
+        let meta = txn.open_table(META_TABLE).map_err(redb_err)?;
+        match meta.get(HEADER_KEY).map_err(redb_err)? {
+            Some(v) => deserialize_header(v.value())?,
+            None => {
+                return Err(WalletError::Encryption(
+                    "save_pp_seed called before wallet exists".into(),
+                ));
+            }
+        }
+    };
+    let master_key = derive_master_key(
+        pw,
+        &header.salt,
+        header.argon2_m_cost_kib,
+        header.argon2_t_cost,
+        header.argon2_p_cost,
+    )?;
+    decrypt_blob(master_key.as_slice(), HEADER_AAD, &header.auth_check)
+        .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
+
+    {
+        let record = PpSeedRecord {
+            phrase: phrase.expose_secret().to_string(),
+        };
+        let plaintext = Zeroizing::new(
+            postcard::to_stdvec(&record)
+                .map_err(|e| WalletError::Encryption(format!("serialize pp seed: {e}")))?,
+        );
+        let blob = encrypt_blob(master_key.as_slice(), PP_SEED_AAD, &plaintext)?;
+        let mut tbl = txn.open_table(PP_TABLE).map_err(redb_err)?;
+        tbl.insert(PP_SEED_KEY, blob.as_slice()).map_err(redb_err)?;
+    }
+
+    txn.commit().map_err(redb_err)?;
+    Ok(())
+}
+
+fn load_pp_seed_from(path: &Path, pw: &SecretString) -> Result<Option<SecretString>, WalletError> {
+    let db = match Database::open(path) {
+        Ok(db) => db,
+        Err(redb::DatabaseError::Storage(redb::StorageError::Io(e)))
+            if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Err(WalletError::NotFound);
+        }
+        Err(e) => return Err(redb_err(e)),
+    };
+    let txn = db.begin_read().map_err(redb_err)?;
+
+    let meta = txn.open_table(META_TABLE).map_err(redb_err)?;
+    let header_guard = meta
+        .get(HEADER_KEY)
+        .map_err(redb_err)?
+        .ok_or_else(|| WalletError::Encryption("missing header in store".into()))?;
+    let header = deserialize_header(header_guard.value())?;
+
+    let master_key = derive_master_key(
+        pw,
+        &header.salt,
+        header.argon2_m_cost_kib,
+        header.argon2_t_cost,
+        header.argon2_p_cost,
+    )?;
+    decrypt_blob(master_key.as_slice(), HEADER_AAD, &header.auth_check)
+        .map_err(|_| WalletError::Encryption("incorrect password".into()))?;
+
+    // A wallet created before Privacy Pools shipped has no `pp` table; a wallet
+    // that has one but no row hasn't set up pools yet. Both collapse to `None`.
+    let tbl = match txn.open_table(PP_TABLE) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(redb_err(e)),
+    };
+    let Some(v) = tbl.get(PP_SEED_KEY).map_err(redb_err)? else {
+        return Ok(None);
+    };
+    let plaintext = decrypt_blob(master_key.as_slice(), PP_SEED_AAD, v.value())?;
+    let record: PpSeedRecord = postcard::from_bytes(&plaintext)
+        .map_err(|e| WalletError::Encryption(format!("deserialize pp seed: {e}")))?;
+    Ok(Some(SecretString::new(record.phrase.into_boxed_str())))
 }
 
 fn redb_err<E: std::fmt::Display>(e: E) -> WalletError {
@@ -1427,5 +1702,140 @@ mod tests {
         assert!(!desc.contains_safe(same, 10));
         // Different address, same chain → not a duplicate.
         assert!(!desc.contains_safe(other, 1));
+    }
+
+    // ── Privacy Pools seed tests ─────────────────────────────────────────
+
+    const SAMPLE_PP_PHRASE: &str = "test test test test test test test test test test test test \
+         test test test test test test test test test test test junk";
+
+    #[test]
+    fn pp_seed_save_and_load_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
+        });
+        save_to(&path, &desc, &pw("pw")).unwrap();
+
+        let phrase = SecretString::new(SAMPLE_PP_PHRASE.to_string().into_boxed_str());
+        save_pp_seed_to(&path, &phrase, &pw("pw")).unwrap();
+        let loaded = load_pp_seed_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded.unwrap().expose_secret(), SAMPLE_PP_PHRASE);
+
+        // Overwrite replaces (single row): saving a new phrase wins.
+        let phrase2 = SecretString::new(
+            "abandon "
+                .repeat(23)
+                .trim_end()
+                .to_string()
+                .into_boxed_str(),
+        );
+        save_pp_seed_to(&path, &phrase2, &pw("pw")).unwrap();
+        let loaded2 = load_pp_seed_from(&path, &pw("pw")).unwrap();
+        assert_eq!(loaded2.unwrap().expose_secret(), phrase2.expose_secret());
+    }
+
+    #[test]
+    fn pp_seed_missing_table_loads_none() {
+        // A wallet created before Privacy Pools shipped has no `pp` table; load
+        // must collapse that to `None`, not error, or unlock breaks on upgrade.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
+        });
+        save_to(&path, &desc, &pw("pw")).unwrap();
+        assert!(load_pp_seed_from(&path, &pw("pw")).unwrap().is_none());
+    }
+
+    #[test]
+    fn pp_seed_save_refuses_wrong_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let desc = WalletDescriptor::single(AccountDescriptor::Local {
+            name: None,
+            key_bytes: crate::wallet::SecretKeyBytes::new([0x42; 32]),
+        });
+        save_to(&path, &desc, &pw("right")).unwrap();
+        let phrase = SecretString::new(SAMPLE_PP_PHRASE.to_string().into_boxed_str());
+        let err = save_pp_seed_to(&path, &phrase, &pw("wrong")).unwrap_err();
+        match err {
+            WalletError::Encryption(msg) => assert!(msg.contains("incorrect password")),
+            other => panic!("expected wrong-password error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pp_seed_aad_namespaces_against_other_tables() {
+        // Four-way AAD isolation: a pp-seed ciphertext must not decrypt under
+        // the account/contact/safe AAD (and vice versa), so a file-write
+        // attacker can't move the seed record into another table.
+        let key = [0x77u8; 32];
+        let plaintext = b"seed-bytes";
+        let blob_pp = encrypt_blob(&key, PP_SEED_AAD, plaintext).unwrap();
+        let blob_a = encrypt_blob(&key, &account_aad(0), plaintext).unwrap();
+        let blob_c = encrypt_blob(&key, &contact_aad(0), plaintext).unwrap();
+        let blob_s = encrypt_blob(&key, &safe_aad(0), plaintext).unwrap();
+
+        assert!(decrypt_blob(&key, &account_aad(0), &blob_pp).is_err());
+        assert!(decrypt_blob(&key, &contact_aad(0), &blob_pp).is_err());
+        assert!(decrypt_blob(&key, &safe_aad(0), &blob_pp).is_err());
+        assert!(decrypt_blob(&key, PP_SEED_AAD, &blob_a).is_err());
+        assert!(decrypt_blob(&key, PP_SEED_AAD, &blob_c).is_err());
+        assert!(decrypt_blob(&key, PP_SEED_AAD, &blob_s).is_err());
+
+        // Sanity: the pp AAD round-trips on its own blob.
+        assert_eq!(
+            decrypt_blob(&key, PP_SEED_AAD, &blob_pp)
+                .unwrap()
+                .as_slice(),
+            plaintext,
+        );
+    }
+
+    // ── Privacy Pools note cache tests ───────────────────────────────────
+
+    #[test]
+    fn pp_notes_save_load_clear_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("wallet.redb");
+        let key = [0x33u8; 32];
+        let pool = Address::from([0xab; 20]);
+        let notes = CachedNotes {
+            to_block: 4242,
+            ..Default::default()
+        };
+        save_pp_notes_to(&path, 1, pool, &notes, &key).unwrap();
+
+        // Round-trips under the right key, keyed by (chain_id, pool).
+        let loaded = load_all_pp_notes_from(&path, &key).unwrap();
+        assert_eq!(loaded.get(&(1, pool)).map(|n| n.to_block), Some(4242));
+
+        // A different identity's key can't read the row — skipped, not an error.
+        assert!(
+            load_all_pp_notes_from(&path, &[0x99u8; 32])
+                .unwrap()
+                .is_empty()
+        );
+
+        // Clearing wipes the table.
+        clear_pp_notes_at(&path).unwrap();
+        assert!(load_all_pp_notes_from(&path, &key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pp_notes_missing_db_and_table_are_empty() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("nope.redb");
+        assert!(
+            load_all_pp_notes_from(&missing, &[0u8; 32])
+                .unwrap()
+                .is_empty()
+        );
+        // Clear on a missing DB is a no-op, not an error.
+        clear_pp_notes_at(&missing).unwrap();
     }
 }
