@@ -59,6 +59,18 @@ ignore = [
     # signed payloads, or verified chain state, and the fonts/SVG assets it reads
     # ship with the app.
     { id = "RUSTSEC-2026-0192", reason = "ttf-parser 0.25.1 unmaintained (author won't ship further fixes; no known vuln). Reaches the tree via iced's text/SVG rendering (cosmic-text + usvg → fontdb). Glyph/font parsing for rendering only — disjoint from signing, storage, and chain verification. Revisit when iced/cosmic-text/usvg migrate to skrifa." },
+
+    # ── privacy-pools proving subtree (arkworks 0.5 → ark-relations →
+    #    tracing-subscriber 0.2.25) ─────────────────────────────────────────
+    # ark-relations pulls an ancient tracing-subscriber 0.2.25 for its optional
+    # constraint-system tracing. The pool prover never installs a subscriber and
+    # never logs untrusted input through one — proving is a pure in-memory
+    # arkworks computation over the bundled zkey. The advisory is ANSI-escape
+    # injection into terminal output, which needs attacker-controlled data to
+    # reach a subscriber; neither condition holds on this path.
+    { id = "RUSTSEC-2025-0055", reason = "tracing-subscriber 0.2.25 ANSI-escape injection, via ark-relations' optional constraint-tracing (arkworks 0.5, used by privacy-pools' Groth16 prover). No subscriber is installed on the proving path and no untrusted input is logged through it — proving is pure in-memory computation over the bundled circuit. Revisit if arkworks upgrades ark-relations' tracing dep." },
+    { id = "RUSTSEC-2024-0388", reason = "derivative 2.2.0 unmaintained (build-time derive macro). Pulled by arkworks (ark-ff and friends) for Debug/Clone impls in privacy-pools' proving stack. No known vuln, no runtime surface. Revisit when arkworks migrates off it." },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix 0.4.0 unmaintained. Enters via indicatif (progress-bar formatting) inside circom-witnesscalc; the pool prover computes witnesses in-process and never drives indicatif's CLI progress UI. No known vuln, no runtime surface." },
 ]
 
 [licenses]
@@ -181,6 +193,7 @@ allow-git = [
     "https://github.com/a16z/helios",
     "https://github.com/bbqsrc/core2",
     "https://github.com/kaowallet/clear-signing",
+    "https://github.com/kaowallet/privacy-pools",
 ]
 
 [sources.allow-org]

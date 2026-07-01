@@ -1275,7 +1275,7 @@ fn latest_from_rpc_header(header: &alloy_rpc_types_eth::Header) -> LatestBlock {
 /// The same discipline as `indexer::redact_url_in_err`, but applied to
 /// already-formatted strings since alloy's error types don't expose a
 /// `without_url()`.
-fn redact_urls(s: &str) -> String {
+pub(crate) fn redact_urls(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(pos) = rest.find("://") {

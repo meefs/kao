@@ -20,6 +20,7 @@ use crate::cow::tracked::{OrderStatus, TrackedOrder};
 use crate::portfolio::{LiveToken, format_token_balance};
 
 use super::names_app::{self, NamesApp};
+use super::pool_app::{self, PoolApp};
 use crate::ui::kao_theme::{KaoTheme, with_alpha};
 use crate::ui::kao_widgets::{
     avatar, bold, ghost_button, kao_scrollable_style, mono, mono_bold, screen_subtitle,
@@ -35,8 +36,12 @@ pub enum Message {
     OpenSwapApp,
     /// Open the Names app from the launcher.
     OpenNamesApp,
+    /// Open the Privacy Pools app from the launcher.
+    OpenPrivacyPoolsApp,
     /// Messages for the embedded Names app.
     Names(names_app::Message),
+    /// Messages for the embedded Privacy Pools app.
+    Pool(pool_app::Message),
     /// Return from a sub-app to the launcher.
     BackHome,
     Composer(composer::Message),
@@ -56,6 +61,7 @@ enum AppsView {
     Launcher,
     Swap,
     Names,
+    PrivacyPools,
 }
 
 // `Request*`-prefixed by design (these are the requests the pane bubbles up);
@@ -80,12 +86,17 @@ pub enum Outcome {
     /// signed transaction); the coordinator services it and feeds the result
     /// back via [`AppsPane::names_pane`].
     Name(names_app::Outcome),
+    /// A request bubbled up from the embedded Privacy Pools app; the coordinator
+    /// services it (discover/sync/quote/prove/submit, seed plumbing) and feeds
+    /// the result back via [`AppsPane::pool_pane`].
+    Pool(pool_app::Outcome),
 }
 
 #[derive(Debug)]
 pub struct AppsPane {
     composer: SwapComposer,
     names: NamesApp,
+    pool: PoolApp,
     view: AppsView,
 }
 
@@ -94,8 +105,15 @@ impl AppsPane {
         Self {
             composer: SwapComposer::new(),
             names: NamesApp::new(owner),
+            pool: PoolApp::new(),
             view: AppsView::Launcher,
         }
+    }
+
+    /// Mutable access to the Privacy Pools app so the coordinator can deliver
+    /// async results (synced state, quotes, proving progress, backup phrase).
+    pub fn pool_pane(&mut self) -> &mut PoolApp {
+        &mut self.pool
     }
 
     /// Mutable access to the Names app so the coordinator can deliver async
@@ -130,7 +148,21 @@ impl AppsPane {
                 // Kick off the reverse-lookup scan the first time it's opened.
                 self.names.on_open().map(Outcome::Name)
             }
+            Message::OpenPrivacyPoolsApp => {
+                self.view = AppsView::PrivacyPools;
+                // Load the identity + sync the first time it's opened.
+                self.pool.on_open().map(Outcome::Pool)
+            }
             Message::Names(child) => self.names.update(child).map(Outcome::Name),
+            Message::Pool(child) => match self.pool.update(child) {
+                // The pane's "← Apps" link steps back to the launcher rather
+                // than bubbling to the dashboard.
+                Some(pool_app::Outcome::Close) => {
+                    self.view = AppsView::Launcher;
+                    None
+                }
+                other => other.map(Outcome::Pool),
+            },
             Message::BackHome => {
                 self.view = AppsView::Launcher;
                 None
@@ -152,7 +184,10 @@ impl AppsPane {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
                 } = event
-                    && matches!(self.view, AppsView::Swap | AppsView::Names)
+                    && matches!(
+                        self.view,
+                        AppsView::Swap | AppsView::Names | AppsView::PrivacyPools
+                    )
                 {
                     self.view = AppsView::Launcher;
                 }
@@ -172,6 +207,12 @@ impl AppsPane {
                 keyboard::listen().map(Message::Key),
                 self.names.subscription().map(Message::Names),
             ]),
+            // Privacy Pools needs Esc-to-back plus its own tick (quote-expiry
+            // countdown / proving animation).
+            AppsView::PrivacyPools => Subscription::batch([
+                keyboard::listen().map(Message::Key),
+                self.pool.subscription().map(Message::Pool),
+            ]),
             AppsView::Launcher => Subscription::none(),
         }
     }
@@ -182,6 +223,7 @@ impl AppsPane {
         portfolio: &'a [LiveToken],
         orders: &[&'a TrackedOrder],
         names_available: bool,
+        recipients: super::send::ContactsView,
     ) -> Element<'a, Message> {
         let content = match self.view {
             AppsView::Launcher => self.launcher_view(t, orders, names_available),
@@ -191,6 +233,7 @@ impl AppsPane {
             // before switching to such an identity.
             AppsView::Names if !names_available => self.launcher_view(t, orders, names_available),
             AppsView::Names => self.names.view(t).map(Message::Names),
+            AppsView::PrivacyPools => self.pool.view(t, portfolio, recipients).map(Message::Pool),
         };
 
         // Center the bounded (max-width 560) content within the full-width
@@ -251,6 +294,15 @@ impl AppsPane {
                 Message::OpenNamesApp,
             ));
         }
+        // Privacy Pools is its own EOA-independent identity with its own chain
+        // selector (Ethereum + Optimism), so the card is always available.
+        col = col.push(Space::new().height(10)).push(app_card(
+            t,
+            "(≖ᴗ≖)",
+            "Privacy Pools",
+            "Deposit & withdraw privately with ZK proofs",
+            Message::OpenPrivacyPoolsApp,
+        ));
         col.width(Length::Fill).max_width(560).into()
     }
 

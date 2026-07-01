@@ -173,6 +173,12 @@ pub struct App {
     /// index across screen transitions (e.g. through hardware reconnect or
     /// the add-account setup flow).
     wallet: Option<WalletDescriptor>,
+    /// The dedicated Privacy Pools mnemonic, held for the session (like
+    /// `passphrase`) so the pool app can derive its account and re-show the
+    /// backup phrase without a second Argon2 pass. Loaded lazily on first
+    /// dashboard entry; `pp_loaded` records that the (possibly-absent) load ran.
+    pp_seed: Option<SecretString>,
+    pp_loaded: bool,
     /// Why the setup screens are on screen, if at all.
     setup_context: Option<SetupContext>,
     /// Active signer parked here while the user is in the add-account flow,
@@ -246,6 +252,8 @@ impl App {
                 screen: Screen::Unlock(UnlockScreen::default()),
                 passphrase: None,
                 wallet: None,
+                pp_seed: None,
+                pp_loaded: false,
                 setup_context: None,
                 pending_signer: None,
                 network,
@@ -264,6 +272,8 @@ impl App {
                 screen: Screen::CreatePassword(CreatePasswordScreen::default()),
                 passphrase: None,
                 wallet: None,
+                pp_seed: None,
+                pp_loaded: false,
                 setup_context: None,
                 pending_signer: None,
                 network,
@@ -377,6 +387,9 @@ impl App {
         // named, so account switches don't pile up redundant lookups.
         let ens_task = screen.fetch_ens_name_task().map(Message::WalletDashboard);
         self.screen = Screen::Wallet(Box::new(screen));
+        // Load the Privacy Pools identity (once per session) and push it into
+        // the fresh dashboard so the pool app can sync/prove immediately.
+        self.load_pp_identity();
         debug!(
             active_index,
             addr = %address,
@@ -384,6 +397,108 @@ impl App {
             "entered dashboard; verify+portfolio+ens fetch queued",
         );
         iced::Task::batch(vec![verify_task, portfolio_task, ens_task])
+    }
+
+    // ── Privacy Pools identity plumbing ──────────────────────────────────────
+    // The pool seed is a wallet-global secret separate from the account keys, so
+    // the App owns it (like `passphrase`) and pushes the derived account into the
+    // dashboard. Load is Argon2-gated, so it runs at most once per session.
+
+    /// Load the pool seed (once) and push the derived account into the dashboard.
+    fn load_pp_identity(&mut self) {
+        if !self.pp_loaded {
+            if let Some(pw) = self.passphrase.as_ref() {
+                match wallet::load_pp_seed(pw) {
+                    Ok(seed) => self.pp_seed = seed,
+                    Err(e) => {
+                        warn!(error = %e, "privacy pools: loading the saved pool seed failed")
+                    }
+                }
+            }
+            self.pp_loaded = true;
+        }
+        let account = self.pp_seed.as_ref().and_then(|p| {
+            match crate::pool::account::account_from_phrase(p) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    error!(error = %e, "privacy pools: deriving the pool account failed");
+                    None
+                }
+            }
+        });
+        if let Screen::Wallet(ws) = &mut self.screen {
+            ws.set_pp_account(account);
+        }
+    }
+
+    /// Persist + adopt a pool mnemonic: derive the account, push it into the
+    /// dashboard, and (on create) show the masked backup.
+    fn adopt_pp_seed(&mut self, phrase: SecretString, show_backup: bool) {
+        let account = match crate::pool::account::account_from_phrase(&phrase) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                error!(error = %e, "privacy pools: deriving the pool account failed");
+                None
+            }
+        };
+        self.pp_seed = Some(phrase.clone());
+        self.pp_loaded = true;
+        if let Screen::Wallet(ws) = &mut self.screen {
+            ws.set_pp_account(account);
+            if show_backup {
+                ws.show_pool_backup(phrase);
+            }
+        }
+    }
+
+    fn pool_error(&mut self, e: String) {
+        if let Screen::Wallet(ws) = &mut self.screen {
+            ws.set_pool_error(e);
+        }
+    }
+
+    /// Generate a fresh pool identity, persist it, and show its backup phrase.
+    fn pool_create_identity(&mut self) -> iced::Task<Message> {
+        let Some(pw) = self.passphrase.clone() else {
+            self.pool_error("wallet is locked".into());
+            return iced::Task::none();
+        };
+        let phrase = match wallet::generate_pp_mnemonic() {
+            Ok(p) => p,
+            Err(e) => {
+                self.pool_error(e.to_string());
+                return iced::Task::none();
+            }
+        };
+        if let Err(e) = wallet::save_pp_seed(&phrase, &pw) {
+            self.pool_error(e.to_string());
+            return iced::Task::none();
+        }
+        self.adopt_pp_seed(phrase, true);
+        iced::Task::none()
+    }
+
+    /// Persist + adopt a restored pool mnemonic (already BIP39-validated).
+    fn pool_restore_identity(&mut self, phrase: SecretString) -> iced::Task<Message> {
+        let Some(pw) = self.passphrase.clone() else {
+            self.pool_error("wallet is locked".into());
+            return iced::Task::none();
+        };
+        if let Err(e) = wallet::save_pp_seed(&phrase, &pw) {
+            self.pool_error(e.to_string());
+            return iced::Task::none();
+        }
+        self.adopt_pp_seed(phrase, false);
+        iced::Task::none()
+    }
+
+    fn pool_reveal_backup(&mut self) -> iced::Task<Message> {
+        if let Some(seed) = self.pp_seed.clone()
+            && let Screen::Wallet(ws) = &mut self.screen
+        {
+            ws.show_pool_backup(seed);
+        }
+        iced::Task::none()
     }
 
     /// Routes the active account of `self.wallet` to the right destination.
@@ -498,6 +613,8 @@ impl App {
         self.screen = if wallet::wallet_exists() {
             self.passphrase = None;
             self.wallet = None;
+            self.pp_seed = None;
+            self.pp_loaded = false;
             Screen::Unlock(UnlockScreen::default())
         } else {
             Screen::SelectHardwareWallet(SelectHardwareWalletScreen::default())
@@ -1091,6 +1208,8 @@ impl App {
                     }
                     Some(NetworkSetupOutcome::Back) => {
                         self.passphrase = None;
+                        self.pp_seed = None;
+                        self.pp_loaded = false;
                         self.setup_context = None;
                         self.screen = Screen::CreatePassword(CreatePasswordScreen::default());
                         focus_widget(crate::ui::create_password::PASSWORD_INPUT_ID)
@@ -1508,6 +1627,18 @@ impl App {
                         let save = self.set_safe_service_url(index, url);
                         iced::Task::batch(vec![cmd.map(Message::WalletDashboard), save])
                     }
+                    Some(WalletDashboardOutcome::PoolCreateIdentity) => {
+                        let t = self.pool_create_identity();
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), t])
+                    }
+                    Some(WalletDashboardOutcome::PoolRestoreIdentity(phrase)) => {
+                        let t = self.pool_restore_identity(phrase);
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), t])
+                    }
+                    Some(WalletDashboardOutcome::PoolRevealBackup) => {
+                        let t = self.pool_reveal_backup();
+                        iced::Task::batch(vec![cmd.map(Message::WalletDashboard), t])
+                    }
                     None => cmd.map(Message::WalletDashboard),
                 }
             }
@@ -1781,6 +1912,8 @@ mod tests {
             screen,
             passphrase: None,
             wallet: None,
+            pp_seed: None,
+            pp_loaded: false,
             setup_context: None,
             pending_signer: None,
             network,

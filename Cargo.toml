@@ -4,7 +4,7 @@ exclude = ["vendor/op-alloy-network"]
 
 [package]
 name = "kao"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 publish = false
 
@@ -104,6 +104,14 @@ helios-opstack = { git = "https://github.com/a16z/helios", rev = "204c998a927348
 # `advanced` exposes the custom-widget API (Widget/Tree/Clipboard), used by
 # `colored_address`'s hover-grey + click-to-copy widget in src/ui/kao_widgets.rs.
 iced = { version = "0.14.0", features = ["tokio", "image", "qr_code", "svg", "advanced"] }
+# Privacy Pools (0xbow) proving + wallet SDK, pure Rust. `wallet` = onchain +
+# account (alloy 2.0.1 bindings + BIP-44 HD derivation + the flow/sync helpers);
+# the default `bundled` feature embeds the ~19 MB Groth16 circuit artifacts so
+# proving needs no wasm/node/circom at runtime. The crate pins & re-exports
+# alloy 2.0.1 — import alloy through `privacy_pools::alloy` where boundary types
+# (Address/U256/Provider) cross — and pulls arkworks 0.5 + circom-witnesscalc
+# (new ark-*/witnesscalc crates need supply-chain exemptions).
+privacy-pools = { git = "https://github.com/kaowallet/privacy-pools", features = ["wallet"] }
 rand = "0.8"
 redb = "4.1.0"
 # Local EVM for transaction preflight. Pinned to the same version helios

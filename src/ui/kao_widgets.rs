@@ -830,7 +830,8 @@ pub const COPY_TOAST: Duration = Duration::from_millis(1400);
 /// has no message channel to the app — this is the matching direct signal back.
 static LAST_COPY: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// Record that an address was just copied — drives the "Copied!" toast.
+/// Record that something was just copied — a `colored_address` click or a Copy
+/// button (via `arm_clipboard_clear`). Drives the "Copied!" toast.
 pub fn mark_copied() {
     if let Ok(mut g) = LAST_COPY.lock() {
         *g = Some(Instant::now());
@@ -1421,4 +1422,30 @@ pub fn kaomoji_for_account(idx: usize) -> &'static str {
         "(˘ᵕ˘)",
     ];
     KAOS[idx % KAOS.len()]
+}
+
+/// A 7-cell track with a 3-bullet cluster bouncing across it, sampled from
+/// `elapsed` seconds — a font-safe "alive" indicator for indeterminate waits
+/// (the ZK proving screen and the sign-review "waiting for a signature" state).
+/// Uses `•`/`·` (both broadly supported) so it renders in the generic Monospace
+/// family without relying on braille glyphs.
+pub fn bullet_wave(elapsed: f32) -> String {
+    const CELLS: usize = 7;
+    const CLUSTER: usize = 3;
+    let span = CELLS - CLUSTER; // head positions 0..=span
+    let phase = (elapsed * 6.0) as usize % (span * 2); // ping-pong period
+    let head = if phase <= span {
+        phase
+    } else {
+        span * 2 - phase
+    };
+    (0..CELLS)
+        .map(|i| {
+            if i >= head && i < head + CLUSTER {
+                '•'
+            } else {
+                '·'
+            }
+        })
+        .collect()
 }
